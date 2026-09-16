@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/otto-tenant",
+  "crates/otto-core",
+  "crates/otto-billing",
+  "crates/otto-auth",
+  "crates/otto-platform-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+rust-version = "1.88"
+
+[workspace.dependencies]
+otto-tenant = { path = "crates/otto-tenant" }
+otto-core = { path = "crates/otto-core" }
+otto-billing = { path = "crates/otto-billing" }
+otto-auth = { path = "crates/otto-auth" }
+
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "macros", "migrate", "json",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+schemars = { version = "1.1", features = ["chrono04", "uuid1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+# Only used by otto-core's labels.rs test module (asserting the generated
+# handle's shape). Not a runtime dependency of any crate in this workspace.
+regex = "1"
+url = "2"
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+subtle = "2"
+# Loads .env for local runs. Never overrides a variable already set, so a
+# deployment's real environment always wins over a file that got shipped.
+dotenvy = "0.15"
+
+[profile.release]
+lto = "thin"
+strip = true
