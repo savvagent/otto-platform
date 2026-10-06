@@ -1,0 +1,52 @@
+# otto-platform-server image. Mirrors otto-factory's Dockerfile minus the
+# console stage — the console moves here in Phase 4 of
+# docs/plans/2026-10-06-platform-cutover.md.
+
+FROM rust:1-slim-bookworm AS build
+
+# webauthn-rs (otto-auth) pulls in webauthn-attestation-ca, which links
+# openssl for attestation certificate verification. openssl-sys builds against
+# the system OpenSSL, so it needs the headers and pkg-config to find them.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+
+# No DATABASE_URL and no `.sqlx` offline data: every statement is a runtime
+# `sqlx::query`, not a `query!` macro, so the image builds with no database.
+#
+# The cache mounts hold the registry and the target directory across builds.
+# `target/` lives inside one, so the binary has to be copied out within the
+# same RUN — anything left there vanishes with the mount. Ids keep these
+# caches from being shared with other projects' builds on the same host.
+RUN --mount=type=cache,id=otto-platform-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=otto-platform-target,target=/app/target,sharing=locked \
+    cargo build --release -p otto-platform-server \
+    && cp target/release/otto-platform-server /usr/local/bin/otto-platform-server
+
+# ---------------------------------------------------------------- runtime
+FROM debian:bookworm-slim AS runtime
+
+# ca-certificates for Postgres over TLS (and, later, outbound OIDC calls).
+# libssl3 because the binary links the system OpenSSL dynamically (see above).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Nothing here writes to the filesystem or binds a privileged port.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin otto
+USER otto
+
+COPY --from=build /usr/local/bin/otto-platform-server /usr/local/bin/otto-platform-server
+
+ENV OTTO_BIND=0.0.0.0:8080 \
+    OTTO_LOG_FORMAT=json \
+    RUST_LOG=info
+
+EXPOSE 8080
+
+# Exec form, so the process is PID 1 and receives SIGTERM directly and the
+# graceful shutdown actually runs on every deploy.
+ENTRYPOINT ["/usr/local/bin/otto-platform-server"]

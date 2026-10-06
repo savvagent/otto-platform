@@ -1,0 +1,54 @@
+# otto-platform on Fly.io, org "savvagent".
+#
+# Database: a dedicated, standalone (unmanaged) Fly Postgres app,
+# `otto-platform-db` (region iad), for the same reason otto-factory has its
+# own: 0004_rls.sql runs `CREATE ROLE otto_app NOLOGIN`, which needs
+# CREATEROLE, and the managed `savvagent-pg` cluster does not grant that to a
+# tenant app's role (see otto-factory docs/deploy/fly.md). The connecting role
+# created by `fly postgres attach` is a superuser on this dedicated instance,
+# so it bypasses RLS: isolation rests on `Db::begin` issuing
+# `SET LOCAL ROLE otto_app`, which the startup isolation check verifies.
+#
+# Secrets are NOT in this file. `fly postgres attach` stages DATABASE_URL.
+#
+# Hostname: otto-platform.fly.dev for now. Phase 4 of
+# docs/plans/2026-10-06-platform-cutover.md moves it to otto.savvagent.com,
+# which becomes the WebAuthn relying party id — settle that before anyone
+# registers a passkey here.
+
+app = "otto-platform"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Fly's proxy terminates TLS and forwards plain HTTP over the internal network.
+  OTTO_BIND = "0.0.0.0:8080"
+  OTTO_LOG_FORMAT = "json"
+  RUST_LOG = "info"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  # Nothing depends on this service yet, so let it stop when idle. Revisit in
+  # Phase 4, when every otto-* service's logins and token checks go through it.
+  auto_stop_machines = "stop"
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    # /readyz, not /healthz: this check decides whether traffic is routed
+    # here, which is the question readiness answers.
+    path = "/readyz"
+    method = "GET"
+    interval = "15s"
+    timeout = "5s"
+    # Migrations run at startup under an advisory lock, so a first boot against
+    # a fresh database has DDL to get through before it can answer.
+    grace_period = "30s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

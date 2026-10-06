@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same PR cancels the run already in flight. Main pushes
+# each get their own group (github.run_id), so a push that release-please just
+# turned into a release is never cancelled or stranded behind a later one —
+# release_created only flips true once, on the commit that created it. Same
+# reasoning as otto-factory's ci.yml.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Read-only by default; only jobs that name their own `permissions:` get more.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # fmt, clippy, and test stay one job so a fmt failure still lets clippy and
+  # test report their own results in the same log.
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      # `#[sqlx::test]` runs against a real Postgres, no mocks. The service
+      # account is a superuser, which is what lets 0004_rls.sql create
+      # otto_app and exercise the explicit `SET LOCAL ROLE` guard.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: otto
+          POSTGRES_PASSWORD: otto
+          POSTGRES_DB: otto_platform
+        ports:
+          - 15434:5432
+        options: >-
+          --health-cmd "pg_isready -U otto -d otto_platform"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://otto:otto@localhost:15434/otto_platform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Pre-create the otto_app role
+        # 0004_rls.sql's create-if-missing is idempotent but not atomic, and
+        # `#[sqlx::test]` migrates one throwaway database per test, many in
+        # parallel, against this one cluster-scoped role. Creating it before
+        # any test starts means every migration takes the skip-create branch.
+        run: psql "$DATABASE_URL" -c "CREATE ROLE otto_app NOLOGIN;"
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  # Proves the deploy artifact builds: cargo test can stay green while the
+  # image fails (e.g. on missing OpenSSL headers in the build stage).
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for image-relevant changes
+        if: github.event_name == 'pull_request'
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            image:
+              - 'Dockerfile'
+              - '.dockerignore'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/**'
+
+      - uses: docker/setup-buildx-action@v3
+        if: github.event_name == 'push' || steps.filter.outputs.image == 'true'
+
+      - name: Build image
+        if: github.event_name == 'push' || steps.filter.outputs.image == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # PR titles become the main commit on squash-merge, and release-please reads
+  # their Conventional Commits type to compute the version bump.
+  pr-title:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            perf
+            refactor
+            docs
+            test
+            build
+            ci
+            chore
+            revert
+          scopes: |
+            otto-tenant
+            otto-core
+            otto-billing
+            otto-auth
+            otto-platform-server
+            docs
+            ci
+            release
+          requireScope: false
+          subjectPattern: ^(?![A-Z]).+$
+
+  # Maintains a single "chore: release X.Y.Z" PR. Merging it cuts the tag and
+  # GitHub Release, and release_created becomes true — the signal deploy gates on.
+  release-please:
+    runs-on: ubuntu-latest
+    needs: [rust, docker-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # Only a push that release-please just turned into a real release deploys.
+  # The predicate is spelled out here rather than inherited from
+  # release-please's, so an edit to that job's `if:` can't re-arm this one.
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [release-please]
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.release-please.outputs.release_created == 'true'
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # v1
+
+      - name: Deploy to Fly.io
+        run: flyctl deploy --remote-only -a otto-platform
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
