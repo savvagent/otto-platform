@@ -1,13 +1,18 @@
-# The console on Cloudflare
+# The console on Cloudflare (optional)
+
+> **This is not how production runs.** `otto.savvagent.com` resolves straight to Fly and
+> `otto-platform-server` serves the console itself; see [`fly.md`](fly.md). This document
+> describes an optional alternative: a Worker in front, for a deployment whose DNS is on
+> Cloudflare. Using it means switching `OTTO_CLIENT_IP_HEADER` to `cf-connecting-ip` and
+> unsetting `OTTO_STATIC_DIR`. Nothing in the primary path depends on it.
 
 **One Worker serves the built SPA and proxies everything dynamic to
 `otto-platform-server`.** The browser sees one hostname, `otto.savvagent.com`.
 `web/wrangler.jsonc` and `web/worker/index.ts` are the whole of it; this file is the
 account-side setup neither can express, and the traps a first deploy hits.
 
-Self-hosted deployments are unaffected. With `OTTO_STATIC_DIR` set, `otto-platform-server`
-serves `web/build` itself (the image carries it at `/srv/console`), and nothing here is
-required. Cloudflare is a deployment choice, not an architecture.
+Cloudflare is a deployment choice, not an architecture: with `OTTO_STATIC_DIR` set,
+`otto-platform-server` serves `web/build` itself and nothing here is required.
 
 ## Why a Worker rather than two origins
 
@@ -42,9 +47,11 @@ Matching is on **segment boundaries**, after percent-decoding and collapsing rep
 slashes. `/apiary` is a legal org slug and stays with the console; `/oauth//introspect` and
 `/oauth/%69ntrospect` are `/oauth/introspect` and are refused.
 
-**Why `/internal/*` and `/oauth/introspect` are refused rather than proxied.** They are
-server-to-server: they authenticate with a resource server's own credential and are called
-at `https://otto-platform.fly.dev`, never by a browser. Proxying them would be harmless in
+**Why `/internal/*` and `/oauth/introspect` are refused rather than proxied** (Worker
+deployment only; served directly they are reachable on the public hostname, which is fine
+because they are credential-authenticated). They are server-to-server: they authenticate
+with a resource server's own credential and are called at `https://otto-platform.fly.dev`,
+never by a browser. Proxying them would be harmless in
 the sense that the credential check is the same either way, but it is a second public path
 to a credential check for no caller, and the Worker's `cf-connecting-ip` header means
 nothing to a client that is not a browser. Resource servers should be configured with
@@ -93,7 +100,7 @@ override: `npx wrangler deploy --var OTTO_ORIGIN:https://other.fly.dev`.
 
 ## What must be true on the origin
 
-`fly.toml` already sets these; this is why each one is what it is.
+For the Worker deployment, `fly.toml` must be changed from its primary-path values (`OTTO_CLIENT_IP_HEADER=fly-client-ip`, `OTTO_STATIC_DIR=/srv/console`). This is why each one is what it is.
 
 | Variable                | Value                        | Why                                                                                                                        |
 | ----------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
@@ -175,16 +182,6 @@ What that run established:
 - **Redirects pass through.** The Worker sets `redirect: 'manual'`, without which Cloudflare
   would follow `/oauth/authorize`'s `303` to the client's loopback callback itself, burn the
   single-use code, and leave the agent waiting forever.
-
-## Without Cloudflare
-
-If moving `savvagent.com` DNS is not wanted, the server can serve the console itself, as
-otto-factory does today: set `OTTO_STATIC_DIR=/srv/console` in `fly.toml` (the image already
-contains the bundle), set `OTTO_CLIENT_IP_HEADER` back to `fly-client-ip` (Fly's proxy
-overwrites it, so it needs no origin lock), point `otto.savvagent.com` at Fly with
-`fly certs add otto.savvagent.com -a otto-platform` and the A/AAAA records `fly certs show`
-prints, and skip the Worker. Nothing else changes: the rp_id, the CSRF origin and the
-discovery documents all come from `OTTO_PUBLIC_URL`.
 
 ## Caching
 

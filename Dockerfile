@@ -2,10 +2,9 @@
 
 # otto-platform-server image, with the console bundle baked in for self-hosters.
 #
-# The hosted deployment does not use the bundle from here: a Cloudflare Worker
-# (web/worker, docs/deploy/cloudflare.md) serves the SPA and proxies the API to
-# this image. It stays in the image so a self-hosted deployment is one container:
-# set OTTO_STATIC_DIR=/srv/console and the server serves the console itself.
+# The bundle lives at /srv/console; the server serves it when OTTO_STATIC_DIR
+# points there (fly.toml does). An optional Cloudflare Worker (web/worker,
+# docs/deploy/cloudflare.md) can serve it from the edge instead.
 
 # ---------------------------------------------------------------- console
 # Built first and separately. It changes on a different cadence from the server
@@ -62,9 +61,8 @@ USER otto
 COPY --from=build   /usr/local/bin/otto-platform-server /usr/local/bin/otto-platform-server
 COPY --from=console /web/build                          /srv/console
 
-# OTTO_STATIC_DIR is deliberately not set: the bundle is present at /srv/console
-# but only served when a deployment asks for it, so the hosted API-only shape
-# is the default and a Worker in front is not shadowed by a second console.
+# OTTO_STATIC_DIR is deliberately not defaulted here: a deployment opts in (fly.toml
+# does), so an API-only or Worker-fronted deployment is not shadowed by a second console.
 ENV OTTO_BIND=0.0.0.0:8080 \
     OTTO_LOG_FORMAT=json \
     RUST_LOG=info

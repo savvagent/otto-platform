@@ -112,11 +112,13 @@ chose", not "English".
 | `worker/index.ts`           | The Cloudflare Worker: serves this bundle, proxies the API.                    |
 | `wrangler.jsonc`            | That Worker's config. `worker/tsconfig.json` type-checks it separately.        |
 
-## Deploying to Cloudflare
+## Deploying
 
-`npm run deploy` uploads `build/` and `worker/index.ts` as one Worker, `--env production`,
-which names the Worker `otto-platform-console`, proxies to `https://otto-platform.fly.dev`
-and serves `otto.savvagent.com`. A bare `wrangler deploy` lands on the separate
-`otto-platform-console-dev` Worker. Account setup, the proxied route list, why
-`/oauth/introspect` and `/internal/*` are not carried, and the client-address trap are in
-[`docs/deploy/cloudflare.md`](../docs/deploy/cloudflare.md).
+Production serves this bundle from `otto-platform-server` on Fly (`OTTO_STATIC_DIR=/srv/console`
+in `fly.toml`; the Dockerfile builds it), at `otto.savvagent.com`:
+[`docs/deploy/fly.md`](../docs/deploy/fly.md).
+
+`worker/index.ts` and `wrangler.jsonc` are an **optional** Cloudflare Worker alternative
+(`npm run deploy`, `--env production`; a bare `wrangler deploy` lands on the separate
+`otto-platform-console-dev` Worker). It needs the domain's DNS on Cloudflare and a different
+client-IP header; see [`docs/deploy/cloudflare.md`](../docs/deploy/cloudflare.md).

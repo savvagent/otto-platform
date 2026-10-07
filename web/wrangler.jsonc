@@ -1,5 +1,6 @@
 {
-  // The console, deployed to Cloudflare as one Worker that serves the built SPA
+  // OPTIONAL alternative to serving the console from otto-platform-server (the
+  // primary path, docs/deploy/fly.md). The console, deployed to Cloudflare as one Worker that serves the built SPA
   // and forwards everything dynamic to otto-platform-server. See
   // docs/deploy/cloudflare.md for the account-side setup this file cannot
   // express, and worker/index.ts for why it is a proxy rather than a second
