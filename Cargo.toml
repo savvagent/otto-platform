@@ -5,6 +5,7 @@ members = [
   "crates/otto-core",
   "crates/otto-billing",
   "crates/otto-auth",
+  "crates/otto-web",
   "crates/otto-platform-server",
 ]
 
@@ -19,12 +20,15 @@ otto-tenant = { path = "crates/otto-tenant" }
 otto-core = { path = "crates/otto-core" }
 otto-billing = { path = "crates/otto-billing" }
 otto-auth = { path = "crates/otto-auth" }
+otto-web = { path = "crates/otto-web" }
 
 sqlx = { version = "0.8", default-features = false, features = [
   "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "macros", "migrate", "json",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net"] }
 axum = "0.8"
+http = "1"
+tower-http = "0.6"
 tower = { version = "0.5", features = ["util"] }
 schemars = { version = "1.1", features = ["chrono04", "uuid1"] }
 serde = { version = "1", features = ["derive"] }

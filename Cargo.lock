@@ -1602,7 +1602,7 @@ dependencies = [
 
 [[package]]
 name = "otto-auth"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "otto-billing"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "otto-core",
@@ -1643,7 +1643,7 @@ dependencies = [
 
 [[package]]
 name = "otto-core"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1661,23 +1661,26 @@ dependencies = [
 
 [[package]]
 name = "otto-platform-server"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
  "dotenvy",
  "otto-tenant",
+ "otto-web",
  "serde_json",
  "sqlx",
  "tokio",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
 name = "otto-tenant"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -1691,6 +1694,35 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "otto-web"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "http",
+ "jsonwebtoken",
+ "otto-auth",
+ "otto-billing",
+ "otto-core",
+ "otto-tenant",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
+ "webauthn-authenticator-rs",
+ "webauthn-rs",
+ "webauthn-rs-proto",
 ]
 
 [[package]]
@@ -2999,6 +3031,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 

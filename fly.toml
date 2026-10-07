@@ -14,12 +14,20 @@
 # isolation rests on `Db::begin` issuing `SET LOCAL ROLE otto_app`, which the
 # startup isolation check verifies.
 #
-# Secrets are NOT in this file. `fly postgres attach` stages DATABASE_URL.
+# Secrets are NOT in this file. `fly postgres attach` stages DATABASE_URL, and
+# OTTO_ENCRYPTION_KEY (32 random bytes, base64: `openssl rand -base64 32`) must
+# be staged by hand with `fly secrets set -a otto-platform`. The server refuses
+# to start without it, which is the point: a deploy that cannot encrypt SSO
+# secrets should fail its health check rather than limp.
 #
-# Hostname: otto-platform.fly.dev for now. Phase 4 of
-# docs/plans/2026-10-06-platform-cutover.md moves it to otto.savvagent.com,
-# which becomes the WebAuthn relying party id — settle that before anyone
-# registers a passkey here.
+# Hostname: Phase 4 of docs/plans/2026-10-06-platform-cutover.md serves this
+# app at otto.savvagent.com (`fly certs add otto.savvagent.com`, DNS at
+# Namecheap), and OTTO_PUBLIC_URL below says so. Its host is the WebAuthn
+# relying party id, so passkeys only work when the browser is actually on that
+# host: until the certificate and DNS exist, otto-platform.fly.dev serves the
+# API and health checks but cannot complete a passkey ceremony. Settle the
+# hostname before anyone registers a passkey here — changing it later
+# invalidates every one.
 
 app = "otto-platform"
 primary_region = "iad"
@@ -32,6 +40,12 @@ primary_region = "iad"
   OTTO_BIND = "0.0.0.0:8080"
   OTTO_LOG_FORMAT = "json"
   RUST_LOG = "info"
+  # The origin browsers see; also fixes the WebAuthn relying party id (its host).
+  OTTO_PUBLIC_URL = "https://otto.savvagent.com"
+  # Fly's proxy overwrites this header with the real client address (it does
+  # not append, unlike X-Forwarded-For), which is the only property that makes
+  # a per-IP throttle keyed on it worth anything.
+  OTTO_CLIENT_IP_HEADER = "fly-client-ip"
 
 [http_service]
   internal_port = 8080

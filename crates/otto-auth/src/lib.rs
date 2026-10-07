@@ -9,7 +9,7 @@
 //!   joins this layer through [`oidc`] (discovery, token exchange, `id_token`
 //!   validation, behind an SSRF guard) and [`dns`] (TXT domain verification);
 //!   the data layer lives in `otto_core`'s `idp`/`domains`/`identities`/
-//!   `ceremonies` modules. The HTTP routes that drive them are not here yet.
+//!   `ceremonies` modules. The HTTP routes that drive them live in `otto-web`.
 //!
 //!   **No email, anywhere.** There is no verification link, no recovery link,
 //!   and no mailer — a passkey is the only factor, a second passkey is the
