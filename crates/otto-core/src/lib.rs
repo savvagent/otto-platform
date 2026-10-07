@@ -25,6 +25,7 @@ pub mod identities;
 pub mod idp;
 pub mod invites;
 pub mod labels;
+pub mod lifecycle;
 pub mod orgs;
 pub mod teams;
 

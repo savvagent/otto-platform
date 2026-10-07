@@ -12,3 +12,4 @@ sqlx.workspace = true
 serde.workspace = true
 chrono.workspace = true
 schemars.workspace = true
+uuid.workspace = true

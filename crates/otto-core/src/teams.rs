@@ -20,9 +20,12 @@
 //! foreign key to check), so [`TeamsExt::delete_team`] here simply deletes the
 //! team. A service that scopes its own domain rows to a team is responsible
 //! for its own "team still in use" guard against its own tables before (or
-//! instead of) calling this.
+//! instead of) calling this. Resource servers are told afterwards through the
+//! `team.deleted` lifecycle webhook, queued in the same transaction
+//! ([`crate::lifecycle`]).
 
 use crate::error::{Error, Result};
+use crate::lifecycle::{self, LifecycleEvent};
 use otto_tenant::ids::{OrgId, TeamId, UserId};
 use otto_tenant::Tx;
 use serde::{Deserialize, Serialize};
@@ -280,6 +283,10 @@ impl TeamsExt for Tx<'_> {
                 known: String::new(),
             });
         }
+
+        // Same transaction as the delete: a resource server holding rows
+        // scoped to this team is told if and only if the delete commits.
+        lifecycle::enqueue(self.conn(), &LifecycleEvent::TeamDeleted { org, team: id }).await?;
         Ok(())
     }
 

@@ -6,22 +6,34 @@
 //!
 //! ```text
 //!   /healthz /readyz          health      no database on the liveness path
+//!   POST /oauth/introspect    introspect  RFC 7662, resource-server credential
+//!   /internal/*               internal    usage ingest and identity lookups,
+//!                                         resource-server credential
 //!   /api/…  /oauth/…          otto-web    session cookies, the account/org API, the AS
 //!   /sso/callback             otto-web    the enterprise IdP's redirect back
 //!   /.well-known/…            otto-web    AS discovery, open by necessity
 //! ```
 //!
-//! Resource-server-facing endpoints (token introspection, usage ingest,
-//! lifecycle webhooks) and the console bundle are separate pieces of Phase 4 of
-//! `docs/plans/2026-10-06-platform-cutover.md`.
+//! The resource-server-facing endpoints authenticate with the resource
+//! server's own credential ([`api::CallingResourceServer`]), not a session
+//! cookie, and are outside `otto-web`'s CSRF guard, which only wraps its own
+//! router. Lifecycle webhooks are delivered by [`webhooks::run`], a background
+//! task the binary starts; `otto-platform-server resource ...` provisions
+//! resource servers ([`resource_cmd`]). The console bundle is a separate piece
+//! of Phase 4 of `docs/plans/2026-10-06-platform-cutover.md`.
 //!
 //! Assembly is a library function rather than something buried in `main` so a
 //! test can build the whole router: axum panics on a route registered twice,
 //! and a panic at startup is only a good failure if something other than a
 //! deployment reaches it first.
 
+pub mod api;
 pub mod config;
 pub mod health;
+pub mod internal;
+pub mod introspect;
+pub mod resource_cmd;
+pub mod webhooks;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -30,12 +42,16 @@ use tower_http::trace::TraceLayer;
 
 pub use config::{Config, LogFormat};
 
-/// The health routes alone, which need nothing but a database handle.
+/// The routes that need nothing but a database handle: health and the
+/// resource-server API.
 pub fn router(db: Db) -> Router {
-    health::router(db)
+    health::router(db.clone())
+        .merge(introspect::router(db.clone()))
+        .merge(internal::router(db))
 }
 
-/// Build the whole application: health plus the identity HTTP surface.
+/// Build the whole application: health, the resource-server API, and the
+/// identity HTTP surface.
 ///
 /// Fallible because the encryption key is only a `String` until something tries
 /// to use it, and a `Config` assembled by hand — a test, a future binary — need

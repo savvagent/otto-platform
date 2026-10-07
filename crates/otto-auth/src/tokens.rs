@@ -423,6 +423,19 @@ pub async fn mint_pat(
     let rs = crate::resources::get_active(db, resource).await?;
     let scopes = rs.grant_scopes(scopes)?;
 
+    // A deleted org must not gain new credentials.
+    let live: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM orgs WHERE id = $1 AND deleted_at IS NULL)",
+    )
+    .bind(org)
+    .fetch_one(db.pool())
+    .await?;
+    if !live {
+        return Err(AuthError::InvalidRequest(
+            "that org no longer exists".into(),
+        ));
+    }
+
     let token = crypto::generate(prefix::PAT);
     let ttl = ttl_days.unwrap_or(PAT_TTL_DAYS).clamp(1, 365);
 

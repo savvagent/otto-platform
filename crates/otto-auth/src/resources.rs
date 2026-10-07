@@ -15,14 +15,18 @@
 //! are never touched by `register`.
 
 use chrono::{DateTime, Utc};
+use otto_tenant::crypto::Cipher;
 use otto_tenant::Db;
 use serde::Serialize;
 
-use crate::crypto;
+use crate::crypto::{self, Secret};
 use crate::error::{AuthError, Result};
 
 /// Prefix for a resource server's introspection credential.
 pub const INTROSPECTION_SECRET_PREFIX: &str = "otto_rs_";
+
+/// Prefix for the key a resource server verifies lifecycle webhooks with.
+pub const WEBHOOK_SECRET_PREFIX: &str = "otto_whsec_";
 
 /// What a resource server declares about itself.
 #[derive(Debug, Clone, Copy)]
@@ -45,11 +49,15 @@ pub struct ResourceServer {
     pub scopes: Vec<String>,
     pub default_scopes: Vec<String>,
     pub disabled: bool,
+    /// Where lifecycle webhooks are delivered, if configured. The signing
+    /// secret is never part of this struct; see [`set_webhook`].
+    pub webhook_url: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-const COLS: &str = "resource_uri, name, scopes, default_scopes, disabled, created_at, updated_at";
+const COLS: &str =
+    "resource_uri, name, scopes, default_scopes, disabled, webhook_url, created_at, updated_at";
 
 impl ResourceServer {
     /// The scopes a request for `requested` on this resource server is
@@ -238,6 +246,89 @@ pub async fn authenticate_introspection(
     Ok(rs)
 }
 
+/// Authenticate a resource server by its credential alone, for callers that
+/// present `Authorization: Bearer <secret>` and so do not say who they are.
+///
+/// The credential is a 256-bit random value with a unique index on its hash
+/// (migration 0007), so the secret identifies the server. The same single
+/// refusal as [`authenticate_introspection`] covers every failure.
+pub async fn authenticate_secret(db: &Db, presented: &str) -> Result<ResourceServer> {
+    let hash = crypto::hash(presented.trim());
+    let row: Option<ResourceServer> = sqlx::query_as(&format!(
+        "SELECT {COLS} FROM resource_servers WHERE introspection_secret_hash = $1 AND NOT disabled"
+    ))
+    .bind(&hash)
+    .fetch_optional(db.pool())
+    .await?;
+    row.ok_or_else(|| AuthError::InvalidClient("resource server authentication failed".into()))
+}
+
+/// Configure (or, with `url: None`, clear) the lifecycle webhook of a resource
+/// server. Setting one always issues a fresh signing secret, returned once as
+/// plaintext; only its sealed form is stored. Re-running with the same URL is
+/// how the secret is rotated.
+///
+/// The URL is admin-provisioned, so unlike the IdP URLs in [`crate::oidc`] it
+/// is not run through the SSRF guard in [`crate::ssrf`], which would refuse
+/// the private and loopback addresses resource servers legitimately sit on
+/// (a Fly private network, a local test). It still has to be `https`, or
+/// `http` on loopback, with no credentials or fragment, so a typo cannot send
+/// signed event bodies over plaintext.
+pub async fn set_webhook(
+    db: &Db,
+    cipher: &Cipher,
+    resource_uri: &str,
+    url: Option<&str>,
+) -> Result<Option<String>> {
+    let (url, secret) = match url {
+        Some(u) => {
+            validate_webhook_url(u)?;
+            (Some(u), Some(crypto::generate(WEBHOOK_SECRET_PREFIX)))
+        }
+        None => (None, None),
+    };
+    let sealed = secret
+        .as_ref()
+        .map(|s| cipher.seal(s.expose().as_bytes()))
+        .transpose()?;
+
+    let updated = sqlx::query(
+        "UPDATE resource_servers SET webhook_url = $2, webhook_secret_ciphertext = $3, \
+                webhook_secret_nonce = $4, updated_at = now() \
+         WHERE resource_uri = $1",
+    )
+    .bind(resource_uri)
+    .bind(url)
+    .bind(sealed.as_ref().map(|s| s.ciphertext.as_slice()))
+    .bind(sealed.as_ref().map(|s| s.nonce.as_slice()))
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        return Err(AuthError::InvalidTarget(format!(
+            "{resource_uri:?} is not a registered resource"
+        )));
+    }
+    Ok(secret.map(Secret::into_plaintext))
+}
+
+fn validate_webhook_url(url: &str) -> Result<()> {
+    let bad = |why: &str| AuthError::InvalidRequest(format!("webhook url {url:?} {why}"));
+    let parsed = url::Url::parse(url).map_err(|_| bad("is not an absolute URL"))?;
+    if parsed.fragment().is_some() || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(bad("must not contain a fragment or credentials"));
+    }
+    let loopback = matches!(
+        parsed.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("[::1]")
+    );
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if loopback => Ok(()),
+        _ => Err(bad("must be https (http is allowed only on loopback)")),
+    }
+}
+
 /// Every scope any enabled resource server defines, sorted and deduplicated,
 /// for the AS metadata's `scopes_supported`.
 pub fn all_scopes(servers: &[ResourceServer]) -> Vec<String> {
@@ -308,6 +399,7 @@ mod tests {
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             default_scopes: defaults.iter().map(|s| s.to_string()).collect(),
             disabled: false,
+            webhook_url: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

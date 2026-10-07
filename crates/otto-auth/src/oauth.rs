@@ -476,6 +476,8 @@ pub async fn redeem_code(
     let row: Option<CodeRow> = sqlx::query_as(
         "UPDATE authorization_codes SET consumed_at = now() \
          WHERE code_hash = $1 AND consumed_at IS NULL \
+           AND EXISTS (SELECT 1 FROM orgs o \
+                        WHERE o.id = authorization_codes.org_id AND o.deleted_at IS NULL) \
          RETURNING client_id, user_id, org_id, redirect_uri, code_challenge, \
                    code_challenge_method, scopes, resource, expires_at",
     )

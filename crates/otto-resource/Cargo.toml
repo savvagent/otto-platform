@@ -1,0 +1,24 @@
+[package]
+name = "otto-resource"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Client for the otto-platform resource-server API: token introspection, usage metering, identity lookups, and lifecycle webhook verification. No database dependency."
+
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hmac = "0.12"
+hex = "0.4"
+percent-encoding = "2"
+moka = { version = "0.12", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+axum.workspace = true

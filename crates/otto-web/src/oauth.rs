@@ -1017,6 +1017,7 @@ mod tests {
                 scopes: vec!["things:read".into()],
                 default_scopes: vec!["things:read".into()],
                 disabled: false,
+                webhook_url: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             },

@@ -159,6 +159,7 @@ jobs:
             otto-billing
             otto-auth
             otto-web
+            otto-resource
             otto-platform-server
             docs
             ci
