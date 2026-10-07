@@ -1,0 +1,41 @@
+[package]
+name = "otto-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+otto-tenant.workspace = true
+otto-core.workspace = true
+otto-auth.workspace = true
+otto-billing.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+axum.workspace = true
+http.workspace = true
+url.workspace = true
+anyhow.workspace = true
+schemars.workspace = true
+
+[dev-dependencies]
+# Integration tests link otto-web as an external crate, so anything they name
+# directly has to be declared here too.
+tokio = { workspace = true, features = ["full"] }
+# test-support relaxes otto-auth::oidc's SSRF guard for loopback addresses
+# only, so this crate's own mock-IdP tests (tests/sso.rs) can run against a
+# local server — never enabled by the production dependency above. See that
+# feature's doc comment in crates/otto-auth/Cargo.toml.
+otto-auth = { workspace = true, features = ["test-support"] }
+base64.workspace = true
+sha2.workspace = true
+jsonwebtoken.workspace = true
+# `ServiceExt::oneshot`, for driving the assembled router without binding a port.
+tower = { workspace = true, features = ["util"] }
+webauthn-authenticator-rs = { version = "0.5.4", default-features = false, features = ["softtoken"] }
+webauthn-rs = { version = "0.5.4", features = ["danger-allow-state-serialisation", "resident-key-support", "conditional-ui"] }
+webauthn-rs-proto = "0.5.5"

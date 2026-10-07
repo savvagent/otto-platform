@@ -2,13 +2,15 @@
 //! against a real Postgres, runs migrations, proves tenant isolation is
 //! actually in force, and only then starts serving HTTP.
 //!
-//! The HTTP surface is health checks only for now (see `lib.rs`). The OAuth
-//! endpoints and console are Phase 4 of
+//! The HTTP surface is health checks plus the identity API and OAuth
+//! authorization server (see `lib.rs`). Resource-server endpoints and the
+//! console are the rest of Phase 4 of
 //! `docs/plans/2026-10-06-platform-cutover.md`.
 
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
+use otto_platform_server::{app, Config, LogFormat};
 use otto_tenant::Db;
 use tokio::net::TcpListener;
 
@@ -19,32 +21,29 @@ async fn main() -> Result<()> {
     // override the deployment's real configuration.
     let dotenv = dotenvy::dotenv();
 
-    init_tracing()?;
+    let config = Config::from_env().context(
+        "configuration is incomplete. Copy .env.example to .env for local runs, \
+         or set the variables named above in the deployment",
+    )?;
+
+    init_tracing(config.log_format)?;
     match dotenv {
         Ok(path) => tracing::debug!(path = %path.display(), "loaded .env"),
         Err(_) => tracing::debug!("no .env file; using the process environment"),
     }
 
-    let bind: SocketAddr = std::env::var("OTTO_BIND")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
-        .parse()
-        .context("OTTO_BIND must be a socket address like 0.0.0.0:8080")?;
+    // Validate the key before anything else can be built with it, so a bad one
+    // is a startup error naming the variable rather than a failure the first
+    // time something needs to encrypt a secret hours later. `app` checks it
+    // again, which is cheap and keeps it from relying on this call.
+    otto_tenant::crypto::Cipher::from_base64_key(&config.encryption_key)
+        .context("OTTO_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
 
-    let database_url = std::env::var("DATABASE_URL")
-        .context("DATABASE_URL must be set. Copy .env.example to .env for local runs.")?;
-
-    // Off by default in case a deployment wants a separate migration step
-    // ahead of a rolling restart. On by default for local development, where
-    // `cargo run` should always leave the schema current.
-    let run_migrations = std::env::var("OTTO_RUN_MIGRATIONS")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-
-    let db = Db::connect(&database_url)
+    let db = Db::connect(&config.database_url)
         .await
         .context("could not connect to DATABASE_URL")?;
 
-    if run_migrations {
+    if config.run_migrations {
         // sqlx holds a Postgres advisory lock for the whole run, so several
         // replicas starting together is safe: the losers block until the
         // winner is done rather than racing each other through the same DDL.
@@ -67,15 +66,30 @@ async fn main() -> Result<()> {
         .context("refusing to serve: tenant isolation is not enforced by this database")?;
     tracing::info!("{}", isolation.summary());
 
-    let listener = TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("could not bind {bind}"))?;
-    tracing::info!(%bind, "otto-platform-server ready: schema migrated, tenant isolation verified");
+    let router = app(db, &config)?;
 
-    axum::serve(listener, otto_platform_server::router(db))
-        .with_graceful_shutdown(shutdown_signal())
+    let listener = TcpListener::bind(config.bind)
         .await
-        .context("server error")?;
+        .with_context(|| format!("could not bind {}", config.bind))?;
+    tracing::info!(
+        bind = %config.bind,
+        public_url = %config.public_url,
+        enforce_quotas = config.enforce_quotas,
+        "otto-platform-server ready: schema migrated, tenant isolation verified"
+    );
+
+    // `ConnectInfo` is not decoration: `otto_web::state::client_ip` reads the
+    // peer address out of it, and that address is what every per-IP throttle and
+    // every audit entry is keyed on. Serve without this and `client_ip` returns
+    // `None` for every request, which silently disables rate limiting on the
+    // login and registration endpoints.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("server error")?;
     tracing::info!("shut down cleanly");
     Ok(())
 }
@@ -110,7 +124,7 @@ async fn shutdown_signal() {
     }
 }
 
-fn init_tracing() -> Result<()> {
+fn init_tracing(format: LogFormat) -> Result<()> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
@@ -119,15 +133,12 @@ fn init_tracing() -> Result<()> {
     let registry = tracing_subscriber::registry().with(filter);
 
     // JSON for deployments, whose log pipeline parses fields; human-readable
-    // text for a terminal. Read directly rather than after dotenv-loaded
-    // config, because tracing has to be up before anything else can log.
-    let json = std::env::var("OTTO_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json"));
-    if json {
-        registry
+    // text for a terminal.
+    match format {
+        LogFormat::Json => registry
             .with(tracing_subscriber::fmt::layer().json())
-            .try_init()
-    } else {
-        registry.with(tracing_subscriber::fmt::layer()).try_init()
+            .try_init(),
+        LogFormat::Text => registry.with(tracing_subscriber::fmt::layer()).try_init(),
     }
     .context("could not initialize tracing")?;
     Ok(())

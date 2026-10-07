@@ -158,6 +158,7 @@ jobs:
             otto-core
             otto-billing
             otto-auth
+            otto-web
             otto-platform-server
             docs
             ci

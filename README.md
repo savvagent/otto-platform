@@ -33,8 +33,10 @@ split compiles and boots against a real Postgres; wiring otto-factory to
 depend on it (and otto-flags to build its own domain crate against
 `otto-tenant`) is deliberately deferred, separate work.
 
-This repo currently ships no HTTP surface (no OAuth endpoints, no console) —
-see "What's not here yet" below.
+`otto-platform-server` serves the identity HTTP surface — the OAuth 2.1
+authorization server, sign-in (passkeys and enterprise SSO), and the
+account/org API — for every registered resource server. See "What's not here
+yet" below for what is still to come.
 
 ## Crate layout
 
@@ -58,14 +60,19 @@ crates/
 │                         login-attempt rate limiting, OIDC federation client
 │                         and DNS domain verification. Built on
 │                         otto-tenant and otto-core.
+├── otto-web/             the HTTP surface as a library: OAuth discovery,
+│                         /oauth/*, /sso/callback, /api/auth/*, /api/me*,
+│                         and the org API (members, invites, teams, SSO
+│                         admin, tokens, usage, audit). Routes and the
+│                         OpenAPI document come from one catalog. Built on
+│                         otto-tenant, otto-core, otto-billing, otto-auth.
 └── otto-platform-server/ thin binary: loads config, connects, runs
-                          migrations, verifies tenant isolation, prints
-                          ready. Not a full HTTP API yet — see below.
+                          migrations, verifies tenant isolation, then serves
+                          /healthz, /readyz and otto-web's router.
 ```
 
 Dependency direction: `otto-tenant` ← `otto-core` ← `otto-billing`,
-`otto-auth`. `otto-platform-server` depends only on `otto-tenant` (it just
-needs to migrate and verify isolation).
+`otto-auth` ← `otto-web` ← `otto-platform-server`.
 
 Because `otto_tenant::Db` and `otto_tenant::Tx` are defined in a crate that
 `otto-core`/`otto-billing`/`otto-auth` depend on rather than own, Rust's
@@ -86,30 +93,42 @@ let user = db.get_user(user_id).await?;
 
 ## What's not here yet
 
-- **No HTTP surface.** `otto-platform-server` migrates and verifies isolation
-  and then idles; it does not serve OAuth endpoints, a console, or any REST
-  API. Otto Console and the OAuth HTTP routes are future work.
-- **Enterprise SSO has no HTTP routes yet.** The data layer
-  (`idp_connections`, `claimed_domains`, `user_identities`, `sso_ceremonies`,
-  the `enforce_sso` lockout guards in `otto-core`) and the OIDC client
-  (`otto-auth`'s discovery, token exchange, `id_token` validation, SSRF guard,
-  and DNS TXT domain verification) are present, as is the `enforce_sso`
-  refusal in passkey login. The routes that drive them (connection and domain
-  admin, the sign-in and link ceremonies, `/sso/callback`) arrive in Phase 4.
+- **No resource-server API yet.** Token introspection (RFC 7662), usage
+  ingest, and lifecycle webhooks are separate pieces of Phase 4 of
+  `docs/plans/2026-10-06-platform-cutover.md`, as is the console UI (the
+  server serves the API the console calls, not the console itself).
+- **Consent screens show raw scope names.** Each resource server's scopes
+  come from the `resource_servers` registry, which carries no human-readable
+  descriptions yet. Adding them needs a migration; tracked in #3.
 - **No `plans.features` JSONB column.** Design doc §4 proposes one to gate
   per-service capabilities from a shared plan; not added here since no
   extracted code reads or writes it yet.
 
 ## Running it locally
 
-Requires a local Postgres. Point `DATABASE_URL` at it (see `.env.example`):
+Requires a local Postgres. Point `DATABASE_URL` at it and set the two
+required settings (see `.env.example`, which documents every variable):
 
 ```sh
 cp .env.example .env
 # edit .env: DATABASE_URL=postgres://postgres:postgres@localhost:5432/otto_platform
+#            OTTO_ENCRYPTION_KEY=$(openssl rand -base64 32)
 
 cargo run -p otto-platform-server
 ```
+
+Configuration is all `OTTO_*` (plus `DATABASE_URL` and `RUST_LOG`):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DATABASE_URL` | required | Postgres connection string. |
+| `OTTO_PUBLIC_URL` | required | Public origin, e.g. `https://otto.savvagent.com`. The OAuth issuer and every link are built from it, and its **host is the WebAuthn relying party id** — changing it invalidates every passkey. |
+| `OTTO_ENCRYPTION_KEY` | required | 32 bytes, base64. Encrypts secrets at rest (SSO IdP client secrets). |
+| `OTTO_BIND` | `0.0.0.0:8080` | Listen address. |
+| `OTTO_CLIENT_IP_HEADER` | unset | Header a trusted proxy *overwrites* with the client address (`fly-client-ip` on Fly). Keys rate limits and audit IPs; leave unset without such a proxy. |
+| `OTTO_ENFORCE_QUOTAS` | `0` | Reporting only: whether resource servers enforce hard-stop plans, echoed as `enforced` by the usage endpoint. |
+| `OTTO_RUN_MIGRATIONS` | `1` | Apply migrations at startup. |
+| `OTTO_LOG_FORMAT` | `text` | `json` for structured logs. |
 
 On startup it will:
 
@@ -120,10 +139,17 @@ On startup it will:
 3. Verify tenant isolation is actually enforced — as the role a tenant
    transaction runs as, not just that the migrations ran — and refuse to
    report ready if it is not.
-4. Log `otto-platform-server ready: ...` and idle until `Ctrl-C`.
+4. Build the WebAuthn relying party from `OTTO_PUBLIC_URL` (failing here, not
+   at someone's first sign-in, if it has no host) and serve HTTP.
 
 Set `OTTO_RUN_MIGRATIONS=0` to skip step 2 (e.g. a deployment that migrates
 as a separate step ahead of a rolling restart).
+
+A resource server must be registered (`otto_auth::resources::register`, which
+each service calls at its own startup) before clients can authorize against
+it. The authorization server serves every registered one; a client names its
+target with the RFC 8707 `resource` parameter, which may be omitted only while
+exactly one is registered.
 
 ### Running just the migrations
 
@@ -141,17 +167,19 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Every unit test in this workspace runs without a database (pure-logic tests
-for the isolation-report judgment, redirect-URI matching, PKCE, rate-limit
-math, label generation, and locale parsing). No `#[sqlx::test]` integration
-tests are included in this extraction — otto-factory's original `of-core`/
-`of-auth` integration test suites (which exercise real signup/login/OAuth
-flows against a live Postgres) were not ported; see the extraction notes for
-why. To exercise the schema and RLS against a real database by hand:
+Unit tests run without a database. The integration tests (`#[sqlx::test]`,
+including `otto-web`'s HTTP tests, which drive the real router with a
+software passkey authenticator and a mock IdP) need a Postgres whose role can
+create databases, named by `DATABASE_URL` — CI uses a `postgres:16` service on
+port 15434 (see `.github/workflows/ci.yml`; create the `otto_app` role first).
+To run the server against a database by hand:
 
 ```sh
 createdb otto_platform_dev
-DATABASE_URL=postgres://localhost/otto_platform_dev cargo run -p otto-platform-server
+DATABASE_URL=postgres://localhost/otto_platform_dev \
+  OTTO_PUBLIC_URL=http://localhost:8080 \
+  OTTO_ENCRYPTION_KEY=$(openssl rand -base64 32) \
+  cargo run -p otto-platform-server
 ```
 
 A successful boot logs a line like:
