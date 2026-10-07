@@ -21,7 +21,7 @@ fn sealed(cipher: &Cipher, plaintext: &[u8]) -> otto_tenant::crypto::Sealed {
     cipher.seal(plaintext).unwrap()
 }
 
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn idp_connections_round_trip_and_rebind_replaces(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -94,7 +94,7 @@ async fn idp_connections_round_trip_and_rebind_replaces(pool: PgPool) {
 /// review found `upsert_connection` kept them, which would let a `sub` at
 /// the *new* IdP that happens to collide with an old pin resolve straight
 /// onto that account (`sub` is only unique within an issuer).
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn rebinding_to_a_different_issuer_clears_stale_identity_pins(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -151,7 +151,7 @@ async fn rebinding_to_a_different_issuer_clears_stale_identity_pins(pool: PgPool
 /// Rebinding with the *same* issuer and client_id (e.g. re-saving after a
 /// client secret rotation) must not disturb existing pins — only a change to
 /// which IdP is bound clears them.
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn rebinding_with_the_same_issuer_and_client_id_keeps_identity_pins(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -206,7 +206,7 @@ fn generate_verification_token_is_unique_and_url_safe() {
     assert!(a.len() > 16);
 }
 
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn claimed_domains_claim_reclaim_and_verify(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -248,7 +248,7 @@ async fn claimed_domains_claim_reclaim_and_verify(pool: PgPool) {
     tx.commit().await.unwrap();
 }
 
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn identities_link_converges_on_a_racing_duplicate(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -294,7 +294,7 @@ async fn identities_link_converges_on_a_racing_duplicate(pool: PgPool) {
 // ---------------------------------------------------- create_user_for_federation
 
 /// (a) A brand-new email creates a brand-new row.
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn create_user_for_federation_creates_a_new_row(pool: PgPool) {
     let db = db(pool);
 
@@ -315,7 +315,7 @@ async fn create_user_for_federation_creates_a_new_row(pool: PgPool) {
 /// literal implementation of the "never `DO UPDATE`" fix from spec review
 /// round 3: `Db::upsert_user` would silently converge onto (and mutate the
 /// caller's belief about) whoever's row already held this email.
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn create_user_for_federation_refuses_a_second_call_for_the_same_email(pool: PgPool) {
     let db = db(pool);
 
@@ -348,7 +348,7 @@ async fn create_user_for_federation_refuses_a_second_call_for_the_same_email(poo
 /// two different user ids, which would mean two accounts silently sharing
 /// one email address in the exact window this function's `ON CONFLICT ...
 /// DO NOTHING` exists to close.
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn create_user_for_federation_concurrent_calls_never_both_win(pool: PgPool) {
     let db = db(pool);
 
@@ -395,7 +395,7 @@ async fn make_connection(db: &otto_tenant::Db, org: otto_tenant::OrgId) -> uuid:
     conn.id
 }
 
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn ceremony_create_and_consume_round_trip(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -435,7 +435,7 @@ async fn ceremony_create_and_consume_round_trip(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn ceremony_expired_rows_are_not_resolved(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -464,7 +464,7 @@ async fn ceremony_expired_rows_are_not_resolved(pool: PgPool) {
 /// exists for: two overlapping callers racing the exact same `state_hash`
 /// (a replayed callback URL racing the legitimate one) must never both
 /// resolve the ceremony -- exactly one gets the row, the other gets `None`.
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn consume_by_state_hash_never_resolves_the_same_ceremony_twice_under_a_race(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -511,7 +511,7 @@ async fn consume_by_state_hash_never_resolves_the_same_ceremony_twice_under_a_ra
 /// spec §3's mid-flight-reassignment test; the callback's actual reliance on
 /// this fact (trusting `ceremony.org_id` over a fresh `resolve_for_domain`
 /// call) is Task 3's test.
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn ceremony_org_id_survives_a_mid_flight_domain_reassignment(pool: PgPool) {
     let db = db(pool);
     let a = tenant(&db, "acme").await;
@@ -594,7 +594,7 @@ async fn ceremony_org_id_survives_a_mid_flight_domain_reassignment(pool: PgPool)
 
 // ------------------------------------------------------------ lockout guards
 
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn set_enforce_sso_refuses_with_no_connection_or_verified_domain(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -641,7 +641,7 @@ async fn set_enforce_sso_refuses_with_no_connection_or_verified_domain(pool: PgP
     tx.commit().await.unwrap();
 }
 
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn set_enforce_sso_refuses_when_the_caller_has_not_linked_their_own_identity(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -683,7 +683,7 @@ async fn set_enforce_sso_refuses_when_the_caller_has_not_linked_their_own_identi
     tx.commit().await.unwrap();
 }
 
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn set_enforce_sso_does_not_require_a_different_admins_link(pool: PgPool) {
     // A second admin's own linked identity does not satisfy the guard for
     // the caller turning enforcement on — the whole point is that *this*
@@ -725,7 +725,7 @@ async fn set_enforce_sso_does_not_require_a_different_admins_link(pool: PgPool) 
     tx.rollback().await.unwrap();
 }
 
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn delete_connection_and_delete_last_domain_are_refused_while_enforced(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -771,7 +771,7 @@ async fn delete_connection_and_delete_last_domain_are_refused_while_enforced(poo
 /// the row — a security review found `claim` took no lockout guard at all,
 /// so re-POSTing the org's only verified domain silently produced the exact
 /// stranded state `delete`'s own guard exists to prevent.
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn reclaiming_the_only_verified_domain_is_refused_while_enforced(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -820,7 +820,7 @@ async fn reclaiming_the_only_verified_domain_is_refused_while_enforced(pool: PgP
     tx.commit().await.unwrap();
 }
 
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn delete_a_non_last_verified_domain_is_never_refused(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -870,7 +870,7 @@ async fn delete_a_non_last_verified_domain_is_never_refused(pool: PgPool) {
 /// last one" before either commits, and both deletes land -- leaving the org
 /// with `enforce_sso = true` and zero verified domains. With it, exactly one
 /// must succeed and the other must see the updated count and refuse.
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn concurrent_domain_deletes_never_both_leave_zero_verified_domains(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;

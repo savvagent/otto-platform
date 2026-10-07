@@ -1,7 +1,7 @@
 //! Shared fixtures for otto-core's DB-backed integration tests.
 //!
 //! Each test gets a throwaway database from `#[sqlx::test]`, migrated with
-//! otto-tenant's full schema via `otto_tenant::MIGRATOR`.
+//! otto-tenant's full schema via `otto_tenant::db::MIGRATOR`.
 
 #![allow(dead_code)]
 

@@ -41,7 +41,7 @@ async fn audit_count(pool: &PgPool, user: UserId, action: &str) -> i64 {
         .expect("count audit events")
 }
 
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn passkey_login_is_refused_for_a_member_of_an_enforce_sso_org(pool: PgPool) {
     let db = Db::from_pool(pool.clone());
     let org = db.create_org("acme", "Acme").await.unwrap();
@@ -69,7 +69,7 @@ async fn passkey_login_is_refused_for_a_member_of_an_enforce_sso_org(pool: PgPoo
 
 /// `enforce_sso` is scoped to org membership: belonging to one enforcing org
 /// is enough, even if the same account also belongs to a non-enforcing one.
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn one_enforcing_org_among_several_is_enough_to_refuse(pool: PgPool) {
     let db = Db::from_pool(pool.clone());
     let plain = db.create_org("plain", "Plain").await.unwrap();
@@ -85,7 +85,7 @@ async fn one_enforcing_org_among_several_is_enough_to_refuse(pool: PgPool) {
     assert!(matches!(err, AuthError::SsoRequired), "got {err:?}");
 }
 
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn passkey_login_still_works_when_no_org_enforces_sso(pool: PgPool) {
     let db = Db::from_pool(pool.clone());
     let org = db.create_org("acme", "Acme").await.unwrap();
@@ -100,7 +100,7 @@ async fn passkey_login_still_works_when_no_org_enforces_sso(pool: PgPool) {
 
 /// The flag belongs to the org, not to the people outside it: an enforcing
 /// org must not affect an account that is not one of its members.
-#[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn an_enforcing_org_does_not_affect_non_members(pool: PgPool) {
     let db = Db::from_pool(pool.clone());
     let strict = db.create_org("strict", "Strict").await.unwrap();
