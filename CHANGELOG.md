@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/savvagent/otto-platform/compare/v0.2.0...v0.2.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* **otto-auth:** pin OIDC connections to validated addresses ([#12](https://github.com/savvagent/otto-platform/issues/12)) ([c7437af](https://github.com/savvagent/otto-platform/commit/c7437afdc63bc211f00f003868f7de208ae2341b)), closes [#7](https://github.com/savvagent/otto-platform/issues/7)
+
 ## [0.2.0](https://github.com/savvagent/otto-platform/compare/v0.1.0...v0.2.0) (2026-10-07)
 
 
