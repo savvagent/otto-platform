@@ -2,10 +2,12 @@
 //! against a real Postgres, runs migrations, proves tenant isolation is
 //! actually in force, and only then starts serving HTTP.
 //!
-//! The HTTP surface is health checks plus the identity API and OAuth
-//! authorization server (see `lib.rs`). Resource-server endpoints and the
-//! console are the rest of Phase 4 of
-//! `docs/plans/2026-10-06-platform-cutover.md`.
+//! The HTTP surface is health checks, the identity API and OAuth authorization
+//! server, and the resource-server API (see `lib.rs`). The console is the rest
+//! of Phase 4 of `docs/plans/2026-10-06-platform-cutover.md`.
+//!
+//! `otto-platform-server resource ...` is an operator command instead: it
+//! provisions resource servers and exits.
 
 use std::net::SocketAddr;
 
@@ -20,6 +22,19 @@ async fn main() -> Result<()> {
     // is already set, so a file that accidentally ships inside an image cannot
     // override the deployment's real configuration.
     let dotenv = dotenvy::dotenv();
+
+    // `resource ...` provisions and exits. It needs only the database and,
+    // for a webhook secret, the key, so it runs before `Config::from_env`
+    // demands the server's whole configuration (public URL and so on). It
+    // does not migrate or verify isolation; point it at a database a server
+    // has already migrated.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("resource") {
+        return run_resource_command(&args[1..]).await;
+    }
+    if !args.is_empty() {
+        anyhow::bail!("unknown arguments {args:?}; run with none to serve, or `resource ...`");
+    }
 
     let config = Config::from_env().context(
         "configuration is incomplete. Copy .env.example to .env for local runs, \
@@ -36,7 +51,7 @@ async fn main() -> Result<()> {
     // is a startup error naming the variable rather than a failure the first
     // time something needs to encrypt a secret hours later. `app` checks it
     // again, which is cheap and keeps it from relying on this call.
-    otto_tenant::crypto::Cipher::from_base64_key(&config.encryption_key)
+    let cipher = otto_tenant::crypto::Cipher::from_base64_key(&config.encryption_key)
         .context("OTTO_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
 
     let db = Db::connect(&config.database_url)
@@ -66,7 +81,12 @@ async fn main() -> Result<()> {
         .context("refusing to serve: tenant isolation is not enforced by this database")?;
     tracing::info!("{}", isolation.summary());
 
-    let router = app(db, &config)?;
+    let router = app(db.clone(), &config)?;
+
+    // Lifecycle webhooks: the same key that seals IdP secrets seals each
+    // resource server's signing secret.
+    let (stop_webhooks, stop_rx) = tokio::sync::watch::channel(false);
+    let webhook_task = tokio::spawn(otto_platform_server::webhooks::run(db, cipher, stop_rx));
 
     let listener = TcpListener::bind(config.bind)
         .await
@@ -90,8 +110,29 @@ async fn main() -> Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .context("server error")?;
+    let _ = stop_webhooks.send(true);
+    let _ = webhook_task.await;
     tracing::info!("shut down cleanly");
     Ok(())
+}
+
+async fn run_resource_command(args: &[String]) -> Result<()> {
+    use otto_platform_server::resource_cmd;
+
+    let cmd = resource_cmd::parse(args)
+        .map_err(|e| anyhow::anyhow!("{e}\n\n{}", resource_cmd::USAGE))?;
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+    let db = Db::connect(&database_url)
+        .await
+        .context("could not connect to DATABASE_URL")?;
+    let cipher = match std::env::var("OTTO_ENCRYPTION_KEY") {
+        Ok(k) if !k.trim().is_empty() => Some(
+            otto_tenant::crypto::Cipher::from_base64_key(&k)
+                .context("OTTO_ENCRYPTION_KEY is not a valid 32-byte base64 key")?,
+        ),
+        _ => None,
+    };
+    resource_cmd::execute(&db, cipher.as_ref(), cmd, &mut std::io::stdout()).await
 }
 
 /// Resolves on SIGINT or SIGTERM.

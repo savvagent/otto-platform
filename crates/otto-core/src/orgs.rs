@@ -8,6 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::labels;
+use crate::lifecycle::{self, LifecycleEvent};
 use otto_tenant::ids::{OrgId, UserId};
 use otto_tenant::{Db, Tx};
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,18 @@ pub enum Plan {
     Team,
     Business,
     Enterprise,
+}
+
+impl Plan {
+    /// The lowercase name used in the database and on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Plan::Free => "free",
+            Plan::Team => "team",
+            Plan::Business => "business",
+            Plan::Enterprise => "enterprise",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, FromRow)]
@@ -184,6 +197,23 @@ pub trait OrgsExt {
 
     fn get_org(&self, id: OrgId) -> impl std::future::Future<Output = Result<Option<Org>>> + Send;
 
+    /// As [`Self::get_org`], but `None` for an org that has been deleted.
+    fn get_active_org(
+        &self,
+        id: OrgId,
+    ) -> impl std::future::Future<Output = Result<Option<Org>>> + Send;
+
+    /// Delete an org: mark it deleted, revoke every token it issued, and queue
+    /// an `org.deleted` webhook, all in one transaction. Idempotent only in the
+    /// sense that a second call fails with [`Error::OrgNotFound`] and queues
+    /// nothing.
+    ///
+    /// A soft delete (`orgs.deleted_at`), because everything else in this
+    /// database that references the org would otherwise cascade away with no
+    /// record that it existed. Callers that need the rows gone entirely do that
+    /// separately, after the resource servers have been told.
+    fn delete_org(&self, id: OrgId) -> impl std::future::Future<Output = Result<()>> + Send;
+
     fn get_org_by_slug(
         &self,
         slug: &str,
@@ -229,6 +259,16 @@ pub trait OrgsExt {
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 
     fn member_role(
+        &self,
+        org: OrgId,
+        user: UserId,
+    ) -> impl std::future::Future<Output = Result<Option<Role>>> + Send;
+
+    /// The user's role in an org, but only while that role still entitles them
+    /// to act: `None` if they are not a member, the org was deleted, or the
+    /// account is disabled. This is the check token introspection runs, so a
+    /// removed member's still-unexpired token stops working immediately.
+    fn active_member_role(
         &self,
         org: OrgId,
         user: UserId,
@@ -315,6 +355,61 @@ impl OrgsExt for Db {
             .fetch_optional(self.pool())
             .await?;
         Ok(org)
+    }
+
+    async fn get_active_org(&self, id: OrgId) -> Result<Option<Org>> {
+        let org = sqlx::query_as(&format!(
+            "SELECT {ORG_COLS} FROM orgs WHERE id = $1 AND deleted_at IS NULL"
+        ))
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(org)
+    }
+
+    async fn delete_org(&self, id: OrgId) -> Result<()> {
+        // Pinned, not unpinned: `org_invites` is tenant-scoped and an unpinned
+        // transaction would not reliably see or touch its rows.
+        let mut tx = self.begin(id).await?;
+
+        let n =
+            sqlx::query("UPDATE orgs SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL")
+                .bind(id)
+                .execute(tx.conn())
+                .await?
+                .rows_affected();
+        if n == 0 {
+            return Err(Error::OrgNotFound(id));
+        }
+
+        // Nothing issued for a deleted org may outlive it. Introspection also
+        // refuses these tokens (`active_member_role`), but revoking keeps the
+        // token list honest, and the credentials that could still *mint* a
+        // token or a membership have to go too: outstanding authorization
+        // codes (redemption also checks `deleted_at`) and pending invites.
+        for table in ["access_tokens", "refresh_tokens"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET revoked_at = now() WHERE org_id = $1 AND revoked_at IS NULL"
+            ))
+            .bind(id)
+            .execute(tx.conn())
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE authorization_codes SET consumed_at = now() \
+             WHERE org_id = $1 AND consumed_at IS NULL",
+        )
+        .bind(id)
+        .execute(tx.conn())
+        .await?;
+        sqlx::query("DELETE FROM org_invites WHERE org_id = $1 AND accepted_at IS NULL")
+            .bind(id)
+            .execute(tx.conn())
+            .await?;
+
+        lifecycle::enqueue(tx.conn(), &LifecycleEvent::OrgDeleted { org: id }).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn get_org_by_slug(&self, slug: &str) -> Result<Option<Org>> {
@@ -466,11 +561,20 @@ impl OrgsExt for Db {
     }
 
     async fn remove_member(&self, org: OrgId, user: UserId) -> Result<()> {
-        sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
+        let mut tx = self.begin_unpinned().await?;
+        let n = sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
             .bind(org)
             .bind(user)
-            .execute(self.pool())
-            .await?;
+            .execute(tx.conn())
+            .await?
+            .rows_affected();
+        // Only a membership that existed is news: removing a non-member is a
+        // no-op and must not tell resource servers to clean up after someone
+        // they may still be serving.
+        if n > 0 {
+            lifecycle::enqueue(tx.conn(), &LifecycleEvent::MemberRemoved { org, user }).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -488,6 +592,21 @@ impl OrgsExt for Db {
                 .bind(user)
                 .fetch_optional(self.pool())
                 .await?;
+        Ok(role)
+    }
+
+    async fn active_member_role(&self, org: OrgId, user: UserId) -> Result<Option<Role>> {
+        let role = sqlx::query_scalar(
+            "SELECT m.role FROM org_members m \
+             JOIN orgs o ON o.id = m.org_id \
+             JOIN users u ON u.id = m.user_id \
+             WHERE m.org_id = $1 AND m.user_id = $2 \
+               AND o.deleted_at IS NULL AND u.disabled_at IS NULL",
+        )
+        .bind(org)
+        .bind(user)
+        .fetch_optional(self.pool())
+        .await?;
         Ok(role)
     }
 
@@ -624,11 +743,18 @@ impl OrgsTxExt for Tx<'_> {
     /// any cleanup, and an audit entry either all land or none do.
     async fn remove_member(&mut self, user: UserId) -> Result<()> {
         let org = self.org();
-        sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
+        let n = sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
             .bind(org)
             .bind(user)
             .execute(self.conn())
-            .await?;
+            .await?
+            .rows_affected();
+        // Queued in this transaction, so the webhook exists if and only if
+        // the removal commits. See `OrgsExt::remove_member` for why a
+        // non-member removal queues nothing.
+        if n > 0 {
+            lifecycle::enqueue(self.conn(), &LifecycleEvent::MemberRemoved { org, user }).await?;
+        }
         Ok(())
     }
 }

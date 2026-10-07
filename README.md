@@ -66,13 +66,22 @@ crates/
 │                         admin, tokens, usage, audit). Routes and the
 │                         OpenAPI document come from one catalog. Built on
 │                         otto-tenant, otto-core, otto-billing, otto-auth.
-└── otto-platform-server/ thin binary: loads config, connects, runs
-                          migrations, verifies tenant isolation, then serves
-                          /healthz, /readyz and otto-web's router.
+├── otto-resource/        what a resource server (otto-factory, otto-flags)
+│                         links: introspection, usage and lookup clients
+│                         with 60 s caches, webhook signature verification.
+│                         No database dependency.
+└── otto-platform-server/ binary: loads config, connects, runs migrations,
+                          verifies tenant isolation, then serves /healthz,
+                          /readyz, otto-web's router, and the
+                          resource-server API (`POST /oauth/introspect`,
+                          `/internal/*`). Delivers lifecycle webhooks and
+                          provisions resource servers
+                          (`otto-platform-server resource ...`).
 ```
 
 Dependency direction: `otto-tenant` ← `otto-core` ← `otto-billing`,
-`otto-auth` ← `otto-web` ← `otto-platform-server`.
+`otto-auth` ← `otto-web` ← `otto-platform-server`. The server also uses
+`otto-resource` for the wire types it shares with resource servers.
 
 Because `otto_tenant::Db` and `otto_tenant::Tx` are defined in a crate that
 `otto-core`/`otto-billing`/`otto-auth` depend on rather than own, Rust's

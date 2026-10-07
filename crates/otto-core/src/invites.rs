@@ -218,6 +218,7 @@ impl InvitesExt for Tx<'_> {
         let claimed: Option<(String, Role)> = sqlx::query_as(
             "UPDATE org_invites SET accepted_at = now() \
              WHERE org_id = $1 AND token_hash = $2 AND accepted_at IS NULL AND expires_at > now() \
+               AND EXISTS (SELECT 1 FROM orgs WHERE id = $1 AND deleted_at IS NULL) \
              RETURNING email, role",
         )
         .bind(org)
