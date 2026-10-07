@@ -1,6 +1,13 @@
 # Build outputs: rebuilt in the image anyway.
 target
 
+# The console is rebuilt in its own stage from a clean `npm ci`.
+web/node_modules
+web/build
+web/.svelte-kit
+web/.wrangler
+web/src/lib/paraglide
+
 # Never in an image: a file holding a database URL does not belong in a layer
 # anyone who can pull the image can read.
 .env

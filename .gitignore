@@ -3,3 +3,12 @@
 .env
 .env.*
 !.env.example
+
+# The console (web/). Generated or machine-local, never reviewed.
+web/node_modules
+web/.svelte-kit
+web/.wrangler
+web/build
+# Paraglide compiles messages into here on every check/build.
+web/src/lib/paraglide
+web/project.inlang/cache

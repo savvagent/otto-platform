@@ -1,7 +1,27 @@
-# otto-platform-server image. Mirrors otto-factory's Dockerfile minus the
-# console stage — the console moves here in Phase 4 of
-# docs/plans/2026-10-06-platform-cutover.md.
+# syntax=docker/dockerfile:1
 
+# otto-platform-server image, with the console bundle baked in for self-hosters.
+#
+# The hosted deployment does not use the bundle from here: a Cloudflare Worker
+# (web/worker, docs/deploy/cloudflare.md) serves the SPA and proxies the API to
+# this image. It stays in the image so a self-hosted deployment is one container:
+# set OTTO_STATIC_DIR=/srv/console and the server serves the console itself.
+
+# ---------------------------------------------------------------- console
+# Built first and separately. It changes on a different cadence from the server
+# and shares none of its toolchain, so a Rust edit must not reinstall npm
+# packages and a console edit must not recompile a workspace.
+FROM node:22-slim AS console
+
+WORKDIR /web
+# Manifests alone, so `npm ci` is cached until a dependency actually changes.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+
+COPY web/ ./
+RUN npm run build
+
+# ---------------------------------------------------------------- server
 FROM rust:1-slim-bookworm AS build
 
 # webauthn-rs (otto-auth) pulls in webauthn-attestation-ca, which links
@@ -39,8 +59,12 @@ RUN apt-get update \
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin otto
 USER otto
 
-COPY --from=build /usr/local/bin/otto-platform-server /usr/local/bin/otto-platform-server
+COPY --from=build   /usr/local/bin/otto-platform-server /usr/local/bin/otto-platform-server
+COPY --from=console /web/build                          /srv/console
 
+# OTTO_STATIC_DIR is deliberately not set: the bundle is present at /srv/console
+# but only served when a deployment asks for it, so the hosted API-only shape
+# is the default and a Worker in front is not shadowed by a second console.
 ENV OTTO_BIND=0.0.0.0:8080 \
     OTTO_LOG_FORMAT=json \
     RUST_LOG=info

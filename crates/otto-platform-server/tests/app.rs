@@ -15,6 +15,7 @@ fn config() -> Config {
         encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
         client_ip_header: None,
         enforce_quotas: false,
+        static_dir: None,
         run_migrations: true,
         log_format: otto_platform_server::LogFormat::Text,
     }
