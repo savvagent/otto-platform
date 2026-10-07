@@ -1,13 +1,18 @@
 # otto-platform on Fly.io, org "savvagent".
 #
-# Database: a dedicated, standalone (unmanaged) Fly Postgres app,
-# `otto-platform-db` (region iad), for the same reason otto-factory has its
-# own: 0004_rls.sql runs `CREATE ROLE otto_app NOLOGIN`, which needs
-# CREATEROLE, and the managed `savvagent-pg` cluster does not grant that to a
-# tenant app's role (see otto-factory docs/deploy/fly.md). The connecting role
-# created by `fly postgres attach` is a superuser on this dedicated instance,
-# so it bypasses RLS: isolation rests on `Db::begin` issuing
-# `SET LOCAL ROLE otto_app`, which the startup isolation check verifies.
+# Database: `otto_platform` on `otto-db` (region iad), a single unmanaged Fly
+# Postgres app shared with otto-factory, which uses its own `otto_factory`
+# database there. Separate databases, one machine — chosen for cost while all
+# data is disposable. The trade-off: `fly postgres attach` makes each app's
+# role a superuser on that instance, so either app's credential can reach the
+# other's database. Split onto dedicated instances before real customers.
+#
+# Unmanaged rather than the managed `savvagent-pg` cluster because
+# 0004_rls.sql runs `CREATE ROLE otto_app NOLOGIN`, which needs CREATEROLE,
+# and the managed cluster does not grant it (see otto-factory
+# docs/deploy/fly.md). The connecting role bypasses RLS as a superuser:
+# isolation rests on `Db::begin` issuing `SET LOCAL ROLE otto_app`, which the
+# startup isolation check verifies.
 #
 # Secrets are NOT in this file. `fly postgres attach` stages DATABASE_URL.
 #

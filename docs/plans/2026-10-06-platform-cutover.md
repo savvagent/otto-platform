@@ -50,9 +50,11 @@ This document covers the "how, in what order."
 2. **Dockerfile** for `otto-platform-server`, a multi-stage build modeled on otto-factory's.
 3. **Fly infrastructure, provisioned early to shake out problems:**
    - App `otto-platform` in org `savvagent`, region `iad`.
-   - A dedicated unmanaged Postgres app, `otto-platform-db`. It must be dedicated for the
-     same reason as `otto-factory-mcp-db`: migrations need CREATEROLE, which the managed
-     `savvagent-pg` cluster won't grant (otto-factory `docs/deploy/fly.md`).
+   - Database `otto_platform` on `otto-db`, one unmanaged Postgres app shared with
+     otto-factory (`otto_factory`). It's unmanaged because migrations need CREATEROLE,
+     which the managed `savvagent-pg` cluster won't grant (otto-factory
+     `docs/deploy/fly.md`). It's shared for cost; split onto dedicated instances before
+     real customers, since each app's attach role is a superuser on the instance.
    - Deploy the current boot-only binary and confirm `/readyz`. This needs a minimal
      health route.
 4. **Add the CI deploy job** (`flyctl deploy` on release), using an app-scoped
@@ -129,12 +131,12 @@ its own left in `of-core`/`of-auth`.
                      ├── login / signup / passkeys / SSO (WebAuthn rp_id = otto.savvagent.com)
                      ├── account + org console (members, teams, SSO, tokens, usage, audit)
                      └── internal API for resource servers (usage ingest, member lookup)
-                                 │ identity DB: otto-platform-db
+                                 │ identity DB: otto_platform on otto-db
                                  │
      otto-factory.savvagent.com  ├── (Fly app: otto-factory-mcp)
        ├── POST /mcp  (resource server; validates tokens via introspection)
        ├── factory console (queue, repos, trackers, connect), logs in via OAuth to otto.savvagent.com
-       └── domain DB: otto-factory-mcp-db (no identity tables)
+       └── domain DB: otto_factory on otto-db (no identity tables)
 
      otto-flags (later): same shape as otto-factory
 ```
