@@ -6,8 +6,10 @@
 //! - **Layer 2, who the human is**: [`login`] is the front door, over
 //!   [`passkeys`] (WebAuthn, usernameless, phishing-resistant) and
 //!   [`sessions`] (a console's browser cookie). Enterprise OIDC federation
-//!   would join this layer later; it does not exist in this baseline (see
-//!   `otto-tenant`'s auth migration docs).
+//!   joins this layer through [`oidc`] (discovery, token exchange, `id_token`
+//!   validation, behind an SSRF guard) and [`dns`] (TXT domain verification);
+//!   the data layer lives in `otto_core`'s `idp`/`domains`/`identities`/
+//!   `ceremonies` modules. The HTTP routes that drive them are not here yet.
 //!
 //!   **No email, anywhere.** There is no verification link, no recovery link,
 //!   and no mailer — a passkey is the only factor, a second passkey is the
@@ -34,9 +36,11 @@
 //! primitive is hand-written — see [`crypto`] for what is used where.
 
 pub mod crypto;
+pub mod dns;
 pub mod error;
 pub mod login;
 pub mod oauth;
+pub mod oidc;
 pub mod passkeys;
 pub mod ratelimit;
 pub mod sessions;

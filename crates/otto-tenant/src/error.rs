@@ -32,6 +32,15 @@ pub enum Error {
     #[error("org {0} not found")]
     OrgNotFound(OrgId),
 
+    /// Misconfiguration detected while building a component, e.g. an
+    /// encryption key that is not valid base64 or the wrong length.
+    #[error("{0}")]
+    Config(String),
+
+    /// A seal/open failure in [`crate::crypto::Cipher`].
+    #[error("{0}")]
+    Crypto(String),
+
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -43,6 +52,8 @@ impl Error {
             Error::Invalid(_) => "invalid_argument",
             Error::IsolationNotEnforced { .. } => "isolation_not_enforced",
             Error::OrgNotFound(_) => "org_not_found",
+            Error::Config(_) => "internal_error",
+            Error::Crypto(_) => "internal_error",
             Error::Db(_) => "internal_error",
         }
     }

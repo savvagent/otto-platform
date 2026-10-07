@@ -22,7 +22,27 @@ sha2.workspace = true
 subtle.workspace = true
 webauthn-rs = { version = "0.5.4", features = ["danger-allow-state-serialisation", "resident-key-support", "conditional-ui"] }
 webauthn-rs-proto = "0.5.5"
+jsonwebtoken.workspace = true
+hickory-resolver.workspace = true
+reqwest.workspace = true
+# `net` for tokio::net::lookup_host: resolving a URL's host before fetching it,
+# to reject a private/loopback/link-local address (SSRF guard in oidc.rs).
+tokio = { workspace = true, features = ["net"] }
+# StreamExt, for reading an IdP response body in capped chunks (oidc.rs): an
+# admin- or IdP-controlled URL must not be able to push an unbounded response
+# into this process's memory.
+futures.workspace = true
+
+[features]
+# Relaxes oidc.rs's SSRF guard to allow loopback addresses, so the crate's own
+# test suite can exercise fetch_discovery/exchange_code/verify_id_token against
+# a local mock server. Enabled only via the self-referencing dev-dependency
+# below, never by a normal consumer of this crate.
+test-support = []
 
 [dev-dependencies]
+# Integration tests link otto-auth as an external crate, so anything they use
+# directly must be declared here even when it is already a normal dependency.
+otto-auth = { path = ".", features = ["test-support"] }
 tokio = { workspace = true, features = ["full"] }
 webauthn-authenticator-rs = { version = "0.5.4", default-features = false, features = ["softtoken"] }

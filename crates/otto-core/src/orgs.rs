@@ -241,6 +241,14 @@ pub trait OrgsExt {
         user: UserId,
     ) -> impl std::future::Future<Output = Result<Vec<Membership>>> + Send;
 
+    /// Whether `user` belongs to any org that currently has `enforce_sso =
+    /// true` — the one check passkey login gains for enterprise OIDC
+    /// federation. See the implementation for why this is unscoped.
+    fn is_member_of_sso_enforced_org(
+        &self,
+        user: UserId,
+    ) -> impl std::future::Future<Output = Result<bool>> + Send;
+
     fn list_org_members(
         &self,
         org: OrgId,
@@ -515,6 +523,31 @@ impl OrgsExt for Db {
         Ok(rows)
     }
 
+    /// Whether `user` belongs to any org that currently has `enforce_sso =
+    /// true` — the one check passkey login gains for enterprise OIDC
+    /// federation (spec §5, "Passkey login enforcement").
+    ///
+    /// Unscoped and unpinned, the same bootstrap class as
+    /// [`Db::member_role`]: at login time the caller's org is not yet known
+    /// (they may belong to several, only some of which enforce SSO), so
+    /// there is no [`OrgId`] to pin a [`Tx`] to — this is exactly the
+    /// question that has to be answered *before* any org-scoped work can
+    /// begin. `enforce_sso` is scoped to org membership, not to which
+    /// address the account holds (otto-factory's OIDC design
+    /// spec's Premise corrections), so this is a membership join, not a domain check.
+    async fn is_member_of_sso_enforced_org(&self, user: UserId) -> Result<bool> {
+        let enforced: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+               SELECT 1 FROM org_members m JOIN orgs o ON o.id = m.org_id \
+               WHERE m.user_id = $1 AND o.enforce_sso \
+             )",
+        )
+        .bind(user)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(enforced)
+    }
+
     async fn list_org_members(&self, org: OrgId) -> Result<Vec<OrgMember>> {
         let rows = sqlx::query_as(
             "SELECT u.id, u.email, u.name, u.label, u.created_at, u.disabled_at, \
@@ -598,4 +631,159 @@ impl OrgsTxExt for Tx<'_> {
             .await?;
         Ok(())
     }
+}
+
+// ------------------------------------------------------ enterprise OIDC SSO
+
+/// Lock this org's row for the rest of the transaction, before evaluating
+/// whether a working SSO path still exists.
+///
+/// Three call sites share this: [`set_enforce_sso`]'s enable path,
+/// `idp::delete_connection`, and `domains::delete`. All three answer the same
+/// underlying question — "does this org still have a working SSO path" —
+/// about the same row, and without locking it, two concurrent admin actions
+/// (two deletes against the org's two verified domains, say, or one delete
+/// racing one enable) can each read "still safe" before either commits, and
+/// both writes land — landing the org in the exact locked-out state this
+/// guard exists to prevent (`enforce_sso = true` with no bound connection or
+/// no verified domain). This is the same locked-read-then-write discipline
+/// [`Tx::count_owners_for_update`] already uses for its own concurrent-
+/// admin-action race; a plain read-then-write without it is a real TOCTOU
+/// race, not a theoretical one, since two admins acting on the same org's SSO
+/// settings at once is exactly the scenario the console makes easy to
+/// trigger by accident.
+///
+/// Only locks — callers read whatever they need (e.g. [`enforce_sso_flag`])
+/// in a second statement inside the same, now-locked transaction.
+pub async fn lock_for_sso_guard(tx: &mut Tx<'_>) -> Result<()> {
+    sqlx::query("SELECT 1 FROM orgs WHERE id = $1 FOR UPDATE")
+        .bind(tx.org())
+        .execute(tx.conn())
+        .await?;
+    Ok(())
+}
+
+/// Read `enforce_sso` for the caller's own org.
+///
+/// `pub(crate)` rather than `pub`: every caller of this is expected to have
+/// called [`lock_for_sso_guard`] first, in the same transaction, so the value
+/// read here cannot change out from under the decision it feeds — a bare
+/// unlocked read would reopen the exact TOCTOU window that guard exists to
+/// close. Keeping it crate-private means `idp::delete_connection` and
+/// `domains::delete` (both call this after their own `lock_for_sso_guard`)
+/// are the only callers, rather than a public accessor someone could reach
+/// for without the lock.
+pub(crate) async fn enforce_sso_flag(tx: &mut Tx<'_>) -> Result<bool> {
+    let enforce_sso: bool = sqlx::query_scalar("SELECT enforce_sso FROM orgs WHERE id = $1")
+        .bind(tx.org())
+        .fetch_one(tx.conn())
+        .await?;
+    Ok(enforce_sso)
+}
+
+/// Turn `enforce_sso` on or off for the caller's own org.
+///
+/// Turning it **on** is refused (`Error::SsoLockout`, naming which piece is
+/// missing) unless the org has a bound `idp_connection`, at least one
+/// verified `claimed_domains` row, **and** `caller` (the admin making this
+/// call) already has a `user_identities` row linked to that connection.
+///
+/// **Why the third condition, and why it's about `caller` specifically, not
+/// "does anyone in the org have a link."** A third-round review of this
+/// feature traced what happens to an *existing* passkey member once
+/// enforcement is on with nobody yet linked: passkey login is refused
+/// (`login::with_passkey`'s `enforce_sso` check); the anonymous SSO path
+/// refuses them too, because their email already has an account
+/// (`EMAIL_COLLISION` — correctly, per the never-link-by-email invariant);
+/// and the one path that *would* work, the authenticated "link my identity"
+/// ceremony, needs a session they can no longer obtain. That includes the
+/// admin who flips the switch — their current session keeps working until
+/// it lapses, but nothing in the product can turn `enforce_sso` back off
+/// once it does, because reaching this very endpoint again needs a session
+/// too. The first two conditions (a bound connection, a verified domain)
+/// only prove *some* working IdP path exists; they say nothing about
+/// whether *any specific person* can reach it. Requiring the caller
+/// specifically — not "some member" — is what turns this from "prove the
+/// org has infrastructure" into "prove at least one person, right now,
+/// making this exact call, can still get back in after it succeeds": since
+/// `caller` already holds a session in order to be calling this endpoint at
+/// all, requiring them to link first (`POST /api/me/sso/link/start`, while
+/// they still have that session) is always reachable before they flip the
+/// switch, and guarantees the org is never left with zero working sign-ins.
+/// It does not, by itself, guarantee every *other* existing member has a
+/// path back in — an admin still needs to walk them through linking (or
+/// remove-then-relink-then-readd) afterward — but it closes the one case
+/// that has no recovery at all: everyone, including whoever turned it on,
+/// locked out simultaneously with nobody left who can reach the console to
+/// undo it.
+///
+/// `idp::resolve_for_domain` is an inner join, so either of the first two
+/// conditions missing alone already makes SSO sign-in unreachable for
+/// everyone, caller included — that case is still named first. Turning it
+/// **off** has no guard — disabling enforcement can never itself produce a
+/// lockout.
+///
+/// `orgs` carries no RLS policy at all — it is the tenant, not tenant-scoped
+/// data (absent from `0004_rls.sql`'s `tenant_tables`
+/// array). This function's only protection
+/// is guard 1: `UPDATE orgs SET enforce_sso = $2 WHERE id = tx.org()` — the
+/// caller cannot name a different org's row because `Tx` is pinned to the
+/// caller's own org id and `orgs.id` (not `org_id`) is the match column.
+pub async fn set_enforce_sso(tx: &mut Tx<'_>, enforce: bool, caller: UserId) -> Result<Org> {
+    if enforce {
+        lock_for_sso_guard(tx).await?;
+
+        let has_verified_domain = crate::domains::list(tx)
+            .await?
+            .iter()
+            .any(|d| d.verified_at.is_some());
+
+        // let-else, not an Option<T> plus a later unwrap/expect: a prior
+        // draft of this function paired a bool flag with an unreachable!()
+        // arm for "both present" — correct, but fragile to a future edit
+        // reordering the checks. Binding `connection` here means there is
+        // no later point where its presence needs re-proving to the
+        // compiler by anything other than the type itself.
+        let Some(connection) = crate::idp::get_connection(tx).await? else {
+            let reason = if has_verified_domain {
+                "no IdP connection is bound for this org"
+            } else {
+                "no IdP connection is bound and no domain is verified for this org"
+            };
+            return Err(Error::SsoLockout {
+                reason: format!(
+                    "cannot turn on enforce_sso: {reason} — bind a connection and verify \
+                     a domain first, or SSO sign-in would be unreachable for every member."
+                ),
+            });
+        };
+        if !has_verified_domain {
+            return Err(Error::SsoLockout {
+                reason: "cannot turn on enforce_sso: no domain is verified for this org — \
+                    verify a domain first, or SSO sign-in would be unreachable for every \
+                    member."
+                    .to_string(),
+            });
+        }
+
+        if !crate::identities::is_linked(tx, caller, connection.id).await? {
+            return Err(Error::SsoLockout {
+                reason: "cannot turn on enforce_sso: you have not linked your own account to \
+                    this org's identity provider yet — passkey login will stop working for \
+                    everyone immediately, including you, with no way back in. Link your SSO \
+                    identity from account settings first, then turn this on."
+                    .to_string(),
+            });
+        }
+    }
+
+    let org: Org = sqlx::query_as(&format!(
+        "UPDATE orgs SET enforce_sso = $2 WHERE id = $1 RETURNING {ORG_COLS}"
+    ))
+    .bind(tx.org())
+    .bind(enforce)
+    .fetch_one(tx.conn())
+    .await?;
+
+    Ok(org)
 }
