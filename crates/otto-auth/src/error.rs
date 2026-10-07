@@ -65,6 +65,27 @@ pub enum AuthError {
     #[error("this org requires single sign-on")]
     SsoRequired,
 
+    /// The ceremony's stored account does not match what the caller expected,
+    /// meaning a substituted or hijacked ceremony (see
+    /// [`crate::passkeys::finish_registration_tx`]'s `expected` parameter).
+    /// Checked before anything the completed ceremony would write, so a
+    /// mismatch fails before the credential insert and its audit row exist at
+    /// all, not just before they commit.
+    ///
+    /// Carries both accounts rather than being a unit variant: nothing else
+    /// records which two accounts a hijack attempt named, so
+    /// `finish_registration` uses these fields to write a best-effort trace of
+    /// the attempt on a connection independent of the transaction this error
+    /// rolls back.
+    #[error("that ceremony belongs to a different account")]
+    CeremonyAccountMismatch {
+        /// The account the ceremony actually belongs to, the one a successful
+        /// attach would have added a credential to.
+        ceremony_account: otto_tenant::ids::UserId,
+        /// Who the caller expected to be finishing it.
+        caller_account: otto_tenant::ids::UserId,
+    },
+
     // ---- rate limiting
     #[error("too many attempts; retry in {retry_after_secs}s")]
     RateLimited { retry_after_secs: i64 },
@@ -155,6 +176,9 @@ impl AuthError {
             }
 
             AuthError::WrongAudience => "token is not valid for this resource",
+            AuthError::CeremonyAccountMismatch { .. } => {
+                "that ceremony belongs to a different account"
+            }
             AuthError::NotAMember => "not a member of that organization",
             AuthError::SsoRequired => "this organization requires single sign-on",
             AuthError::RateLimited { .. } => "too many attempts",
@@ -190,7 +214,9 @@ impl AuthError {
     pub fn status(&self) -> u16 {
         match self {
             AuthError::RateLimited { .. } => 429,
-            AuthError::NotAMember | AuthError::SsoRequired => 403,
+            AuthError::NotAMember
+            | AuthError::SsoRequired
+            | AuthError::CeremonyAccountMismatch { .. } => 403,
             AuthError::Config(_)
             | AuthError::Crypto(_)
             | AuthError::Core(_)

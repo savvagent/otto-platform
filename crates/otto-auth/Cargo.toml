@@ -22,3 +22,7 @@ sha2.workspace = true
 subtle.workspace = true
 webauthn-rs = { version = "0.5.4", features = ["danger-allow-state-serialisation", "resident-key-support", "conditional-ui"] }
 webauthn-rs-proto = "0.5.5"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+webauthn-authenticator-rs = { version = "0.5.4", default-features = false, features = ["softtoken"] }

@@ -72,9 +72,12 @@ impl TenantTable {
 /// (which are the states a healthy test database cannot be put into).
 #[derive(Debug, Clone)]
 pub struct IsolationReport {
+    /// The role a tenant transaction tries to assume (see
+    /// [`crate::Db::with_tenant_role`]); `otto_app` by default.
+    pub tenant_role: String,
     /// `current_user` inside a transaction shaped exactly like [`crate::Db::begin`].
     pub effective_role: String,
-    /// Whether `SET LOCAL ROLE otto_app` was issued. False means the role does
+    /// Whether `SET LOCAL ROLE <tenant_role>` was issued. False means the role does
     /// not exist or is not assumable — legitimate on managed Postgres.
     pub tenant_role_assumed: bool,
     /// The effective role is a superuser. Bypasses RLS unconditionally.
@@ -107,12 +110,18 @@ impl IsolationReport {
                  {}",
                 self.effective_role,
                 if self.tenant_role_assumed {
-                    "SET LOCAL ROLE otto_app succeeded but landed on an exempt role: \
-                     revoke SUPERUSER/BYPASSRLS from otto_app."
+                    format!(
+                        "SET LOCAL ROLE {role} succeeded but landed on an exempt role: \
+                         revoke SUPERUSER/BYPASSRLS from {role}.",
+                        role = self.tenant_role
+                    )
                 } else {
-                    "Either grant the application an otto_app role to drop into \
-                     (CREATE ROLE otto_app NOLOGIN; GRANT otto_app TO CURRENT_USER), \
-                     or connect as a role that is neither."
+                    format!(
+                        "Either grant the application a {role} role to drop into \
+                         (CREATE ROLE {role} NOLOGIN; GRANT {role} TO CURRENT_USER), \
+                         or connect as a role that is neither.",
+                        role = self.tenant_role
+                    )
                 }
             ));
         }
@@ -152,9 +161,9 @@ impl IsolationReport {
             "tenant isolation enforced as role {:?} ({}); {} tenant tables, {} forced",
             self.effective_role,
             if self.tenant_role_assumed {
-                "assumed via SET LOCAL ROLE"
+                format!("assumed via SET LOCAL ROLE {}", self.tenant_role)
             } else {
-                "connecting role, not exempt from RLS"
+                "connecting role, not exempt from RLS".to_string()
             },
             self.tables.len(),
             self.tables.iter().filter(|t| t.rls_forced).count(),
@@ -168,6 +177,7 @@ impl IsolationReport {
 /// exactly the session a real tenant query would.
 pub(crate) async fn gather(
     tx: &mut sqlx::PgConnection,
+    tenant_role: &str,
     tenant_role_assumed: bool,
 ) -> Result<IsolationReport> {
     let (effective_role, role_is_superuser, role_bypasses_rls): (String, bool, bool) =
@@ -208,6 +218,7 @@ pub(crate) async fn gather(
     .await?;
 
     Ok(IsolationReport {
+        tenant_role: tenant_role.to_string(),
         effective_role,
         tenant_role_assumed,
         role_is_superuser,
@@ -243,6 +254,7 @@ mod tests {
 
     fn report(tables: Vec<TenantTable>) -> IsolationReport {
         IsolationReport {
+            tenant_role: "otto_app".to_string(),
             effective_role: "otto_app".to_string(),
             tenant_role_assumed: true,
             role_is_superuser: false,
@@ -288,6 +300,35 @@ mod tests {
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("superuser"), "{problems:?}");
         assert!(problems[0].contains("CREATE ROLE otto_app"), "{problems:?}");
+    }
+
+    /// The remediation text names the configured role, not the default.
+    #[test]
+    fn a_custom_role_is_named_in_problems_and_summary() {
+        let r = IsolationReport {
+            tenant_role: "of_app".to_string(),
+            effective_role: "postgres".to_string(),
+            tenant_role_assumed: false,
+            role_is_superuser: true,
+            ..report(vec![table("teams", true, true, true)])
+        };
+        let problems = r.problems();
+        assert!(
+            problems[0].contains("CREATE ROLE of_app NOLOGIN"),
+            "{problems:?}"
+        );
+        assert!(!problems[0].contains("otto_app"), "{problems:?}");
+
+        let ok = IsolationReport {
+            tenant_role: "of_app".to_string(),
+            effective_role: "of_app".to_string(),
+            ..report(vec![table("teams", true, true, false)])
+        };
+        assert!(
+            ok.summary().contains("SET LOCAL ROLE of_app"),
+            "{}",
+            ok.summary()
+        );
     }
 
     #[test]
