@@ -46,6 +46,7 @@ subtle = "2"
 # Loads .env for local runs. Never overrides a variable already set, so a
 # deployment's real environment always wins over a file that got shipped.
 dotenvy = "0.15"
+aes-gcm = "0.10"
 
 [profile.release]
 lto = "thin"
