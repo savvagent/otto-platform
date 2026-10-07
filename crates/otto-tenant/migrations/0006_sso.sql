@@ -5,6 +5,10 @@
 -- user_identities, plus 0031_sso_ceremonies.sql). No later otto-factory
 -- migration altered any of these four tables.
 --
+-- 0002_auth.sql's header still says these tables were left out. That comment
+-- is stale but stays: editing an applied migration changes its checksum, and
+-- sqlx then refuses to start against any database that already ran it.
+--
 -- None of the four is registered in 0004_rls.sql's tenant_tables, matching
 -- otto-factory: authentication has to resolve them BEFORE an org is known
 -- (a person types an email, the domain routes to an IdP; an IdP subject

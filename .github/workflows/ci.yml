@@ -105,6 +105,30 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # Migrations are append-only. sqlx stores each applied migration's checksum
+  # and refuses to start against a database whose files no longer match, so
+  # editing even a comment in an applied migration takes down the next deploy.
+  migrations-append-only:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Refuse changes to existing migrations
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-status --diff-filter=MDR "origin/${BASE_REF}...HEAD" -- 'crates/*/migrations/')
+          if [ -n "$changed" ]; then
+            echo "::error::existing migrations were modified, deleted, or renamed; add a new migration instead"
+            echo "$changed"
+            exit 1
+          fi
+
   # PR titles become the main commit on squash-merge, and release-please reads
   # their Conventional Commits type to compute the version bump.
   pr-title:
