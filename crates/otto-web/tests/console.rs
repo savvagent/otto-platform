@@ -2049,6 +2049,52 @@ async fn an_admin_cannot_reset_an_owners_authenticator(pool: PgPool) {
     sign_in(&h, &mut owner).await.expect(StatusCode::OK);
 }
 
+/// A passkey reset is a takeover of the *account*, which is not org-scoped. An
+/// admin of one org must not be able to use it to seize a member who owns a
+/// different org — being trusted here is not authority there.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_reset_cannot_reach_an_account_that_holds_power_in_another_org(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let acme = org_with_owner(&h, "acme", &rob).await;
+    let mut bob = onboard(&h, "bob@bobco.test").await;
+    org_with_owner(&h, "bobco", &bob).await;
+    add_member(&h, acme, bob.user, Role::Member).await;
+
+    let reset = format!("/api/orgs/acme/members/{}/reset-passkeys", bob.user);
+
+    // rob owns acme, where bob is a mere member — and has no standing in bobco.
+    let refused = Call::post(&reset)
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    refused.expect(StatusCode::FORBIDDEN);
+    assert!(
+        !refused.text.contains("bobco"),
+        "the refusal named an org the caller has no business knowing: {}",
+        refused.text
+    );
+    sign_in(&h, &mut bob).await.expect(StatusCode::OK);
+
+    // An admin of bobco is not enough where bob is bobco's *owner*.
+    let bobco = h.db.get_org_by_slug("bobco").await.unwrap().unwrap().id;
+    add_member(&h, bobco, rob.user, Role::Admin).await;
+    Call::post(&reset)
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await
+        .expect(StatusCode::FORBIDDEN);
+    sign_in(&h, &mut bob).await.expect(StatusCode::OK);
+
+    // An owner of bobco as well as of acme has authority over the whole account.
+    add_member(&h, bobco, rob.user, Role::Owner).await;
+    Call::post(&reset)
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await
+        .expect(StatusCode::CREATED);
+}
+
 // ------------------------------------------------- cross-site request guard
 
 /// The bodyless POSTs are the ones a body-shaped check never notices, and the

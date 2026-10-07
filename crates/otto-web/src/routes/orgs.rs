@@ -335,6 +335,8 @@ pub async fn force_logout(
 ///
 /// - Admin-only, and an owner's credentials may be reset only by an owner —
 ///   the same ordering as `remove_member`, so this is not a way around it.
+///   The same ordering must hold in **every other org the member belongs
+///   to**, because the account is not org-scoped: see the check below.
 /// - Every live session of theirs dies, so a reset interrupts whoever is
 ///   currently holding the account.
 /// - It grants the admin nothing *directly*: no session is opened here. But the
@@ -358,6 +360,37 @@ pub async fn reset_member_passkeys(
 
     if current == Role::Owner && target != ctx.user.id {
         ctx.require_owner()?;
+    }
+
+    // An account is not org-scoped: clearing its passkeys and handing out a
+    // claim code is a full takeover of a person who may belong to — and own —
+    // other orgs this caller has no authority in. Being an admin *here* must
+    // not be a way into an owner seat *there*, so the caller must hold at
+    // least the same authority over the account in every org it belongs to
+    // (owner where the target is an owner, admin otherwise). Resetting your
+    // own account is always yours to do. The refusal does not name the other
+    // orgs, which are not this caller's to learn.
+    if target != ctx.user.id {
+        for membership in state.db.list_user_orgs(target).await? {
+            if membership.org_id == ctx.org.id {
+                continue;
+            }
+            let held = state.db.member_role(membership.org_id, ctx.user.id).await?;
+            let sufficient = match (held, membership.role) {
+                (Some(Role::Owner), _) => true,
+                (Some(_), Role::Owner) => false,
+                (Some(role), _) => role.can_administer(),
+                (None, _) => false,
+            };
+            if !sufficient {
+                return Err(ApiError::forbidden(
+                    "this account belongs to other organizations you do not administer, so \
+                     its authenticators cannot be reset from here. The member can sign in \
+                     with another registered passkey, or an admin of their other \
+                     organizations can reset them",
+                ));
+            }
+        }
     }
 
     let ip = client_ip(&parts, &state.config);
