@@ -16,6 +16,10 @@ use sqlx::{PgPool, Transaction};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
+/// The tenant migrations, exposed so a consumer's tests can hand them to
+/// `#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]`.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 /// The application role that tenant transactions run as. Must match migration
 /// `0004_rls.sql`.
 const TENANT_ROLE: &str = "otto_app";
@@ -90,7 +94,7 @@ impl Db {
     /// takes a Postgres advisory lock for the duration, so the losers wait
     /// rather than racing each other through the same DDL.
     pub async fn migrate(&self) -> Result<()> {
-        sqlx::migrate!("./migrations")
+        MIGRATOR
             .run(&self.pool)
             .await
             .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
