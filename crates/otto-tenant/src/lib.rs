@@ -34,4 +34,16 @@ pub mod isolation;
 
 pub use db::{Db, Tx, Unpinned};
 pub use error::{Error, Result};
+/// Every migration this crate owns, embedded at compile time.
+///
+/// [`Db::migrate`] applies the same set at startup. Exposed so downstream
+/// crates' integration tests can hand it to `#[sqlx::test(migrator = ...)]`
+/// and get a throwaway database with the full schema:
+///
+/// ```ignore
+/// #[sqlx::test(migrator = "otto_tenant::MIGRATOR")]
+/// async fn my_test(pool: sqlx::PgPool) { /* ... */ }
+/// ```
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 pub use ids::{OrgId, TeamId, UserId};

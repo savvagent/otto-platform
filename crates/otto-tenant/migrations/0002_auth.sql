@@ -11,10 +11,9 @@
 -- `magic_links`, all of which were later dropped there in favor of passkeys.
 -- None of that history exists in this schema — it starts from passkeys
 -- directly. Enterprise IdP/SSO federation tables (`idp_connections`,
--- `claimed_domains`, `user_identities`) are deliberately excluded too: no
--- extracted code in otto-auth touches them today (see that crate's docs), and
--- `orgs.enforce_sso` is carried as a plain flag for a future implementation
--- to build on rather than half-shipping unused schema now.
+-- `claimed_domains`, `user_identities`, `sso_ceremonies`) are created
+-- separately in 0006_sso.sql; `orgs.enforce_sso` (0001_identity.sql) is the
+-- flag they build on.
 
 CREATE TYPE token_kind AS ENUM ('oauth', 'pat');
 

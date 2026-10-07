@@ -76,6 +76,8 @@ pub mod action {
     pub const IDP_DISCONNECTED: &str = "org.idp.disconnected";
     pub const DOMAIN_CLAIMED: &str = "org.domain.claimed";
     pub const DOMAIN_VERIFIED: &str = "org.domain.verified";
+    pub const DOMAIN_UNCLAIMED: &str = "org.domain.unclaimed";
+    pub const ENFORCE_SSO_CHANGED: &str = "org.enforce_sso.changed";
     pub const PLAN_CHANGED: &str = "org.plan.changed";
 }
 

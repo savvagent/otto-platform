@@ -17,8 +17,12 @@
 //! the trait alongside `Db`/`Tx` to call its methods — e.g.
 //! `use otto_core::orgs::OrgsExt;` for `db.get_user(...)`.
 
+pub mod ceremonies;
+pub mod domains;
 pub mod error;
 pub mod i18n;
+pub mod identities;
+pub mod idp;
 pub mod invites;
 pub mod labels;
 pub mod orgs;

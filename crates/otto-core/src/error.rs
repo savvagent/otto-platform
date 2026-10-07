@@ -43,6 +43,26 @@ pub enum Error {
         signed_in_as: String,
     },
 
+    /// A domain is globally unique (`claimed_domains.domain` is the primary
+    /// key) and another org already holds it. Deliberately generic: a domain
+    /// claim is a full account/organization identity, so nothing beyond "you
+    /// were refused" is confirmed here, not even which org holds it.
+    #[error("this domain is already claimed by another organization")]
+    DomainAlreadyClaimed,
+
+    /// A change to an org's SSO configuration was refused because it would
+    /// leave (or already leaves) the org with `enforce_sso = true` and no
+    /// working IdP sign-in path: no bound connection, no verified domain, or
+    /// (for a domain delete) no verified domain left once this one is gone.
+    /// Raised by `orgs::set_enforce_sso`'s enable path, `idp::delete_connection`,
+    /// and `domains::delete`/`domains::claim`, each behind
+    /// `orgs::lock_for_sso_guard` so the check this error reports on cannot be
+    /// raced by a concurrent admin action. `reason` names which piece is
+    /// missing: an admin fixing this needs to know whether to bind a
+    /// connection, verify a domain, or turn enforcement off first.
+    #[error("{reason}")]
+    SsoLockout { reason: String },
+
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 
@@ -63,6 +83,8 @@ impl Error {
             Error::AlreadyAMember { .. } => "already_a_member",
             Error::InviteInvalid => "invite_invalid",
             Error::InviteWrongAccount { .. } => "invite_wrong_account",
+            Error::DomainAlreadyClaimed => "domain_already_claimed",
+            Error::SsoLockout { .. } => "sso_lockout",
             Error::Db(_) => "internal_error",
             Error::Tenant(e) => e.code(),
         }
