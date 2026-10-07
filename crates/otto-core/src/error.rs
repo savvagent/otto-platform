@@ -43,8 +43,8 @@ pub enum Error {
         signed_in_as: String,
     },
 
-    /// A domain is globally unique (`claimed_domains.domain` is the primary
-    /// key) and another org already holds it. Deliberately generic: a domain
+    /// Another org has already *verified* this domain (only one verified
+    /// claim per domain is allowed; pending claims do not conflict). Deliberately generic: a domain
     /// claim is a full account/organization identity, so nothing beyond "you
     /// were refused" is confirmed here, not even which org holds it.
     #[error("this domain is already claimed by another organization")]

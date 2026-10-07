@@ -1,9 +1,12 @@
 //! Enterprise OIDC federation — claimed email domains.
 //!
-//! A domain is globally unique, claimed by at most one org at a time
-//! (`claimed_domains.domain` is the primary key). Control is proved with a
-//! DNS TXT record before `verified_at` is set — an unverified claim routes
-//! nobody, so claiming `gmail.com` accomplishes nothing. Like
+//! Any number of orgs may hold a pending claim on a domain, but at most one
+//! may hold a *verified* one (`claimed_domains_verified_domain_key`, migration
+//! 0008). Control is proved with a DNS TXT record before `verified_at` is
+//! set: an unverified claim routes nobody, so claiming `gmail.com`
+//! accomplishes nothing, and it no longer blocks anyone either — the first
+//! org to pass verification wins, and its verified claim then blocks every
+//! other org until it is released. Like
 //! `idp_connections`, this table carries no `org_id`-based RLS policy
 //! (`0004_rls.sql` leaves them out: bootstrap-before-org-known), so every statement
 //! here carries an explicit `org_id = $1` predicate (guard 1).
@@ -60,20 +63,16 @@ fn normalize_domain(domain: &str) -> Result<String> {
 /// token and resetting `verified_at` to `NULL` — a re-claim always restarts
 /// verification rather than trusting a stale proof.
 ///
-/// `INSERT ... ON CONFLICT (domain) DO UPDATE ... WHERE claimed_domains.org_id
-/// = $1`: the `WHERE` clause is what makes this safe for a domain already
-/// held by *another* org. Postgres still finds the conflicting row (the
-/// `ON CONFLICT` target matched), but the `WHERE` blocks the `DO UPDATE`, so
-/// the statement acts like `DO NOTHING` for that specific conflict and
-/// `RETURNING` yields zero rows — which is exactly what `fetch_optional`
-/// coming back `None` means here (the same "zero rows affected" outcome
-/// `rows_affected() == 0` would report on a plain `execute`, just observed
-/// through `RETURNING` since a successful claim needs the row back anyway).
-/// A `None` is `Error::DomainAlreadyClaimed` — a generic message that
-/// deliberately does not name which org holds it: this is a full
-/// account/organization identity, not a bounded disclosure like the JIRA
-/// site-registration precedent, so nothing beyond "you were refused" is
-/// confirmed.
+/// Refused with `Error::DomainAlreadyClaimed` only when **another org has
+/// verified** this domain. Another org's pending claim does not block this
+/// one: a claim proves nothing until DNS verification, so letting an
+/// unverified claim reserve a domain would let any org squat on any domain
+/// and lock its real owner out of SSO (savvagent/otto-platform#6). The error
+/// deliberately does not name which org holds the domain.
+///
+/// A race with another org verifying between the check and the insert is
+/// harmless: this org ends up with a pending claim it can never verify while
+/// the other holds the domain, which [`mark_verified`] reports.
 ///
 /// Re-claiming this org's own *only verified* domain while `enforce_sso` is
 /// on is refused the same way [`delete`] refuses removing it: a re-claim
@@ -124,22 +123,43 @@ pub async fn claim(
         }
     }
 
-    let row: Option<ClaimedDomain> = sqlx::query_as(&format!(
+    if verified_elsewhere(tx, &domain).await? {
+        return Err(Error::DomainAlreadyClaimed);
+    }
+
+    let row = sqlx::query_as(&format!(
         "INSERT INTO claimed_domains (org_id, domain, verification_token, verified_at) \
          VALUES ($1, $2, $3, NULL) \
-         ON CONFLICT (domain) DO UPDATE SET \
+         ON CONFLICT (org_id, domain) DO UPDATE SET \
            verification_token = EXCLUDED.verification_token, \
            verified_at = NULL \
-         WHERE claimed_domains.org_id = $1 \
          RETURNING {DOMAIN_COLS}"
     ))
     .bind(org_id)
     .bind(&domain)
     .bind(verification_token)
-    .fetch_optional(tx.conn())
+    .fetch_one(tx.conn())
     .await?;
 
-    row.ok_or(Error::DomainAlreadyClaimed)
+    Ok(row)
+}
+
+/// Whether an org other than this one holds a verified claim on `domain`.
+///
+/// The one read in this module that is not pinned to `org_id = $1`, because
+/// its whole question is about other orgs. It returns a boolean and nothing
+/// about who.
+async fn verified_elsewhere(tx: &mut Tx<'_>, domain: &str) -> Result<bool> {
+    let org_id = tx.org();
+    let held: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM claimed_domains \
+                        WHERE domain = $1 AND org_id <> $2 AND verified_at IS NOT NULL)",
+    )
+    .bind(domain)
+    .bind(org_id)
+    .fetch_one(tx.conn())
+    .await?;
+    Ok(held)
 }
 
 pub async fn list(tx: &mut Tx<'_>) -> Result<Vec<ClaimedDomain>> {
@@ -157,9 +177,23 @@ pub async fn list(tx: &mut Tx<'_>) -> Result<Vec<ClaimedDomain>> {
 /// see `otto_auth::dns::verify_txt_record`) has already succeeded. Called only
 /// on a domain this org itself claimed; a domain this org never claimed (or
 /// already released) is `Error::Invalid`, not a silent no-op.
+///
+/// If another org verified the domain first, this is
+/// `Error::DomainAlreadyClaimed`. That is checked up front for a clean error,
+/// and enforced by the `claimed_domains_verified_domain_key` unique index for
+/// the race where both orgs verify at once; in that case the losing
+/// statement has aborted the transaction and the caller must roll back.
+///
+/// Other orgs' pending claims on the domain are left in place rather than
+/// deleted: every write here is pinned to this org, and a pending claim
+/// becomes verifiable again if the winner later releases the domain.
 pub async fn mark_verified(tx: &mut Tx<'_>, domain: &str) -> Result<ClaimedDomain> {
     let org_id = tx.org();
     let domain = normalize_domain(domain)?;
+
+    if verified_elsewhere(tx, &domain).await? {
+        return Err(Error::DomainAlreadyClaimed);
+    }
 
     let row: Option<ClaimedDomain> = sqlx::query_as(&format!(
         "UPDATE claimed_domains SET verified_at = now() \
@@ -169,7 +203,15 @@ pub async fn mark_verified(tx: &mut Tx<'_>, domain: &str) -> Result<ClaimedDomai
     .bind(org_id)
     .bind(&domain)
     .fetch_optional(tx.conn())
-    .await?;
+    .await
+    .map_err(|e| match &e {
+        sqlx::Error::Database(db)
+            if db.constraint() == Some("claimed_domains_verified_domain_key") =>
+        {
+            Error::DomainAlreadyClaimed
+        }
+        _ => Error::from(e),
+    })?;
 
     row.ok_or_else(|| Error::Invalid(format!("domain {domain:?} is not claimed by this org")))
 }
@@ -236,9 +278,8 @@ pub async fn delete(tx: &mut Tx<'_>, domain: &str) -> Result<()> {
         .await?;
 
     // Mirrors mark_verified's own rule, above: a domain this org never
-    // claimed (a typo, already-released, or — since `domain` is a global
-    // primary key — actually owned by a different org) is a refusal, not a
-    // silent no-op. Without this, a caller sees 204/success and an audit
+    // claimed (a typo, already released, or claimed only by a different org)
+    // is a refusal, not a silent no-op. Without this, a caller sees 204/success and an audit
     // row for a deletion that never happened.
     if result.rows_affected() == 0 {
         return Err(Error::Invalid(format!(
