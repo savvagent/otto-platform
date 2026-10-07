@@ -1135,3 +1135,132 @@ async fn discovery_is_503_when_the_database_is_unreachable(pool: PgPool) {
     reply.expect(StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(reply.error_code(), Some("temporarily_unavailable"));
 }
+
+// ------------------------------------------------ the form pins the resource
+
+/// A client that names no resource is resolved to the only registered one for
+/// the page. The decision form must carry *that*, not the request's empty
+/// value: if a second resource server registers between render and submit, an
+/// empty field would be ambiguous (or, in an older design, resolve to a
+/// different server than the page showed).
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_consent_form_pins_the_resource_the_page_showed(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let page = Call::get(authorize_url(&client_id, &challenge, "", "s"))
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    page.expect(StatusCode::OK);
+    let marker = "name=resource value=\"";
+    let start = page.text.find(marker).expect("no resource field") + marker.len();
+    let pinned = &page.text[start..start + page.text[start..].find('"').unwrap()];
+    assert_eq!(
+        pinned, RESOURCE,
+        "the hidden field echoed the request, not the resolution"
+    );
+
+    // A second resource server registers while the human reads the page.
+    common::register_other_resource(&h.db).await;
+
+    let granted = consent_for(&h, &rob, &client_id, &challenge, "", pinned).await;
+    granted.expect(StatusCode::SEE_OTHER);
+    let code = query_param(&location(&granted), "code").expect("no code");
+    let tokens = Call::post("/oauth/token")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("client_id", &client_id),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", &verifier),
+        ])
+        .send(&h.router)
+        .await;
+    tokens.expect(StatusCode::OK);
+    let access = tokens.body["access_token"].as_str().unwrap();
+    otto_auth::tokens::introspect(&h.db, access, RESOURCE)
+        .await
+        .expect("the token is for the server the page named");
+
+    // And the old behaviour — submitting the empty value — is now refused
+    // rather than guessed at.
+    let (_, challenge2) = pkce();
+    let ambiguous = consent_for(&h, &rob, &client_id, &challenge2, "", "").await;
+    ambiguous.expect(StatusCode::BAD_REQUEST);
+}
+
+// ------------------------------------------------- cross-site request guard
+
+/// The consent decision is the highest-value forgery target: one form POST
+/// from any same-site sibling (an XSS on another `*.savvagent.com` host) would
+/// hand an attacker's client a token. `SameSite=Lax` does not stop a sibling.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_consent_decision_from_a_sibling_origin_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Attacker", REDIRECT).await;
+    let (_, challenge) = pkce();
+
+    for origin in ["https://blog.otto.test", "https://evil.test", "null"] {
+        let org_id = h.db.get_org_by_slug("acme").await.unwrap().unwrap().id;
+        let decision = Call::post("/oauth/authorize")
+            .with_session(&rob.session)
+            .header("origin", origin)
+            .form(&[
+                ("response_type", "code"),
+                ("client_id", &client_id),
+                ("redirect_uri", REDIRECT),
+                ("code_challenge", &challenge),
+                ("code_challenge_method", "S256"),
+                ("scope", "things:read"),
+                ("resource", RESOURCE),
+                ("state", "s"),
+                ("org_id", &org_id.to_string()),
+                ("decision", "allow"),
+            ])
+            .send(&h.router)
+            .await;
+        decision.expect(StatusCode::FORBIDDEN);
+        assert_eq!(
+            decision.error_code(),
+            Some("cross_site_request"),
+            "{origin}"
+        );
+        assert!(decision.headers.get(http::header::LOCATION).is_none());
+    }
+}
+
+/// Agents call the token, registration and revocation endpoints with no cookie
+/// and no `Origin`. There is no ambient credential there to forge, so the
+/// guard must not touch them.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn agent_endpoints_without_a_cookie_are_not_guarded(pool: PgPool) {
+    let h = harness(pool).await;
+
+    // Reaches the handler (which refuses the empty grant) rather than the guard.
+    let token = Call::post("/oauth/token")
+        .form(&[("grant_type", "authorization_code")])
+        .send(&h.router)
+        .await;
+    assert_ne!(token.status, StatusCode::FORBIDDEN, "{}", token.text);
+    assert_eq!(token.body["error"], "invalid_request");
+
+    Call::post("/oauth/revoke")
+        .form(&[("token", "otto_at_nothing")])
+        .send(&h.router)
+        .await
+        .expect(StatusCode::OK);
+
+    // Even an agent that happens to send a foreign Origin, cookie-less.
+    let registered = Call::post("/oauth/register")
+        .header("origin", "https://some-web-agent.test")
+        .json(serde_json::json!({ "client_name": "x", "redirect_uris": [REDIRECT] }))
+        .send(&h.router)
+        .await;
+    registered.expect(StatusCode::CREATED);
+}

@@ -39,6 +39,7 @@
 //! server's own domain routes live in its own service.
 
 pub mod catalog;
+pub mod csrf;
 pub mod error;
 pub mod i18n;
 pub mod oauth;
@@ -95,6 +96,10 @@ pub fn router(state: AppState) -> Router {
         .fold(Router::new(), |router, (path, methods)| {
             router.route(path, methods)
         })
+        .layer(axum::middleware::from_fn_with_state(
+            csrf::allowed_origin(&state.config),
+            csrf::check,
+        ))
         .with_state(state)
 }
 

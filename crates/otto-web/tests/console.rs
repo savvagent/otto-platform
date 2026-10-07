@@ -2048,3 +2048,67 @@ async fn an_admin_cannot_reset_an_owners_authenticator(pool: PgPool) {
     // The owner's credential is untouched.
     sign_in(&h, &mut owner).await.expect(StatusCode::OK);
 }
+
+// ------------------------------------------------- cross-site request guard
+
+/// The bodyless POSTs are the ones a body-shaped check never notices, and the
+/// ones a same-site sibling can fire with the victim's cookie.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn cookie_bearing_writes_need_the_sites_own_origin(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let bob = onboard(&h, "bob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    add_member(&h, org, bob.user, Role::Member).await;
+
+    let force_logout = format!("/api/orgs/acme/members/{}/logout", bob.user);
+    for path in [
+        "/api/auth/logout".to_string(),
+        force_logout.clone(),
+        "/api/orgs/acme/sso/domains/example.com/verify".to_string(),
+    ] {
+        for origin in ["https://evil.test", "https://blog.otto.test"] {
+            let refused = Call::post(&path)
+                .with_session(&rob.session)
+                .header("origin", origin)
+                .send(&h.router)
+                .await;
+            refused.expect(StatusCode::FORBIDDEN);
+            assert_eq!(
+                refused.error_code(),
+                Some("cross_site_request"),
+                "{path} {origin}"
+            );
+        }
+    }
+
+    // Nothing was done by the refused calls: rob is still signed in.
+    Call::get("/api/me")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await
+        .expect(StatusCode::OK);
+
+    // Fetch Metadata stands in for a missing Origin (the no-header case is a
+    // unit test in `csrf.rs`; `Call` always supplies the honest Origin).
+    Call::post(&force_logout)
+        .with_session(&rob.session)
+        .header("sec-fetch-site", "same-origin")
+        .send(&h.router)
+        .await
+        .expect(StatusCode::OK);
+    Call::post(&force_logout)
+        .with_session(&rob.session)
+        .header("sec-fetch-site", "same-site")
+        .send(&h.router)
+        .await
+        .expect(StatusCode::FORBIDDEN);
+
+    // The same-origin browser path works and does what it says.
+    Call::post("/api/auth/logout")
+        .with_session(&rob.session)
+        .header("origin", common::PUBLIC_URL)
+        .send(&h.router)
+        .await
+        .expect(StatusCode::NO_CONTENT);
+}

@@ -231,6 +231,17 @@ impl Call {
                 format!("__Host-otto_session={token}; theme=dark"),
             );
         }
+        // A browser attaches `Origin` to every non-GET it sends, and the
+        // cross-site guard refuses a cookie-bearing write without one. A test
+        // that cares about the origin sets its own header; the rest get the
+        // honest one.
+        if self.session.is_some()
+            && !self.headers.iter().any(|(name, _)| {
+                name.eq_ignore_ascii_case("origin") || name.eq_ignore_ascii_case("sec-fetch-site")
+            })
+        {
+            builder = builder.header(http::header::ORIGIN, PUBLIC_URL);
+        }
         for (name, value) in &self.headers {
             builder = builder.header(*name, value.as_str());
         }

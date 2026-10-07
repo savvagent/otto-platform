@@ -288,7 +288,7 @@ pub async fn authorize_page(
     Html(consent_html(
         client,
         &params,
-        &authorization.resource.name,
+        &authorization.resource,
         &authorization.scopes,
         &orgs,
         caller
@@ -750,7 +750,7 @@ button.primary{background:#111;color:#fff;border-color:#111}\
 fn consent_html(
     client: &oauth::Client,
     params: &AuthorizeParams,
-    resource_name: &str,
+    resource: &resources::ResourceServer,
     scopes: &[String],
     orgs: &[otto_core::orgs::Membership],
     signed_in_as: &str,
@@ -808,7 +808,13 @@ fn consent_html(
             params.code_challenge_method.as_str(),
         ),
         ("scope", params.scope.as_deref().unwrap_or("")),
-        ("resource", params.resource.as_deref().unwrap_or("")),
+        // The *resolved* audience, not the client's original value. A client
+        // that named none gets an empty field echoed back, and the decision POST
+        // would resolve it again — possibly to a different resource server if
+        // one registered in between, so the human would consent to the page
+        // they saw and be issued a code for something else. Pinning it here
+        // makes the form say exactly what the page showed.
+        ("resource", resource.resource_uri.as_str()),
         ("state", params.state.as_deref().unwrap_or("")),
     ]
     .iter()
@@ -848,7 +854,7 @@ fn consent_html(
         // is still text, not markup.
         heading = escape(&i18n::fill(
             i18n::msg(locale, Key::ConsentHeading),
-            resource_name
+            &resource.name
         )),
         // `asking` already carries escaped markup for the host span.
         warn = escape(i18n::msg(locale, Key::ConsentWarnName)),
@@ -1005,7 +1011,15 @@ mod tests {
         let html = consent_html(
             &client,
             &params,
-            "Things <Server>",
+            &resources::ResourceServer {
+                resource_uri: "https://things.otto.test/mcp".into(),
+                name: "Things <Server>".into(),
+                scopes: vec!["things:read".into()],
+                default_scopes: vec!["things:read".into()],
+                disabled: false,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
             &["things:read".to_string()],
             &orgs,
             "rob@acme.test",
@@ -1030,5 +1044,9 @@ mod tests {
             "a scope with no description falls back to its raw name"
         );
         assert!(html.contains("name=org_id"), "no organization picker");
+        assert!(
+            html.contains("name=resource value=\"https://things.otto.test/mcp\""),
+            "the form must carry the resolved resource, not the request's original (empty) one"
+        );
     }
 }
