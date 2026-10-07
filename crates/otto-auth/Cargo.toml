@@ -25,8 +25,8 @@ webauthn-rs-proto = "0.5.5"
 jsonwebtoken.workspace = true
 hickory-resolver.workspace = true
 reqwest.workspace = true
-# `net` for tokio::net::lookup_host: resolving a URL's host before fetching it,
-# to reject a private/loopback/link-local address (SSRF guard in oidc.rs).
+# `net` for tokio::net::lookup_host: the SSRF-pinning resolver's inner lookup
+# (ssrf.rs), which vets every resolved address before a connection is made.
 tokio = { workspace = true, features = ["net"] }
 # StreamExt, for reading an IdP response body in capped chunks (oidc.rs): an
 # admin- or IdP-controlled URL must not be able to push an unbounded response
