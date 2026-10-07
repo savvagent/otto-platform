@@ -20,14 +20,49 @@ use tokio::sync::OnceCell;
 /// `#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]`.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-/// The application role that tenant transactions run as. Must match migration
-/// `0004_rls.sql`.
-const TENANT_ROLE: &str = "otto_app";
+/// The default application role that tenant transactions run as. Matches the
+/// role migration `0004_rls.sql` creates; override it per [`Db`] with
+/// [`Db::with_tenant_role`] when a deployment's database already uses another
+/// name.
+pub const DEFAULT_TENANT_ROLE: &str = "otto_app";
+
+/// Longest identifier Postgres accepts (`NAMEDATALEN - 1`).
+const MAX_ROLE_LEN: usize = 63;
+
+/// Check that `role` is a plain, unquoted-safe SQL identifier
+/// (`^[a-z_][a-z0-9_]*$`, at most 63 bytes).
+///
+/// The role name is interpolated into `SET LOCAL ROLE`, which takes no bind
+/// parameters, so this is what keeps the interpolation safe.
+///
+/// ```
+/// use otto_tenant::db::validate_role_name;
+/// assert!(validate_role_name("of_app").is_ok());
+/// assert!(validate_role_name("of_app; DROP TABLE users").is_err());
+/// ```
+pub fn validate_role_name(role: &str) -> Result<()> {
+    let mut bytes = role.bytes();
+    let ok = role.len() <= MAX_ROLE_LEN
+        && matches!(bytes.next(), Some(b'a'..=b'z' | b'_'))
+        && bytes.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'));
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "{role:?} is not a valid tenant role name: expected ^[a-z_][a-z0-9_]*$, \
+             at most {MAX_ROLE_LEN} bytes"
+        )))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Db {
     pool: PgPool,
-    /// Whether this connection can `SET LOCAL ROLE otto_app`, resolved once and
+    /// The role tenant transactions assume. Validated by
+    /// [`validate_role_name`] before it can be set, so it is safe to
+    /// interpolate into `SET LOCAL ROLE`.
+    tenant_role: &'static str,
+    /// Whether this connection can `SET LOCAL ROLE <tenant_role>`, resolved once and
     /// shared by every clone.
     ///
     /// Resolved lazily rather than in `connect`, because `from_pool` is sync and
@@ -51,11 +86,40 @@ impl Db {
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             pool,
+            tenant_role: DEFAULT_TENANT_ROLE,
             tenant_role_assumable: Arc::new(OnceCell::new()),
         }
     }
 
-    /// Whether `SET LOCAL ROLE otto_app` will succeed on this connection.
+    /// Use `role` instead of the default [`DEFAULT_TENANT_ROLE`] for tenant
+    /// transactions, for a database whose application role has another name.
+    ///
+    /// The migrations still create `otto_app`; a custom role must already
+    /// exist (with the same grants) and be assumable by the connecting role,
+    /// otherwise it is treated like a missing `otto_app`: tenant transactions
+    /// skip `SET LOCAL ROLE` and [`Self::verify_tenant_isolation`] decides
+    /// whether that is acceptable.
+    ///
+    /// Call this right after construction. The assumability probe is reset, so
+    /// clones made *before* this call keep the old role and their own probe.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] if `role` does not match `^[a-z_][a-z0-9_]*$` or is
+    /// longer than 63 bytes.
+    pub fn with_tenant_role(mut self, role: &'static str) -> Result<Self> {
+        validate_role_name(role)?;
+        self.tenant_role = role;
+        self.tenant_role_assumable = Arc::new(OnceCell::new());
+        Ok(self)
+    }
+
+    /// The role tenant transactions assume.
+    pub fn tenant_role(&self) -> &'static str {
+        self.tenant_role
+    }
+
+    /// Whether `SET LOCAL ROLE <tenant_role>` will succeed on this connection.
     ///
     /// Two conditions, and asking the catalog is the only honest way to know
     /// both: the role has to exist, and the connecting role has to be a member of
@@ -77,7 +141,7 @@ impl Db {
                          AND pg_catalog.pg_has_role(current_user, r.oid, 'USAGE') \
                      )",
                 )
-                .bind(TENANT_ROLE)
+                .bind(self.tenant_role)
                 .fetch_one(&self.pool)
                 .await?;
                 Ok(assumable)
@@ -105,7 +169,7 @@ impl Db {
     ///
     /// Two statements run before the caller gets control, and both are load-bearing:
     ///
-    /// - `SET LOCAL ROLE otto_app` drops out of any superuser/owner identity for
+    /// - `SET LOCAL ROLE <tenant_role>` (default `otto_app`) drops out of any superuser/owner identity for
     ///   the rest of the transaction. **Where the connecting role is exempt, RLS
     ///   does nothing without this** — Postgres exempts superusers and table
     ///   owners from their own policies, and the connecting user is frequently
@@ -114,7 +178,7 @@ impl Db {
     ///
     ///   Issued only when the role can actually be assumed. A managed Postgres
     ///   deployment is routinely handed a database-scoped role with no
-    ///   CREATEROLE, so `otto_app` never gets created and this statement would
+    ///   CREATEROLE, so the role never gets created and this statement would
     ///   abort every tenant transaction; there, `FORCE ROW LEVEL SECURITY`
     ///   carries the guarantee instead. Skipping it is safe *only* under
     ///   conditions this function cannot check per-transaction without paying
@@ -134,7 +198,7 @@ impl Db {
         let mut tx = self.pool.begin().await?;
 
         if self.tenant_role_assumable().await? {
-            sqlx::query(&format!("SET LOCAL ROLE {TENANT_ROLE}"))
+            sqlx::query(&format!("SET LOCAL ROLE {}", self.tenant_role))
                 .execute(&mut *tx)
                 .await?;
         }
@@ -162,11 +226,11 @@ impl Db {
         let assumed = self.tenant_role_assumable().await?;
         let mut tx = self.pool.begin().await?;
         if assumed {
-            sqlx::query(&format!("SET LOCAL ROLE {TENANT_ROLE}"))
+            sqlx::query(&format!("SET LOCAL ROLE {}", self.tenant_role))
                 .execute(&mut *tx)
                 .await?;
         }
-        let report = crate::isolation::gather(&mut tx, assumed).await?;
+        let report = crate::isolation::gather(&mut tx, self.tenant_role, assumed).await?;
         tx.rollback().await?;
 
         let problems = report.problems();
@@ -266,5 +330,39 @@ impl<'a> Tx<'a> {
     pub async fn rollback(self) -> Result<()> {
         self.tx.rollback().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_plain_identifiers() {
+        for ok in ["otto_app", "of_app", "_x", "a1_b2", &"a".repeat(63)] {
+            assert!(validate_role_name(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn rejects_everything_else() {
+        for bad in [
+            "",
+            "1app",
+            "App",
+            "of-app",
+            "of app",
+            "of_app;",
+            "of_app\"; DROP",
+            "\"of_app\"",
+            "of_app\n",
+            "r\u{f4}le",
+            &"a".repeat(64),
+        ] {
+            assert!(
+                matches!(validate_role_name(bad), Err(Error::Invalid(_))),
+                "{bad:?}"
+            );
+        }
     }
 }

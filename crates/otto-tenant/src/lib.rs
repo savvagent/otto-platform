@@ -15,7 +15,8 @@
 //! 1. **Every tenant-scoped operation takes an [`OrgId`]** — usually by being a
 //!    method on [`Tx`], which cannot be constructed without one.
 //! 2. **Every tenant transaction runs pinned.** [`Db::begin`] issues
-//!    `SET LOCAL ROLE otto_app` and `SET LOCAL app.org_id`, so Postgres
+//!    `SET LOCAL ROLE otto_app` (configurable with [`Db::with_tenant_role`]) and
+//!    `SET LOCAL app.org_id`, so Postgres
 //!    row-level security applies even when the connecting user owns the
 //!    tables. A query that forgets its `org_id` predicate returns nothing
 //!    instead of leaking. Where `otto_app` cannot exist — managed Postgres
