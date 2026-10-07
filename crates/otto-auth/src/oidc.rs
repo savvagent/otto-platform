@@ -22,7 +22,7 @@ use serde_json::Value;
 use url::{Host, Url};
 
 use crate::error::{AuthError, Result};
-use crate::ssrf::{is_publicly_routable, PinnedResolver};
+use crate::ssrf::{is_publicly_routable, PinnedResolver, ResolveError};
 
 /// The outbound calls here happen inline in a browser-facing request (the
 /// admin binding a connection, or the callback exchanging a code) — a
@@ -50,13 +50,14 @@ const JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
 /// client lives in a `OnceLock` instead — same lifetime, same reuse, no
 /// per-call rebuild of the pool.
 ///
-/// Infallible: `Client::builder().build()` only fails on an invalid TLS
-/// backend configuration, which is fixed at compile time by this workspace's
-/// `reqwest` feature flags and so cannot fail differently across calls or
-/// environments. On that unreachable path this falls back to
-/// `reqwest::Client::new()` (the same infallible default `build()` uses
-/// internally) rather than propagating a fabricated error or panicking —
-/// the only thing lost in that case is the custom timeout, not correctness.
+/// Fails closed: if the builder errors, this panics (via `expect`) instead
+/// of falling back to a default `reqwest::Client`. A default client would have
+/// neither the [`PinnedResolver`] nor the no-redirect policy, silently
+/// reopening the SSRF this module exists to prevent. `build()` only fails on
+/// an invalid TLS backend configuration, which is fixed at compile time by
+/// this workspace's `reqwest` feature flags, so a failure here is a
+/// startup/config bug that must be loud, not a runtime condition to degrade
+/// through. No other `reqwest::Client` is constructed in this crate.
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -75,8 +76,28 @@ fn http_client() -> &'static reqwest::Client {
             // vetted set — closes DNS rebinding (see `ssrf::PinnedResolver`).
             .dns_resolver(Arc::new(PinnedResolver::system()))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .expect("OIDC HTTP client must build; refusing to fall back to an unpinned client")
     })
+}
+
+/// Maps a failed `send()` to an [`AuthError`]. A refusal by the
+/// [`PinnedResolver`] (host resolves to a non-public address, to nothing, or
+/// not at all) happens inside the connector, so reqwest reports it as a
+/// generic connect error with the resolver's error buried in the source
+/// chain. Find it by downcasting along `Error::source()` (not by matching on
+/// message text) and surface it as [`AuthError::OidcUnsafeUrl`] for `field`.
+fn send_error(action: &'static str, field: &'static str, source: reqwest::Error) -> AuthError {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&source);
+    while let Some(err) = cause {
+        if let Some(refused) = err.downcast_ref::<ResolveError>() {
+            return AuthError::OidcUnsafeUrl {
+                field,
+                reason: refused.to_string(),
+            };
+        }
+        cause = err.source();
+    }
+    AuthError::OidcHttp { action, source }
 }
 
 /// Rejects a URL this server is about to fetch (`fetch_discovery`'s
@@ -246,10 +267,7 @@ pub async fn fetch_discovery(issuer: &str) -> Result<Value> {
         .get(url)
         .send()
         .await
-        .map_err(|source| AuthError::OidcHttp {
-            action: "fetching the discovery document",
-            source,
-        })?;
+        .map_err(|source| send_error("fetching the discovery document", "issuer", source))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -354,9 +372,12 @@ pub async fn exchange_code(
         ])
         .send()
         .await
-        .map_err(|source| AuthError::OidcHttp {
-            action: "exchanging the authorization code",
-            source,
+        .map_err(|source| {
+            send_error(
+                "exchanging the authorization code",
+                "token_endpoint",
+                source,
+            )
         })?;
 
     let status = response.status();
@@ -486,10 +507,7 @@ async fn fetch_jwks(jwks_uri: &str) -> Result<JwkSet> {
         .get(jwks_url)
         .send()
         .await
-        .map_err(|source| AuthError::OidcHttp {
-            action: "fetching the JWKS document",
-            source,
-        })?;
+        .map_err(|source| send_error("fetching the JWKS document", "jwks_uri", source))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -639,5 +657,57 @@ mod ssrf_guard_tests {
     fn accepts_https_domains_and_public_literals() {
         assert!(require_safe_url("https://idp.example.com/x", "issuer").is_ok());
         assert!(require_safe_url("https://8.8.8.8/x", "issuer").is_ok());
+    }
+
+    struct FixedLookup(&'static str);
+    impl crate::ssrf::Lookup for FixedLookup {
+        fn lookup<'a>(
+            &'a self,
+            _host: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::io::Result<Vec<IpAddr>>> + Send + 'a>,
+        > {
+            let ip: IpAddr = self.0.parse().unwrap();
+            Box::pin(async move { Ok(vec![ip]) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resolver_refusal_surfaces_as_oidc_unsafe_url_for_the_field() {
+        let client = reqwest::Client::builder()
+            .dns_resolver(Arc::new(PinnedResolver::new(FixedLookup("10.255.255.1"))))
+            .build()
+            .unwrap();
+        let source = client
+            .get("https://private.test/")
+            .send()
+            .await
+            .expect_err("private answer must be refused");
+        match send_error("fetching the JWKS document", "jwks_uri", source) {
+            AuthError::OidcUnsafeUrl { field, reason } => {
+                assert_eq!(field, "jwks_uri");
+                assert!(reason.contains("10.255.255.1"), "{reason}");
+            }
+            other => panic!("expected OidcUnsafeUrl, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_connect_failure_stays_oidc_http() {
+        // Port 1 on an IP literal: refused connection, no resolver involved.
+        let source = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(matches!(
+            send_error("fetching the discovery document", "issuer", source),
+            AuthError::OidcHttp { .. }
+        ));
+    }
+
+    #[test]
+    fn the_shared_client_builds() {
+        let _ = http_client();
     }
 }
