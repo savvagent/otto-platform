@@ -45,6 +45,7 @@ pub mod passkeys;
 pub mod ratelimit;
 pub mod resources;
 pub mod sessions;
+pub mod ssrf;
 pub mod tokens;
 
 pub use error::{AuthError, Result};

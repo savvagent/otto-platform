@@ -9,8 +9,8 @@
 //! [`exchange_code`], [`verify_id_token`].
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::{OnceLock, RwLock};
+use std::net::IpAddr;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -19,9 +19,10 @@ use jsonwebtoken::{DecodingKey, Validation};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use url::Url;
+use url::{Host, Url};
 
 use crate::error::{AuthError, Result};
+use crate::ssrf::{is_publicly_routable, PinnedResolver, ResolveError};
 
 /// The outbound calls here happen inline in a browser-facing request (the
 /// admin binding a connection, or the callback exchanging a code) — a
@@ -49,13 +50,14 @@ const JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
 /// client lives in a `OnceLock` instead — same lifetime, same reuse, no
 /// per-call rebuild of the pool.
 ///
-/// Infallible: `Client::builder().build()` only fails on an invalid TLS
-/// backend configuration, which is fixed at compile time by this workspace's
-/// `reqwest` feature flags and so cannot fail differently across calls or
-/// environments. On that unreachable path this falls back to
-/// `reqwest::Client::new()` (the same infallible default `build()` uses
-/// internally) rather than propagating a fabricated error or panicking —
-/// the only thing lost in that case is the custom timeout, not correctness.
+/// Fails closed: if the builder errors, this panics (via `expect`) instead
+/// of falling back to a default `reqwest::Client`. A default client would have
+/// neither the [`PinnedResolver`] nor the no-redirect policy, silently
+/// reopening the SSRF this module exists to prevent. `build()` only fails on
+/// an invalid TLS backend configuration, which is fixed at compile time by
+/// this workspace's `reqwest` feature flags, so a failure here is a
+/// startup/config bug that must be loud, not a runtime condition to degrade
+/// through. No other `reqwest::Client` is constructed in this crate.
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -70,16 +72,38 @@ fn http_client() -> &'static reqwest::Client {
             // unvalidated second one, so following them is refused
             // outright rather than re-validated per hop.
             .redirect(reqwest::redirect::Policy::none())
+            // Resolve once, vet every address, and pin the connection to the
+            // vetted set — closes DNS rebinding (see `ssrf::PinnedResolver`).
+            .dns_resolver(Arc::new(PinnedResolver::system()))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .expect("OIDC HTTP client must build; refusing to fall back to an unpinned client")
     })
+}
+
+/// Maps a failed `send()` to an [`AuthError`]. A refusal by the
+/// [`PinnedResolver`] (host resolves to a non-public address, to nothing, or
+/// not at all) happens inside the connector, so reqwest reports it as a
+/// generic connect error with the resolver's error buried in the source
+/// chain. Find it by downcasting along `Error::source()` (not by matching on
+/// message text) and surface it as [`AuthError::OidcUnsafeUrl`] for `field`.
+fn send_error(action: &'static str, field: &'static str, source: reqwest::Error) -> AuthError {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&source);
+    while let Some(err) = cause {
+        if let Some(refused) = err.downcast_ref::<ResolveError>() {
+            return AuthError::OidcUnsafeUrl {
+                field,
+                reason: refused.to_string(),
+            };
+        }
+        cause = err.source();
+    }
+    AuthError::OidcHttp { action, source }
 }
 
 /// Rejects a URL this server is about to fetch (`fetch_discovery`'s
 /// `issuer`, or `exchange_code`/`fetch_jwks`'s `token_endpoint`/`jwks_uri`
-/// read out of a stored discovery document) unless it is `https` and
-/// resolves to at least one address, all of which must be publicly
-/// routable.
+/// read out of a stored discovery document) unless it is `https` and its
+/// host cannot be an internal address.
 ///
 /// **Why every call site, not just bind time.** `issuer` is admin-typed,
 /// but `token_endpoint` and `jwks_uri` are not admin input at all — they
@@ -96,113 +120,45 @@ fn http_client() -> &'static reqwest::Client {
 /// guarding `PUT .../sso/connection` is not itself a meaningful barrier —
 /// the check has to hold regardless of who is making the request.
 ///
-/// **What this does not close.** DNS is resolved once, here, and the
-/// connection that follows resolves it again — a resolver that answers
-/// differently the second time (DNS rebinding) is not pinned to the
-/// address this function validated. Redirects are refused outright
-/// (`http_client()`'s `Policy::none()`) specifically because a second,
-/// unvalidated hop would be a much easier version of the same gap. Full
-/// rebinding protection needs a custom `reqwest::dns::Resolve` that pins
-/// the connection to the exact address validated here; that is a larger
-/// change than this fix, and is called out as a residual, accepted risk
-/// rather than silently assumed away.
-async fn require_safe_url(raw: &str, field: &'static str) -> Result<Url> {
+/// **Division of labour.** A *domain* host is not resolved here: the shared
+/// client's [`PinnedResolver`] resolves it once at connect time, classifies
+/// every address, and the connection is pinned to exactly those addresses, so
+/// there is no check-then-use window for DNS rebinding. reqwest never
+/// consults a resolver for an IP-*literal* host, so this function classifies
+/// literals itself. Redirects are refused outright (`http_client()`'s
+/// `Policy::none()`), so no second, unvalidated hop exists either.
+fn require_safe_url(raw: &str, field: &'static str) -> Result<Url> {
     let unsafe_url = |reason: &str| AuthError::OidcUnsafeUrl {
         field,
         reason: reason.to_string(),
     };
 
     let url = Url::parse(raw).map_err(|_| unsafe_url("not a valid URL"))?;
-    let host = url.host_str().ok_or_else(|| unsafe_url("no host"))?;
-    let port = url.port_or_known_default().unwrap_or(443);
+    let literal_ip = match url.host() {
+        None => return Err(unsafe_url("no host")),
+        Some(Host::Domain(_)) => None,
+        Some(Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+        Some(Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+    };
 
-    let addrs: Vec<IpAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_| unsafe_url("host does not resolve"))?
-        .map(|socket_addr| socket_addr.ip())
-        .collect();
-    if addrs.is_empty() {
-        return Err(unsafe_url("host does not resolve to any address"));
-    }
-    if let Some(blocked) = addrs.iter().find(|ip| !is_publicly_routable(ip)) {
-        return Err(unsafe_url(&format!(
-            "resolves to a non-public address ({blocked})"
-        )));
+    if let Some(ip) = literal_ip {
+        if !is_publicly_routable(&ip) {
+            return Err(unsafe_url(&format!(
+                "resolves to a non-public address ({ip})"
+            )));
+        }
     }
 
-    // The scheme check comes *after* resolving and vetting the address, and
-    // is itself relaxed only when every resolved address is loopback under
-    // `test-support` — never for an arbitrary public host. A blanket
-    // "http is fine under test-support" exception would have quietly
-    // widened what a real build refuses to fetch by nothing more than a
-    // Cargo feature name; gating it on the same is_publicly_routable
-    // decision keeps the two checks from drifting apart.
-    let all_loopback = addrs.iter().all(IpAddr::is_loopback);
-    let scheme_ok = url.scheme() == "https" || (cfg!(feature = "test-support") && all_loopback);
+    // `http` is allowed only under `test-support`, and only for a loopback IP
+    // literal (the crate's own mock server) — never for a named host, so a
+    // Cargo feature cannot widen what a real build refuses to fetch.
+    let loopback_literal = literal_ip.is_some_and(|ip| ip.is_loopback());
+    let scheme_ok = url.scheme() == "https" || (cfg!(feature = "test-support") && loopback_literal);
     if !scheme_ok {
         return Err(unsafe_url("scheme must be https"));
     }
 
     Ok(url)
-}
-
-/// Deliberately conservative: only stable `std::net` predicates plus
-/// explicit ranges for the well-known blocks those predicates don't cover
-/// (CGNAT, IANA "192.0.0.0/24" special-purpose, IPv6 unique-local,
-/// IPv6 link-local, and IPv4-mapped-IPv6 — unwrapped to its IPv4 form and
-/// checked again, since `::ffff:169.254.169.254` is exactly as reachable
-/// as the bare IPv4 literal). Errs toward rejecting a real edge case this
-/// list missed over accepting one — this exists to keep this server from
-/// dialing its own infrastructure, not to allow the widest possible set of
-/// "probably fine" addresses.
-fn is_publicly_routable(ip: &IpAddr) -> bool {
-    // `test-support` only: the crate's own mock server binds to 127.0.0.1.
-    // Never enabled by a normal consumer of this crate — see the feature's
-    // doc comment in Cargo.toml.
-    if cfg!(feature = "test-support") && ip.is_loopback() {
-        return true;
-    }
-    match ip {
-        IpAddr::V4(v4) => is_v4_publicly_routable(v4),
-        IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_v4_publicly_routable(&mapped);
-            }
-            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
-                return false;
-            }
-            let segments = v6.segments();
-            // fc00::/7 (unique local) and fe80::/10 (link-local).
-            if segments[0] & 0xfe00 == 0xfc00 || segments[0] & 0xffc0 == 0xfe80 {
-                return false;
-            }
-            true
-        }
-    }
-}
-
-fn is_v4_publicly_routable(v4: &Ipv4Addr) -> bool {
-    if v4.is_private()
-        || v4.is_loopback()
-        || v4.is_link_local()
-        || v4.is_broadcast()
-        || v4.is_documentation()
-        || v4.is_unspecified()
-        || v4.is_multicast()
-    {
-        return false;
-    }
-    let octets = v4.octets();
-    // 100.64.0.0/10 (CGNAT) and 192.0.0.0/24 (IANA special-purpose,
-    // includes the IETF Protocol Assignments block) — neither is covered
-    // by the stable Ipv4Addr predicates above.
-    if octets[0] == 100 && (64..=127).contains(&octets[1]) {
-        return false;
-    }
-    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
-        return false;
-    }
-    true
 }
 
 /// The largest response body this client will buffer into memory from a
@@ -305,16 +261,13 @@ pub async fn fetch_discovery(issuer: &str) -> Result<Value> {
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
     );
-    let url = require_safe_url(&url, "issuer").await?;
+    let url = require_safe_url(&url, "issuer")?;
     let client = http_client();
     let response = client
         .get(url)
         .send()
         .await
-        .map_err(|source| AuthError::OidcHttp {
-            action: "fetching the discovery document",
-            source,
-        })?;
+        .map_err(|source| send_error("fetching the discovery document", "issuer", source))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -406,7 +359,7 @@ pub async fn exchange_code(
     redirect_uri: &str,
 ) -> Result<TokenResponse> {
     let token_endpoint = discovery_str(discovery, "token_endpoint")?;
-    let token_endpoint = require_safe_url(token_endpoint, "token_endpoint").await?;
+    let token_endpoint = require_safe_url(token_endpoint, "token_endpoint")?;
     let client = http_client();
     let response = client
         .post(token_endpoint)
@@ -419,9 +372,12 @@ pub async fn exchange_code(
         ])
         .send()
         .await
-        .map_err(|source| AuthError::OidcHttp {
-            action: "exchanging the authorization code",
-            source,
+        .map_err(|source| {
+            send_error(
+                "exchanging the authorization code",
+                "token_endpoint",
+                source,
+            )
         })?;
 
     let status = response.status();
@@ -545,16 +501,13 @@ async fn fetch_jwks(jwks_uri: &str) -> Result<JwkSet> {
         }
     }
 
-    let jwks_url = require_safe_url(jwks_uri, "jwks_uri").await?;
+    let jwks_url = require_safe_url(jwks_uri, "jwks_uri")?;
     let client = http_client();
     let response = client
         .get(jwks_url)
         .send()
         .await
-        .map_err(|source| AuthError::OidcHttp {
-            action: "fetching the JWKS document",
-            source,
-        })?;
+        .map_err(|source| send_error("fetching the JWKS document", "jwks_uri", source))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -666,71 +619,95 @@ pub async fn verify_id_token(
 mod ssrf_guard_tests {
     use super::*;
 
-    // These deliberately use non-loopback private/reserved addresses (never
-    // 127.0.0.1) so they exercise the real guard even when compiled with
-    // `test-support` active (which, per its own doc comment, relaxes only
-    // the loopback case for the crate's own mock-server tests — never any
-    // other private/reserved range).
+    // The address classifier and resolver have their own tests in `ssrf.rs`;
+    // these cover the URL-level checks that stay here.
 
     #[test]
-    fn rejects_rfc1918_private_ranges() {
-        for ip in ["10.0.0.1", "172.16.0.1", "192.168.1.1"] {
+    fn rejects_a_non_https_scheme_outside_test_support() {
+        // Must fail even under `test-support`, since the http exception there
+        // only covers loopback IP literals.
+        for url in ["http://example.com/foo", "http://localhost:8080/foo"] {
+            let err = require_safe_url(url, "issuer")
+                .expect_err("a non-https, non-loopback-literal URL must be refused");
+            assert!(matches!(err, AuthError::OidcUnsafeUrl { .. }), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_ip_literal_hosts_the_resolver_never_sees() {
+        for url in [
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1/",
+            "https://[fdaa::1]/",
+            "https://[64:ff9b::a9fe:a9fe]/",
+            "https://[::ffff:169.254.169.254]/",
+            // url normalises these numeric forms to a dotted quad.
+            "https://2852039166/",
+            "https://0xa9fea9fe/",
+        ] {
+            let err = require_safe_url(url, "jwks_uri").expect_err(url);
             assert!(
-                !is_publicly_routable(&ip.parse().unwrap()),
-                "{ip} must be rejected"
+                matches!(err, AuthError::OidcUnsafeUrl { .. }),
+                "{url}: {err:?}"
             );
         }
     }
 
     #[test]
-    fn rejects_the_cloud_metadata_link_local_address() {
-        // 169.254.169.254 — the AWS/GCP/Azure instance-metadata endpoint,
-        // the single most common real-world SSRF target this guard exists
-        // to close.
-        assert!(!is_publicly_routable(&"169.254.169.254".parse().unwrap()));
+    fn accepts_https_domains_and_public_literals() {
+        assert!(require_safe_url("https://idp.example.com/x", "issuer").is_ok());
+        assert!(require_safe_url("https://8.8.8.8/x", "issuer").is_ok());
     }
 
-    #[test]
-    fn rejects_cgnat_range() {
-        assert!(!is_publicly_routable(&"100.64.0.1".parse().unwrap()));
-        // 100.128.0.1 is outside the /10 (100.64.0.0-100.127.255.255) and
-        // must NOT be rejected by the CGNAT check specifically — confirms
-        // the range boundary, not just "some 100.x is blocked".
-        assert!(is_publicly_routable(&"100.128.0.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn rejects_ipv6_unique_local_and_link_local() {
-        assert!(!is_publicly_routable(&"fc00::1".parse().unwrap()));
-        assert!(!is_publicly_routable(&"fe80::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn rejects_an_ipv4_mapped_ipv6_metadata_address() {
-        // ::ffff:169.254.169.254 — the same metadata address, reachable
-        // through the IPv4-mapped IPv6 form some resolvers/stacks produce.
-        // Must be unwrapped to its IPv4 form and checked again, not treated
-        // as an ordinary global IPv6 address.
-        assert!(!is_publicly_routable(
-            &"::ffff:169.254.169.254".parse().unwrap()
-        ));
-    }
-
-    #[test]
-    fn accepts_an_ordinary_public_address() {
-        assert!(is_publicly_routable(&"8.8.8.8".parse().unwrap()));
-        assert!(is_publicly_routable(
-            &"2001:4860:4860::8888".parse().unwrap()
-        ));
+    struct FixedLookup(&'static str);
+    impl crate::ssrf::Lookup for FixedLookup {
+        fn lookup<'a>(
+            &'a self,
+            _host: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::io::Result<Vec<IpAddr>>> + Send + 'a>,
+        > {
+            let ip: IpAddr = self.0.parse().unwrap();
+            Box::pin(async move { Ok(vec![ip]) })
+        }
     }
 
     #[tokio::test]
-    async fn require_safe_url_rejects_a_non_https_scheme_outside_test_support() {
-        // This one specifically must fail even under `test-support`, since
-        // the http exception there only covers loopback hosts.
-        let err = require_safe_url("http://example.com/foo", "issuer")
+    async fn a_resolver_refusal_surfaces_as_oidc_unsafe_url_for_the_field() {
+        let client = reqwest::Client::builder()
+            .dns_resolver(Arc::new(PinnedResolver::new(FixedLookup("10.255.255.1"))))
+            .build()
+            .unwrap();
+        let source = client
+            .get("https://private.test/")
+            .send()
             .await
-            .expect_err("a non-https, non-loopback URL must be refused");
-        assert!(matches!(err, AuthError::OidcUnsafeUrl { .. }), "{err:?}");
+            .expect_err("private answer must be refused");
+        match send_error("fetching the JWKS document", "jwks_uri", source) {
+            AuthError::OidcUnsafeUrl { field, reason } => {
+                assert_eq!(field, "jwks_uri");
+                assert!(reason.contains("10.255.255.1"), "{reason}");
+            }
+            other => panic!("expected OidcUnsafeUrl, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_connect_failure_stays_oidc_http() {
+        // Port 1 on an IP literal: refused connection, no resolver involved.
+        let source = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(matches!(
+            send_error("fetching the discovery document", "issuer", source),
+            AuthError::OidcHttp { .. }
+        ));
+    }
+
+    #[test]
+    fn the_shared_client_builds() {
+        let _ = http_client();
     }
 }
