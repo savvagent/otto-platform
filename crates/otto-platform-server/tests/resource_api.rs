@@ -1276,3 +1276,72 @@ fn a_response_for_another_audience_is_not_trusted() {
     r.aud = None;
     assert!(r.into_claims(FLAGS).is_none());
 }
+
+// ------------------------------------------------- the assembled application
+
+/// otto-web's CSRF guard wraps only its own router. Resource-server calls
+/// reach the same assembled `app`, and must work whatever `Origin` they carry
+/// and even with a (stray) session cookie, which the guard would refuse on a
+/// cookie-bearing write from a foreign origin.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn resource_server_calls_are_not_subject_to_the_browser_csrf_guard(pool: PgPool) {
+    let w = world(pool).await;
+    let config = otto_platform_server::Config {
+        database_url: "unused".into(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        public_url: "https://otto.test".into(),
+        encryption_key: B64.encode([5u8; 32]),
+        client_ip_header: None,
+        enforce_quotas: false,
+        run_migrations: true,
+        log_format: otto_platform_server::LogFormat::Text,
+    };
+    let app = || otto_platform_server::app(w.db.clone(), &config).unwrap();
+    let token = w.oauth_token(FACTORY, &["jobs:read"]).await;
+
+    // Control: the guard is live on the browser surface for this same request shape.
+    let res = app()
+        .oneshot(
+            Request::post("/api/auth/logout")
+                .header("origin", "https://evil.example")
+                .header("cookie", "__Host-otto_session=x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    let res = app()
+        .oneshot(
+            Request::post("/oauth/introspect")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("authorization", w.factory_basic())
+                .header("origin", "https://evil.example")
+                .header("sec-fetch-site", "cross-site")
+                .header("cookie", "__Host-otto_session=x")
+                .body(Body::from(url_form(&[("token", &token)])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["active"],
+        true
+    );
+
+    let res = app()
+        .oneshot(
+            Request::post("/internal/usage")
+                .header("content-type", "application/json")
+                .header("authorization", w.factory_basic())
+                .header("origin", "https://evil.example")
+                .body(Body::from(r#"{"events":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}

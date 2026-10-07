@@ -119,8 +119,8 @@ async fn main() -> Result<()> {
 async fn run_resource_command(args: &[String]) -> Result<()> {
     use otto_platform_server::resource_cmd;
 
-    let cmd = resource_cmd::parse(args)
-        .map_err(|e| anyhow::anyhow!("{e}\n\n{}", resource_cmd::USAGE))?;
+    let cmd =
+        resource_cmd::parse(args).map_err(|e| anyhow::anyhow!("{e}\n\n{}", resource_cmd::USAGE))?;
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
     let db = Db::connect(&database_url)
         .await

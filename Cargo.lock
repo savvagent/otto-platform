@@ -1639,6 +1639,7 @@ dependencies = [
  "schemars",
  "serde",
  "sqlx",
+ "uuid",
 ]
 
 [[package]]
@@ -1665,10 +1666,21 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
+ "chrono",
  "dotenvy",
+ "futures",
+ "otto-auth",
+ "otto-billing",
+ "otto-core",
+ "otto-resource",
  "otto-tenant",
  "otto-web",
+ "percent-encoding",
+ "reqwest",
+ "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "tower",
@@ -1676,6 +1688,26 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "otto-resource"
+version = "0.2.1"
+dependencies = [
+ "axum",
+ "chrono",
+ "hex",
+ "hmac",
+ "moka",
+ "percent-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
