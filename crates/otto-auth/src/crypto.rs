@@ -30,6 +30,11 @@ pub mod prefix {
     pub const SESSION: &str = "otto_ss_";
     pub const PAT: &str = "otto_pat_";
     pub const INVITE: &str = "otto_inv_";
+    /// Enterprise OIDC federation (`sso_ceremonies.state_hash`) — see
+    /// otto-factory's `docs/specs/2026-09-16-oidc-federation-design.md` §5.
+    pub const SSO_STATE: &str = "otto_sst_";
+    /// The `__Host-otto_sso_binding` cookie value (`sso_ceremonies.binding_hash`).
+    pub const SSO_BINDING: &str = "otto_ssb_";
 }
 
 /// A freshly minted credential: the plaintext to hand out **once**, and the
@@ -70,6 +75,20 @@ pub fn generate(prefix: &str) -> Secret {
     let plaintext = format!("{prefix}{}", URL_SAFE_NO_PAD.encode(buf));
     let hash = hash(&plaintext);
     Secret { plaintext, hash }
+}
+
+/// A plain random string with no prefix and no matching hash — for the OIDC
+/// `nonce` (`sso_ceremonies.nonce`), which is not a bearer credential: it is
+/// sent to the IdP as a plaintext query parameter and stored in plaintext,
+/// its only job anti-replay on the returned `id_token`. Deliberately not
+/// [`generate`] — a prefixed, `otto_ss...`-shaped value handed to a third-party
+/// IdP as `nonce` would be a strange thing for that IdP to log back, and
+/// there is no hash to keep in step with a [`Secret`] here in the first
+/// place.
+pub fn generate_nonce() -> String {
+    let mut buf = [0u8; TOKEN_BYTES];
+    rand::thread_rng().fill_bytes(&mut buf);
+    URL_SAFE_NO_PAD.encode(buf)
 }
 
 /// Hash a credential for storage.
@@ -129,5 +148,28 @@ mod tests {
         let rendered = format!("{s:?}");
         assert!(!rendered.contains(s.expose()), "Debug leaked the token");
         assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn sso_prefixes_are_distinct_and_otto_scoped() {
+        let state = generate(prefix::SSO_STATE);
+        let binding = generate(prefix::SSO_BINDING);
+        assert!(state.expose().starts_with("otto_sst_"));
+        assert!(binding.expose().starts_with("otto_ssb_"));
+        assert_ne!(state.hash, binding.hash);
+    }
+
+    /// The nonce is sent to a third-party IdP in the clear, so it must carry
+    /// none of this crate's credential prefixes, and must never repeat.
+    #[test]
+    fn nonce_is_unprefixed_url_safe_and_unique() {
+        let a = generate_nonce();
+        let b = generate_nonce();
+        assert_ne!(a, b);
+        assert!(!a.starts_with("otto_"));
+        assert_eq!(a.len(), 43, "32 bytes, base64url without padding");
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 }

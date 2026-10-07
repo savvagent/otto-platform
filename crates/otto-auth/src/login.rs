@@ -56,8 +56,20 @@ pub async fn with_passkey(db: &Db, user: UserId, ip: Option<&str>) -> Result<Log
     // refusing here means the refusal is attributable in the trail instead of
     // being a silent non-answer.
     if account.disabled_at.is_some() {
-        note_refusal(db, user, ip).await;
+        note_refusal(db, user, ip, "account disabled").await;
         return Err(AuthError::Disabled);
+    }
+
+    // Enterprise OIDC federation: a member of any org with `enforce_sso =
+    // true` cannot complete a passkey sign-in, full stop — `enforce_sso` is
+    // scoped to org membership, not to which address the account holds, so
+    // this is a membership check, not a domain check. Checked here, at the
+    // same resolved-user_id-before-session-mint point every other login-time
+    // decision (the disabled check above) already uses, rather than as a
+    // second lookup bolted on elsewhere.
+    if db.is_member_of_sso_enforced_org(user).await? {
+        note_refusal(db, user, ip, "member of an org that requires SSO").await;
+        return Err(AuthError::SsoRequired);
     }
 
     let session = sessions::create(db, user).await?;
@@ -110,11 +122,11 @@ pub async fn logout(db: &Db, session_token: &str, ip: Option<&str>) -> Result<()
 /// Best-effort: an audit write that fails is logged, never turned into an
 /// authentication outage. The row names the account because by this point the
 /// credential has already identified it — there is no address being guessed at.
-async fn note_refusal(db: &Db, user: UserId, ip: Option<&str>) {
+async fn note_refusal(db: &Db, user: UserId, ip: Option<&str>, reason: &str) {
     let entry = Entry::new(action::LOGIN_FAILED)
         .actor(user)
         .from_request(ip, None)
-        .detail(serde_json::json!({ "method": "passkey", "reason": "account disabled" }));
+        .detail(serde_json::json!({ "method": "passkey", "reason": reason }));
     if let Err(e) = db.audit_global(entry).await {
         tracing::error!(error = %e, "failed to write audit event for a refused sign-in");
     }

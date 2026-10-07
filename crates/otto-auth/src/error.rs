@@ -133,6 +133,62 @@ pub enum AuthError {
 
     #[error(transparent)]
     Db(#[from] sqlx::Error),
+
+    // ---- OIDC federation client (crate::oidc) and DNS verification
+    // (crate::dns) — see otto-factory's docs/specs/2026-09-16-oidc-federation-design.md §4.
+    /// A network call to the IdP itself failed (discovery, token exchange, or
+    /// fetching its JWKS document) — distinct from the IdP answering with a
+    /// non-2xx status, which is [`AuthError::OidcApi`].
+    #[error("IdP request failed while {action}: {source}")]
+    OidcHttp {
+        action: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    /// The IdP answered, but not with 2xx — the body is truncated, since it's
+    /// operator-facing diagnostic text, not something to echo back whole.
+    #[error("IdP returned HTTP {status} while {action}: {body}")]
+    OidcApi {
+        action: &'static str,
+        status: u16,
+        body: String,
+    },
+
+    /// The cached `idp_connections.discovery` document is missing (or has a
+    /// non-string) required field. Surfaced at bind time
+    /// (`PUT .../sso/connection`), never silently deferred to first login.
+    #[error("the identity provider's discovery document is missing or has an invalid {0:?} field")]
+    OidcDiscoveryField(&'static str),
+
+    /// Every `id_token` verification failure collapses here — bad signature,
+    /// wrong `iss`/`aud`, expired, or a `nonce` that doesn't match this
+    /// ceremony. the HTTP layer's `/sso/callback` handler answers all of these with
+    /// the same generic error page (see the design spec's Assumptions on why
+    /// the four callback failure classes are not distinguished to the
+    /// caller); the detail here is for the log, not the browser.
+    #[error("id_token verification failed: {0}")]
+    IdTokenInvalid(String),
+
+    /// A genuine DNS resolver/transport failure — never returned for
+    /// NXDOMAIN, a timeout, or "no records": those are "not verified yet"
+    /// and come back as `Ok(false)` from [`crate::dns::verify_txt_record`],
+    /// not as this error. This is the resolver itself being unreachable, an
+    /// operator-facing problem, not the domain's.
+    #[error("DNS resolver failure while checking domain verification: {0}")]
+    DnsResolverFailure(String),
+
+    /// A URL this server was about to fetch — the admin-supplied `issuer`,
+    /// or a `token_endpoint`/`jwks_uri` read back out of a stored discovery
+    /// document — is not `https`, or resolves to a loopback/link-local/
+    /// private/reserved address. Every one of these three URLs is either
+    /// typed by an org admin or served by a third party this server does
+    /// not control, so each is checked immediately before the connection
+    /// that would use it, not only once at bind time — an admin-configured
+    /// SSRF primitive against this server's own network would otherwise be
+    /// one `issuer` field away.
+    #[error("refusing to fetch {field} ({reason}) — it must be an https URL that does not resolve to a private, loopback, or link-local address")]
+    OidcUnsafeUrl { field: &'static str, reason: String },
 }
 
 impl AuthError {
@@ -189,6 +245,19 @@ impl AuthError {
             AuthError::UnsupportedGrantType(_) => "unsupported_grant_type",
             AuthError::InvalidScope(_) => "invalid_scope",
 
+            AuthError::OidcDiscoveryField(_) => {
+                "the identity provider's configuration is incomplete"
+            }
+            AuthError::IdTokenInvalid(_) => {
+                "the identity provider's response could not be verified"
+            }
+            AuthError::OidcUnsafeUrl { .. } => {
+                "the identity provider's configuration points at a URL this server will not fetch"
+            }
+            AuthError::OidcHttp { .. }
+            | AuthError::OidcApi { .. }
+            | AuthError::DnsResolverFailure(_) => "internal error",
+
             AuthError::Config(_)
             | AuthError::Crypto(_)
             | AuthError::Core(_)
@@ -223,6 +292,12 @@ impl AuthError {
             | AuthError::Tenant(_)
             | AuthError::Db(_) => 500,
             AuthError::InvalidClient(_) => 401,
+            // The IdP or the DNS resolver failed to answer: this server's own
+            // request was fine, so it is a gateway failure, not a bad request
+            // from our caller.
+            AuthError::OidcHttp { .. }
+            | AuthError::OidcApi { .. }
+            | AuthError::DnsResolverFailure(_) => 502,
             _ => 400,
         }
     }
