@@ -1,18 +1,16 @@
 //! `otto-platform-server` — boots the shared identity/auth/billing substrate
-//! against a real Postgres, runs migrations, and proves tenant isolation is
-//! actually in force before calling itself ready.
+//! against a real Postgres, runs migrations, proves tenant isolation is
+//! actually in force, and only then starts serving HTTP.
 //!
-//! This is deliberately **not** a full HTTP API yet. otto-platform's own
-//! network surface (OAuth endpoints, a console) is future work — see
-//! `docs/specs/2026-09-15-otto-flags-design.md` in the otto-flags repo. What
-//! this binary proves today is narrower and load-bearing on its own: that the
-//! five-crate workspace (`otto-tenant`, `otto-core`, `otto-billing`,
-//! `otto-auth`) compiles together, that its migrations apply cleanly to a
-//! fresh database, and that row-level security is genuinely enforced against
-//! whatever role it connects as.
+//! The HTTP surface is health checks only for now (see `lib.rs`). The OAuth
+//! endpoints and console are Phase 4 of
+//! `docs/plans/2026-10-06-platform-cutover.md`.
+
+use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use otto_tenant::Db;
+use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,6 +24,11 @@ async fn main() -> Result<()> {
         Ok(path) => tracing::debug!(path = %path.display(), "loaded .env"),
         Err(_) => tracing::debug!("no .env file; using the process environment"),
     }
+
+    let bind: SocketAddr = std::env::var("OTTO_BIND")
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
+        .parse()
+        .context("OTTO_BIND must be a socket address like 0.0.0.0:8080")?;
 
     let database_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL must be set. Copy .env.example to .env for local runs.")?;
@@ -64,17 +67,47 @@ async fn main() -> Result<()> {
         .context("refusing to serve: tenant isolation is not enforced by this database")?;
     tracing::info!("{}", isolation.summary());
 
-    tracing::info!("otto-platform-server ready: schema migrated, tenant isolation verified");
-
-    // No HTTP surface yet — see this binary's module docs. Idle until asked
-    // to stop, so a deployment can treat this the same as any other
-    // long-running service (health-checked, restarted on exit) rather than
-    // this boot check racing the process's own shutdown.
-    tokio::signal::ctrl_c()
+    let listener = TcpListener::bind(bind)
         .await
-        .context("failed to listen for ctrl-c")?;
-    tracing::info!("shutting down");
+        .with_context(|| format!("could not bind {bind}"))?;
+    tracing::info!(%bind, "otto-platform-server ready: schema migrated, tenant isolation verified");
+
+    axum::serve(listener, otto_platform_server::router(db))
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")?;
+    tracing::info!("shut down cleanly");
     Ok(())
+}
+
+/// Resolves on SIGINT or SIGTERM.
+///
+/// `SIGTERM` is the one that matters — it is what a container runtime sends
+/// before it waits its grace period and then sends `SIGKILL`. A server that
+/// only handles `SIGINT` looks fine in a terminal and is hard-killed on every
+/// single deploy, dropping whatever was in flight.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install the SIGINT handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install the SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("SIGINT; shutting down"),
+        _ = terminate => tracing::info!("SIGTERM; shutting down"),
+    }
 }
 
 fn init_tracing() -> Result<()> {
@@ -83,10 +116,19 @@ fn init_tracing() -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer())
-        .try_init()
-        .context("could not initialize tracing")?;
+    let registry = tracing_subscriber::registry().with(filter);
+
+    // JSON for deployments, whose log pipeline parses fields; human-readable
+    // text for a terminal. Read directly rather than after dotenv-loaded
+    // config, because tracing has to be up before anything else can log.
+    let json = std::env::var("OTTO_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json"));
+    if json {
+        registry
+            .with(tracing_subscriber::fmt::layer().json())
+            .try_init()
+    } else {
+        registry.with(tracing_subscriber::fmt::layer()).try_init()
+    }
+    .context("could not initialize tracing")?;
     Ok(())
 }

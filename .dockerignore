@@ -1,0 +1,12 @@
+# Build outputs: rebuilt in the image anyway.
+target
+
+# Never in an image: a file holding a database URL does not belong in a layer
+# anyone who can pull the image can read.
+.env
+.env.*
+!.env.example
+
+.git
+.github
+*.log
