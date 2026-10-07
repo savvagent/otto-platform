@@ -261,6 +261,9 @@ struct RefreshRow {
 
 /// Redeem a refresh token, rotating it.
 ///
+/// `requested_resource` is the refresh request's optional `resource`
+/// parameter.
+///
 /// On success the presented token is consumed and a successor is issued. On
 /// **reuse** — a token that was already consumed — the whole chain is revoked
 /// and [`AuthError::InvalidGrant`] is returned. That is the correct response to
@@ -270,7 +273,7 @@ pub async fn redeem_refresh(
     db: &Db,
     presented: &str,
     client_id: &str,
-    expected_resource: &str,
+    requested_resource: Option<&str>,
 ) -> Result<(IssuedTokens, UserId, OrgId, bool)> {
     let hash = crypto::hash(presented.trim());
 
@@ -305,11 +308,15 @@ pub async fn redeem_refresh(
             "refresh token was issued to a different client".into(),
         ));
     }
-    if r.resource != expected_resource {
+    // RFC 8707 §2.2: a refresh request may name a resource, and if it does it
+    // must be the one the token was issued for.
+    if requested_resource.is_some_and(|res| res != r.resource) {
         return Err(AuthError::InvalidGrant(
             "refresh token was issued for a different resource".into(),
         ));
     }
+    // A disabled resource server gets no new tokens, refreshed ones included.
+    crate::resources::get_active(db, &r.resource).await?;
 
     let issued = issue(
         db,
@@ -411,6 +418,10 @@ pub async fn mint_pat(
     if name.is_empty() {
         return Err(AuthError::InvalidRequest("a PAT needs a name".into()));
     }
+    // Same registry checks as the OAuth path: a PAT must not be a way around
+    // an unregistered or disabled resource, or a scope its server never defined.
+    let rs = crate::resources::get_active(db, resource).await?;
+    let scopes = rs.grant_scopes(scopes)?;
 
     let token = crypto::generate(prefix::PAT);
     let ttl = ttl_days.unwrap_or(PAT_TTL_DAYS).clamp(1, 365);
@@ -425,8 +436,8 @@ pub async fn mint_pat(
     .bind(name)
     .bind(user)
     .bind(org)
-    .bind(scopes)
-    .bind(resource)
+    .bind(&scopes)
+    .bind(&rs.resource_uri)
     // `days` is an integer parameter of make_interval; `secs` is the double
     // one. Binding an f64 here fails at runtime with a no-such-function error.
     .bind(ttl as i32)
