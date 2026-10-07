@@ -108,6 +108,11 @@ pub enum AuthError {
     #[error("invalid_scope: {0}")]
     InvalidScope(String),
 
+    /// RFC 8707 §2: the requested resource is not one this AS issues tokens
+    /// for (unregistered, or disabled).
+    #[error("invalid_target: {0}")]
+    InvalidTarget(String),
+
     // ---- operational
     #[error("configuration error: {0}")]
     Config(String),
@@ -244,6 +249,7 @@ impl AuthError {
             AuthError::InvalidGrant(_) => "invalid_grant",
             AuthError::UnsupportedGrantType(_) => "unsupported_grant_type",
             AuthError::InvalidScope(_) => "invalid_scope",
+            AuthError::InvalidTarget(_) => "invalid_target",
 
             AuthError::OidcDiscoveryField(_) => {
                 "the identity provider's configuration is incomplete"
@@ -275,6 +281,7 @@ impl AuthError {
             AuthError::InvalidGrant(_) => Some("invalid_grant"),
             AuthError::UnsupportedGrantType(_) => Some("unsupported_grant_type"),
             AuthError::InvalidScope(_) => Some("invalid_scope"),
+            AuthError::InvalidTarget(_) => Some("invalid_target"),
             _ => None,
         }
     }

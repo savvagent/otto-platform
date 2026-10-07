@@ -1,7 +1,8 @@
 //! The OAuth 2.1 authorization server.
 //!
 //! Scope is deliberately narrow: one grant (`authorization_code`) plus
-//! `refresh_token`, PKCE S256 mandatory, one resource server per audience. No
+//! `refresh_token`, PKCE S256 mandatory, one audience per token. Audiences
+//! and their scopes come from the [`crate::resources`] registry. No
 //! implicit grant, no password grant, no `plain` challenge method. Most of
 //! OAuth's historical footguns are absent because the corresponding features
 //! are.
@@ -20,33 +21,8 @@ use sha2::{Digest, Sha256};
 
 use crate::crypto::{self, prefix};
 use crate::error::{AuthError, Result};
+use crate::resources::{self, ResourceServer};
 use crate::tokens::{self, IssueParams, IssuedTokens, AUTH_CODE_TTL_SECONDS};
-
-/// Every scope this server will issue. An unknown scope is rejected rather than
-/// ignored — silently dropping a requested scope gives a client a token that
-/// does less than it believes, which fails later and confusingly.
-///
-/// Carried over from otto-factory's `of-auth` verbatim. These particular
-/// scope strings (`jobs:*`, `repos:*`, `trackers`) are otto-factory's own
-/// domain, not generic identity — a real multi-service deployment should
-/// give each otto-* resource server its own scope namespace (or otherwise
-/// generalize this list) rather than sharing otto-factory's. Left as-is here
-/// because narrowing or renaming it was not part of this extraction's scope;
-/// flagged for whoever wires up the second consumer.
-pub const KNOWN_SCOPES: &[&str] = &[
-    "jobs:read",
-    "jobs:write",
-    "repos:read",
-    "repos:write",
-    "messages",
-    "trackers",
-    "org:admin",
-];
-
-/// Granted when a client asks for nothing in particular. Read-only: a client
-/// that wants to change anything has to say so, and the user has to see it on
-/// the consent screen.
-pub const DEFAULT_SCOPES: &[&str] = &["jobs:read", "repos:read"];
 
 // ---------------------------------------------------------------------------
 // Redirect URI matching — the highest-consequence function in this file
@@ -342,6 +318,8 @@ pub struct ConsentDisplay {
     /// Where the authorization code will be delivered. This is the fact a user
     /// can actually judge.
     pub redirect_host: String,
+    /// The resource server the token will be for, from the registry.
+    pub resource_name: String,
     pub scopes: Vec<String>,
     pub org_name: String,
 }
@@ -361,17 +339,24 @@ pub struct AuthorizeRequest {
     pub state: Option<String>,
 }
 
+/// A validated authorization request: who is asking, for which resource
+/// server, and the scopes the user will be asked to grant.
+#[derive(Debug, Clone)]
+pub struct Authorization {
+    pub client: Client,
+    pub resource: ResourceServer,
+    /// What the user consents to: the resource server's defaults when the
+    /// client asked for nothing, otherwise exactly what it asked for.
+    pub scopes: Vec<String>,
+}
+
 /// Validate an authorization request before showing a consent screen.
 ///
 /// Order is a security property: the redirect URI is validated **first**,
 /// because every later error is reported by redirecting to it. Validating
 /// anything else first would mean bouncing an error — with `state` — to an
 /// unvalidated destination.
-pub async fn validate_authorize(
-    db: &Db,
-    req: &AuthorizeRequest,
-    expected_resource: &str,
-) -> Result<Client> {
+pub async fn validate_authorize(db: &Db, req: &AuthorizeRequest) -> Result<Authorization> {
     let client = get_client(db, &req.client_id).await?;
     if client.disabled {
         return Err(AuthError::InvalidClient("client is disabled".into()));
@@ -401,31 +386,15 @@ pub async fn validate_authorize(
     }
 
     // RFC 8707: the client must say which resource the token is for, and it
-    // must be ours. Without this the AS would happily mint tokens audienced
-    // for somewhere else.
-    if req.resource != expected_resource {
-        return Err(AuthError::InvalidRequest(format!(
-            "resource must be {expected_resource:?}"
-        )));
-    }
-
-    validate_scopes(&req.scopes)?;
-    Ok(client)
-}
-
-pub fn validate_scopes(requested: &[String]) -> Result<Vec<String>> {
-    if requested.is_empty() {
-        return Ok(DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect());
-    }
-    for s in requested {
-        if !KNOWN_SCOPES.contains(&s.as_str()) {
-            return Err(AuthError::InvalidScope(format!(
-                "unknown scope {s:?}; supported scopes are {}",
-                KNOWN_SCOPES.join(" ")
-            )));
-        }
-    }
-    Ok(requested.to_vec())
+    // must be one we issue tokens for. Without this the AS would happily mint
+    // tokens audienced for somewhere else.
+    let resource = resources::get_active(db, &req.resource).await?;
+    let scopes = resource.grant_scopes(&req.scopes)?;
+    Ok(Authorization {
+        client,
+        resource,
+        scopes,
+    })
 }
 
 /// Issue an authorization code after the user consents.
@@ -434,12 +403,19 @@ pub fn validate_scopes(requested: &[String]) -> Result<Vec<String>> {
 /// resource. Every one of those is re-checked at redemption, so a code stolen
 /// in transit is useless without the verifier that only the initiating client
 /// holds.
+///
+/// The resource and scopes are resolved again here rather than trusted from
+/// the consent screen, so a resource disabled (or a scope removed) between
+/// consent and issuance is caught, and the code carries the scopes actually
+/// granted — the resource server's defaults when the client asked for none.
 pub async fn issue_authorization_code(
     db: &Db,
     req: &AuthorizeRequest,
     user: UserId,
     org: OrgId,
 ) -> Result<String> {
+    let resource = resources::get_active(db, &req.resource).await?;
+    let scopes = resource.grant_scopes(&req.scopes)?;
     let code = crypto::generate(prefix::AUTH_CODE);
 
     sqlx::query(
@@ -455,8 +431,8 @@ pub async fn issue_authorization_code(
     .bind(&req.redirect_uri)
     .bind(&req.code_challenge)
     .bind(&req.code_challenge_method)
-    .bind(&req.scopes)
-    .bind(&req.resource)
+    .bind(&scopes)
+    .bind(&resource.resource_uri)
     .bind(AUTH_CODE_TTL_SECONDS as f64)
     .execute(db.pool())
     .await?;
@@ -480,6 +456,8 @@ struct CodeRow {
 
 /// Exchange an authorization code for tokens.
 ///
+/// `requested_resource` is the token request's optional `resource` parameter.
+///
 /// Single-use, enforced by a conditional UPDATE rather than a read-then-write:
 /// two concurrent redemptions of the same stolen code must not both succeed,
 /// and only the database can arbitrate that.
@@ -489,7 +467,7 @@ pub async fn redeem_code(
     client_id: &str,
     redirect_uri: &str,
     code_verifier: &str,
-    expected_resource: &str,
+    requested_resource: Option<&str>,
 ) -> Result<(IssuedTokens, UserId, OrgId)> {
     let hash = crypto::hash(code.trim());
 
@@ -533,11 +511,16 @@ pub async fn redeem_code(
             "redirect_uri does not match the one used to obtain the code".into(),
         ));
     }
-    if c.resource != expected_resource {
+    // RFC 8707 §2.2: a token request may repeat `resource`, and if it does it
+    // must name the resource the code was issued for.
+    if requested_resource.is_some_and(|r| r != c.resource) {
         return Err(AuthError::InvalidGrant(
             "authorization code was issued for a different resource".into(),
         ));
     }
+    // Still registered and enabled: disabling a resource server stops new
+    // tokens for it, including from codes issued before it was disabled.
+    resources::get_active(db, &c.resource).await?;
 
     verify_pkce(&c.code_challenge, &c.code_challenge_method, code_verifier)?;
 
@@ -588,7 +571,10 @@ pub async fn sweep_codes(db: &Db) -> Result<u64> {
 /// This document is how every MCP client learns where to register and what to
 /// call. Its accuracy is a functional requirement, not documentation — a client
 /// will believe it over anything written elsewhere.
-pub fn as_metadata(public_url: &str) -> serde_json::Value {
+///
+/// `scopes_supported` is the union across enabled resource servers; see
+/// [`resources::all_scopes`].
+pub fn as_metadata(public_url: &str, scopes_supported: &[String]) -> serde_json::Value {
     let base = public_url.trim_end_matches('/');
     serde_json::json!({
         "issuer": base,
@@ -596,7 +582,7 @@ pub fn as_metadata(public_url: &str) -> serde_json::Value {
         "token_endpoint": format!("{base}/oauth/token"),
         "registration_endpoint": format!("{base}/oauth/register"),
         "revocation_endpoint": format!("{base}/oauth/revoke"),
-        "scopes_supported": KNOWN_SCOPES,
+        "scopes_supported": scopes_supported,
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
@@ -612,12 +598,16 @@ pub fn as_metadata(public_url: &str) -> serde_json::Value {
 /// A resource server also names this document in a `WWW-Authenticate` header
 /// on a 401, which is how an unauthenticated client discovers where to
 /// authenticate without being configured with anything but the server URL.
-pub fn protected_resource_metadata(resource_uri: &str, public_url: &str) -> serde_json::Value {
+pub fn protected_resource_metadata(
+    resource: &ResourceServer,
+    public_url: &str,
+) -> serde_json::Value {
     let base = public_url.trim_end_matches('/');
     serde_json::json!({
-        "resource": resource_uri,
+        "resource": resource.resource_uri,
+        "resource_name": resource.name,
         "authorization_servers": [base],
-        "scopes_supported": KNOWN_SCOPES,
+        "scopes_supported": resource.scopes,
         "bearer_methods_supported": ["header"],
     })
 }
@@ -801,27 +791,6 @@ mod tests {
         assert!(
             verify_pkce(&challenge, "S256", &bad).is_err(),
             "'!' is outside the alphabet"
-        );
-    }
-
-    // ---- scopes ----
-
-    #[test]
-    fn unknown_scopes_are_rejected_not_dropped() {
-        assert!(validate_scopes(&["jobs:read".into()]).is_ok());
-        let err = validate_scopes(&["jobs:read".into(), "root".into()]).unwrap_err();
-        assert!(err.to_string().contains("root"));
-    }
-
-    #[test]
-    fn empty_scope_request_gets_read_only_defaults() {
-        let granted = validate_scopes(&[]).unwrap();
-        assert_eq!(granted, DEFAULT_SCOPES);
-        assert!(
-            !granted
-                .iter()
-                .any(|s| s.ends_with(":write") || s == "org:admin"),
-            "the default grant must not include write or admin"
         );
     }
 }

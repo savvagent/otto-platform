@@ -43,6 +43,7 @@ pub mod oauth;
 pub mod oidc;
 pub mod passkeys;
 pub mod ratelimit;
+pub mod resources;
 pub mod sessions;
 pub mod tokens;
 
