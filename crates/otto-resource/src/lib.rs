@@ -14,7 +14,8 @@
 //! | Authenticate a request's bearer token | [`PlatformClient::introspect`] (cached 60 s) |
 //! | Refuse work over the plan's quota | [`PlatformClient::usage_status`] (cached 60 s), [`UsageStatus::is_blocked`] |
 //! | Report metered calls | [`PlatformClient::ship_usage`] from your own outbox |
-//! | Resolve members and teams | [`PlatformClient::member`], [`member_by_email`](PlatformClient::member_by_email), [`team`](PlatformClient::team), [`team_by_slug`](PlatformClient::team_by_slug) |
+//! | Resolve members and teams | [`PlatformClient::member`], [`member_teams`](PlatformClient::member_teams), [`member_by_email`](PlatformClient::member_by_email), [`team`](PlatformClient::team), [`team_by_slug`](PlatformClient::team_by_slug) |
+//! | Link to the platform console | [`PlatformClient::usage_page_url`] |
 //! | Clean up when the platform deletes things | [`webhook::verify`], [`webhook::LifecycleEvent`] |
 //!
 //! # Metering
@@ -31,6 +32,12 @@
 //! A token revoked at the platform, or whose user is removed from the org,
 //! keeps working at this resource server for up to [`INTROSPECTION_TTL`].
 //! That is the cost of not calling the platform on every request.
+//!
+//! Likewise [`PlatformClient::member`] and [`PlatformClient::member_teams`]
+//! are cached for [`MEMBER_TTL`] (10 s, `ClientConfig::member_ttl`, zero
+//! disables), and "not a member" for at most [`MEMBER_NEGATIVE_TTL`]. A role
+//! or team change made at the platform therefore takes up to that long to
+//! apply at the resource server.
 
 mod cache;
 mod client;
@@ -38,6 +45,9 @@ mod error;
 mod types;
 pub mod webhook;
 
-pub use client::{ClientConfig, PlatformClient, INTROSPECTION_TTL, NEGATIVE_TTL, USAGE_STATUS_TTL};
+pub use client::{
+    ClientConfig, PlatformClient, INTROSPECTION_TTL, MEMBER_NEGATIVE_TTL, MEMBER_TTL, NEGATIVE_TTL,
+    USAGE_STATUS_TTL,
+};
 pub use error::{Error, Result};
 pub use types::*;

@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::cache::TtlCache;
 use crate::error::{Error, Result};
 use crate::types::{
-    looks_like_token, IntrospectionResponse, MemberInfo, TeamInfo, TokenClaims, UsageBatch,
-    UsageEvent, UsageReceipt, UsageStatus, MAX_USAGE_BATCH,
+    looks_like_token, IntrospectionResponse, MemberInfo, MemberTeams, TeamInfo, TokenClaims,
+    UsageBatch, UsageEvent, UsageReceipt, UsageStatus, MAX_USAGE_BATCH,
 };
 
 /// How long a positive introspection result is trusted, and so the longest a
@@ -24,6 +24,14 @@ pub const NEGATIVE_TTL: Duration = Duration::from_secs(5);
 /// How long an org's usage status is reused. Overrun of a quota is bounded by
 /// this window.
 pub const USAGE_STATUS_TTL: Duration = Duration::from_secs(60);
+
+/// How long a member lookup ([`PlatformClient::member`],
+/// [`PlatformClient::member_teams`]) is reused, and so the longest a role or
+/// team change at the platform takes to apply at this resource server.
+pub const MEMBER_TTL: Duration = Duration::from_secs(10);
+/// How long "not a member" is remembered. Shorter than [`MEMBER_TTL`] so a
+/// freshly invited user is not turned away for long.
+pub const MEMBER_NEGATIVE_TTL: Duration = Duration::from_secs(2);
 
 const MAX_POSITIVE_ENTRIES: u64 = 10_000;
 /// Negatives are cheap to recompute and are the only thing junk input can
@@ -43,6 +51,12 @@ pub struct ClientConfig {
     pub introspection_ttl: Duration,
     pub negative_ttl: Duration,
     pub usage_status_ttl: Duration,
+    /// How long [`PlatformClient::member`] and [`PlatformClient::member_teams`]
+    /// results are reused. [`Duration::ZERO`] disables member caching,
+    /// negatives included.
+    pub member_ttl: Duration,
+    /// How long "not a member" is reused; capped at `member_ttl`.
+    pub member_negative_ttl: Duration,
     pub timeout: Duration,
 }
 
@@ -59,6 +73,8 @@ impl ClientConfig {
             introspection_ttl: INTROSPECTION_TTL,
             negative_ttl: NEGATIVE_TTL,
             usage_status_ttl: USAGE_STATUS_TTL,
+            member_ttl: MEMBER_TTL,
+            member_negative_ttl: MEMBER_NEGATIVE_TTL,
             timeout: Duration::from_secs(10),
         }
     }
@@ -108,6 +124,12 @@ pub struct PlatformClient {
     introspections: TtlCache<[u8; 32], TokenClaims>,
     inactive: TtlCache<[u8; 32], ()>,
     usage: TtlCache<Uuid, UsageStatus>,
+    // Keyed by (org, user). Absences live in their own small caches so that
+    // junk ids can only displace other junk.
+    members: TtlCache<(Uuid, Uuid), MemberInfo>,
+    members_absent: TtlCache<(Uuid, Uuid), ()>,
+    member_teams: TtlCache<(Uuid, Uuid), Vec<TeamInfo>>,
+    member_teams_absent: TtlCache<(Uuid, Uuid), ()>,
 }
 
 impl std::fmt::Debug for PlatformClient {
@@ -144,6 +166,10 @@ impl PlatformClient {
             introspections: TtlCache::new(MAX_POSITIVE_ENTRIES),
             inactive: TtlCache::new(MAX_NEGATIVE_ENTRIES),
             usage: TtlCache::new(MAX_POSITIVE_ENTRIES),
+            members: TtlCache::new(MAX_POSITIVE_ENTRIES),
+            members_absent: TtlCache::new(MAX_NEGATIVE_ENTRIES),
+            member_teams: TtlCache::new(MAX_POSITIVE_ENTRIES),
+            member_teams_absent: TtlCache::new(MAX_NEGATIVE_ENTRIES),
         })
     }
 
@@ -273,15 +299,95 @@ impl PlatformClient {
     /// The user, org, and role for a member of `org`; `None` if the user is
     /// not an active member (never a member, removed, disabled, or the org was
     /// deleted). What a `whoami` needs.
+    ///
+    /// Cached per `(org, user)` for [`ClientConfig::member_ttl`] (default
+    /// [`MEMBER_TTL`]), and "not a member" for at most
+    /// [`ClientConfig::member_negative_ttl`]. A role change or removal at the
+    /// platform therefore takes up to that long to apply here. Errors are
+    /// never cached.
     pub async fn member(&self, org_id: Uuid, user_id: Uuid) -> Result<Option<MemberInfo>> {
-        self.get_optional(self.url(&[
-            "internal",
-            "orgs",
-            &org_id.to_string(),
-            "members",
-            &user_id.to_string(),
-        ]))
-        .await
+        let key = (org_id, user_id);
+        if let Some(hit) = self.members.get(&key) {
+            return Ok(Some(hit));
+        }
+        if self.members_absent.get(&key).is_some() {
+            return Ok(None);
+        }
+        let found: Option<MemberInfo> = self
+            .get_optional(self.url(&[
+                "internal",
+                "orgs",
+                &org_id.to_string(),
+                "members",
+                &user_id.to_string(),
+            ]))
+            .await?;
+        match &found {
+            Some(m) => self.members.insert(key, m.clone(), self.cfg.member_ttl),
+            None => self
+                .members_absent
+                .insert(key, (), self.negative_member_ttl()),
+        }
+        Ok(found)
+    }
+
+    /// The teams `user` belongs to in `org`, ordered by name; `None` if the
+    /// user is not an active member of the org. A member on no team is
+    /// `Some(vec![])`. Teams in other orgs are never included.
+    ///
+    /// Cached exactly as [`Self::member`] is, so a team change takes up to
+    /// [`ClientConfig::member_ttl`] to apply here.
+    pub async fn member_teams(&self, org_id: Uuid, user_id: Uuid) -> Result<Option<Vec<TeamInfo>>> {
+        let key = (org_id, user_id);
+        if let Some(hit) = self.member_teams.get(&key) {
+            return Ok(Some(hit));
+        }
+        if self.member_teams_absent.get(&key).is_some() {
+            return Ok(None);
+        }
+        let found: Option<Vec<TeamInfo>> = self
+            .get_optional::<MemberTeams>(self.url(&[
+                "internal",
+                "orgs",
+                &org_id.to_string(),
+                "members",
+                &user_id.to_string(),
+                "teams",
+            ]))
+            .await?
+            .map(|t| t.teams);
+        match &found {
+            Some(t) => self
+                .member_teams
+                .insert(key, t.clone(), self.cfg.member_ttl),
+            None => self
+                .member_teams_absent
+                .insert(key, (), self.negative_member_ttl()),
+        }
+        Ok(found)
+    }
+
+    fn negative_member_ttl(&self) -> Duration {
+        self.cfg.member_negative_ttl.min(self.cfg.member_ttl)
+    }
+
+    // ---------------------------------------------------------------- console
+
+    /// The platform console's usage page for an org, `/o/{org_slug}/usage`
+    /// under the platform origin: where to send a user whose org is over its
+    /// plan ([`UsageStatus::is_blocked`]). Takes the org's slug
+    /// ([`crate::OrgInfo::slug`]), not its id; the slug is percent-encoded.
+    ///
+    /// ```
+    /// # use otto_resource::{ClientConfig, PlatformClient};
+    /// let c = PlatformClient::new(ClientConfig::new(
+    ///     "https://otto.savvagent.com", "https://x.example/mcp", "otto_rs_x",
+    /// ))?;
+    /// assert_eq!(c.usage_page_url("acme"), "https://otto.savvagent.com/o/acme/usage");
+    /// # Ok::<(), otto_resource::Error>(())
+    /// ```
+    pub fn usage_page_url(&self, org_slug: &str) -> String {
+        self.url(&["o", org_slug, "usage"]).into()
     }
 
     /// Resolve an email address to a member of `org`. `None` covers both "no

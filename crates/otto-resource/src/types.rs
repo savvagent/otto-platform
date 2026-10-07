@@ -271,3 +271,10 @@ pub struct TeamInfo {
     pub slug: String,
     pub name: String,
 }
+
+/// The teams one member belongs to in one org, from
+/// `GET /internal/orgs/{org}/members/{user}/teams`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberTeams {
+    pub teams: Vec<TeamInfo>,
+}

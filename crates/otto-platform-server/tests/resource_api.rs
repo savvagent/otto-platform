@@ -477,6 +477,7 @@ async fn internal_routes_require_the_resource_server_credential(pool: PgPool) {
     for path in [
         format!("/internal/orgs/{}/usage-status", w.org),
         format!("/internal/orgs/{}/members/{}", w.org, w.user),
+        format!("/internal/orgs/{}/members/{}/teams", w.org, w.user),
         format!("/internal/orgs/{}/teams/{}", w.org, Uuid::new_v4()),
     ] {
         let (status, _) = send(&w.db, Request::get(&path).body(Body::empty()).unwrap()).await;
@@ -597,6 +598,84 @@ async fn team_lookups_require_the_team_to_be_in_the_org(pool: PgPool) {
         format!("/internal/orgs/{}/teams/{}", other.id, team.id),
         format!("/internal/orgs/{}/teams/by-slug/platform", other.id),
         format!("/internal/orgs/{}/teams/{}", w.org, Uuid::new_v4()),
+    ] {
+        assert_eq!(
+            get(&w.db, &auth, &path).await.0,
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn member_teams_lists_only_this_orgs_teams_for_a_member(pool: PgPool) {
+    let w = world(pool).await;
+    let auth = w.factory_basic();
+    let other = w.db.create_org("other", "Other").await.unwrap();
+    w.db.add_member(other.id, w.user, Role::Member)
+        .await
+        .unwrap();
+    let stranger = w.db.upsert_user("x@elsewhere.example", None).await.unwrap();
+
+    let mut tx = w.db.begin(w.org).await.unwrap();
+    let zed = tx.create_team("zed", "Zed").await.unwrap();
+    let alpha = tx.create_team("alpha", "Alpha").await.unwrap();
+    tx.create_team("unjoined", "Unjoined").await.unwrap();
+    tx.add_team_member(zed.id, w.user).await.unwrap();
+    tx.add_team_member(alpha.id, w.user).await.unwrap();
+    tx.commit().await.unwrap();
+    // A team in the other org the same user belongs to must not leak.
+    let mut tx = w.db.begin(other.id).await.unwrap();
+    let foreign = tx.create_team("foreign", "Foreign").await.unwrap();
+    tx.add_team_member(foreign.id, w.user).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let (status, body) = get(
+        &w.db,
+        &auth,
+        &format!("/internal/orgs/{}/members/{}/teams", w.org, w.user),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let slugs: Vec<_> = body["teams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["slug"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(slugs, ["alpha", "zed"], "ordered by name, this org only");
+    assert_eq!(body["teams"][0]["id"], alpha.id.to_string());
+    assert_eq!(body["teams"][0]["name"], "Alpha");
+    assert_eq!(body["teams"][0]["org_id"], w.org.to_string());
+
+    // The other org sees only its own team.
+    let (_, body) = get(
+        &w.db,
+        &auth,
+        &format!("/internal/orgs/{}/members/{}/teams", other.id, w.user),
+    )
+    .await;
+    assert_eq!(body["teams"].as_array().unwrap().len(), 1);
+    assert_eq!(body["teams"][0]["slug"], "foreign");
+
+    // A member on no team: 200 and empty.
+    w.db.add_member(w.org, stranger.id, Role::Member)
+        .await
+        .unwrap();
+    let (status, body) = get(
+        &w.db,
+        &auth,
+        &format!("/internal/orgs/{}/members/{}/teams", w.org, stranger.id),
+    )
+    .await;
+    assert_eq!((status, body), (StatusCode::OK, json!({"teams": []})));
+
+    // Non-members, unknown users and unknown orgs are all the same 404.
+    let outsider = w.db.upsert_user("o@elsewhere.example", None).await.unwrap();
+    for path in [
+        format!("/internal/orgs/{}/members/{}/teams", w.org, outsider.id),
+        format!("/internal/orgs/{}/members/{}/teams", w.org, Uuid::new_v4()),
+        format!("/internal/orgs/{}/members/{}/teams", Uuid::new_v4(), w.user),
     ] {
         assert_eq!(
             get(&w.db, &auth, &path).await.0,
@@ -1015,6 +1094,120 @@ async fn the_client_ships_usage_and_reads_status_lookups(pool: PgPool) {
         .await
         .unwrap()
         .is_none());
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_client_lists_member_teams(pool: PgPool) {
+    let w = world(pool).await;
+    let base = serve(&w.db).await;
+    let client = PlatformClient::new(ClientConfig::new(&base, FACTORY, &w.factory_secret)).unwrap();
+    let org = w.org.as_uuid();
+
+    let mut tx = w.db.begin(w.org).await.unwrap();
+    let team = tx.create_team("platform", "Platform").await.unwrap();
+    tx.add_team_member(team.id, w.user).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let teams = client
+        .member_teams(org, w.user.as_uuid())
+        .await
+        .unwrap()
+        .expect("member");
+    assert_eq!(teams.len(), 1);
+    assert_eq!(
+        (teams[0].id, teams[0].slug.as_str(), teams[0].name.as_str()),
+        (team.id.as_uuid(), "platform", "Platform")
+    );
+    assert!(client
+        .member_teams(org, Uuid::new_v4())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        client.usage_page_url("acme"),
+        format!("{base}/o/acme/usage")
+    );
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn member_lookups_are_cached_briefly_and_expire(pool: PgPool) {
+    let w = world(pool).await;
+    let base = serve(&w.db).await;
+    let mut cfg = ClientConfig::new(&base, FACTORY, &w.factory_secret);
+    cfg.member_ttl = std::time::Duration::from_millis(400);
+    cfg.member_negative_ttl = std::time::Duration::from_millis(400);
+    let client = PlatformClient::new(cfg).unwrap();
+    let (org, user) = (w.org.as_uuid(), w.user.as_uuid());
+
+    let mut tx = w.db.begin(w.org).await.unwrap();
+    let team = tx.create_team("platform", "Platform").await.unwrap();
+    tx.add_team_member(team.id, w.user).await.unwrap();
+    tx.commit().await.unwrap();
+    let newcomer = w.db.upsert_user("new@acme.example", None).await.unwrap();
+
+    assert_eq!(
+        client.member(org, user).await.unwrap().unwrap().role,
+        otto_resource::Role::Admin
+    );
+    assert_eq!(
+        client.member_teams(org, user).await.unwrap().unwrap().len(),
+        1
+    );
+    // Not a member yet; remembered.
+    assert!(client
+        .member(org, newcomer.id.as_uuid())
+        .await
+        .unwrap()
+        .is_none());
+
+    // Platform-side changes are invisible inside the TTL...
+    w.db.add_member(w.org, newcomer.id, Role::Member)
+        .await
+        .unwrap();
+    let mut tx = w.db.begin(w.org).await.unwrap();
+    tx.remove_team_member(team.id, w.user).await.unwrap();
+    tx.commit().await.unwrap();
+    w.db.add_member(w.org, w.user, Role::Member).await.unwrap();
+    assert_eq!(
+        client.member(org, user).await.unwrap().unwrap().role,
+        otto_resource::Role::Admin
+    );
+    assert_eq!(
+        client.member_teams(org, user).await.unwrap().unwrap().len(),
+        1
+    );
+    assert!(client
+        .member(org, newcomer.id.as_uuid())
+        .await
+        .unwrap()
+        .is_none());
+
+    // ...and visible after it.
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert_eq!(
+        client.member(org, user).await.unwrap().unwrap().role,
+        otto_resource::Role::Member
+    );
+    assert!(client
+        .member_teams(org, user)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_empty());
+    assert!(client
+        .member(org, newcomer.id.as_uuid())
+        .await
+        .unwrap()
+        .is_some());
+
+    // A zero TTL disables caching altogether.
+    let mut cfg = ClientConfig::new(&base, FACTORY, &w.factory_secret);
+    cfg.member_ttl = std::time::Duration::ZERO;
+    let uncached = PlatformClient::new(cfg).unwrap();
+    assert!(uncached.member(org, user).await.unwrap().is_some());
+    w.db.remove_member(w.org, w.user).await.unwrap();
+    assert!(uncached.member(org, user).await.unwrap().is_none());
+    assert!(uncached.member_teams(org, user).await.unwrap().is_none());
 }
 
 #[test]
