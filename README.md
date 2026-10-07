@@ -42,18 +42,22 @@ see "What's not here yet" below.
 crates/
 ├── otto-tenant/          lowest-level: typed ids, the pinned-transaction
 │                         connection pool (Db/Tx/Unpinned), the row-level-
-│                         security isolation proof, the audit-events pattern.
+│                         security isolation proof, the audit-events pattern,
+│                         `Cipher` (AES-256-GCM encryption at rest).
 │                         Owns no domain model — no users, no orgs.
 ├── otto-core/            identity domain: users, orgs, org_members, teams,
-│                         org_invites, locales, account labels. Built on
-│                         otto-tenant.
+│                         org_invites, locales, account labels, enterprise
+│                         SSO data (IdP connections, claimed domains,
+│                         federated identities, SSO ceremonies,
+│                         enforce_sso guards). Built on otto-tenant.
 ├── otto-billing/         usage metering and plan-limit queries
 │                         (usage_events, org_period_usage, plans,
 │                         subscriptions). Built on otto-tenant and otto-core.
 ├── otto-auth/            OAuth 2.1 authorization server, passkeys/WebAuthn,
 │                         browser sessions, personal access tokens,
-│                         login-attempt rate limiting. Built on otto-tenant
-│                         and otto-core.
+│                         login-attempt rate limiting, OIDC federation client
+│                         and DNS domain verification. Built on
+│                         otto-tenant and otto-core.
 └── otto-platform-server/ thin binary: loads config, connects, runs
                           migrations, verifies tenant isolation, prints
                           ready. Not a full HTTP API yet — see below.
@@ -85,9 +89,13 @@ let user = db.get_user(user_id).await?;
 - **No HTTP surface.** `otto-platform-server` migrates and verifies isolation
   and then idles; it does not serve OAuth endpoints, a console, or any REST
   API. Otto Console and the OAuth HTTP routes are future work.
-- **No enterprise SSO.** `idp_connections`/`claimed_domains`/`user_identities`
-  were not carried over from otto-factory — no extracted code touches them.
-  `orgs.enforce_sso` is carried as a plain flag for a future implementation.
+- **Enterprise SSO has no HTTP routes yet.** The data layer
+  (`idp_connections`, `claimed_domains`, `user_identities`, `sso_ceremonies`,
+  the `enforce_sso` lockout guards in `otto-core`) and the OIDC client
+  (`otto-auth`'s discovery, token exchange, `id_token` validation, SSRF guard,
+  and DNS TXT domain verification) are present, as is the `enforce_sso`
+  refusal in passkey login. The routes that drive them (connection and domain
+  admin, the sign-in and link ceremonies, `/sso/callback`) arrive in Phase 4.
 - **No `plans.features` JSONB column.** Design doc §4 proposes one to gate
   per-service capabilities from a shared plan; not added here since no
   extracted code reads or writes it yet.
