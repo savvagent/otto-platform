@@ -57,10 +57,9 @@ pub struct Config {
     pub enforce_quotas: bool,
 
     /// The built console bundle (`OTTO_STATIC_DIR`), served with an
-    /// `index.html` fallback for self-hosters who run no Cloudflare Worker.
-    /// `None` serves no console at all, which is what the hosted deployment
-    /// wants: there the Worker in `web/worker/` serves the bundle, and this
-    /// process is the API only.
+    /// `index.html` fallback. The hosted deployment sets it (`fly.toml`);
+    /// `None` serves no console at all, for a deployment that puts the optional
+    /// Worker in `web/worker/` in front instead.
     pub static_dir: Option<PathBuf>,
 
     pub run_migrations: bool,

@@ -258,7 +258,16 @@ fn sso_schemas() -> Value {
             "description":
                 "Only used by /api/auth/sso/start — /api/me/sso/link/start takes no body, \
                  it derives the domain from the caller's own account email.",
-            "properties": { "email": { "type": "string" } },
+            "properties": {
+                "email": { "type": "string" },
+                "next": {
+                    "type": "string",
+                    "description":
+                        "Optional. A path on this origin (one leading `/`, not `//` or `/\\`) \
+                         to land on after signing in, such as the /oauth/authorize URL the \
+                         login page was reached from. Anything else is ignored.",
+                },
+            },
             "required": ["email"],
         },
         "SsoStartResponse": {

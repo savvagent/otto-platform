@@ -410,6 +410,7 @@ async fn ceremony_create_and_consume_round_trip(pool: PgPool) {
         b"binding-hash-1",
         "nonce-1",
         Utc::now() + Duration::minutes(10),
+        None,
     )
     .await
     .unwrap();
@@ -436,6 +437,36 @@ async fn ceremony_create_and_consume_round_trip(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn ceremony_carries_its_next_path_to_the_consumer(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme").await;
+    let conn_id = make_connection(&db, t.org).await;
+
+    ceremonies::create(
+        &db,
+        t.org,
+        conn_id,
+        None,
+        b"state-hash-next",
+        b"binding-hash-next",
+        "nonce",
+        Utc::now() + Duration::minutes(10),
+        Some("/oauth/authorize?client_id=c"),
+    )
+    .await
+    .unwrap();
+
+    let consumed = ceremonies::consume_by_state_hash(&db, b"state-hash-next")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        consumed.next_path.as_deref(),
+        Some("/oauth/authorize?client_id=c")
+    );
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn ceremony_expired_rows_are_not_resolved(pool: PgPool) {
     let db = db(pool);
     let t = tenant(&db, "acme").await;
@@ -450,6 +481,7 @@ async fn ceremony_expired_rows_are_not_resolved(pool: PgPool) {
         b"binding-hash-expired",
         "nonce",
         Utc::now() - Duration::minutes(1),
+        None,
     )
     .await
     .unwrap();
@@ -479,6 +511,7 @@ async fn consume_by_state_hash_never_resolves_the_same_ceremony_twice_under_a_ra
         b"binding-hash-race",
         "nonce",
         Utc::now() + Duration::minutes(10),
+        None,
     )
     .await
     .unwrap();
@@ -547,6 +580,7 @@ async fn ceremony_org_id_survives_a_mid_flight_domain_reassignment(pool: PgPool)
         b"binding-hash-reassign",
         "nonce",
         Utc::now() + Duration::minutes(10),
+        None,
     )
     .await
     .unwrap();

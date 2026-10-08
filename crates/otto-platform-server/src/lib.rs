@@ -21,9 +21,10 @@
 //! cookie, and are outside `otto-web`'s CSRF guard, which only wraps its own
 //! router. Lifecycle webhooks are delivered by [`webhooks::run`], a background
 //! task the binary starts; `otto-platform-server resource ...` provisions
-//! resource servers ([`resource_cmd`]). The console bundle is a separate piece
-//! in `web/`, and is served from here only for self-hosters
-//! (`OTTO_STATIC_DIR`); the hosted deployment serves it from a Cloudflare Worker.
+//! resource servers ([`resource_cmd`]) and `otto-platform-server client ...`
+//! registers first-party OAuth clients ([`client_cmd`]). The console bundle is
+//! a separate piece in `web/`, served from here when `OTTO_STATIC_DIR` is set,
+//! which is how the hosted Fly deployment runs.
 //!
 //! Assembly is a library function rather than something buried in `main` so a
 //! test can build the whole router: axum panics on a route registered twice,
@@ -31,6 +32,7 @@
 //! deployment reaches it first.
 
 pub mod api;
+pub mod client_cmd;
 pub mod config;
 pub mod health;
 pub mod internal;
