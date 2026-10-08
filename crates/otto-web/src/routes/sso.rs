@@ -74,7 +74,39 @@ fn txt_instructions(domain: &str, token: &str) -> (String, String) {
 
 #[cfg(test)]
 mod dns_instructions_tests {
-    use super::txt_instructions;
+    use super::{safe_next, txt_instructions};
+
+    #[test]
+    fn next_accepts_only_same_origin_relative_paths() {
+        for ok in [
+            "/",
+            "/dashboard",
+            "/oauth/authorize?client_id=x&redirect_uri=https%3A%2F%2Fa.test%2Fcb&state=s",
+            "/a//b",
+            "/%2Fevil.test",
+        ] {
+            assert_eq!(safe_next(ok), Some(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "dashboard",
+            "//evil.test",
+            "//evil.test/x",
+            "/\\evil.test",
+            "/a\\b",
+            "https://evil.test/",
+            "javascript:alert(1)",
+            "http:/evil.test",
+            "/\t/evil.test",
+            "/a\nb",
+            "/a\rb",
+            " /a",
+            "\u{0}/a",
+        ] {
+            assert_eq!(safe_next(bad), None, "{bad:?}");
+        }
+        assert_eq!(safe_next(&format!("/{}", "a".repeat(3000))), None);
+    }
 
     /// What the console tells an admin to publish must be what
     /// `otto_auth::dns::verify_txt_record` looks up, or verification can never
@@ -98,12 +130,36 @@ mod dns_instructions_tests {
 #[serde(rename_all = "camelCase")]
 pub struct SsoStartRequest {
     pub email: String,
+    /// Where to land after signing in, e.g. the `/oauth/authorize?...` URL the
+    /// login page was reached from. Stored with the ceremony; see [`safe_next`].
+    #[serde(default)]
+    pub next: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SsoStartResponse {
     pub redirect_url: String,
+}
+
+/// `next` is only ever a path on this origin. Anything else is dropped, and the
+/// caller lands on the console's home instead.
+///
+/// The destination is attacker-influenced input to a redirect that happens
+/// right after authentication, which is exactly the shape of an open redirect:
+/// a phishing link that signs somebody in and then bounces them to a look-alike
+/// of the console. So the check is an allowlist of one shape: a relative path
+/// that starts with a single `/`. `//host` and `/\host` are scheme-relative to
+/// browsers, a backslash is a slash to most of them, and control characters
+/// (CR, LF, tab) are stripped by URL parsers in ways that turn `/\t/evil.test`
+/// into `//evil.test`.
+pub(crate) fn safe_next(next: &str) -> Option<&str> {
+    let bytes = next.as_bytes();
+    let ok = bytes.first() == Some(&b'/')
+        && !matches!(bytes.get(1), Some(b'/' | b'\\'))
+        && next.len() <= 2048
+        && !next.chars().any(|c| c == '\\' || c.is_control());
+    ok.then_some(next)
 }
 
 /// `POST /api/auth/sso/start` — the anonymous "sign in with SSO" entry point.
@@ -122,7 +178,13 @@ pub async fn sso_start(
     Json(req): Json<SsoStartRequest>,
 ) -> ApiResult<Response> {
     throttle_by_source(&state, &parts, "sso_start").await?;
-    start_ceremony(&state, &req.email, None).await
+    start_ceremony(
+        &state,
+        &req.email,
+        None,
+        req.next.as_deref().and_then(safe_next),
+    )
+    .await
 }
 
 /// Shared with [`sso_start`]'s throttle: keys on source IP, same as
@@ -161,13 +223,14 @@ pub async fn sso_link_start(
              identity provider's verified email against.",
         )
     })?;
-    start_ceremony(&state, &email, Some(caller.user.id)).await
+    start_ceremony(&state, &email, Some(caller.user.id), None).await
 }
 
 async fn start_ceremony(
     state: &AppState,
     email: &str,
     caller_user_id: Option<UserId>,
+    next: Option<&str>,
 ) -> ApiResult<Response> {
     let domain = email_domain(email)
         .filter(|d| !d.is_empty())
@@ -195,6 +258,7 @@ async fn start_ceremony(
         &binding_secret.hash,
         &nonce,
         expires_at,
+        next,
     )
     .await?;
 
@@ -287,7 +351,7 @@ pub async fn callback(
     Query(params): Query<CallbackParams>,
 ) -> Response {
     match callback_inner(&state, &parts, &params).await {
-        Ok((user_id, token)) => {
+        Ok((user_id, token, next)) => {
             let ip = client_ip(&parts, &state.config);
             // Best-effort, matching `login::with_passkey`'s own audit write
             // for the passkey path — a lost row here is worse to compound
@@ -301,7 +365,11 @@ pub async fn callback(
                 tracing::error!(error = %e, "failed to write audit event for an SSO sign-in");
             }
 
-            let mut response = Redirect::to(&state.config.url("/")).into_response();
+            // The destination was validated when the ceremony started and is
+            // checked again here; it comes from the ceremony row, never from
+            // this request's query string.
+            let landing = next.as_deref().and_then(safe_next).unwrap_or("/");
+            let mut response = Redirect::to(&state.config.url(landing)).into_response();
             response = session::with_cookie(response, session::set_cookie(&token));
             session::with_cookie(response, session::clear_binding_cookie())
         }
@@ -340,7 +408,7 @@ async fn callback_inner(
     state: &AppState,
     parts: &Parts,
     params: &CallbackParams,
-) -> Result<(UserId, String), Outcome> {
+) -> Result<(UserId, String, Option<String>), Outcome> {
     // Step 1: hash the incoming `state`, resolve and burn the ceremony.
     let raw_state = params
         .state
@@ -537,7 +605,7 @@ async fn callback_inner(
 
     // Step 7: success.
     let new_session = sessions::create(&state.db, user_id).await?;
-    Ok((user_id, new_session.token))
+    Ok((user_id, new_session.token, ceremony.next_path))
 }
 
 /// Step 5: the authenticated-link ceremony, `resolve_user` returned `None`.
