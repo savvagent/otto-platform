@@ -900,7 +900,7 @@ fn consent_html(
 
     let scope_items = scopes
         .iter()
-        // TODO(savvagent/otto-platform#3): a consent screen listing a bare
+        // TODO(savvagent/otto-platform#20): a consent screen listing a bare
         // scope name has not obtained informed consent from anybody. Scope
         // descriptions belong to each resource server, so they need an
         // optional per-scope description on its `resource_servers` row (a

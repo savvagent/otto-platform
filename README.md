@@ -28,15 +28,18 @@ short:
   (RFC 8707 resource indicators). A token minted for one otto-* service
   cannot be replayed against another.
 
-**otto-factory is not yet repointed at this repo.** This extraction proves the
-split compiles and boots against a real Postgres; wiring otto-factory to
-depend on it (and otto-flags to build its own domain crate against
-`otto-tenant`) is deliberately deferred, separate work.
+It is deployed at `https://otto.savvagent.com`. otto-factory is its first
+resource server: it depends on `otto-tenant` and `otto-resource` from this repo,
+validates bearer tokens through introspection, and its console signs in here
+with OAuth. otto-flags is meant to be the second, needing nothing from the
+platform beyond registering itself.
 
 `otto-platform-server` serves the identity HTTP surface — the OAuth 2.1
 authorization server, sign-in (passkeys and enterprise SSO), and the
-account/org API — for every registered resource server. See "What's not here
-yet" below for what is still to come.
+account/org API — for every registered resource server, plus the
+resource-server API (introspection, usage ingest, member lookup, lifecycle
+webhooks) and the account/org console built from `web/` (see
+`web/README.md`). See "What's not here yet" below for what is still to come.
 
 ## Crate layout
 
@@ -103,13 +106,9 @@ let user = db.get_user(user_id).await?;
 
 ## What's not here yet
 
-- **No resource-server API yet.** Token introspection (RFC 7662), usage
-  ingest, and lifecycle webhooks are separate pieces of Phase 4 of
-  `docs/plans/2026-10-06-platform-cutover.md`, as is the console UI (the
-  server serves the API the console calls, not the console itself).
 - **Consent screens show raw scope names.** Each resource server's scopes
   come from the `resource_servers` registry, which carries no human-readable
-  descriptions yet. Adding them needs a migration; tracked in #3.
+  descriptions yet. Adding them needs a migration; tracked in #20.
 - **No `plans.features` JSONB column.** Design doc §4 proposes one to gate
   per-service capabilities from a shared plan; not added here since no
   extracted code reads or writes it yet.
