@@ -1264,3 +1264,373 @@ async fn agent_endpoints_without_a_cookie_are_not_guarded(pool: PgPool) {
         .await;
     registered.expect(StatusCode::CREATED);
 }
+
+// ------------------------------------------------ first-party clients
+
+/// A client the operator registered as first-party, the only way to get one.
+async fn register_first_party(h: &Harness) -> String {
+    otto_auth::oauth::register_operator_client(
+        &h.db,
+        otto_auth::oauth::RegistrationRequest {
+            client_name: Some("Console".into()),
+            redirect_uris: vec![REDIRECT.into()],
+            software_id: None,
+            grant_types: None,
+        },
+        true,
+    )
+    .await
+    .unwrap()
+    .client_id
+}
+
+/// `authorize_url` plus an `org_hint`.
+fn hinted_url(client_id: &str, challenge: &str, scope: &str, hint: &str) -> String {
+    format!(
+        "{}&org_hint={hint}",
+        authorize_url(client_id, challenge, scope, "opaque-state")
+    )
+}
+
+async fn redeem(h: &Harness, client_id: &str, callback: &str, verifier: &str) -> common::Reply {
+    let code = query_param(callback, "code").expect("no code in the callback");
+    Call::post("/oauth/token")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("client_id", client_id),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", verifier),
+            ("resource", RESOURCE),
+        ])
+        .send(&h.router)
+        .await
+}
+
+/// Registration is open, so nothing a caller sends it may confer first-party
+/// status. The flag is not part of the request, and a client that sends it
+/// anyway is registered like any other.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn dynamic_registration_cannot_create_a_first_party_client(pool: PgPool) {
+    let h = harness(pool).await;
+
+    let registered = Call::post("/oauth/register")
+        .json(serde_json::json!({
+            "client_name": "Sneaky",
+            "redirect_uris": [REDIRECT],
+            "first_party": true,
+        }))
+        .send(&h.router)
+        .await;
+    registered.expect(StatusCode::CREATED);
+    assert!(registered.body.get("first_party").is_none());
+
+    let client_id = registered.body["client_id"].as_str().unwrap();
+    let client = otto_auth::oauth::get_client(&h.db, client_id)
+        .await
+        .unwrap();
+    assert!(!client.first_party);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_first_party_client_with_one_org_skips_consent(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register_first_party(&h).await;
+    let (verifier, challenge) = pkce();
+
+    let reply = Call::get(authorize_url(
+        &client_id,
+        &challenge,
+        "things:read things:write",
+        "opaque-state",
+    ))
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    reply.expect(StatusCode::SEE_OTHER);
+
+    let callback = location(&reply);
+    assert!(callback.starts_with(REDIRECT), "{callback}");
+    assert_eq!(
+        query_param(&callback, "state").as_deref(),
+        Some("opaque-state")
+    );
+
+    // The same bindings as the consent path: PKCE, redirect URI, resource.
+    // A wrong verifier is refused (and burns that code).
+    redeem(&h, &client_id, &callback, &"y".repeat(64))
+        .await
+        .expect(StatusCode::BAD_REQUEST);
+
+    let reply = Call::get(authorize_url(
+        &client_id,
+        &challenge,
+        "things:read things:write",
+        "opaque-state",
+    ))
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    let tokens = redeem(&h, &client_id, &location(&reply), &verifier).await;
+    tokens.expect(StatusCode::OK);
+    assert_eq!(tokens.body["scope"], "things:read things:write");
+    let principal = otto_auth::tokens::introspect(
+        &h.db,
+        tokens.body["access_token"].as_str().unwrap(),
+        RESOURCE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(principal.org_id, org);
+    assert_eq!(principal.user_id, rob.user);
+}
+
+/// The skip is after full validation: a bad redirect URI or missing PKCE is
+/// still an error page, never a code.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn skipping_consent_does_not_skip_validation(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register_first_party(&h).await;
+    let (_, challenge) = pkce();
+
+    let evil = Call::get(
+        authorize_url(&client_id, &challenge, "things:read", "s")
+            .replace("127.0.0.1%3A1455", "evil.test"),
+    )
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    evil.expect(StatusCode::BAD_REQUEST);
+    assert!(!evil.headers.contains_key(http::header::LOCATION));
+
+    let no_pkce = Call::get(
+        authorize_url(&client_id, &challenge, "things:read", "s")
+            .replace("code_challenge_method=S256", "code_challenge_method=plain"),
+    )
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    no_pkce.expect(StatusCode::BAD_REQUEST);
+
+    let bad_scope = Call::get(authorize_url(&client_id, &challenge, "nope:nope", "s"))
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    bad_scope.expect(StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_valid_org_hint_picks_the_org_for_a_first_party_client(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let globex = org_with_owner(&h, "globex", &rob).await;
+    let client_id = register_first_party(&h).await;
+    let (verifier, challenge) = pkce();
+
+    // Two orgs and no hint: there is a choice, so the screen appears.
+    let page = Call::get(authorize_url(&client_id, &challenge, "things:read", "s"))
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    page.expect(StatusCode::OK);
+    assert!(page.text.contains("name=org_id"));
+
+    // By slug, and by id.
+    for hint in ["globex".to_string(), globex.to_string()] {
+        let reply = Call::get(hinted_url(&client_id, &challenge, "things:read", &hint))
+            .with_session(&rob.session)
+            .send(&h.router)
+            .await;
+        reply.expect(StatusCode::SEE_OTHER);
+        let tokens = redeem(&h, &client_id, &location(&reply), &verifier).await;
+        tokens.expect(StatusCode::OK);
+        let principal = otto_auth::tokens::introspect(
+            &h.db,
+            tokens.body["access_token"].as_str().unwrap(),
+            RESOURCE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(principal.org_id, globex, "hint {hint}");
+    }
+}
+
+/// A hint naming an org the caller is not in is ignored, and the response is
+/// the same whether or not that org exists.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_org_hint_the_caller_cannot_use_is_ignored_without_leaking(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let eve = onboard(&h, "eve@initech.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    org_with_owner(&h, "globex", &rob).await;
+    org_with_owner(&h, "initech", &eve).await;
+    let client_id = register_first_party(&h).await;
+    let (_, challenge) = pkce();
+
+    let page = |hint: &'static str| {
+        let url = hinted_url(&client_id, &challenge, "things:read", hint);
+        let h = &h;
+        let rob = &rob;
+        async move {
+            let page = Call::get(url)
+                .with_session(&rob.session)
+                .send(&h.router)
+                .await;
+            page.expect(StatusCode::OK);
+            page.text
+        }
+    };
+    let someone_elses = page("initech").await;
+    let nonexistent = page("nonexistent").await;
+
+    assert!(someone_elses.contains("name=org_id"), "no consent screen");
+    assert!(!someone_elses.contains(" selected"));
+    assert!(!someone_elses.contains("initech</option>"));
+    // Same page, byte for byte, apart from the caller's own echoed input.
+    assert_eq!(someone_elses.replace("initech", "nonexistent"), nonexistent);
+}
+
+/// With exactly one org there is nothing to pick, so a hint that is useless is
+/// just ignored and the client still skips.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_useless_hint_does_not_block_the_single_org_skip(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register_first_party(&h).await;
+    let (verifier, challenge) = pkce();
+
+    let reply = Call::get(hinted_url(&client_id, &challenge, "things:read", "initech"))
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    reply.expect(StatusCode::SEE_OTHER);
+    let tokens = redeem(&h, &client_id, &location(&reply), &verifier).await;
+    tokens.expect(StatusCode::OK);
+    let principal = otto_auth::tokens::introspect(
+        &h.db,
+        tokens.body["access_token"].as_str().unwrap(),
+        RESOURCE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(principal.org_id, org);
+}
+
+/// Third-party clients always get the screen, hint or no hint, one org or
+/// many. The hint only preselects.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_client_that_is_not_first_party_always_gets_the_consent_screen(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+
+    for url in [
+        authorize_url(&client_id, &challenge, "things:read", "s"),
+        hinted_url(&client_id, &challenge, "things:read", "acme"),
+    ] {
+        let page = Call::get(url)
+            .with_session(&rob.session)
+            .send(&h.router)
+            .await;
+        page.expect(StatusCode::OK);
+        assert!(page.text.contains("name=org_id"));
+        assert!(!page.headers.contains_key(http::header::LOCATION));
+    }
+
+    let globex = org_with_owner(&h, "globex", &rob).await;
+    let page = Call::get(hinted_url(&client_id, &challenge, "things:read", "globex"))
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    page.expect(StatusCode::OK);
+    assert!(
+        page.text.contains(&format!("value=\"{globex}\" selected")),
+        "the hinted org should be preselected: {}",
+        page.text
+    );
+    assert!(
+        page.text.contains("name=org_hint value=\"globex\""),
+        "the hint must ride through the form"
+    );
+}
+
+/// A requested admin scope is dropped, not refused, when the human is not an
+/// admin; the token says what it actually carries. Covered on both routes.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_member_requesting_org_admin_gets_a_downscoped_token(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let bob = onboard(&h, "bob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    common::add_member(&h, org, bob.user, otto_core::orgs::Role::Member).await;
+    let (verifier, challenge) = pkce();
+    let scope = "things:read org:admin";
+
+    // First-party skip.
+    let first_party = register_first_party(&h).await;
+    for (who, expected) in [(&bob, "things:read"), (&rob, "things:read org:admin")] {
+        let reply = Call::get(authorize_url(&first_party, &challenge, scope, "s"))
+            .with_session(&who.session)
+            .send(&h.router)
+            .await;
+        reply.expect(StatusCode::SEE_OTHER);
+        let tokens = redeem(&h, &first_party, &location(&reply), &verifier).await;
+        tokens.expect(StatusCode::OK);
+        assert_eq!(tokens.body["scope"], expected);
+        let principal = otto_auth::tokens::introspect(
+            &h.db,
+            tokens.body["access_token"].as_str().unwrap(),
+            RESOURCE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            principal.has_scope("org:admin"),
+            expected.contains("org:admin")
+        );
+    }
+
+    // Consent POST.
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let granted = Call::post("/oauth/authorize")
+        .with_session(&bob.session)
+        .form(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", REDIRECT),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("scope", scope),
+            ("resource", RESOURCE),
+            ("org_id", &org.to_string()),
+            ("decision", "allow"),
+        ])
+        .send(&h.router)
+        .await;
+    granted.expect(StatusCode::SEE_OTHER);
+    let tokens = redeem(&h, &client_id, &location(&granted), &verifier).await;
+    tokens.expect(StatusCode::OK);
+    assert_eq!(tokens.body["scope"], "things:read");
+
+    // Nothing left after the drop: that is still an error, as a redirect.
+    let nothing = Call::get(authorize_url(&first_party, &challenge, "org:admin", "s"))
+        .with_session(&bob.session)
+        .send(&h.router)
+        .await;
+    nothing.expect(StatusCode::SEE_OTHER);
+    let callback = location(&nothing);
+    assert_eq!(
+        query_param(&callback, "error").as_deref(),
+        Some("invalid_scope")
+    );
+    assert!(query_param(&callback, "code").is_none());
+}

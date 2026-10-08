@@ -144,6 +144,13 @@ pub struct AuthorizeParams {
     pub resource: Option<String>,
     #[serde(default)]
     pub state: Option<String>,
+    /// Which org the sign-in is for, as a slug or an id. A hint, never a grant:
+    /// it preselects the org on the consent screen, and lets a first-party
+    /// client skip the screen, only when the signed-in user is a member of it.
+    /// Anything else (unknown, or an org they are not in) is ignored without a
+    /// word, so the parameter cannot be used to probe which orgs exist.
+    #[serde(default)]
+    pub org_hint: Option<String>,
 }
 
 /// The scope that means "act as an administrator of the org", on every otto-*
@@ -156,6 +163,11 @@ pub struct AuthorizeParams {
 /// human is — here — and it cannot ask each resource server what its scopes
 /// mean. A resource server that defines a scope called `org:admin` is opting
 /// into this gate.
+///
+/// A requester who is not an admin of the chosen org is not refused: the scope
+/// is dropped from the grant, and the token's `scope` says what was actually
+/// granted. A client that needs it has to check the response, not assume it.
+/// Only a request left with no scope at all is an `invalid_scope` error.
 pub(crate) const ADMIN_SCOPE: &str = "org:admin";
 
 /// The resource server a request is for.
@@ -215,6 +227,30 @@ impl AuthorizeParams {
             state: self.state.clone(),
         })
     }
+}
+
+/// The org `hint` names, if the caller belongs to it. Matches the slug or the
+/// id; a miss and a non-membership are the same `None`.
+fn resolve_org_hint<'a>(
+    orgs: &'a [otto_core::orgs::Membership],
+    hint: Option<&str>,
+) -> Option<&'a otto_core::orgs::Membership> {
+    let hint = hint?.trim();
+    if hint.is_empty() {
+        return None;
+    }
+    orgs.iter()
+        .find(|m| m.org_slug.eq_ignore_ascii_case(hint) || m.org_id.to_string() == hint)
+}
+
+/// The scopes a member of `role` may hold: everything asked for, minus the
+/// admin scope unless they can administer the org.
+fn downscope(scopes: &[String], role: otto_core::orgs::Role) -> Vec<String> {
+    scopes
+        .iter()
+        .filter(|s| *s != ADMIN_SCOPE || role.can_administer())
+        .cloned()
+        .collect()
 }
 
 /// `GET /oauth/authorize` — render the consent screen.
@@ -283,6 +319,38 @@ pub async fn authorize_page(
         );
     }
 
+    // The hint only ever selects among orgs the caller is already in.
+    let hinted = resolve_org_hint(&orgs, params.org_hint.as_deref());
+
+    // A first-party client is the operator's own service. Asking a person
+    // whether the product they just signed in to may use itself is friction,
+    // not consent, so when there is no choice left to put in front of them (the
+    // org is named by a hint they belong to, or they have only one) the code is
+    // issued here. A client that is not first-party always gets the screen: it
+    // is the only defense against a look-alike client.
+    if client.first_party {
+        let determined = hinted.or(match orgs.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        });
+        if let Some(membership) = determined {
+            let mut request = request;
+            request.scopes = authorization.scopes;
+            return grant(
+                &state,
+                &parts,
+                &caller,
+                &params,
+                request,
+                membership.org_id,
+                membership.role,
+                true,
+                locale,
+            )
+            .await;
+        }
+    }
+
     // The registry resolved the scopes: the resource server's defaults when the
     // client asked for none, otherwise exactly what it asked for.
     Html(consent_html(
@@ -291,6 +359,7 @@ pub async fn authorize_page(
         &authorization.resource,
         &authorization.scopes,
         &orgs,
+        hinted.map(|m| m.org_id),
         caller
             .user
             .email
@@ -326,6 +395,8 @@ pub struct ConsentForm {
     pub resource: Option<String>,
     #[serde(default)]
     pub state: Option<String>,
+    #[serde(default)]
+    pub org_hint: Option<String>,
     /// Which org this token will act in. A token opens exactly one.
     pub org_id: OrgId,
     /// "allow" or anything else, which is a denial.
@@ -348,6 +419,7 @@ impl ConsentForm {
             scope: blank_to_none(self.scope.clone()),
             resource: blank_to_none(self.resource.clone()),
             state: blank_to_none(self.state.clone()),
+            org_hint: blank_to_none(self.org_hint.clone()),
         }
     }
 }
@@ -414,31 +486,73 @@ pub async fn authorize_decision(
         Err(e) => return ApiError::internal("check membership for consent", e).into_response(),
     };
 
+    grant(
+        &state,
+        &parts,
+        &caller,
+        &params,
+        req,
+        form.org_id,
+        role,
+        false,
+        locale,
+    )
+    .await
+}
+
+/// Issue the authorization code for `org_id` and send the browser to the
+/// client's callback. The single place a code is minted for the authorization
+/// endpoint, so the consent POST and a first-party skip cannot drift apart.
+///
+/// `req` must already carry the resolved scopes. `role` is the caller's role in
+/// `org_id`, which the caller has established.
+#[allow(clippy::too_many_arguments)]
+async fn grant(
+    state: &AppState,
+    parts: &Parts,
+    caller: &CurrentUser,
+    params: &AuthorizeParams,
+    mut req: oauth::AuthorizeRequest,
+    org_id: OrgId,
+    role: otto_core::orgs::Role,
+    skipped_consent: bool,
+    locale: Locale,
+) -> Response {
     // `org:admin` is a real capability. A member consenting to it would hand a
-    // client authority the human granting it does not have.
-    if req.scopes.iter().any(|s| s == ADMIN_SCOPE) && !role.can_administer() {
+    // client authority the human granting it does not have, so it is dropped
+    // rather than granted. Dropped rather than refused: the client asked for
+    // the most it could use, and a first-party client asks for the admin scope
+    // of every user, most of whom are not admins. Only a request that loses
+    // everything is an error.
+    let requested = std::mem::take(&mut req.scopes);
+    req.scopes = downscope(&requested, role);
+    if req.scopes.is_empty() {
         return redirect_error(
-            &params,
+            params,
             "invalid_scope",
             "org:admin needs an owner or admin of the selected organization",
         );
     }
 
-    let code =
-        match oauth::issue_authorization_code(&state.db, &req, caller.user.id, form.org_id).await {
-            Ok(code) => code,
-            Err(e) => return error_page(&e, locale),
-        };
+    let code = match oauth::issue_authorization_code(&state.db, &req, caller.user.id, org_id).await
+    {
+        Ok(code) => code,
+        Err(e) => return error_page(&e, locale),
+    };
 
     let _ = state
         .db
         .audit_for_org(
-            form.org_id,
+            org_id,
             Entry::new(action::AUTHORIZATION_GRANTED)
                 .actor(caller.user.id)
                 .target("client", params.client_id.clone())
-                .from_request(client_ip(&parts, &state.config).as_deref(), None)
-                .detail(serde_json::json!({ "scopes": req.scopes, "resource": req.resource })),
+                .from_request(client_ip(parts, &state.config).as_deref(), None)
+                .detail(serde_json::json!({
+                    "scopes": req.scopes,
+                    "resource": req.resource,
+                    "consent_skipped": skipped_consent,
+                })),
         )
         .await;
 
@@ -753,6 +867,7 @@ fn consent_html(
     resource: &resources::ResourceServer,
     scopes: &[String],
     orgs: &[otto_core::orgs::Membership],
+    preselected: Option<OrgId>,
     signed_in_as: &str,
     locale: Locale,
 ) -> String {
@@ -791,8 +906,13 @@ fn consent_html(
         .iter()
         .map(|m| {
             format!(
-                "<option value=\"{}\">{}</option>",
+                "<option value=\"{}\"{}>{}</option>",
                 escape(&m.org_id.to_string()),
+                if preselected == Some(m.org_id) {
+                    " selected"
+                } else {
+                    ""
+                },
                 escape(&m.org_name)
             )
         })
@@ -816,6 +936,7 @@ fn consent_html(
         // makes the form say exactly what the page showed.
         ("resource", resource.resource_uri.as_str()),
         ("state", params.state.as_deref().unwrap_or("")),
+        ("org_hint", params.org_hint.as_deref().unwrap_or("")),
     ]
     .iter()
     .map(|(k, v)| format!("<input type=hidden name={k} value=\"{}\">", escape(v)))
@@ -971,6 +1092,48 @@ mod tests {
         );
     }
 
+    fn membership(slug: &str, role: otto_core::orgs::Role) -> otto_core::orgs::Membership {
+        otto_core::orgs::Membership {
+            org_id: OrgId::new(),
+            user_id: otto_tenant::ids::UserId::new(),
+            role,
+            org_slug: slug.into(),
+            org_name: slug.into(),
+            plan: otto_core::orgs::Plan::Free,
+        }
+    }
+
+    #[test]
+    fn an_org_hint_matches_slug_or_id_among_the_callers_orgs_only() {
+        use otto_core::orgs::Role;
+        let orgs = vec![
+            membership("acme", Role::Owner),
+            membership("globex", Role::Member),
+        ];
+
+        assert_eq!(resolve_org_hint(&orgs, Some("globex")), Some(&orgs[1]));
+        assert_eq!(resolve_org_hint(&orgs, Some("ACME")), Some(&orgs[0]));
+        let id = orgs[1].org_id.to_string();
+        assert_eq!(resolve_org_hint(&orgs, Some(&id)), Some(&orgs[1]));
+
+        // A real org the caller is not in looks exactly like one that does not exist.
+        assert!(resolve_org_hint(&orgs, Some("initech")).is_none());
+        assert!(resolve_org_hint(&orgs, Some(&OrgId::new().to_string())).is_none());
+        assert!(resolve_org_hint(&orgs, Some("  ")).is_none());
+        assert!(resolve_org_hint(&orgs, None).is_none());
+    }
+
+    #[test]
+    fn only_administrators_keep_the_admin_scope() {
+        use otto_core::orgs::Role;
+        let asked: Vec<String> = ["things:read", ADMIN_SCOPE].map(String::from).to_vec();
+
+        assert_eq!(downscope(&asked, Role::Owner), asked);
+        assert_eq!(downscope(&asked, Role::Admin), asked);
+        assert_eq!(downscope(&asked, Role::Member), vec!["things:read"]);
+        assert!(downscope(&[ADMIN_SCOPE.to_string()], Role::Member).is_empty());
+    }
+
     #[test]
     fn url_encoding_protects_the_state_parameter() {
         assert_eq!(urlencode("abc-123_x.y~z"), "abc-123_x.y~z");
@@ -999,6 +1162,7 @@ mod tests {
             scope: Some("things:read".into()),
             resource: None,
             state: Some("opaque".into()),
+            org_hint: None,
         };
         let orgs = vec![otto_core::orgs::Membership {
             org_id: OrgId::new(),
@@ -1024,6 +1188,7 @@ mod tests {
             },
             &["things:read".to_string()],
             &orgs,
+            None,
             "rob@acme.test",
             Locale::En,
         );
