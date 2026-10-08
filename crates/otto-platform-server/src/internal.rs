@@ -10,6 +10,7 @@
 //!   GET  /internal/orgs/{org}/usage-status                   period usage vs plan
 //!   GET  /internal/orgs/{org}/members/{user}                 whoami: user + org + role
 //!   GET  /internal/orgs/{org}/members/by-email?email=        member lookup
+//!   GET  /internal/orgs/{org}/members/{user}/teams           the member's teams in the org
 //!   GET  /internal/orgs/{org}/teams/{team}                   team in org
 //!   GET  /internal/orgs/{org}/teams/by-slug/{slug}           team in org, by slug
 //! ```
@@ -34,8 +35,8 @@ use otto_billing::usage::{IngestOutcome, ShippedUsage, UsageExt};
 use otto_core::orgs::{Org, OrgsExt};
 use otto_core::teams::{Team, TeamsExt};
 use otto_resource::{
-    MemberInfo, OrgInfo, RejectedEvent, TeamInfo, UsageBatch, UsageReceipt, UsageStatus, UserInfo,
-    MAX_USAGE_BATCH,
+    MemberInfo, MemberTeams, OrgInfo, RejectedEvent, TeamInfo, UsageBatch, UsageReceipt,
+    UsageStatus, UserInfo, MAX_USAGE_BATCH,
 };
 use otto_tenant::ids::{OrgId, TeamId, UserId};
 use otto_tenant::Db;
@@ -57,6 +58,10 @@ pub fn router(db: Db) -> Router {
             get(member_by_email),
         )
         .route("/internal/orgs/{org}/members/{user}", get(member))
+        .route(
+            "/internal/orgs/{org}/members/{user}/teams",
+            get(member_teams),
+        )
         .route(
             "/internal/orgs/{org}/teams/by-slug/{slug}",
             get(team_by_slug),
@@ -284,4 +289,29 @@ async fn team_by_slug(
     let found = tx.get_team_by_slug(&slug).await?;
     tx.rollback().await?;
     found.map(team_info).map(Json).ok_or(ApiError::NotFound)
+}
+
+/// The teams one active member belongs to in the named org.
+///
+/// 404 unless the user is an active member of that live org (the same single
+/// shape as `member`), so this is no oracle for accounts or for teams in other
+/// orgs: the query runs in a transaction pinned to `org`, which only ever sees
+/// that org's teams and memberships. A member on no teams is a 200 with an
+/// empty list.
+async fn member_teams(
+    State(db): State<Db>,
+    CallingResourceServer(_rs): CallingResourceServer,
+    Path((org, user)): Path<(Uuid, Uuid)>,
+) -> Result<Json<MemberTeams>, ApiError> {
+    let org_row = live_org(&db, org).await?;
+    let user = UserId::from(user);
+    db.active_member_role(org_row.id, user)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let mut tx = db.begin(org_row.id).await?;
+    let teams = tx.list_user_teams(user).await?;
+    tx.rollback().await?;
+    Ok(Json(MemberTeams {
+        teams: teams.into_iter().map(team_info).collect(),
+    }))
 }
