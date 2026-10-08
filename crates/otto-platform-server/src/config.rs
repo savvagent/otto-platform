@@ -19,10 +19,12 @@
 //!
 //! Every variable is `OTTO_*`, ported from otto-factory's `OF_*` set. The
 //! factory-only settings (GitHub App, JIRA, the MCP resource URI, MCP host and
-//! origin allow-lists, the console bundle directory) did not come with it: a
-//! resource server's configuration belongs to that resource server.
+//! origin allow-lists) did not come with it: a resource server's configuration
+//! belongs to that resource server. The console bundle directory did, as the
+//! optional `OTTO_STATIC_DIR`.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 
@@ -53,6 +55,12 @@ pub struct Config {
     /// it tells the console what the resource servers are doing. See
     /// `otto_web::Config::enforce_quotas`.
     pub enforce_quotas: bool,
+
+    /// The built console bundle (`OTTO_STATIC_DIR`), served with an
+    /// `index.html` fallback. The hosted deployment sets it (`fly.toml`);
+    /// `None` serves no console at all, for a deployment that puts the optional
+    /// Worker in `web/worker/` in front instead.
+    pub static_dir: Option<PathBuf>,
 
     pub run_migrations: bool,
     pub log_format: LogFormat,
@@ -85,6 +93,7 @@ impl Config {
                 .map(|v| v.trim().to_ascii_lowercase())
                 .filter(|v| !v.is_empty()),
             enforce_quotas: parse_var("OTTO_ENFORCE_QUOTAS", "0", parse_bool)?,
+            static_dir: optional("OTTO_STATIC_DIR").map(|v| PathBuf::from(v.trim())),
             run_migrations: parse_var("OTTO_RUN_MIGRATIONS", "1", parse_bool)?,
             log_format: parse_var("OTTO_LOG_FORMAT", "text", |v| match v {
                 "json" => Ok(LogFormat::Json),
@@ -160,6 +169,7 @@ impl Config {
             encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             client_ip_header: None,
             enforce_quotas: false,
+            static_dir: None,
             run_migrations: true,
             log_format: LogFormat::Text,
         }

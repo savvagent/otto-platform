@@ -1,0 +1,40 @@
+{
+  "name": "otto-platform-console",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm run paraglide:compile && vite dev",
+    "build": "npm run paraglide:compile && vite build",
+    "preview": "vite preview",
+    "check": "npm run paraglide:compile && npm run check:messages && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && npm run check:worker",
+    "check:worker": "tsc -p worker/tsconfig.json --noEmit",
+    "test": "vitest run",
+    "check:watch": "npm run paraglide:compile && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+    "format": "prettier --write .",
+    "lint": "prettier --check .",
+    "deploy": "npm run build && wrangler deploy --env production",
+    "paraglide:compile": "paraglide-js compile --project ./project.inlang --outdir ./src/lib/paraglide --emit-ts-declarations",
+    "check:messages": "node scripts/check-messages.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260902.1",
+    "@inlang/paraglide-js": "^2.25.0",
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.70.3",
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^22.20.5",
+    "jsdom": "^29.1.1",
+    "prettier": "^3.9.6",
+    "prettier-plugin-svelte": "^4.1.1",
+    "prettier-plugin-tailwindcss": "^0.8.1",
+    "svelte": "^5.57.0",
+    "svelte-check": "^4.7.6",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.128.0"
+  }
+}

@@ -20,14 +20,14 @@
 # to start without it, which is the point: a deploy that cannot encrypt SSO
 # secrets should fail its health check rather than limp.
 #
-# Hostname: Phase 4 of docs/plans/2026-10-06-platform-cutover.md serves this
-# app at otto.savvagent.com (`fly certs add otto.savvagent.com`, DNS at
-# Namecheap), and OTTO_PUBLIC_URL below says so. Its host is the WebAuthn
-# relying party id, so passkeys only work when the browser is actually on that
-# host: until the certificate and DNS exist, otto-platform.fly.dev serves the
-# API and health checks but cannot complete a passkey ceremony. Settle the
-# hostname before anyone registers a passkey here — changing it later
-# invalidates every one.
+# Hostname: Phase 4 of docs/plans/2026-10-06-platform-cutover.md serves the
+# console at otto.savvagent.com, straight from this app (DNS at Namecheap points
+# at Fly; `fly certs add otto.savvagent.com -a otto-platform`; see
+# docs/deploy/fly.md). OTTO_PUBLIC_URL below says so, and its host is the
+# WebAuthn relying party id, so passkeys only work when the browser is actually
+# on that host: otto-platform.fly.dev serves the API but cannot complete a
+# passkey ceremony. Settle the hostname before anyone registers a passkey:
+# changing it later invalidates every one.
 
 app = "otto-platform"
 primary_region = "iad"
@@ -44,8 +44,16 @@ primary_region = "iad"
   OTTO_PUBLIC_URL = "https://otto.savvagent.com"
   # Fly's proxy overwrites this header with the real client address (it does
   # not append, unlike X-Forwarded-For), which is the only property that makes
-  # a per-IP throttle keyed on it worth anything.
+  # a per-IP throttle keyed on it worth anything. Nothing sits in front of Fly:
+  # otto.savvagent.com resolves straight to this app, so no edge can rewrite it.
+  # (Behind the optional Cloudflare Worker this would have to be
+  # `cf-connecting-ip`; see docs/deploy/cloudflare.md.)
   OTTO_CLIENT_IP_HEADER = "fly-client-ip"
+  # This process serves the console itself, the way otto-factory does: the image
+  # carries the built bundle at /srv/console, served with an index.html fallback
+  # for client-side routes. Unknown /api, /oauth, /sso, /.well-known and
+  # /internal paths still answer a JSON 404.
+  OTTO_STATIC_DIR = "/srv/console"
 
 [http_service]
   internal_port = 8080

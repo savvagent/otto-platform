@@ -28,10 +28,11 @@ tracing-subscriber.workspace = true
 dotenvy.workspace = true
 anyhow.workspace = true
 url.workspace = true
-tower-http = { workspace = true, features = ["trace"] }
+tower.workspace = true
+http.workspace = true
+tower-http = { workspace = true, features = ["trace", "fs"] }
 
 [dev-dependencies]
-tower.workspace = true
 base64.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["full"] }

@@ -1293,6 +1293,7 @@ async fn resource_server_calls_are_not_subject_to_the_browser_csrf_guard(pool: P
         encryption_key: B64.encode([5u8; 32]),
         client_ip_header: None,
         enforce_quotas: false,
+        static_dir: None,
         run_migrations: true,
         log_format: otto_platform_server::LogFormat::Text,
     };

@@ -1,0 +1,74 @@
+{
+  // OPTIONAL alternative to serving the console from otto-platform-server (the
+  // primary path, docs/deploy/fly.md). The console, deployed to Cloudflare as one Worker that serves the built SPA
+  // and forwards everything dynamic to otto-platform-server. See
+  // docs/deploy/cloudflare.md for the account-side setup this file cannot
+  // express, and worker/index.ts for why it is a proxy rather than a second
+  // origin.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // The default config is the development one, and it is named as such: a
+  // bare `wrangler deploy` should never be able to land on the Worker the
+  // console actually runs on. Production is a named environment below.
+  "name": "otto-platform-console-dev",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-02",
+
+  "assets": {
+    // `npm run build` output. adapter-static writes hashed filenames under
+    // _app/immutable, so the bundle is safe to cache hard and the HTML is not.
+    "directory": "./build",
+    "binding": "ASSETS",
+    // Client-side routing: an unknown path is a route the SPA renders, not a
+    // 404. The server's optional static fallback does the same thing for
+    // self-hosters.
+    "not_found_handling": "single-page-application",
+
+    // Every request enters the Worker, including asset requests.
+    //
+    // The alternative is a glob list, which is cheaper because assets would be
+    // served without an invocation. It is also a second, differently-shaped copy
+    // of a rule that already exists in the server, and when the glob is wrong
+    // the failure is silent and specific: the asset router answers with
+    // index.html and a 200. It would also have to express an exception
+    // (/oauth/introspect and /internal are carved out of /oauth and refused),
+    // which a glob list cannot do.
+    //
+    // One rule, in TypeScript, matching the server's.
+    "run_worker_first": true
+  },
+
+  "vars": {
+    // Where otto-platform-server listens. Not a secret: a hostname.
+    //
+    // The default is the local origin on purpose. A deploy that forgets to name
+    // an environment then proxies to somewhere that is not listening and fails
+    // loudly, which is the failure everyone wants; the same slot holding a
+    // production hostname would mean a staging Worker silently serving real
+    // user traffic from production, and nothing about it would look wrong.
+    "OTTO_ORIGIN": "http://127.0.0.1:8080"
+  },
+
+  // Production is named, never inherited: `wrangler deploy --env production`.
+  //
+  // `name` is stated here because wrangler otherwise derives it by suffixing the
+  // top-level one, and a deploy that silently created
+  // `otto-platform-console-dev-production` would look successful while serving
+  // nobody.
+  "env": {
+    "production": {
+      "name": "otto-platform-console",
+      "vars": {
+        "OTTO_ORIGIN": "https://otto-platform.fly.dev"
+      },
+      // The hostname humans use, and the one the server's OTTO_PUBLIC_URL names.
+      // `custom_domain` makes Cloudflare create the DNS record and certificate
+      // itself, which needs the savvagent.com zone to be on this Cloudflare
+      // account. See docs/deploy/cloudflare.md before the first deploy.
+      "routes": [{ "pattern": "otto.savvagent.com", "custom_domain": true }]
+    }
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}

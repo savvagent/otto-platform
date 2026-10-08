@@ -12,6 +12,8 @@
 //!   /api/…  /oauth/…          otto-web    session cookies, the account/org API, the AS
 //!   /sso/callback             otto-web    the enterprise IdP's redirect back
 //!   /.well-known/…            otto-web    AS discovery, open by necessity
+//!   everything else           web/build   the console SPA, index.html fallback;
+//!                                         only with OTTO_STATIC_DIR set
 //! ```
 //!
 //! The resource-server-facing endpoints authenticate with the resource
@@ -20,8 +22,9 @@
 //! router. Lifecycle webhooks are delivered by [`webhooks::run`], a background
 //! task the binary starts; `otto-platform-server resource ...` provisions
 //! resource servers ([`resource_cmd`]) and `otto-platform-server client ...`
-//! registers first-party OAuth clients ([`client_cmd`]). The console bundle is a separate piece
-//! of Phase 4 of `docs/plans/2026-10-06-platform-cutover.md`.
+//! registers first-party OAuth clients ([`client_cmd`]). The console bundle is
+//! a separate piece in `web/`, served from here when `OTTO_STATIC_DIR` is set,
+//! which is how the hosted Fly deployment runs.
 //!
 //! Assembly is a library function rather than something buried in `main` so a
 //! test can build the whole router: axum panics on a route registered twice,
@@ -37,9 +40,17 @@ pub mod introspect;
 pub mod resource_cmd;
 pub mod webhooks;
 
+use std::convert::Infallible;
+use std::path::Path;
+
 use anyhow::{Context, Result};
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Router;
 use otto_tenant::Db;
+use tower::ServiceExt;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 pub use config::{Config, LogFormat};
@@ -62,13 +73,82 @@ pub fn router(db: Db) -> Router {
 pub fn app(db: Db, config: &Config) -> Result<Router> {
     let web = otto_web::router(web_state(db.clone(), config)?);
 
-    Ok(router(db)
-        .merge(web)
+    let app = router(db).merge(web);
+    // Either way an unmatched path answers JSON, never an empty body: a client
+    // that guessed a route needs something it can parse.
+    let app = match &config.static_dir {
+        Some(dir) => app.fallback_service(console(dir)),
+        None => app.fallback(|uri: axum::http::Uri| async move { not_found(uri.path()) }),
+    };
+
+    Ok(app
         // Request spans, without headers. `DefaultMakeSpan::include_headers`
         // would put `Authorization` and `Cookie` into the logs — every bearer
         // token and every session cookie, in plaintext, in whatever the log
         // aggregator retains. Do not turn it on.
         .layer(TraceLayer::new_for_http()))
+}
+
+/// Path prefixes that belong to an API rather than to the console's routing.
+///
+/// Everything else falls through to the single-page app, which is what makes a
+/// hard refresh of `/o/acme/members` work. An unmatched path under one of these
+/// must not: a client that `GET`s `/api/orgs/nope` needs a `404` it can parse,
+/// and `200 text/html` is the shape that makes a client retry forever against a
+/// route that will never exist.
+///
+/// **`web/worker/index.ts` keeps the matching list for the Cloudflare
+/// deployment** (`ORIGIN_PREFIXES` plus `NEVER_PROXIED`) and must not drift from
+/// this one. `/healthz` and `/readyz` are not here because they are real routes
+/// mounted ahead of the fallback.
+const API_PREFIXES: [&str; 5] = ["/api", "/oauth", "/sso", "/.well-known", "/internal"];
+
+fn is_api_path(path: &str) -> bool {
+    API_PREFIXES
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+/// The console bundle, or a JSON `404` for anything API-shaped.
+///
+/// `ServeDir` falls back to `index.html` for any path it has no file for, which
+/// is what `adapter-static` produces and what client-side routing needs. That
+/// fallback is exactly why the API prefixes are checked first.
+fn console(
+    static_dir: &Path,
+) -> impl tower::Service<Request<Body>, Response = Response, Error = Infallible, Future = impl Send>
+       + Clone
+       + Send
+       + 'static {
+    let assets = ServeDir::new(static_dir)
+        .append_index_html_on_directories(true)
+        .fallback(ServeFile::new(static_dir.join("index.html")));
+
+    tower::service_fn(move |req: Request<Body>| {
+        let assets = assets.clone();
+        async move {
+            if is_api_path(req.uri().path()) {
+                return Ok(not_found(req.uri().path()));
+            }
+            Ok(assets
+                .oneshot(req)
+                .await
+                .map(|res| res.map(Body::new))
+                .into_response())
+        }
+    })
+}
+
+fn not_found(path: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "error": "not_found",
+            "error_description":
+                format!("no route serves {path}. See /api/openapi.json for the API."),
+        })),
+    )
+        .into_response()
 }
 
 /// `otto-web`'s state, with the settings that are this deployment's to decide.
@@ -103,6 +183,9 @@ fn web_config(config: &Config) -> otto_web::Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
 
     #[test]
     fn every_deployment_setting_reaches_otto_web() {
@@ -152,6 +235,76 @@ mod tests {
             format!("{err:#}").contains("OTTO_ENCRYPTION_KEY"),
             "{err:#}"
         );
+    }
+
+    fn bundle() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("otto-console-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("_app")).expect("mkdir");
+        std::fs::write(dir.join("index.html"), "<html>console</html>").expect("index");
+        std::fs::write(dir.join("_app/app.js"), "console.log(1)").expect("asset");
+        dir
+    }
+
+    async fn status_and_body(app: Router, path: &str) -> (StatusCode, String) {
+        let res = app
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn lazy_db() -> Db {
+        Db::from_pool(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://localhost/does-not-exist")
+                .expect("lazy pool"),
+        )
+    }
+
+    /// With `OTTO_STATIC_DIR` the server also serves the console: real files
+    /// as themselves, any other page route as the SPA shell, and anything
+    /// API-shaped as a JSON `404` rather than HTML with a `200`.
+    #[tokio::test]
+    async fn the_console_is_served_only_when_a_bundle_is_configured() {
+        let mut config = Config::for_test();
+        config.static_dir = Some(bundle());
+        let make = || app(lazy_db(), &config).expect("app assembles");
+
+        let (status, body) = status_and_body(make(), "/o/acme/members").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("console"), "{body}");
+
+        let (status, body) = status_and_body(make(), "/_app/app.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "console.log(1)");
+
+        // `/apiary` is a legal org slug: a page, not an API path.
+        let (status, body) = status_and_body(make(), "/apiary").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("console"), "{body}");
+
+        for path in [
+            "/api/no/such/thing",
+            "/oauth/nope",
+            "/sso/nope",
+            "/.well-known/nope",
+            "/internal/nope",
+        ] {
+            let (status, body) = status_and_body(make(), path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            assert!(body.contains("\"not_found\""), "{path}: {body}");
+        }
+
+        // No bundle configured: the hosted shape. Nothing answers for pages,
+        // and the refusal is still JSON.
+        let api_only = app(lazy_db(), &Config::for_test()).expect("app assembles");
+        let (status, body) = status_and_body(api_only, "/o/acme/members").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("\"not_found\""), "{body}");
     }
 
     /// The whole application assembles — health and web together — which is

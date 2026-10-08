@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <style>
+    .bg { fill: #0f172a; }
+    .mark { fill: #f8fafc; }
+    @media (prefers-color-scheme: light) {
+      .bg { fill: #eaf6ff; }
+      .mark { fill: #0f172a; }
+    }
+  </style>
+  <rect class="bg" width="32" height="32" rx="7"/>
+  <rect class="mark" x="7" y="19" width="18" height="7" rx="0.5"/>
+  <rect class="mark" x="10.5" y="11" width="3.4" height="8" rx="0.5"/>
+  <rect class="mark" x="14.3" y="7.5" width="3.6" height="11.5" rx="0.5"/>
+  <rect class="mark" x="18.2" y="11" width="3.4" height="8" rx="0.5"/>
+  <circle class="mark" cx="16.1" cy="5" r="2"/>
+</svg>

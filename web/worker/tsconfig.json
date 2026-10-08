@@ -1,0 +1,20 @@
+{
+  // The Worker is type-checked on its own, against the Workers runtime rather
+  // than the browser. Folding `@cloudflare/workers-types` into the SPA's
+  // tsconfig would redefine `fetch`, `Request` and `Response` for every Svelte
+  // component in the console — the two runtimes disagree about those types, and
+  // the one the components need is the DOM's.
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "lib": ["es2022"],
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true
+  },
+  "include": ["index.ts", "index.test.ts"]
+}
