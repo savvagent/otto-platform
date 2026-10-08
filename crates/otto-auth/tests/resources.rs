@@ -139,6 +139,123 @@ async fn register_refuses_defaults_outside_the_scope_list(pool: PgPool) {
     assert!(matches!(err, AuthError::InvalidRequest(_)), "{err:?}");
 }
 
+// ---- scope descriptions ----
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn scope_descriptions_are_stored_and_replaced_wholesale(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register_both(&db).await;
+    assert!(resources::get(&db, FACTORY)
+        .await
+        .unwrap()
+        .unwrap()
+        .scope_descriptions
+        .is_empty());
+
+    let rs = resources::set_scope_descriptions(
+        &db,
+        FACTORY,
+        &[("jobs:read", "  View jobs "), ("jobs:write", "Change jobs")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rs.scope_description("jobs:read"), Some("View jobs"));
+
+    let stored = resources::get(&db, FACTORY).await.unwrap().unwrap();
+    assert_eq!(stored.scope_description("jobs:write"), Some("Change jobs"));
+    // Another resource server is untouched.
+    let other = resources::get(&db, FLAGS).await.unwrap().unwrap();
+    assert!(other.scope_descriptions.is_empty());
+
+    // Replace, not merge; an empty set clears.
+    let rs = resources::set_scope_descriptions(&db, FACTORY, &[("jobs:read", "Look")])
+        .await
+        .unwrap();
+    assert_eq!(rs.scope_description("jobs:write"), None);
+    let rs = resources::set_scope_descriptions(&db, FACTORY, &[])
+        .await
+        .unwrap();
+    assert!(rs.scope_descriptions.is_empty());
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn scope_descriptions_are_validated(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register_both(&db).await;
+
+    let long = "x".repeat(resources::MAX_SCOPE_DESCRIPTION_CHARS + 1);
+    for bad in [
+        vec![("flags:read", "a scope of another resource server")],
+        vec![("jobs:read", "")],
+        vec![("jobs:read", long.as_str())],
+        vec![("jobs:read", "multi\nline")],
+    ] {
+        let err = resources::set_scope_descriptions(&db, FACTORY, &bad)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidRequest(_)),
+            "{bad:?}: {err:?}"
+        );
+    }
+    let err = resources::set_scope_descriptions(&db, "https://nope.example/mcp", &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidTarget(_)), "{err:?}");
+}
+
+/// A service re-registers at every startup; that must not erase what an
+/// operator wrote, but a description must not outlive its scope.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn re_registering_keeps_descriptions_of_surviving_scopes_only(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register_both(&db).await;
+    resources::set_scope_descriptions(
+        &db,
+        FACTORY,
+        &[("jobs:read", "View jobs"), ("jobs:write", "Change jobs")],
+    )
+    .await
+    .unwrap();
+
+    let rs = resources::register(
+        &db,
+        ResourceServerSpec {
+            resource_uri: FACTORY,
+            name: "otto-factory",
+            scopes: &["jobs:read", "jobs:admin"],
+            default_scopes: &["jobs:read"],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(rs.scope_description("jobs:read"), Some("View jobs"));
+    assert_eq!(rs.scope_description("jobs:write"), None);
+    assert_eq!(rs.scope_descriptions.len(), 1);
+}
+
+/// The database refuses an orphan description even if the Rust check is
+/// bypassed.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_database_refuses_a_description_for_an_unknown_scope(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register_both(&db).await;
+    let r = sqlx::query(
+        "UPDATE resource_servers SET scope_descriptions = '{\"ghost\": \"x\"}' WHERE resource_uri = $1",
+    )
+    .bind(FACTORY)
+    .execute(db.pool())
+    .await;
+    assert!(r.is_err());
+    let r = sqlx::query(
+        "UPDATE resource_servers SET scope_descriptions = '[]' WHERE resource_uri = $1",
+    )
+    .bind(FACTORY)
+    .execute(db.pool())
+    .await;
+    assert!(r.is_err());
+}
+
 // ---- authorize ----
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]

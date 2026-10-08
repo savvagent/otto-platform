@@ -4,13 +4,23 @@
 //!
 //! ```text
 //! otto-platform-server resource register <resource-uri> --name <name> \
-//!     --scopes a,b,c [--default-scopes a]
+//!     --scopes a,b,c [--default-scopes a] [--scope-description a=text]...
+//! otto-platform-server resource describe <resource-uri> \
+//!     [--scope-description a=text]... [--clear]
 //! otto-platform-server resource rotate-secret <resource-uri>
 //! otto-platform-server resource set-webhook <resource-uri> <url>
 //! otto-platform-server resource set-webhook <resource-uri> --clear
 //! otto-platform-server resource enable|disable <resource-uri>
 //! otto-platform-server resource list
 //! ```
+//!
+//! `--scope-description scope=text` (repeatable) sets the human-readable text
+//! the consent screen shows for a scope in place of its bare name. Text is
+//! everything after the first `=`, so scope names must not contain one. On
+//! `register` the flags, when given, replace the server's descriptions;
+//! without them re-registering keeps what is there. `describe` always
+//! replaces the whole set, so it is also how one is removed: repeat the
+//! descriptions you want to keep, or pass `--clear` for none.
 //!
 //! Secrets are printed once, on stdout, and cannot be read back: the
 //! introspection secret is stored hashed, the webhook secret sealed. Losing
@@ -29,6 +39,9 @@ usage: otto-platform-server resource <command>
 
 commands:
   register <resource-uri> --name <name> --scopes a,b [--default-scopes a]
+           [--scope-description a=text]...
+  describe <resource-uri> [--scope-description a=text]... [--clear]
+                                      replace the scope descriptions shown on the consent screen
   rotate-secret <resource-uri>        issue a new introspection credential
   set-webhook <resource-uri> <url>    set the lifecycle webhook, issue a new signing secret
   set-webhook <resource-uri> --clear  remove the webhook
@@ -44,6 +57,13 @@ pub enum Command {
         name: String,
         scopes: Vec<String>,
         default_scopes: Vec<String>,
+        /// `(scope, text)`; empty leaves existing descriptions alone.
+        scope_descriptions: Vec<(String, String)>,
+    },
+    /// Replace all scope descriptions; empty clears them.
+    Describe {
+        resource_uri: String,
+        scope_descriptions: Vec<(String, String)>,
     },
     RotateSecret {
         resource_uri: String,
@@ -68,7 +88,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut it = rest.iter().map(String::as_str);
     while let Some(a) = it.next() {
         match a {
-            "--name" | "--scopes" | "--default-scopes" => {
+            "--name" | "--scopes" | "--default-scopes" | "--scope-description" => {
                 let v = it.next().ok_or_else(|| format!("{a} needs a value"))?;
                 flags.push((a, Some(v)));
             }
@@ -83,6 +103,21 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
+            .collect()
+    };
+    let descriptions = || -> Result<Vec<(String, String)>, String> {
+        flags
+            .iter()
+            .filter(|(f, _)| *f == "--scope-description")
+            .map(|(_, v)| {
+                let v = v.unwrap_or_default();
+                match v.split_once('=') {
+                    Some((scope, text)) if !scope.trim().is_empty() => {
+                        Ok((scope.trim().to_owned(), text.to_owned()))
+                    }
+                    _ => Err(format!("--scope-description expects scope=text, got {v:?}")),
+                }
+            })
             .collect()
     };
     let one_uri = |positional: &[&str]| match positional {
@@ -102,7 +137,22 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 .flatten()
                 .map(list)
                 .unwrap_or_default(),
+            scope_descriptions: descriptions()?,
         }),
+        "describe" => {
+            let scope_descriptions = descriptions()?;
+            let clear = flag("--clear").is_some();
+            if clear != scope_descriptions.is_empty() {
+                return Err(
+                    "describe needs --scope-description scope=text (one or more), or --clear"
+                        .into(),
+                );
+            }
+            Ok(Command::Describe {
+                resource_uri: one_uri(&positional)?,
+                scope_descriptions,
+            })
+        }
         "rotate-secret" => Ok(Command::RotateSecret {
             resource_uri: one_uri(&positional)?,
         }),
@@ -139,6 +189,7 @@ pub async fn execute(
             name,
             scopes,
             default_scopes,
+            scope_descriptions,
         } => {
             let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
             let defaults: Vec<&str> = default_scopes.iter().map(String::as_str).collect();
@@ -153,9 +204,28 @@ pub async fn execute(
             )
             .await?;
             writeln!(out, "registered {} ({})", rs.resource_uri, rs.name)?;
+            if !scope_descriptions.is_empty() {
+                let rs = describe(db, &resource_uri, &scope_descriptions).await?;
+                writeln!(
+                    out,
+                    "{} scope description(s) set",
+                    rs.scope_descriptions.len()
+                )?;
+            }
             writeln!(
                 out,
                 "next: `resource rotate-secret` for its credential, `resource set-webhook` for lifecycle events"
+            )?;
+        }
+        Command::Describe {
+            resource_uri,
+            scope_descriptions,
+        } => {
+            let rs = describe(db, &resource_uri, &scope_descriptions).await?;
+            writeln!(
+                out,
+                "{resource_uri} now has {} scope description(s)",
+                rs.scope_descriptions.len()
             )?;
         }
         Command::RotateSecret { resource_uri } => {
@@ -211,6 +281,18 @@ pub async fn execute(
     Ok(())
 }
 
+async fn describe(
+    db: &Db,
+    resource_uri: &str,
+    descriptions: &[(String, String)],
+) -> anyhow::Result<resources::ResourceServer> {
+    let pairs: Vec<(&str, &str)> = descriptions
+        .iter()
+        .map(|(s, t)| (s.as_str(), t.as_str()))
+        .collect();
+    Ok(resources::set_scope_descriptions(db, resource_uri, &pairs).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +313,20 @@ mod tests {
                 name: "X".into(),
                 scopes: vec!["a".into(), "b".into()],
                 default_scopes: vec!["a".into()],
+                scope_descriptions: vec![],
+            }
+        );
+        assert_eq!(
+            parse(&args(
+                "register https://x.example/mcp --name X --scopes a --scope-description a=x=y"
+            ))
+            .unwrap(),
+            Command::Register {
+                resource_uri: "https://x.example/mcp".into(),
+                name: "X".into(),
+                scopes: vec!["a".into()],
+                default_scopes: vec![],
+                scope_descriptions: vec![("a".into(), "x=y".into())],
             }
         );
         assert!(parse(&args("register https://x.example/mcp --name X")).is_err());
@@ -256,6 +352,50 @@ mod tests {
             }
         );
         assert!(parse(&args("set-webhook https://x.example/mcp")).is_err());
+    }
+
+    #[test]
+    fn parses_describe() {
+        let got = parse(&[
+            "describe".into(),
+            "https://x.example/mcp".into(),
+            "--scope-description".into(),
+            "a=Read things".into(),
+            "--scope-description".into(),
+            "b=Write things".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            got,
+            Command::Describe {
+                resource_uri: "https://x.example/mcp".into(),
+                scope_descriptions: vec![
+                    ("a".into(), "Read things".into()),
+                    ("b".into(), "Write things".into())
+                ],
+            }
+        );
+        assert_eq!(
+            parse(&args("describe https://x.example/mcp --clear")).unwrap(),
+            Command::Describe {
+                resource_uri: "https://x.example/mcp".into(),
+                scope_descriptions: vec![],
+            }
+        );
+        // Nothing to do, and contradictory, are both mistakes.
+        assert!(parse(&args("describe https://x.example/mcp")).is_err());
+        assert!(parse(&args(
+            "describe https://x.example/mcp --clear --scope-description a=b"
+        ))
+        .is_err());
+        assert!(parse(&args(
+            "describe https://x.example/mcp --scope-description nope"
+        ))
+        .is_err());
+        assert!(parse(&args(
+            "describe https://x.example/mcp --scope-description =text"
+        ))
+        .is_err());
     }
 
     #[test]

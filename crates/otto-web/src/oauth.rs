@@ -860,6 +860,7 @@ h1{font-size:1.35rem;margin:0 0 1rem}\
 .host{font:600 1.05rem ui-monospace,monospace;background:#eef;padding:.3rem .5rem;border-radius:6px}\
 .name{color:#555}\
 ul{padding-left:1.2rem}li{margin:.25rem 0}\
+code.scope{color:#666;font-size:.8rem;margin-left:.25rem}\
 .note{color:#666;font-size:.875rem}\
 label{display:block;margin:1rem 0 .35rem;font-weight:600}\
 select{font:inherit;padding:.5rem;width:100%;border:1px solid #ccc;border-radius:8px}\
@@ -900,14 +901,21 @@ fn consent_html(
 
     let scope_items = scopes
         .iter()
-        // TODO(savvagent/otto-platform#20): a consent screen listing a bare
-        // scope name has not obtained informed consent from anybody. Scope
-        // descriptions belong to each resource server, so they need an
-        // optional per-scope description on its `resource_servers` row (a
-        // migration, which this change deliberately does not add), rendered
-        // here in place of the raw string. Until then every scope shows as
-        // its name, which is ugly on purpose.
-        .map(|s| format!("<li><code>{}</code></li>", escape(s)))
+        // A description is the main text and the raw scope name stays
+        // beside it as `<code>`: the name is what a client asked for and what
+        // an operator greps for, the description is what a user can actually
+        // consent to. A scope with no registered description is just its
+        // name. Descriptions are single-language (see
+        // `ResourceServer::scope_descriptions`); only the page chrome is
+        // localized. Both are operator-supplied text, never markup.
+        .map(|s| match resource.scope_description(s) {
+            Some(d) => format!(
+                "<li>{} <code class=scope>{}</code></li>",
+                escape(d),
+                escape(s)
+            ),
+            None => format!("<li><code>{}</code></li>", escape(s)),
+        })
         .collect::<String>();
 
     let org_options = orgs
@@ -1189,6 +1197,7 @@ mod tests {
                 name: "Things <Server>".into(),
                 scopes: vec!["things:read".into()],
                 default_scopes: vec!["things:read".into()],
+                scope_descriptions: Default::default(),
                 disabled: false,
                 webhook_url: None,
                 created_at: chrono::Utc::now(),

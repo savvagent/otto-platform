@@ -300,6 +300,52 @@ async fn an_agent_gets_a_token_it_can_use_against_its_resource_server(pool: PgPo
     assert_eq!(replayed.body["error"], "invalid_grant");
 }
 
+/// A registered scope description is the main text of its consent line with
+/// the raw name beside it; a scope without one is its bare name; and the
+/// description is operator-supplied text, never markup.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_consent_page_shows_scope_descriptions_and_falls_back_to_names(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    otto_auth::resources::set_scope_descriptions(
+        &h.db,
+        RESOURCE,
+        &[
+            ("things:read", "See your things"),
+            ("things:write", "Change <b>everything</b> & more"),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let page = Call::get(authorize_url(
+        &client_id,
+        &challenge,
+        "things:read things:write org:admin",
+        "s",
+    ))
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    page.expect(StatusCode::OK);
+
+    assert!(
+        page.text
+            .contains("<li>See your things <code class=scope>things:read</code></li>"),
+        "{}",
+        page.text
+    );
+    assert!(page.text.contains(
+        "<li>Change &lt;b&gt;everything&lt;/b&gt; &amp; more <code class=scope>things:write</code></li>"
+    ));
+    assert!(!page.text.contains("<b>everything</b>"));
+    // No description registered: just the name, as before.
+    assert!(page.text.contains("<li><code>org:admin</code></li>"));
+}
+
 /// A client that omits `scope` gets its resource server's default scopes. The consent page shows
 /// exactly that list before the human decides — the token issued on "allow"
 /// must carry the same scopes, not the empty list a naive read of the
