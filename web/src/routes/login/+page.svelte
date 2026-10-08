@@ -4,6 +4,7 @@
 
   import { api, ApiError } from '$lib/api';
   import { messageFor } from '$lib/errors';
+  import { isServerRoute, safeNext } from '$lib/next';
   import { m } from '$lib/paraglide/messages';
   import { session } from '$lib/session.svelte';
   import * as webauthn from '$lib/webauthn';
@@ -86,7 +87,11 @@
       // before this account had an address is filed in the vault under words
       // nobody chose, and no re-registration would replace them.
       if (session.me) await webauthn.signalAccount(session.me);
-      await goto(next ?? '/', { replaceState: true });
+      // Same rule as the layout guard: `next` is attacker-supplied, and a
+      // server route such as `/oauth/authorize` needs a real navigation.
+      const dest = safeNext(next);
+      if (dest && isServerRoute(dest)) location.assign(dest);
+      else await goto(dest ?? '/', { replaceState: true });
     } catch (e) {
       // The message is set first. `signalUnknownCredential` cannot throw today,
       // but if it ever could, awaiting it before this line would leave someone
@@ -189,7 +194,11 @@
     </p>
     <p class="pt-2">
       {m.login_no_account()}
-      <a class="text-muted underline hover:text-ink" href="/signup">{m.login_create_account()}</a>
+      <a
+        class="text-muted underline hover:text-ink"
+        href={next ? `/signup?next=${encodeURIComponent(next)}` : '/signup'}
+        >{m.login_create_account()}</a
+      >
     </p>
   </div>
 </div>

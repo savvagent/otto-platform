@@ -1,14 +1,18 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { page } from '$app/state';
 
   import { api } from '$lib/api';
   import { messageFor } from '$lib/errors';
+  import { isServerRoute, safeNext } from '$lib/next';
   import { m } from '$lib/paraglide/messages';
   import { session } from '$lib/session.svelte';
   import * as webauthn from '$lib/webauthn';
   import Alert from '$lib/components/Alert.svelte';
   import Button from '$lib/components/Button.svelte';
   import Field from '$lib/components/Field.svelte';
+
+  const next = $derived(page.url.searchParams.get('next'));
 
   /**
    * Create an account.
@@ -72,7 +76,11 @@
       // the key was created under, and only a signal can replace it —
       // registering again would not, since the name is baked in at creation.
       if (session.me) await webauthn.signalAccount(session.me);
-      await goto('/', { replaceState: true });
+      // Carry `next` through, so an account created mid-OAuth-flow lands back
+      // on `/oauth/authorize` rather than on the console home.
+      const dest = safeNext(next);
+      if (dest && isServerRoute(dest)) location.assign(dest);
+      else await goto(dest ?? '/', { replaceState: true });
     } catch (e) {
       error = messageFor(e, m.error_could_not_save());
     } finally {
@@ -120,7 +128,11 @@
 
     <p class="mt-6 text-xs text-faint">
       {m.signup_have_account()}
-      <a class="text-muted underline hover:text-ink" href="/login">{m.signup_sign_in_link()}</a>
+      <a
+        class="text-muted underline hover:text-ink"
+        href={next ? `/login?next=${encodeURIComponent(next)}` : '/login'}
+        >{m.signup_sign_in_link()}</a
+      >
     </p>
   {:else}
     <h1 class="text-lg font-semibold">{m.signup_ready_heading()}</h1>
