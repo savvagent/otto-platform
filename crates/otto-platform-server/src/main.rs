@@ -6,8 +6,8 @@
 //! server, and the resource-server API (see `lib.rs`). The console is the rest
 //! of Phase 4 of `docs/plans/2026-10-06-platform-cutover.md`.
 //!
-//! `otto-platform-server resource ...` is an operator command instead: it
-//! provisions resource servers and exits.
+//! `otto-platform-server resource ...` and `client ...` are operator commands
+//! instead: they provision resource servers and OAuth clients and exit.
 
 use std::net::SocketAddr;
 
@@ -32,8 +32,13 @@ async fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("resource") {
         return run_resource_command(&args[1..]).await;
     }
+    if args.first().map(String::as_str) == Some("client") {
+        return run_client_command(&args[1..]).await;
+    }
     if !args.is_empty() {
-        anyhow::bail!("unknown arguments {args:?}; run with none to serve, or `resource ...`");
+        anyhow::bail!(
+            "unknown arguments {args:?}; run with none to serve, or `resource ...` / `client ...`"
+        );
     }
 
     let config = Config::from_env().context(
@@ -133,6 +138,18 @@ async fn run_resource_command(args: &[String]) -> Result<()> {
         _ => None,
     };
     resource_cmd::execute(&db, cipher.as_ref(), cmd, &mut std::io::stdout()).await
+}
+
+async fn run_client_command(args: &[String]) -> Result<()> {
+    use otto_platform_server::client_cmd;
+
+    let cmd =
+        client_cmd::parse(args).map_err(|e| anyhow::anyhow!("{e}\n\n{}", client_cmd::USAGE))?;
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+    let db = Db::connect(&database_url)
+        .await
+        .context("could not connect to DATABASE_URL")?;
+    client_cmd::execute(&db, cmd, &mut std::io::stdout()).await
 }
 
 /// Resolves on SIGINT or SIGTERM.

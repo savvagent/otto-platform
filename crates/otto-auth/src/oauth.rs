@@ -208,6 +208,37 @@ pub struct RegistrationResponse {
 ///    lives on the consent screen, which **must display the redirect host**
 ///    rather than the self-asserted name. See [`ConsentDisplay`].
 pub async fn register_client(db: &Db, req: RegistrationRequest) -> Result<RegistrationResponse> {
+    // `first_party` is a parameter of the private insert, not a field of
+    // `RegistrationRequest`, so nothing a remote caller can send reaches it.
+    insert_client(db, req, Registration::Dynamic).await
+}
+
+/// Register a client on the operator's behalf (`otto-platform-server client
+/// register`). Same validation as [`register_client`]; the difference is that
+/// the operator may mark the client first-party, which skips the consent
+/// screen once the org is known. See [`Client::first_party`].
+///
+/// Never wired to an HTTP route. The only way to a first-party client is shell
+/// access to the deployment.
+pub async fn register_operator_client(
+    db: &Db,
+    req: RegistrationRequest,
+    first_party: bool,
+) -> Result<RegistrationResponse> {
+    insert_client(db, req, Registration::Operator { first_party }).await
+}
+
+#[derive(Clone, Copy)]
+enum Registration {
+    Dynamic,
+    Operator { first_party: bool },
+}
+
+async fn insert_client(
+    db: &Db,
+    req: RegistrationRequest,
+    how: Registration,
+) -> Result<RegistrationResponse> {
     if req.redirect_uris.is_empty() {
         return Err(AuthError::InvalidRequest(
             "at least one redirect_uri is required".into(),
@@ -240,14 +271,16 @@ pub async fn register_client(db: &Db, req: RegistrationRequest) -> Result<Regist
 
     sqlx::query(
         "INSERT INTO oauth_clients \
-           (client_id, client_name, redirect_uris, grant_types, software_id, registered_via_dcr) \
-         VALUES ($1,$2,$3,$4,$5,true)",
+           (client_id, client_name, redirect_uris, grant_types, software_id, registered_via_dcr, first_party) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7)",
     )
     .bind(&client_id)
     .bind(req.client_name.as_deref())
     .bind(serde_json::to_value(&req.redirect_uris).unwrap_or_default())
     .bind(serde_json::to_value(&grant_types).unwrap_or_default())
     .bind(req.software_id.as_deref())
+    .bind(matches!(how, Registration::Dynamic))
+    .bind(matches!(how, Registration::Operator { first_party: true }))
     .execute(db.pool())
     .await?;
 
@@ -269,6 +302,10 @@ pub struct Client {
     pub client_name: Option<String>,
     pub redirect_uris: Vec<String>,
     pub disabled: bool,
+    /// Registered by the operator for a service they run themselves. The
+    /// authorization server skips the consent screen for these when the org is
+    /// already determined. Not settable through dynamic registration.
+    pub first_party: bool,
 }
 
 /// A row from `oauth_clients`. `redirect_uris` is jsonb in the database and a
@@ -279,11 +316,12 @@ struct ClientRow {
     client_name: Option<String>,
     redirect_uris: serde_json::Value,
     disabled_at: Option<chrono::DateTime<Utc>>,
+    first_party: bool,
 }
 
 pub async fn get_client(db: &Db, client_id: &str) -> Result<Client> {
     let row: Option<ClientRow> = sqlx::query_as(
-        "SELECT client_id, client_name, redirect_uris, disabled_at \
+        "SELECT client_id, client_name, redirect_uris, disabled_at, first_party \
          FROM oauth_clients WHERE client_id = $1",
     )
     .bind(client_id)
@@ -299,6 +337,7 @@ pub async fn get_client(db: &Db, client_id: &str) -> Result<Client> {
         // no redirect URI matches, so no code is ever issued.
         redirect_uris: serde_json::from_value(row.redirect_uris).unwrap_or_default(),
         disabled: row.disabled_at.is_some(),
+        first_party: row.first_party,
     })
 }
 

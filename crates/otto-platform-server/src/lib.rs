@@ -19,7 +19,8 @@
 //! cookie, and are outside `otto-web`'s CSRF guard, which only wraps its own
 //! router. Lifecycle webhooks are delivered by [`webhooks::run`], a background
 //! task the binary starts; `otto-platform-server resource ...` provisions
-//! resource servers ([`resource_cmd`]). The console bundle is a separate piece
+//! resource servers ([`resource_cmd`]) and `otto-platform-server client ...`
+//! registers first-party OAuth clients ([`client_cmd`]). The console bundle is a separate piece
 //! of Phase 4 of `docs/plans/2026-10-06-platform-cutover.md`.
 //!
 //! Assembly is a library function rather than something buried in `main` so a
@@ -28,6 +29,7 @@
 //! deployment reaches it first.
 
 pub mod api;
+pub mod client_cmd;
 pub mod config;
 pub mod health;
 pub mod internal;

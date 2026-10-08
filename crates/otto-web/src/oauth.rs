@@ -988,6 +988,7 @@ mod tests {
             client_name: Some("<b>Claude Code</b>".into()),
             redirect_uris: vec!["http://127.0.0.1:1455/callback".into()],
             disabled: false,
+            first_party: false,
         };
         let params = AuthorizeParams {
             response_type: "code".into(),
