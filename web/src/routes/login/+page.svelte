@@ -57,7 +57,7 @@
     ssoPending = true;
     ssoError = undefined;
     try {
-      const started = await api.ssoStart(ssoEmail.trim());
+      const started = await api.ssoStart(ssoEmail.trim(), safeNext(next));
       window.location.assign(started.redirectUrl);
     } catch (e) {
       ssoError = messageFor(e, m.error_could_not_sign_in());

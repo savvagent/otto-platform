@@ -173,7 +173,13 @@ export const api = {
    * provider purely from the email's domain — no account is looked up, so it
    * works from a signed-out browser.
    */
-  ssoStart: (email: string) => post<SsoStartResponse>('/api/auth/sso/start', { email }),
+  /**
+   * `next` is stored with the ceremony and followed by the callback, so an SSO
+   * sign-in started from `/login?next=/oauth/authorize?…` returns to the
+   * authorization request. The server re-validates it.
+   */
+  ssoStart: (email: string, next?: string) =>
+    post<SsoStartResponse>('/api/auth/sso/start', next ? { email, next } : { email }),
 
   /**
    * The rp_id every passkey on this deployment is bound to.
