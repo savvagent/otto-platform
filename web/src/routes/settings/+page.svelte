@@ -252,6 +252,12 @@
     {/if}
   </Card>
 
+  <Card title={m.settings_activity_title()} description={m.settings_activity_description()}>
+    <a class="text-sm text-muted underline hover:text-ink" href="/settings/activity"
+      >{m.settings_activity_link()}</a
+    >
+  </Card>
+
   <Card title={m.settings_sso_title()} description={m.settings_sso_description()}>
     {#if ssoError}<div class="mb-3"><Alert>{ssoError}</Alert></div>{/if}
     <Button pending={ssoBusy} onclick={linkSso}>{m.settings_sso_link_button()}</Button>

@@ -1,0 +1,42 @@
+-- Control-plane reads of global audit rows.
+--
+-- 0005 gave `audit_events` exactly one SELECT policy, the tenant one
+-- (`org_id = current_org()`), and described global (`org_id IS NULL`) rows as
+-- "reachable only from the unpinned control plane". That was true only where
+-- the control plane's connecting role is exempt from RLS — a superuser or
+-- BYPASSRLS, as in local development and `#[sqlx::test]`. On managed Postgres,
+-- where the application connects as the schema owner and `FORCE ROW LEVEL
+-- SECURITY` subjects that owner to every policy, no policy admitted a NULL-org
+-- row at all: `NULL = current_org()` is never true, pinned or not. Global rows
+-- were writable (0005's append policy allows the unpinned case) but unreadable
+-- by anyone but an operator holding an exempt role.
+--
+-- They now have a reader — `Db::audit_trail_for_user`, behind
+-- `GET /api/me/audit`, which shows an account the sign-ins and passkey changes
+-- it is the actor of — and that reader runs unpinned, on the pool. This policy
+-- is what lets it work on every deployment shape rather than only the exempt
+-- ones.
+--
+-- The shape mirrors `audit_events_retention` (0005): reachable only when
+-- `current_org()` is NULL, i.e. from the unpinned control plane.
+--
+--   * A pinned tenant transaction always has `app.org_id` set, so this policy
+--     is false for it and it still sees only its own org's rows, through the
+--     tenant policy alone. Permissive policies are OR'd together, and this
+--     one contributes nothing once an org is pinned.
+--   * Unpinned, it admits NULL-org rows only — never another org's rows. The
+--     tenant policy is false for every row there too (`current_org()` is
+--     NULL), so an unpinned read still cannot see org-scoped data.
+--
+-- Which global rows a *user* may see is not this policy's decision: the
+-- control plane reads them all, and `Db::audit_trail_for_user` confines its
+-- result to the caller's own rows in its WHERE clause. A policy cannot do that
+-- job, because the control plane has no per-request identity in the session.
+--
+-- Deliberately not named `<table>_tenant_isolation`: that suffix is how
+-- `Db::verify_tenant_isolation` discovers tenant tables (0004), and this is
+-- not a tenant-isolation policy. `audit_events` is already discovered through
+-- `audit_events_tenant_isolation`; a second, differently named policy does not
+-- change that.
+CREATE POLICY audit_events_control_plane_read ON audit_events
+  FOR SELECT USING (current_org() IS NULL AND org_id IS NULL);

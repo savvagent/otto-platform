@@ -331,5 +331,17 @@
   "overview_services_description": "Otras consolas de Otto que inician sesión con esta cuenta.",
   "overview_services_empty_title": "Ningún servicio enlazado",
   "overview_services_empty_hint": "Los servicios aparecen aquí cuando la consola se configura con sus direcciones.",
-  "meter_unbilled_note": "Algunas llamadas, como las esperas largas a un servicio conectado, se registran pero no se facturan, por eso las dos cifras difieren."
+  "meter_unbilled_note": "Algunas llamadas, como las esperas largas a un servicio conectado, se registran pero no se facturan, por eso las dos cifras difieren.",
+  "settings_activity_title": "Actividad de seguridad",
+  "settings_activity_description": "Inicios de sesión y cambios de llaves de acceso en esta cuenta.",
+  "settings_activity_link": "Ver actividad de seguridad",
+  "activity_page_title": "Actividad de seguridad · Otto",
+  "activity_title": "Actividad de seguridad",
+  "activity_subtitle": "Inicios y cierres de sesión y cambios de llaves de acceso en tu cuenta. Solo tú puedes verlo.",
+  "activity_back": "Volver a ajustes",
+  "activity_loading": "Leyendo tu actividad de seguridad",
+  "activity_empty": "Todavía no hay nada registrado.",
+  "activity_error_load": "No se pudo leer tu actividad de seguridad.",
+  "activity_col_address": "Dirección IP",
+  "activity_scope_note": "Los inicios de sesión fallidos que nunca identificaron tu cuenta no aparecen: no se pueden atribuir a nadie. Lo que haces dentro de una organización está en el registro de auditoría de esa organización, que leen sus administradores."
 }
