@@ -39,9 +39,20 @@ async fn register(h: &Harness, name: &str, redirect: &str) -> String {
 }
 
 fn authorize_url(client_id: &str, challenge: &str, scope: &str, state: &str) -> String {
+    authorize_url_to(REDIRECT, client_id, challenge, scope, state)
+}
+
+fn authorize_url_to(
+    redirect: &str,
+    client_id: &str,
+    challenge: &str,
+    scope: &str,
+    state: &str,
+) -> String {
+    let redirect = redirect.replace(':', "%3A").replace('/', "%2F");
     format!(
         "/oauth/authorize?response_type=code&client_id={client_id}\
-         &redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fcallback\
+         &redirect_uri={redirect}\
          &code_challenge={challenge}&code_challenge_method=S256\
          &scope={}&state={state}",
         scope.replace(':', "%3A").replace(' ', "%20")
@@ -1267,13 +1278,21 @@ async fn agent_endpoints_without_a_cookie_are_not_guarded(pool: PgPool) {
 
 // ------------------------------------------------ first-party clients
 
+/// A first-party client's callback: https, because loopback is never allowed
+/// to skip consent (RFC 8252 section 8.6).
+const FP_REDIRECT: &str = "https://console.test/auth/callback";
+
+fn fp_url(client_id: &str, challenge: &str, scope: &str, state: &str) -> String {
+    authorize_url_to(FP_REDIRECT, client_id, challenge, scope, state)
+}
+
 /// A client the operator registered as first-party, the only way to get one.
 async fn register_first_party(h: &Harness) -> String {
     otto_auth::oauth::register_operator_client(
         &h.db,
         otto_auth::oauth::RegistrationRequest {
             client_name: Some("Console".into()),
-            redirect_uris: vec![REDIRECT.into()],
+            redirect_uris: vec![FP_REDIRECT.into()],
             software_id: None,
             grant_types: None,
         },
@@ -1288,18 +1307,28 @@ async fn register_first_party(h: &Harness) -> String {
 fn hinted_url(client_id: &str, challenge: &str, scope: &str, hint: &str) -> String {
     format!(
         "{}&org_hint={hint}",
-        authorize_url(client_id, challenge, scope, "opaque-state")
+        fp_url(client_id, challenge, scope, "opaque-state")
     )
 }
 
 async fn redeem(h: &Harness, client_id: &str, callback: &str, verifier: &str) -> common::Reply {
+    redeem_at(h, client_id, callback, verifier, FP_REDIRECT).await
+}
+
+async fn redeem_at(
+    h: &Harness,
+    client_id: &str,
+    callback: &str,
+    verifier: &str,
+    redirect: &str,
+) -> common::Reply {
     let code = query_param(callback, "code").expect("no code in the callback");
     Call::post("/oauth/token")
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", &code),
             ("client_id", client_id),
-            ("redirect_uri", REDIRECT),
+            ("redirect_uri", redirect),
             ("code_verifier", verifier),
             ("resource", RESOURCE),
         ])
@@ -1340,7 +1369,7 @@ async fn a_first_party_client_with_one_org_skips_consent(pool: PgPool) {
     let client_id = register_first_party(&h).await;
     let (verifier, challenge) = pkce();
 
-    let reply = Call::get(authorize_url(
+    let reply = Call::get(fp_url(
         &client_id,
         &challenge,
         "things:read things:write",
@@ -1352,7 +1381,7 @@ async fn a_first_party_client_with_one_org_skips_consent(pool: PgPool) {
     reply.expect(StatusCode::SEE_OTHER);
 
     let callback = location(&reply);
-    assert!(callback.starts_with(REDIRECT), "{callback}");
+    assert!(callback.starts_with(FP_REDIRECT), "{callback}");
     assert_eq!(
         query_param(&callback, "state").as_deref(),
         Some("opaque-state")
@@ -1364,7 +1393,7 @@ async fn a_first_party_client_with_one_org_skips_consent(pool: PgPool) {
         .await
         .expect(StatusCode::BAD_REQUEST);
 
-    let reply = Call::get(authorize_url(
+    let reply = Call::get(fp_url(
         &client_id,
         &challenge,
         "things:read things:write",
@@ -1398,8 +1427,7 @@ async fn skipping_consent_does_not_skip_validation(pool: PgPool) {
     let (_, challenge) = pkce();
 
     let evil = Call::get(
-        authorize_url(&client_id, &challenge, "things:read", "s")
-            .replace("127.0.0.1%3A1455", "evil.test"),
+        fp_url(&client_id, &challenge, "things:read", "s").replace("console.test", "evil.test"),
     )
     .with_session(&rob.session)
     .send(&h.router)
@@ -1408,7 +1436,7 @@ async fn skipping_consent_does_not_skip_validation(pool: PgPool) {
     assert!(!evil.headers.contains_key(http::header::LOCATION));
 
     let no_pkce = Call::get(
-        authorize_url(&client_id, &challenge, "things:read", "s")
+        fp_url(&client_id, &challenge, "things:read", "s")
             .replace("code_challenge_method=S256", "code_challenge_method=plain"),
     )
     .with_session(&rob.session)
@@ -1416,7 +1444,7 @@ async fn skipping_consent_does_not_skip_validation(pool: PgPool) {
     .await;
     no_pkce.expect(StatusCode::BAD_REQUEST);
 
-    let bad_scope = Call::get(authorize_url(&client_id, &challenge, "nope:nope", "s"))
+    let bad_scope = Call::get(fp_url(&client_id, &challenge, "nope:nope", "s"))
         .with_session(&rob.session)
         .send(&h.router)
         .await;
@@ -1433,7 +1461,7 @@ async fn a_valid_org_hint_picks_the_org_for_a_first_party_client(pool: PgPool) {
     let (verifier, challenge) = pkce();
 
     // Two orgs and no hint: there is a choice, so the screen appears.
-    let page = Call::get(authorize_url(&client_id, &challenge, "things:read", "s"))
+    let page = Call::get(fp_url(&client_id, &challenge, "things:read", "s"))
         .with_session(&rob.session)
         .send(&h.router)
         .await;
@@ -1533,10 +1561,8 @@ async fn a_client_that_is_not_first_party_always_gets_the_consent_screen(pool: P
     let client_id = register(&h, "Test Agent", REDIRECT).await;
     let (_, challenge) = pkce();
 
-    for url in [
-        authorize_url(&client_id, &challenge, "things:read", "s"),
-        hinted_url(&client_id, &challenge, "things:read", "acme"),
-    ] {
+    let base = authorize_url(&client_id, &challenge, "things:read", "s");
+    for url in [base.clone(), format!("{base}&org_hint=acme")] {
         let page = Call::get(url)
             .with_session(&rob.session)
             .send(&h.router)
@@ -1547,7 +1573,7 @@ async fn a_client_that_is_not_first_party_always_gets_the_consent_screen(pool: P
     }
 
     let globex = org_with_owner(&h, "globex", &rob).await;
-    let page = Call::get(hinted_url(&client_id, &challenge, "things:read", "globex"))
+    let page = Call::get(format!("{base}&org_hint=globex"))
         .with_session(&rob.session)
         .send(&h.router)
         .await;
@@ -1578,7 +1604,7 @@ async fn a_member_requesting_org_admin_gets_a_downscoped_token(pool: PgPool) {
     // First-party skip.
     let first_party = register_first_party(&h).await;
     for (who, expected) in [(&bob, "things:read"), (&rob, "things:read org:admin")] {
-        let reply = Call::get(authorize_url(&first_party, &challenge, scope, "s"))
+        let reply = Call::get(fp_url(&first_party, &challenge, scope, "s"))
             .with_session(&who.session)
             .send(&h.router)
             .await;
@@ -1617,12 +1643,12 @@ async fn a_member_requesting_org_admin_gets_a_downscoped_token(pool: PgPool) {
         .send(&h.router)
         .await;
     granted.expect(StatusCode::SEE_OTHER);
-    let tokens = redeem(&h, &client_id, &location(&granted), &verifier).await;
+    let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
     tokens.expect(StatusCode::OK);
     assert_eq!(tokens.body["scope"], "things:read");
 
     // Nothing left after the drop: that is still an error, as a redirect.
-    let nothing = Call::get(authorize_url(&first_party, &challenge, "org:admin", "s"))
+    let nothing = Call::get(fp_url(&first_party, &challenge, "org:admin", "s"))
         .with_session(&bob.session)
         .send(&h.router)
         .await;
@@ -1633,4 +1659,28 @@ async fn a_member_requesting_org_admin_gets_a_downscoped_token(pool: PgPool) {
         Some("invalid_scope")
     );
     assert!(query_param(&callback, "code").is_none());
+}
+
+/// RFC 8252 section 8.6: even if a first-party client somehow has a loopback
+/// redirect (here, a hand-edited row), it gets the consent screen.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_first_party_client_on_a_loopback_redirect_still_gets_consent(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Dev Console", REDIRECT).await;
+    sqlx::query("UPDATE oauth_clients SET first_party = true WHERE client_id = $1")
+        .bind(&client_id)
+        .execute(h.db.pool())
+        .await
+        .unwrap();
+    let (_, challenge) = pkce();
+
+    let page = Call::get(authorize_url(&client_id, &challenge, "things:read", "s"))
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    page.expect(StatusCode::OK);
+    assert!(page.text.contains("name=org_id"));
+    assert!(!page.headers.contains_key(http::header::LOCATION));
 }

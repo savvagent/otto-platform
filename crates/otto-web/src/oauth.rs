@@ -328,7 +328,14 @@ pub async fn authorize_page(
     // org is named by a hint they belong to, or they have only one) the code is
     // issued here. A client that is not first-party always gets the screen: it
     // is the only defense against a look-alike client.
-    if client.first_party {
+    //
+    // Never for a loopback redirect, first-party or not (RFC 8252 section 8.6):
+    // its port is not matched, so any local process can listen on one and take
+    // the code, and the consent screen is what makes the user look at where it
+    // is going. Checked here on every request rather than trusted from
+    // registration, which also refuses the combination, because a row can be
+    // edited by hand.
+    if client.first_party && !oauth::is_loopback_redirect_uri(&params.redirect_uri) {
         let determined = hinted.or(match orgs.as_slice() {
             [only] => Some(only),
             _ => None,
@@ -861,6 +868,7 @@ button{font:inherit;padding:.6rem 1.2rem;border-radius:8px;border:1px solid #ccc
 button.primary{background:#111;color:#fff;border-color:#111}\
 </style>";
 
+#[allow(clippy::too_many_arguments)]
 fn consent_html(
     client: &oauth::Client,
     params: &AuthorizeParams,

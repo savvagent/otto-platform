@@ -84,6 +84,12 @@ fn is_loopback_redirect(u: &url::Url) -> bool {
         )
 }
 
+/// Whether `uri` is a loopback redirect, the shape whose port is ignored when
+/// matching. Unparseable input is not loopback; it fails registration anyway.
+pub fn is_loopback_redirect_uri(uri: &str) -> bool {
+    url::Url::parse(uri).is_ok_and(|u| is_loopback_redirect(&u))
+}
+
 /// Reject a redirect URI that cannot safely be registered at all.
 fn validate_registerable_redirect(uri: &str) -> Result<()> {
     let parsed = url::Url::parse(uri)
@@ -220,11 +226,30 @@ pub async fn register_client(db: &Db, req: RegistrationRequest) -> Result<Regist
 ///
 /// Never wired to an HTTP route. The only way to a first-party client is shell
 /// access to the deployment.
+///
+/// A first-party client may not have a loopback redirect URI. Consent is what
+/// protects a loopback callback: its port is not matched (RFC 8252 §7.3), so
+/// any local process can listen on some port and receive the code, and RFC 8252
+/// §8.6 says the user must be asked. Skipping consent there would hand codes to
+/// whatever is listening. The authorization endpoint enforces the same rule on
+/// every request; this refuses to register the combination at all.
 pub async fn register_operator_client(
     db: &Db,
     req: RegistrationRequest,
     first_party: bool,
 ) -> Result<RegistrationResponse> {
+    if first_party {
+        if let Some(uri) = req
+            .redirect_uris
+            .iter()
+            .find(|u| is_loopback_redirect_uri(u))
+        {
+            return Err(AuthError::InvalidRequest(format!(
+                "a first-party client cannot have a loopback redirect_uri ({uri}): loopback \
+                 callbacks must always go through consent (RFC 8252 section 8.6)"
+            )));
+        }
+    }
     insert_client(db, req, Registration::Operator { first_party }).await
 }
 

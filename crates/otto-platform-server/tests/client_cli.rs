@@ -77,3 +77,31 @@ async fn the_cli_screens_redirect_uris_like_dynamic_registration(pool: PgPool) {
         .unwrap();
     assert_eq!(n, 0);
 }
+
+/// RFC 8252 section 8.6: a loopback callback always goes through consent, so
+/// it cannot belong to a client that skips it.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_first_party_client_cannot_have_a_loopback_redirect(pool: PgPool) {
+    let db = Db::from_pool(pool);
+
+    for uri in [
+        "http://localhost/auth/callback",
+        "http://127.0.0.1:3000/cb",
+        "http://[::1]/cb",
+    ] {
+        let err = run(
+            &db,
+            &format!("register --name X --redirect-uri https://ok.example/cb --redirect-uri {uri} --first-party"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("loopback"), "{err}");
+    }
+    // Still fine for an ordinary client.
+    run(
+        &db,
+        "register --name Tool --redirect-uri http://127.0.0.1:1455/cb",
+    )
+    .await
+    .unwrap();
+}
