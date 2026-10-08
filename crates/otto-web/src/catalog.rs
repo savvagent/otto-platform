@@ -271,7 +271,10 @@ pub fn catalog() -> Vec<Endpoint> {
                 "Renders the consent screen for an authorization request, or redirects \
                  to the login page with `next` set so the flow resumes afterwards. \
                  Reached by a top-level browser navigation, which is why the session \
-                 cookie is SameSite=Lax.",
+                 cookie is SameSite=Lax. `org_hint` (an org slug or id) preselects that \
+                 org when the caller belongs to it and is ignored otherwise. A first-party \
+                 client skips the screen and is redirected with a code when the org is \
+                 determined (a usable `org_hint`, or exactly one org).",
             ),
         Endpoint::post("/oauth/authorize", oauth::authorize_decision)
             .auth(Auth::Session)
@@ -281,7 +284,9 @@ pub fn catalog() -> Vec<Endpoint> {
                 "On approval, issues an authorization code and redirects to the \
                  client's callback. The selected org must be one the caller belongs \
                  to — this is where a token's org is fixed, and it cannot be changed \
-                 afterwards.",
+                 afterwards. An `org:admin` scope requested by someone who is not an \
+                 owner or admin of that org is dropped from the grant rather than \
+                 refused; the token response's `scope` lists what was granted.",
             ),
         Endpoint::post("/oauth/token", oauth::token)
             .auth(Auth::Public)
@@ -396,7 +401,9 @@ pub fn catalog() -> Vec<Endpoint> {
                 "Resolves the identity provider purely from the email's domain — no account \
                  is looked up. sso_not_configured means no org has claimed and verified this \
                  domain; sign in with a passkey instead. Sets a short-lived binding cookie the \
-                 callback requires, and returns a redirectUrl to navigate the browser to.",
+                 callback requires, and returns a redirectUrl to navigate the browser to. \
+                 An optional same-origin `next` path is kept with the ceremony and is \
+                 where the callback sends the browser after sign-in.",
             ),
         // -------------------------------------------------------------- me
         Endpoint::get("/api/me", auth::me)

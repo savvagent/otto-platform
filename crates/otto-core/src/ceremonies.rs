@@ -12,7 +12,7 @@ use serde::Serialize;
 use sqlx::FromRow;
 
 const CEREMONY_COLS: &str = "id, org_id, idp_connection_id, user_id, state_hash, \
-                             binding_hash, nonce, expires_at, consumed_at, created_at";
+                             binding_hash, nonce, expires_at, consumed_at, created_at, next_path";
 
 #[derive(Debug, Clone, PartialEq, Serialize, FromRow, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -33,6 +33,11 @@ pub struct SsoCeremony {
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub consumed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Where to land after a successful anonymous sign-in. The HTTP layer
+    /// validates it before storing and again before redirecting; this module
+    /// only carries it.
+    #[serde(skip)]
+    pub next_path: Option<String>,
 }
 
 /// Mint a new ceremony row.
@@ -53,11 +58,12 @@ pub async fn create(
     binding_hash: &[u8],
     nonce: &str,
     expires_at: chrono::DateTime<chrono::Utc>,
+    next_path: Option<&str>,
 ) -> Result<SsoCeremony> {
     let ceremony = sqlx::query_as(&format!(
         "INSERT INTO sso_ceremonies \
-         (org_id, idp_connection_id, user_id, state_hash, binding_hash, nonce, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         (org_id, idp_connection_id, user_id, state_hash, binding_hash, nonce, expires_at, next_path) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          RETURNING {CEREMONY_COLS}"
     ))
     .bind(org_id)
@@ -67,6 +73,7 @@ pub async fn create(
     .bind(binding_hash)
     .bind(nonce)
     .bind(expires_at)
+    .bind(next_path)
     .fetch_one(db.pool())
     .await?;
 

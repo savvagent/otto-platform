@@ -108,6 +108,23 @@ async fn start_anonymous(h: &Harness, email: &str) -> (String, String, String) {
     (pairs["state"].clone(), pairs["nonce"].clone(), binding)
 }
 
+/// Like [`start_anonymous`], with a `next` for the sign-in to land on.
+async fn start_anonymous_with_next(
+    h: &Harness,
+    email: &str,
+    next: &str,
+) -> (String, String, String) {
+    let reply = Call::post("/api/auth/sso/start")
+        .json(serde_json::json!({ "email": email, "next": next }))
+        .send(&h.router)
+        .await;
+    reply.expect(StatusCode::OK);
+    let redirect = reply.body["redirectUrl"].as_str().unwrap().to_string();
+    let pairs = query_pairs(&redirect);
+    let binding = binding_cookie(&reply).expect("sso/start must set the binding cookie");
+    (pairs["state"].clone(), pairs["nonce"].clone(), binding)
+}
+
 /// Start an authenticated `me/sso/link/start` ceremony for `caller`.
 async fn start_link(h: &Harness, caller: &Account) -> (String, String, String) {
     let reply = Call::post("/api/me/sso/link/start")
@@ -246,6 +263,87 @@ async fn the_full_anonymous_sso_sign_in_flow_opens_a_session_and_joins_the_org(p
             .await
             .unwrap();
     assert_eq!(role, "member");
+}
+
+fn landing(reply: &Reply) -> &str {
+    reply
+        .headers
+        .get(http::header::LOCATION)
+        .expect("no Location header")
+        .to_str()
+        .unwrap()
+}
+
+/// The SPA sends signed-out visitors to /login?next=..., and SSO is a
+/// server-side round trip through the IdP, so `next` has to survive it: a
+/// first-party client's /oauth/authorize URL is the case that matters.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn sso_sign_in_returns_to_next(pool: PgPool) {
+    let (h, _org_id, _admin, idp) = org_with_sso(pool, "acme", "acme.test").await;
+    let next = "/oauth/authorize?response_type=code&client_id=c&state=s%26t";
+
+    let (state, nonce, binding) = start_anonymous_with_next(&h, "alice@acme.test", next).await;
+    let id_token = support::sign_id_token(&id_token_claims(
+        &idp.server.base_url,
+        "alice-sub",
+        "alice@acme.test",
+        true,
+        &nonce,
+    ));
+    let reply = complete_callback(&h, &idp, &state, Some(&binding), &id_token).await;
+    reply.expect(StatusCode::SEE_OTHER);
+    assert!(reply.session_cookie().is_some());
+    assert_eq!(landing(&reply), format!("{}{next}", common::PUBLIC_URL));
+}
+
+/// Not a way to bounce somebody to another site right after they authenticate,
+/// and not something the callback's own query string can set.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn sso_sign_in_ignores_an_unsafe_next(pool: PgPool) {
+    let (h, _org_id, _admin, idp) = org_with_sso(pool, "acme", "acme.test").await;
+    let home = format!("{}/", common::PUBLIC_URL);
+
+    for (i, bad) in [
+        "https://evil.test/",
+        "//evil.test",
+        "/\\evil.test",
+        "javascript:alert(1)",
+        "dashboard",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (state, nonce, binding) = start_anonymous_with_next(&h, "alice@acme.test", bad).await;
+        let id_token = support::sign_id_token(&id_token_claims(
+            &idp.server.base_url,
+            "alice-sub",
+            "alice@acme.test",
+            true,
+            &nonce,
+        ));
+        let reply = complete_callback(&h, &idp, &state, Some(&binding), &id_token).await;
+        reply.expect(StatusCode::SEE_OTHER);
+        assert_eq!(landing(&reply), home, "case {i}: {bad}");
+    }
+
+    // A `next` smuggled onto the callback itself is not read.
+    let (state, nonce, binding) = start_anonymous(&h, "alice@acme.test").await;
+    let id_token = support::sign_id_token(&id_token_claims(
+        &idp.server.base_url,
+        "alice-sub",
+        "alice@acme.test",
+        true,
+        &nonce,
+    ));
+    idp.push_token_response(&id_token);
+    let reply = Call::get(format!(
+        "/sso/callback?code=auth-code-1&state={state}&next=%2Fadmin"
+    ))
+    .header("cookie", format!("__Host-otto_sso_binding={binding}"))
+    .send(&h.router)
+    .await;
+    reply.expect(StatusCode::SEE_OTHER);
+    assert_eq!(landing(&reply), home);
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]

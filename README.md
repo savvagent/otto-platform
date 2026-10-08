@@ -75,8 +75,9 @@ crates/
                           /readyz, otto-web's router, and the
                           resource-server API (`POST /oauth/introspect`,
                           `/internal/*`). Delivers lifecycle webhooks and
-                          provisions resource servers
-                          (`otto-platform-server resource ...`).
+                          provisions resource servers and first-party
+                          OAuth clients
+                          (`otto-platform-server resource ...`, `client ...`).
 ```
 
 Dependency direction: `otto-tenant` ← `otto-core` ← `otto-billing`,
