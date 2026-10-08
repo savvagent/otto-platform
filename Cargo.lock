@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "otto-auth"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1647,7 +1647,7 @@ dependencies = [
 
 [[package]]
 name = "otto-billing"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "otto-core",
@@ -1660,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "otto-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "otto-platform-server"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1710,7 +1710,7 @@ dependencies = [
 
 [[package]]
 name = "otto-resource"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "axum",
  "chrono",
@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "otto-tenant"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -1747,7 +1747,7 @@ dependencies = [
 
 [[package]]
 name = "otto-web"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",

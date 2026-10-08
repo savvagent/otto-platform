@@ -8,8 +8,31 @@
       "pull-request-title-pattern": "chore: release ${version}",
       "bootstrap-sha": "80b17eb9d9161b818c2649e530c9733f989534df",
       "extra-files": [
-        { "type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version" },
-        { "type": "json", "path": "web/package.json", "jsonpath": "$.version" }
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "json",
+          "path": "web/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='otto-auth' || @.name.value=='otto-billing' || @.name.value=='otto-core' || @.name.value=='otto-platform-server' || @.name.value=='otto-resource' || @.name.value=='otto-tenant' || @.name.value=='otto-web')].version"
+        },
+        {
+          "type": "json",
+          "path": "web/package-lock.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "web/package-lock.json",
+          "jsonpath": "$.packages[''].version"
+        }
       ]
     }
   }
