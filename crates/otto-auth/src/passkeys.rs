@@ -161,10 +161,18 @@ pub fn credential_names(user: &User) -> CredentialNames {
 /// address, because the passkey is what brings the account into existence. Pass
 /// `Some` to add a second key to an account that already exists — which is the
 /// recovery story, and what a console should ask for straight after signup.
+///
+/// `via` names the flow minting the ceremony, and the ceremony is stored bound
+/// to it (see [`RegistrationVia::ceremony_kind`]): only the matching finish
+/// path can redeem it. Without that binding the unauthenticated signup finish
+/// would accept a claim or add-a-key ceremony it did not start, since it has
+/// no caller identity to compare the ceremony's account against. Pair `None`
+/// with [`RegistrationVia::Signup`]; the other two need an existing account.
 pub async fn start_registration(
     db: &Db,
     webauthn: &Webauthn,
     user: Option<UserId>,
+    via: RegistrationVia,
 ) -> Result<Ceremony<CreationChallengeResponse>> {
     // Both arms end at the account's own row, because the names below are a
     // function of it and nothing else — a brand-new account is named by the
@@ -201,7 +209,7 @@ pub async fn start_registration(
     // discovers they cannot register at all.
     selection.authenticator_attachment = None;
 
-    let id = store_ceremony(db, "register", Some(user_id), &state).await?;
+    let id = store_ceremony(db, via.ceremony_kind(), Some(user_id), &state).await?;
     Ok(Ceremony { id, challenge })
 }
 
@@ -209,7 +217,11 @@ pub async fn start_registration(
 /// event that follows an admin-assisted passkey reset — the one case that
 /// needs distinguishing from an ordinary signup or an already-signed-in
 /// session adding a second key.
-#[derive(Debug, Clone, Copy)]
+///
+/// It is also the flow a registration ceremony is bound to: the same value
+/// goes to [`start_registration`] and to the finish call that redeems it, and
+/// a ceremony started under one flow cannot be finished under another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistrationVia {
     Signup,
     Add,
@@ -217,6 +229,23 @@ pub enum RegistrationVia {
 }
 
 impl RegistrationVia {
+    /// The `webauthn_ceremonies.kind` this flow's ceremonies are stored under.
+    ///
+    /// One value per flow, so the `kind` predicate in [`take_ceremony`]'s
+    /// atomic `DELETE … RETURNING` is what keeps a flow from redeeming
+    /// another's ceremony. The column is plain text with no `CHECK`, so these
+    /// need no migration. A bare `"register"` row, written before ceremonies
+    /// were bound to a flow, matches none of them: one still in flight at
+    /// deploy time fails as an expired ceremony and the user starts again,
+    /// which a [`CEREMONY_TTL_SECONDS`]-lived row makes a brief inconvenience.
+    fn ceremony_kind(self) -> &'static str {
+        match self {
+            RegistrationVia::Signup => "register:signup",
+            RegistrationVia::Add => "register:add",
+            RegistrationVia::Claim => "register:claim",
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             RegistrationVia::Signup => "signup",
@@ -344,7 +373,7 @@ pub async fn finish_registration_tx(
     ip: Option<&str>,
 ) -> Result<UserId> {
     let (user_id, state): (Option<UserId>, PasskeyRegistration) =
-        take_ceremony(conn.conn(), ceremony, "register").await?;
+        take_ceremony(conn.conn(), ceremony, via.ceremony_kind()).await?;
     let user_id = user_id.ok_or(AuthError::CeremonyExpired)?;
 
     let passkey = webauthn

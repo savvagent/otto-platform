@@ -186,7 +186,13 @@ pub async fn signup_start(
 ) -> ApiResult<Json<ChallengeResponse<passkeys::CreationChallengeResponse>>> {
     throttle_by_source(&state, &parts).await?;
 
-    let ceremony = passkeys::start_registration(&state.db, &state.webauthn, None).await?;
+    let ceremony = passkeys::start_registration(
+        &state.db,
+        &state.webauthn,
+        None,
+        passkeys::RegistrationVia::Signup,
+    )
+    .await?;
     Ok(Json(ChallengeResponse {
         ceremony_id: ceremony.id,
         challenge: ceremony.challenge,
@@ -328,7 +334,13 @@ pub async fn claim_start(
     throttle_by_source(&state, &parts).await?;
 
     let user = state.db.peek_account_claim(&hash_claim(&req.code)).await?;
-    let ceremony = passkeys::start_registration(&state.db, &state.webauthn, Some(user)).await?;
+    let ceremony = passkeys::start_registration(
+        &state.db,
+        &state.webauthn,
+        Some(user),
+        passkeys::RegistrationVia::Claim,
+    )
+    .await?;
 
     Ok(Json(ChallengeResponse {
         ceremony_id: ceremony.id,
@@ -606,8 +618,13 @@ pub async fn add_passkey_start(
     State(state): State<AppState>,
     caller: CurrentUser,
 ) -> ApiResult<Json<ChallengeResponse<passkeys::CreationChallengeResponse>>> {
-    let ceremony =
-        passkeys::start_registration(&state.db, &state.webauthn, Some(caller.user.id)).await?;
+    let ceremony = passkeys::start_registration(
+        &state.db,
+        &state.webauthn,
+        Some(caller.user.id),
+        passkeys::RegistrationVia::Add,
+    )
+    .await?;
     Ok(Json(ChallengeResponse {
         ceremony_id: ceremony.id,
         challenge: ceremony.challenge,
