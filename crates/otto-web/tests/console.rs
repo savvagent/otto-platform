@@ -2158,3 +2158,197 @@ async fn cookie_bearing_writes_need_the_sites_own_origin(pool: PgPool) {
         .await
         .expect(StatusCode::NO_CONTENT);
 }
+
+/// Reset Bob's passkeys as Rob and return the claim code, with Bob an org
+/// member so the admin may do it. Shared by the cross-flow ceremony tests.
+async fn reset_and_get_code(
+    h: &common::Harness,
+    rob: &common::Account,
+    bob: &common::Account,
+) -> String {
+    let reset = Call::post(format!(
+        "/api/orgs/acme/members/{}/reset-passkeys",
+        bob.user
+    ))
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    reset.expect(StatusCode::CREATED);
+    reset.body["code"]
+        .as_str()
+        .expect("no claim code")
+        .to_string()
+}
+
+async fn passkey_count(h: &common::Harness, user: otto_tenant::ids::UserId) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM passkeys WHERE user_id = $1")
+        .bind(user)
+        .fetch_one(h.db.pool())
+        .await
+        .unwrap()
+}
+
+/// A claim ceremony must not be redeemable through the unauthenticated
+/// `signup/finish`: that would attach a passkey to the claimed account and
+/// open a session while leaving the claim code unconsumed, reusable until it
+/// expires, and the audit trail saying "signup". The refusal must also leave
+/// the code and the ceremony intact so the real claim still completes, once.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_claim_ceremony_cannot_be_finished_through_signup(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let bob = onboard(&h, "bob@acme.test").await;
+    add_member(&h, org, bob.user, Role::Member).await;
+    let code = reset_and_get_code(&h, &rob, &bob).await;
+    assert_eq!(passkey_count(&h, bob.user).await, 0);
+
+    let started = Call::post("/api/auth/claim/start")
+        .json(serde_json::json!({ "code": code }))
+        .send(&h.router)
+        .await;
+    started.expect(StatusCode::OK);
+
+    let mut attacker = common::authenticator();
+    let hijack = common::finish_registration(
+        &h,
+        &mut attacker,
+        "/api/auth/signup/finish",
+        &started.body,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(hijack.status, StatusCode::BAD_REQUEST, "{:?}", hijack.body);
+    assert!(hijack.session_cookie().is_none(), "a session was opened");
+    assert_eq!(
+        passkey_count(&h, bob.user).await,
+        0,
+        "signup/finish attached a passkey to the claimed account"
+    );
+    let unconsumed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM account_claims WHERE user_id = $1 AND consumed_at IS NULL",
+    )
+    .bind(bob.user)
+    .fetch_one(h.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(unconsumed, 1, "the claim must still be pending");
+
+    // The legitimate claim still completes with the same ceremony, once.
+    let mut device = common::authenticator();
+    let claimed = common::finish_registration(
+        &h,
+        &mut device,
+        "/api/auth/claim/finish",
+        &started.body,
+        serde_json::json!({ "code": code }),
+    )
+    .await;
+    claimed.expect(StatusCode::OK);
+    assert_eq!(passkey_count(&h, bob.user).await, 1);
+    let via: String = sqlx::query_scalar(
+        "SELECT detail->>'via' FROM audit_events WHERE action = 'auth.passkey.registered' \
+         AND actor_user_id = $1",
+    )
+    .bind(bob.user)
+    .fetch_one(h.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(via, "claim");
+}
+
+/// An add-a-key ceremony (started with the victim's own session) must not be
+/// redeemable through the unauthenticated `signup/finish` either.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_add_passkey_ceremony_cannot_be_finished_through_signup(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let before = passkey_count(&h, rob.user).await;
+
+    let started = Call::post("/api/me/passkeys/start")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    started.expect(StatusCode::OK);
+
+    let (ceremony_id, credential) =
+        common::register_credential(&mut common::authenticator(), &started.body);
+    let body = serde_json::json!({ "ceremonyId": ceremony_id, "credential": credential });
+
+    let hijack = Call::post("/api/auth/signup/finish")
+        .json(body.clone())
+        .send(&h.router)
+        .await;
+    assert_eq!(hijack.status, StatusCode::BAD_REQUEST, "{:?}", hijack.body);
+    assert!(hijack.session_cookie().is_none(), "a session was opened");
+    assert_eq!(passkey_count(&h, rob.user).await, before);
+
+    // The owner's own finish still redeems it.
+    let added = Call::post("/api/me/passkeys/finish")
+        .with_session(&rob.session)
+        .json(body)
+        .send(&h.router)
+        .await;
+    added.expect(StatusCode::NO_CONTENT);
+    assert_eq!(passkey_count(&h, rob.user).await, before + 1);
+}
+
+/// A signup ceremony is redeemable only by signup: neither the claim finish
+/// nor the add-a-key finish may take it.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_signup_ceremony_cannot_be_finished_through_claim_or_add(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let bob = onboard(&h, "bob@acme.test").await;
+    add_member(&h, org, bob.user, Role::Member).await;
+    let code = reset_and_get_code(&h, &rob, &bob).await;
+
+    let started = Call::post("/api/auth/signup/start").send(&h.router).await;
+    started.expect(StatusCode::OK);
+    let (ceremony_id, credential) =
+        common::register_credential(&mut common::authenticator(), &started.body);
+
+    let via_claim = Call::post("/api/auth/claim/finish")
+        .json(serde_json::json!({
+            "ceremonyId": ceremony_id, "credential": credential, "code": code,
+        }))
+        .send(&h.router)
+        .await;
+    assert_eq!(
+        via_claim.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        via_claim.body
+    );
+    let unconsumed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM account_claims WHERE user_id = $1 AND consumed_at IS NULL",
+    )
+    .bind(bob.user)
+    .fetch_one(h.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        unconsumed, 1,
+        "a refused claim finish must not burn the code"
+    );
+
+    let via_add = Call::post("/api/me/passkeys/finish")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "ceremonyId": ceremony_id, "credential": credential }))
+        .send(&h.router)
+        .await;
+    assert_eq!(
+        via_add.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        via_add.body
+    );
+
+    // Signup still redeems its own ceremony.
+    let signed_up = Call::post("/api/auth/signup/finish")
+        .json(serde_json::json!({ "ceremonyId": ceremony_id, "credential": credential }))
+        .send(&h.router)
+        .await;
+    signed_up.expect(StatusCode::OK);
+}

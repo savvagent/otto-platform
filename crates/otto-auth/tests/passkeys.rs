@@ -42,7 +42,17 @@ fn for_soft_token(mut challenge: CreationChallengeResponse) -> CreationChallenge
 /// Start a ceremony for `owner` and sign it, returning the ceremony id and the
 /// signed credential.
 async fn signed_ceremony(db: &Db, owner: UserId) -> (uuid::Uuid, RegisterPublicKeyCredential) {
-    let ceremony = passkeys::start_registration(db, &rp(), Some(owner))
+    signed_ceremony_via(db, owner, RegistrationVia::Add).await
+}
+
+/// [`signed_ceremony`] under an explicit flow, for the tests that start a
+/// ceremony in one flow and try to finish it in another.
+async fn signed_ceremony_via(
+    db: &Db,
+    owner: UserId,
+    via: RegistrationVia,
+) -> (uuid::Uuid, RegisterPublicKeyCredential) {
+    let ceremony = passkeys::start_registration(db, &rp(), Some(owner), via)
         .await
         .unwrap();
     let credential = authenticator()
@@ -102,7 +112,7 @@ async fn a_matching_expected_account_registers(pool: PgPool) {
 async fn no_expected_account_skips_the_check(pool: PgPool) {
     let db = Db::from_pool(pool);
     let owner = db.create_unclaimed_user().await.unwrap().id;
-    let (ceremony, credential) = signed_ceremony(&db, owner).await;
+    let (ceremony, credential) = signed_ceremony_via(&db, owner, RegistrationVia::Signup).await;
 
     let user = passkeys::finish_registration(
         &db,
@@ -205,4 +215,121 @@ async fn a_ceremony_account_mismatch_writes_a_refusal_but_no_credential(pool: Pg
     .await
     .unwrap();
     assert_eq!(user, owner);
+}
+
+const FLOWS: [RegistrationVia; 3] = [
+    RegistrationVia::Signup,
+    RegistrationVia::Add,
+    RegistrationVia::Claim,
+];
+
+/// Each flow redeems its own ceremony: the binding must not lock a legitimate
+/// flow out of the ceremony it started.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn every_flow_finishes_its_own_ceremony(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    for via in FLOWS {
+        let owner = db.create_unclaimed_user().await.unwrap().id;
+        let (ceremony, credential) = signed_ceremony_via(&db, owner, via).await;
+
+        let user =
+            passkeys::finish_registration(&db, &rp(), ceremony, &credential, None, via, None, None)
+                .await
+                .unwrap_or_else(|e| panic!("{via:?} could not finish its own ceremony: {e:?}"));
+        assert_eq!(user, owner);
+    }
+}
+
+/// A ceremony started by one flow is not redeemable by any other, in every
+/// pairing. The unauthenticated signup finish is the dangerous one (it passes
+/// `expected: None`, so nothing else would stop it), but the binding is
+/// symmetric. A refused redemption must leave no credential, must not burn the
+/// ceremony, and must leave the rightful flow able to finish it afterwards.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_ceremony_cannot_be_finished_by_a_different_flow(pool: PgPool) {
+    let db = Db::from_pool(pool);
+
+    for started_by in FLOWS {
+        for finished_by in FLOWS.into_iter().filter(|f| *f != started_by) {
+            let owner = db.create_unclaimed_user().await.unwrap().id;
+            let (ceremony, credential) = signed_ceremony_via(&db, owner, started_by).await;
+
+            let err = passkeys::finish_registration(
+                &db,
+                &rp(),
+                ceremony,
+                &credential,
+                None,
+                finished_by,
+                None,
+                None,
+            )
+            .await
+            .expect_err(&format!(
+                "a {started_by:?} ceremony was redeemed by {finished_by:?}"
+            ));
+            assert!(
+                matches!(err, AuthError::CeremonyExpired),
+                "{started_by:?} -> {finished_by:?}: got {err:?}"
+            );
+
+            assert_eq!(
+                count(&db, "SELECT count(*) FROM passkeys", None).await,
+                0,
+                "{started_by:?} -> {finished_by:?} attached a credential"
+            );
+            let survives: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM webauthn_ceremonies WHERE id = $1)",
+            )
+            .bind(ceremony)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert!(survives, "a refused redemption burned the ceremony");
+
+            passkeys::finish_registration(
+                &db,
+                &rp(),
+                ceremony,
+                &credential,
+                None,
+                started_by,
+                None,
+                None,
+            )
+            .await
+            .expect("the rightful flow can still finish it");
+            sqlx::query("DELETE FROM passkeys")
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// A ceremony written under the bare `"register"` kind, as one still in flight
+/// at deploy time would be, matches no flow and fails as expired rather than
+/// panicking or being redeemable by whichever flow asks first.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_pre_binding_register_ceremony_expires_for_every_flow(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let owner = db.create_unclaimed_user().await.unwrap().id;
+    let (ceremony, credential) = signed_ceremony(&db, owner).await;
+    sqlx::query("UPDATE webauthn_ceremonies SET kind = 'register' WHERE id = $1")
+        .bind(ceremony)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    for via in FLOWS {
+        let err =
+            passkeys::finish_registration(&db, &rp(), ceremony, &credential, None, via, None, None)
+                .await
+                .expect_err("an unbound ceremony must not be redeemable");
+        assert!(
+            matches!(err, AuthError::CeremonyExpired),
+            "{via:?}: {err:?}"
+        );
+    }
+    assert_eq!(count(&db, "SELECT count(*) FROM passkeys", None).await, 0);
 }
