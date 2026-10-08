@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/savvagent/otto-platform/compare/v0.2.1...v0.3.0) (2026-10-08)
+
+
+### Features
+
+* **otto-auth:** first-party console clients, org_hint, and admin downscoping ([#19](https://github.com/savvagent/otto-platform/issues/19)) ([7e0f4f8](https://github.com/savvagent/otto-platform/commit/7e0f4f801d45f60be9f62569cf21aaa8ed4bb2ba))
+* **otto-resource:** member team lookup and member cache ([#18](https://github.com/savvagent/otto-platform/issues/18)) ([a220608](https://github.com/savvagent/otto-platform/commit/a220608fa269321e4b8777e1ba88c0ef0bbd659d)), closes [#3](https://github.com/savvagent/otto-platform/issues/3)
+* **otto-web:** serve the identity HTTP surface ([#14](https://github.com/savvagent/otto-platform/issues/14)) ([2a00db8](https://github.com/savvagent/otto-platform/commit/2a00db8176167704201f2af7fa676480c719fda6))
+* resource-server API (introspection, internal usage, lifecycle webhooks) ([#15](https://github.com/savvagent/otto-platform/issues/15)) ([3cd60b6](https://github.com/savvagent/otto-platform/commit/3cd60b68c576dee9ec8ef11f680e394828917324))
+* **web:** platform console ([#17](https://github.com/savvagent/otto-platform/issues/17)) ([b7df223](https://github.com/savvagent/otto-platform/commit/b7df223e8543761ea33df3361f165c64727108fb))
+
 ## [0.2.1](https://github.com/savvagent/otto-platform/compare/v0.2.0...v0.2.1) (2026-10-07)
 
 
