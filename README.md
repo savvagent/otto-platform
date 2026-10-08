@@ -106,9 +106,6 @@ let user = db.get_user(user_id).await?;
 
 ## What's not here yet
 
-- **Consent screens show raw scope names.** Each resource server's scopes
-  come from the `resource_servers` registry, which carries no human-readable
-  descriptions yet. Adding them needs a migration; tracked in #20.
 - **No `plans.features` JSONB column.** Design doc §4 proposes one to gate
   per-service capabilities from a shared plan; not added here since no
   extracted code reads or writes it yet.
@@ -159,6 +156,26 @@ each service calls at its own startup) before clients can authorize against
 it. The authorization server serves every registered one; a client names its
 target with the RFC 8707 `resource` parameter, which may be omitted only while
 exactly one is registered.
+
+Each scope can carry a human-readable description, which the consent screen
+shows in place of the bare scope name (the name stays alongside it; a scope
+with no description is shown as its name). A service sets them with
+`otto_auth::resources::set_scope_descriptions`, and an operator with the CLI:
+
+```sh
+otto-platform-server resource register https://otto-factory.example/mcp \
+  --name otto-factory --scopes jobs:read,jobs:write \
+  --scope-description 'jobs:read=View your jobs and their results' \
+  --scope-description 'jobs:write=Create, change, and cancel jobs'
+
+# Replace the set later, or remove it with --clear.
+otto-platform-server resource describe https://otto-factory.example/mcp \
+  --scope-description 'jobs:read=View your jobs and their results'
+```
+
+Descriptions are plain text (at most 200 characters), single-language, and
+must name scopes the resource server defines. `describe` replaces the whole
+set; re-registering keeps descriptions of scopes it still lists.
 
 ### Running just the migrations
 

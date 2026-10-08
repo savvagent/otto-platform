@@ -14,6 +14,8 @@
 //! server and issuing its introspection credential are operator actions and
 //! are never touched by `register`.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use otto_tenant::crypto::Cipher;
 use otto_tenant::Db;
@@ -27,6 +29,11 @@ pub const INTROSPECTION_SECRET_PREFIX: &str = "otto_rs_";
 
 /// Prefix for the key a resource server verifies lifecycle webhooks with.
 pub const WEBHOOK_SECRET_PREFIX: &str = "otto_whsec_";
+
+/// Longest scope description accepted, in characters. A description is one
+/// line on a consent screen, not documentation; a cap keeps a registry typo
+/// (or a pasted README) from turning the screen into a wall of text.
+pub const MAX_SCOPE_DESCRIPTION_CHARS: usize = 200;
 
 /// What a resource server declares about itself.
 #[derive(Debug, Clone, Copy)]
@@ -48,6 +55,12 @@ pub struct ResourceServer {
     pub name: String,
     pub scopes: Vec<String>,
     pub default_scopes: Vec<String>,
+    /// Optional human-readable text for some of `scopes`, keyed by scope name,
+    /// shown on the consent screen in place of the bare name. Every key is
+    /// one of `scopes` (enforced by [`set_scope_descriptions`] and by a CHECK
+    /// constraint). Single-language: the consent screen's own text is
+    /// localized, these are shown exactly as registered.
+    pub scope_descriptions: sqlx::types::Json<BTreeMap<String, String>>,
     pub disabled: bool,
     /// Where lifecycle webhooks are delivered, if configured. The signing
     /// secret is never part of this struct; see [`set_webhook`].
@@ -56,10 +69,15 @@ pub struct ResourceServer {
     pub updated_at: DateTime<Utc>,
 }
 
-const COLS: &str =
-    "resource_uri, name, scopes, default_scopes, disabled, webhook_url, created_at, updated_at";
+const COLS: &str = "resource_uri, name, scopes, default_scopes, scope_descriptions, disabled, \
+                    webhook_url, created_at, updated_at";
 
 impl ResourceServer {
+    /// The registered description of `scope`, if it has one.
+    pub fn scope_description(&self, scope: &str) -> Option<&str> {
+        self.scope_descriptions.get(scope).map(String::as_str)
+    }
+
     /// The scopes a request for `requested` on this resource server is
     /// granted: its defaults when nothing is requested, otherwise exactly what
     /// was asked for, provided every one is a scope this server defines.
@@ -93,7 +111,10 @@ impl ResourceServer {
 /// scopes compiled into it.
 ///
 /// Leaves `disabled` and the introspection credential alone: re-registering
-/// must never re-enable a server an operator disabled.
+/// must never re-enable a server an operator disabled. It also keeps scope
+/// descriptions (see [`set_scope_descriptions`]), dropping only those of
+/// scopes the new list no longer contains, so a service that re-registers at
+/// startup does not erase what an operator wrote.
 pub async fn register(db: &Db, spec: ResourceServerSpec<'_>) -> Result<ResourceServer> {
     validate_resource_uri(spec.resource_uri)?;
     let name = spec.name.trim();
@@ -122,6 +143,10 @@ pub async fn register(db: &Db, spec: ResourceServerSpec<'_>) -> Result<ResourceS
            name = EXCLUDED.name, \
            scopes = EXCLUDED.scopes, \
            default_scopes = EXCLUDED.default_scopes, \
+           scope_descriptions = COALESCE(( \
+             SELECT jsonb_object_agg(d.key, d.value) \
+             FROM jsonb_each(resource_servers.scope_descriptions) d \
+             WHERE d.key = ANY(EXCLUDED.scopes)), '{{}}'::jsonb), \
            updated_at = now() \
          RETURNING {COLS}"
     ))
@@ -129,6 +154,39 @@ pub async fn register(db: &Db, spec: ResourceServerSpec<'_>) -> Result<ResourceS
     .bind(name)
     .bind(&scopes)
     .bind(&default_scopes)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(row)
+}
+
+/// Replace the whole set of scope descriptions of a resource server; an empty
+/// slice clears them. Replacing rather than merging keeps removal possible
+/// without a second verb, and a caller that wants to change one description
+/// reads [`ResourceServer::scope_descriptions`] first.
+///
+/// Every key must be a scope the server defines, and every description
+/// non-empty after trimming, at most [`MAX_SCOPE_DESCRIPTION_CHARS`]
+/// characters, and free of control characters (it is rendered on one line).
+/// Markup is fine to store: the consent screen escapes it.
+pub async fn set_scope_descriptions(
+    db: &Db,
+    resource_uri: &str,
+    descriptions: &[(&str, &str)],
+) -> Result<ResourceServer> {
+    let rs = get(db, resource_uri).await?.ok_or_else(|| {
+        AuthError::InvalidTarget(format!("{resource_uri:?} is not a registered resource"))
+    })?;
+    let map = validate_scope_descriptions(&rs.scopes, descriptions)?;
+
+    // Written against the scopes as they are now, not as read above: a
+    // concurrent re-register that dropped a scope trips the CHECK instead of
+    // leaving an orphan description.
+    let row = sqlx::query_as(&format!(
+        "UPDATE resource_servers SET scope_descriptions = $2, updated_at = now() \
+         WHERE resource_uri = $1 RETURNING {COLS}"
+    ))
+    .bind(resource_uri)
+    .bind(sqlx::types::Json(&map))
     .fetch_one(db.pool())
     .await?;
     Ok(row)
@@ -368,6 +426,43 @@ fn validate_resource_uri(uri: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_scope_descriptions(
+    scopes: &[String],
+    descriptions: &[(&str, &str)],
+) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for (scope, text) in descriptions {
+        if !scopes.iter().any(|s| s == scope) {
+            return Err(AuthError::InvalidRequest(format!(
+                "cannot describe {scope:?}: not one of the resource server's scopes ({})",
+                scopes.join(" ")
+            )));
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(AuthError::InvalidRequest(format!(
+                "the description of {scope:?} is empty"
+            )));
+        }
+        if text.chars().count() > MAX_SCOPE_DESCRIPTION_CHARS {
+            return Err(AuthError::InvalidRequest(format!(
+                "the description of {scope:?} is longer than {MAX_SCOPE_DESCRIPTION_CHARS} characters"
+            )));
+        }
+        if text.chars().any(char::is_control) {
+            return Err(AuthError::InvalidRequest(format!(
+                "the description of {scope:?} contains control characters"
+            )));
+        }
+        if out.insert((*scope).to_owned(), text.to_owned()).is_some() {
+            return Err(AuthError::InvalidRequest(format!(
+                "{scope:?} is described twice"
+            )));
+        }
+    }
+    Ok(out)
+}
+
 /// RFC 6749 §3.3 scope-token: one or more of %x21 / %x23-5B / %x5D-7E, so no
 /// spaces, quotes, or backslashes. Duplicates are dropped, order kept.
 fn validate_scope_list(field: &str, scopes: &[&str]) -> Result<Vec<String>> {
@@ -398,6 +493,7 @@ mod tests {
             name: "svc".into(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             default_scopes: defaults.iter().map(|s| s.to_string()).collect(),
+            scope_descriptions: Default::default(),
             disabled: false,
             webhook_url: None,
             created_at: Utc::now(),
@@ -455,6 +551,35 @@ mod tests {
         );
         for bad in ["", "has space", "quo\"te", "back\\slash"] {
             assert!(validate_scope_list("scopes", &[bad]).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn scope_description_rules() {
+        let scopes: Vec<String> = vec!["a".into(), "b".into()];
+        let ok = validate_scope_descriptions(&scopes, &[("a", "  Read things  ")]).unwrap();
+        assert_eq!(ok["a"], "Read things");
+        assert!(validate_scope_descriptions(&scopes, &[])
+            .unwrap()
+            .is_empty());
+
+        let long = "x".repeat(MAX_SCOPE_DESCRIPTION_CHARS + 1);
+        let at_cap = "x".repeat(MAX_SCOPE_DESCRIPTION_CHARS);
+        assert!(validate_scope_descriptions(&scopes, &[("a", &at_cap)]).is_ok());
+        for bad in [
+            vec![("zzz", "unknown scope")],
+            vec![("a", "   ")],
+            vec![("a", long.as_str())],
+            vec![("a", "two\nlines")],
+            vec![("a", "one"), ("a", "two")],
+        ] {
+            assert!(
+                matches!(
+                    validate_scope_descriptions(&scopes, &bad),
+                    Err(AuthError::InvalidRequest(_))
+                ),
+                "{bad:?}"
+            );
         }
     }
 
