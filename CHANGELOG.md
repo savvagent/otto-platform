@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0](https://github.com/savvagent/otto-platform/compare/v0.3.0...v0.4.0) (2026-10-08)
+
+
+### Features
+
+* let users read their own account-level audit events ([#26](https://github.com/savvagent/otto-platform/issues/26)) ([0c51e7d](https://github.com/savvagent/otto-platform/commit/0c51e7dcd0f73dcab96c76b8d5a09e5182dcb195)), closes [#22](https://github.com/savvagent/otto-platform/issues/22)
+* **otto-auth:** per-scope descriptions on the consent screen ([#24](https://github.com/savvagent/otto-platform/issues/24)) ([3298c41](https://github.com/savvagent/otto-platform/commit/3298c41ab7d1674f0ebe9c99bfd8d1f779f5a545)), closes [#20](https://github.com/savvagent/otto-platform/issues/20)
+
+
+### Bug Fixes
+
+* keep the lockfiles in step with release versions ([#28](https://github.com/savvagent/otto-platform/issues/28)) ([6006302](https://github.com/savvagent/otto-platform/commit/60063025029407bee6bf62eb5666624cfdcfa0b3)), closes [#27](https://github.com/savvagent/otto-platform/issues/27)
+* **otto-auth:** bind registration ceremonies to the flow that started them ([#25](https://github.com/savvagent/otto-platform/issues/25)) ([a9d288c](https://github.com/savvagent/otto-platform/commit/a9d288c553005a5bb343a97eef44dd86192a4ba1)), closes [#21](https://github.com/savvagent/otto-platform/issues/21)
+
 ## [0.3.0](https://github.com/savvagent/otto-platform/compare/v0.2.1...v0.3.0) (2026-10-08)
 
 
