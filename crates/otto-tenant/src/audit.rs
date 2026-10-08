@@ -1,17 +1,58 @@
 //! The audit trail.
 //!
-//! Two entry points, matching the two transaction kinds:
+//! ## Writers
+//!
+//! Matching the two transaction kinds, plus two control-plane variants:
 //!
 //! - [`Tx::audit`] for anything that happens inside an org — role changes, PAT
 //!   mints, membership changes. Written in the *same* transaction as the
 //!   change itself, so an action and its record commit or abort together and
 //!   the trail can never disagree with reality.
 //! - [`Db::audit_global`] for events that precede any org context: login
-//!   attempts, passkey enrollment.
+//!   attempts, passkey enrollment. Written with a `NULL` org.
+//! - [`Db::audit_global_on`], the same `NULL`-org write for a caller that
+//!   already holds an unpinned transaction open for something else and needs
+//!   its audit write to commit or roll back with it, rather than best-effort
+//!   on the pool.
+//! - [`Db::audit_for_org`], an org-scoped write from the control plane, where
+//!   no tenant transaction is open yet (signup, token issuance).
 //!
-//! A third entry point, [`Db::audit_global_on`], is for a caller that already
-//! holds a transaction open for something else and needs its audit write to
-//! commit or roll back with it, rather than best-effort on the pool.
+//! ## Readers, and who sees which row
+//!
+//! Every row is either **org-scoped** (`org_id` set) or **global**
+//! (`org_id IS NULL`), and the two halves have one reader each, which never
+//! overlap:
+//!
+//! - [`Tx::audit_trail`] — an org's admins read their org's rows, through a
+//!   pinned transaction. Row-level security (`audit_events_tenant_isolation`,
+//!   `org_id = current_org()`) is what confines it; a global row can never
+//!   match, because `NULL = anything` is not true, and the control-plane
+//!   policy below is false whenever an org is pinned.
+//! - [`Db::audit_trail_for_user`] — a signed-in user reads the global rows
+//!   **they are the actor of**, and nothing else: no org-scoped row (those
+//!   belong to the org's admins, who decide who reads them), and no row
+//!   attributed to anybody else. Unpinned, because global rows are readable
+//!   only from the unpinned control plane — see that method's doc comment for
+//!   the rows it deliberately cannot show.
+//!
+//! **How global rows are reachable at all.** `0005_audit.sql` says `NULL`-org
+//! rows are "reachable only from the unpinned control plane", but as 0005
+//! shipped that was true only where the connecting role is exempt from RLS (a
+//! superuser or `BYPASSRLS`): its one `SELECT` policy is the tenant one, which
+//! no `NULL`-org row passes, so on managed Postgres — a non-exempt owner under
+//! `FORCE ROW LEVEL SECURITY` — nobody could read them. `0015_audit_global_read.sql`
+//! makes 0005's sentence true on every deployment shape with a second
+//! `SELECT` policy, `audit_events_control_plane_read`:
+//! `current_org() IS NULL AND org_id IS NULL`. Unpinned reads see global rows
+//! and still no org's rows; pinned reads are unchanged. (0005 itself is never
+//! edited — sqlx checksums applied migrations — so the correction lives here
+//! and in 0015's header.)
+//!
+//! A global row with no actor — a failed sign-in that never identified an
+//! account, a dynamic client registration — has no reader at all. Those are
+//! forensic: operators query them in the database directly. That is a
+//! consequence of attribution, not an oversight: a row nobody can be shown to
+//! own is not shown to anybody.
 //!
 //! Actions are dotted and stable because they are queried by prefix and because
 //! they end up in customers' SIEM exports. Renaming one is a breaking change.
@@ -178,6 +219,9 @@ const INSERT_SQL: &str = "INSERT INTO audit_events \
      (org_id, actor_user_id, actor_label, action, target_type, target_id, ip, user_agent, detail) \
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)";
 
+/// Most rows one call to either reader returns, whatever the caller asked for.
+const MAX_TRAIL: i64 = 1000;
+
 impl Tx<'_> {
     /// Record an org-scoped event **in the same transaction as the change it
     /// describes**. If the change rolls back, so does its record.
@@ -201,14 +245,120 @@ impl Tx<'_> {
         ))
         .bind(org)
         .bind(action_prefix)
-        .bind(limit.clamp(1, 1000))
+        .bind(limit.clamp(1, MAX_TRAIL))
         .fetch_all(self.conn())
         .await?;
         Ok(events)
     }
 }
 
+/// Global actions whose row involves a **second account** besides its actor:
+/// the actor is the account a ceremony or claim code proved, and the request
+/// that was refused came from — or named — somebody else.
+///
+/// The actor still deserves to know the attempt happened, so the row is
+/// returned to them, but with its `detail`, `ip` and `user_agent` emptied:
+/// `detail` names the other account (`attemptedBy`, or a claim refusal's
+/// reason, which embeds the claimed account's id), and the address and agent
+/// are the other request's, not the actor's own.
+const CROSS_ACCOUNT_ACTIONS: &[&str] =
+    &[action::PASSKEY_REGISTRATION_REFUSED, action::CLAIM_REFUSED];
+
+/// The `detail` keys a user may read back on their own global rows. An
+/// allowlist rather than a denylist so a writer that later adds a key does not
+/// silently publish it to the account holder: anything not named here is
+/// dropped until somebody decides it is theirs to see.
+///
+/// - `method` — `passkey` or `sso`, on sign-in rows.
+/// - `via` — how a passkey was registered (`signup`, `add`, `claim`).
+/// - `reason` — why a sign-in was refused. A writer must never put another
+///   account's identity in a `reason`; the one that does (`auth.claim.refused`)
+///   is in [`CROSS_ACCOUNT_ACTIONS`] and loses its whole `detail`.
+const SELF_VISIBLE_DETAIL: &[&str] = &["method", "via", "reason"];
+
+impl AuditEvent {
+    /// Narrow a global row to what its own actor may read. See
+    /// [`CROSS_ACCOUNT_ACTIONS`] and [`SELF_VISIBLE_DETAIL`].
+    fn redacted_for_actor(mut self) -> Self {
+        if CROSS_ACCOUNT_ACTIONS.contains(&self.action.as_str()) {
+            self.ip = None;
+            self.user_agent = None;
+            self.detail = serde_json::json!({});
+            return self;
+        }
+        if let serde_json::Value::Object(map) = &mut self.detail {
+            map.retain(|key, _| SELF_VISIBLE_DETAIL.contains(&key.as_str()));
+        } else {
+            self.detail = serde_json::json!({});
+        }
+        self
+    }
+}
+
 impl Db {
+    /// Read one user's **own global** audit trail, newest first: the rows with
+    /// no org (`org_id IS NULL`) whose actor is `user`. Powers the console's
+    /// account-level security activity page (`GET /api/me/audit`). Same
+    /// columns, prefix filter and limit clamp as [`Tx::audit_trail`].
+    ///
+    /// **What "own" means.** Attribution is `actor_user_id`, and only that. So:
+    ///
+    /// - Sign-ins (succeeded, and refused once a credential had identified the
+    ///   account), sign-outs, and passkey registration, removal and renaming
+    ///   are all here.
+    /// - A failed sign-in that never identified an account — an unknown
+    ///   credential, a forged assertion — has no actor and so is **not
+    ///   attributable**: it is nobody's to read, and it is not here. Neither is
+    ///   anything else written with no actor (a dynamic client registration).
+    /// - A row about this user that somebody else acted on is not here either:
+    ///   an admin clearing this account's passkeys (`auth.passkey.cleared`) is
+    ///   the admin's row, carrying the admin's address. The org-scoped record
+    ///   of the same reset (`org.member.passkeys_reset`) is in that org's own
+    ///   trail, which is the org admins' to read.
+    /// - Org-scoped rows the user acted on are excluded even though they are
+    ///   the actor: an org's trail is read through [`Tx::audit_trail`], by the
+    ///   org's admins, and the console does not offer a second path around
+    ///   that role check.
+    ///
+    /// Rows are narrowed before they are returned — `detail` to an allowlist
+    /// of keys, and the cross-account refusals to no `detail`, `ip` or
+    /// `user_agent` at all — so nothing about a second account reaches the
+    /// first. See [`SELF_VISIBLE_DETAIL`] and [`CROSS_ACCOUNT_ACTIONS`].
+    ///
+    /// **Unpinned on purpose.** Global rows are readable only from the
+    /// unpinned control plane (`audit_events_control_plane_read`, 0015), so
+    /// this runs on the pool, never on a [`Tx`]: a pinned transaction sees
+    /// only its own org's rows and never a `NULL`-org one. That policy admits
+    /// *every* global row to the control plane — it has no per-request
+    /// identity to filter on — so the `WHERE` clause, not RLS, is what
+    /// confines the result to one user, which is why it names `user` and
+    /// `org_id IS NULL` explicitly rather than trusting any policy to do it.
+    /// The same holds where the connecting role is exempt from RLS altogether.
+    ///
+    /// Served by `audit_events_actor_idx (actor_user_id, created_at DESC)`.
+    pub async fn audit_trail_for_user(
+        &self,
+        user: UserId,
+        action_prefix: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<AuditEvent>> {
+        let events: Vec<AuditEvent> = sqlx::query_as(&format!(
+            "SELECT {AUDIT_COLS} FROM audit_events \
+             WHERE org_id IS NULL AND actor_user_id = $1 \
+               AND ($2::text IS NULL OR action LIKE $2 || '%') \
+             ORDER BY created_at DESC, id DESC LIMIT $3"
+        ))
+        .bind(user)
+        .bind(action_prefix)
+        .bind(limit.clamp(1, MAX_TRAIL))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(events
+            .into_iter()
+            .map(AuditEvent::redacted_for_actor)
+            .collect())
+    }
+
     /// Record an event with no org context — a login attempt, a passkey
     /// enrollment.
     ///

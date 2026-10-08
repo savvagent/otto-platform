@@ -118,6 +118,75 @@ async fn signing_out_everywhere_ends_every_session(pool: PgPool) {
     }
 }
 
+// ------------------------------------------------- account security activity
+
+/// `GET /api/me/audit` (#22): an account reads the audit rows written with no
+/// org — sign-ins, passkey changes — that it is the actor of, and nothing
+/// else: not another account's, and not the org-scoped rows it acted on,
+/// which are the org admins' to read.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_account_reads_its_own_security_activity_and_nobody_elses(pool: PgPool) {
+    let h = harness(pool).await;
+    let mut rob = onboard(&h, "rob@acme.test").await;
+    let bob = onboard(&h, "bob@acme.test").await;
+    sign_in(&h, &mut rob).await.expect(StatusCode::OK);
+    // Writes an org-scoped `org.member.joined` with Rob as its actor.
+    org_with_owner(&h, "acme", &rob).await;
+
+    Call::get("/api/me/audit")
+        .send(&h.router)
+        .await
+        .expect(StatusCode::UNAUTHORIZED);
+
+    let mine = Call::get("/api/me/audit")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    mine.expect(StatusCode::OK);
+    let rows = mine.body.as_array().unwrap();
+    let rob_id = rob.user.to_string();
+    let actions: Vec<&str> = rows.iter().map(|r| r["action"].as_str().unwrap()).collect();
+    assert!(
+        actions.contains(&"auth.passkey.registered") && actions.contains(&"auth.login.succeeded"),
+        "signup and the sign-in after it are Rob's own global events: {actions:?}"
+    );
+    assert!(
+        !actions.iter().any(|a| a.starts_with("org.")),
+        "an org's trail is read by its admins, not here: {actions:?}"
+    );
+    for row in rows {
+        assert_eq!(row["actorUserId"], rob_id.as_str(), "{row}");
+        assert!(row["orgId"].is_null(), "{row}");
+    }
+    assert!(
+        !mine.text.contains(&bob.user.to_string()),
+        "nothing of Bob's reaches Rob"
+    );
+
+    // Newest first, and the org trail's query parameters work here too.
+    let logins = Call::get("/api/me/audit?actionPrefix=auth.login.&limit=1")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    logins.expect(StatusCode::OK);
+    let logins = logins.body.as_array().unwrap();
+    assert_eq!(logins.len(), 1);
+    assert_eq!(logins[0]["action"], "auth.login.succeeded");
+    assert_eq!(logins[0]["detail"]["method"], "passkey");
+
+    // Bob sees his own signup, and none of Rob's sign-ins.
+    let his = Call::get("/api/me/audit")
+        .with_session(&bob.session)
+        .send(&h.router)
+        .await;
+    his.expect(StatusCode::OK);
+    let his = his.body.as_array().unwrap();
+    assert!(!his.is_empty());
+    assert!(his
+        .iter()
+        .all(|r| r["actorUserId"] == bob.user.to_string().as_str()));
+}
+
 // ---------------------------------------------------- login/finish throttle
 
 /// The whole point of #75: a source address shared by many honest sign-ins

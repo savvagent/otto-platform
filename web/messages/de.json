@@ -329,5 +329,17 @@
   "overview_services_description": "Weitere Otto-Konsolen, die sich mit diesem Konto anmelden.",
   "overview_services_empty_title": "Keine Dienste verknüpft",
   "overview_services_empty_hint": "Dienste erscheinen hier, sobald die Konsole mit ihren Adressen konfiguriert ist.",
-  "meter_unbilled_note": "Manche Aufrufe, etwa lange Wartezeiten auf einen verbundenen Dienst, werden erfasst, aber nicht berechnet — deshalb unterscheiden sich die beiden Zahlen."
+  "meter_unbilled_note": "Manche Aufrufe, etwa lange Wartezeiten auf einen verbundenen Dienst, werden erfasst, aber nicht berechnet — deshalb unterscheiden sich die beiden Zahlen.",
+  "settings_activity_title": "Sicherheitsaktivität",
+  "settings_activity_description": "Anmeldungen und Passkey-Änderungen an diesem Konto.",
+  "settings_activity_link": "Sicherheitsaktivität anzeigen",
+  "activity_page_title": "Sicherheitsaktivität · Otto",
+  "activity_title": "Sicherheitsaktivität",
+  "activity_subtitle": "Anmeldungen, Abmeldungen und Passkey-Änderungen an deinem Konto. Nur du kannst das sehen.",
+  "activity_back": "Zurück zu den Einstellungen",
+  "activity_loading": "Deine Sicherheitsaktivität wird gelesen",
+  "activity_empty": "Bisher nichts aufgezeichnet.",
+  "activity_error_load": "Deine Sicherheitsaktivität konnte nicht gelesen werden.",
+  "activity_col_address": "IP-Adresse",
+  "activity_scope_note": "Fehlgeschlagene Anmeldungen, die dein Konto nie identifiziert haben, werden nicht aufgeführt: Sie lassen sich niemandem zuordnen. Was du innerhalb einer Organisation tust, steht im Prüfprotokoll dieser Organisation, das ihre Administratoren lesen."
 }

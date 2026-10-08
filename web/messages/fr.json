@@ -331,5 +331,17 @@
   "overview_services_description": "Autres consoles Otto qui se connectent avec ce compte.",
   "overview_services_empty_title": "Aucun service lié",
   "overview_services_empty_hint": "Les services apparaissent ici une fois la console configurée avec leurs adresses.",
-  "meter_unbilled_note": "Certains appels, comme les longues attentes sur un service connecté, sont enregistrés mais non facturés, d'où l'écart entre les deux chiffres."
+  "meter_unbilled_note": "Certains appels, comme les longues attentes sur un service connecté, sont enregistrés mais non facturés, d'où l'écart entre les deux chiffres.",
+  "settings_activity_title": "Activité de sécurité",
+  "settings_activity_description": "Connexions et modifications de clés d'accès sur ce compte.",
+  "settings_activity_link": "Voir l'activité de sécurité",
+  "activity_page_title": "Activité de sécurité · Otto",
+  "activity_title": "Activité de sécurité",
+  "activity_subtitle": "Connexions, déconnexions et modifications de clés d'accès sur votre compte. Vous seul pouvez voir ceci.",
+  "activity_back": "Retour aux paramètres",
+  "activity_loading": "Lecture de votre activité de sécurité",
+  "activity_empty": "Rien n'a encore été enregistré.",
+  "activity_error_load": "Impossible de lire votre activité de sécurité.",
+  "activity_col_address": "Adresse IP",
+  "activity_scope_note": "Les connexions échouées qui n'ont jamais identifié votre compte ne sont pas listées : elles ne peuvent être attribuées à personne. Ce que vous faites au sein d'une organisation figure dans le journal d'audit de cette organisation, que lisent ses administrateurs."
 }

@@ -329,5 +329,17 @@
   "overview_services_description": "Other Otto consoles that sign in with this account.",
   "overview_services_empty_title": "No services linked",
   "overview_services_empty_hint": "Services appear here once the console is configured with their addresses.",
-  "meter_unbilled_note": "Some calls, such as long waits on a connected service, are recorded but not billed, which is why the two numbers differ."
+  "meter_unbilled_note": "Some calls, such as long waits on a connected service, are recorded but not billed, which is why the two numbers differ.",
+  "settings_activity_title": "Security activity",
+  "settings_activity_description": "Sign-ins and passkey changes on this account.",
+  "settings_activity_link": "View security activity",
+  "activity_page_title": "Security activity · Otto",
+  "activity_title": "Security activity",
+  "activity_subtitle": "Sign-ins, sign-outs and passkey changes on your account. Only you can see this.",
+  "activity_back": "Back to settings",
+  "activity_loading": "Reading your security activity",
+  "activity_empty": "Nothing recorded yet.",
+  "activity_error_load": "Could not read your security activity.",
+  "activity_col_address": "IP address",
+  "activity_scope_note": "Failed sign-ins that never identified your account are not listed: they cannot be attributed to anyone. What you do inside an organization is in that organization's audit log, which its admins read."
 }

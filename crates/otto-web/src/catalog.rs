@@ -413,6 +413,19 @@ pub fn catalog() -> Vec<Endpoint> {
         Endpoint::get("/api/me/sessions", auth::list_sessions)
             .returns("SessionList")
             .summary("Where this account is signed in"),
+        Endpoint::get("/api/me/audit", auth::my_audit)
+            .returns("AuditEventList")
+            .summary("This account's own security activity")
+            .describe(
+                "Sign-ins, refused sign-ins, sign-outs and passkey changes recorded against \
+                 this account outside any organization, newest first. Only events this \
+                 account is the actor of: a failed sign-in that never identified an account \
+                 is not attributable to anyone and is not listed, and organization events \
+                 are read from that organization's audit log by its admins. Rows that \
+                 involve a second account (a refused registration or claim) carry no detail \
+                 or address. Optional query parameters: `actionPrefix` (for example \
+                 `auth.passkey.`) and `limit` (default 100, at most 1000).",
+            ),
         Endpoint::delete("/api/me/sessions", auth::revoke_all_sessions)
             .summary("Sign out everywhere")
             .describe(

@@ -34,11 +34,12 @@ use otto_auth::{login, passkeys, sessions, AuthError};
 use otto_core::invites::AccountClaimsExt;
 use otto_core::orgs::OrgsExt;
 use otto_core::orgs::User;
-use otto_tenant::audit::{action, Entry};
+use otto_tenant::audit::{action, AuditEvent, Entry};
 use otto_tenant::ids::UserId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
+use crate::routes::usage::AuditQuery;
 use crate::session::{self, CurrentUser};
 use crate::state::{client_ip, AppState};
 
@@ -583,6 +584,42 @@ pub async fn list_sessions(
     caller: CurrentUser,
 ) -> ApiResult<Json<Vec<sessions::Session>>> {
     Ok(Json(sessions::list(&state.db, caller.user.id).await?))
+}
+
+/// `GET /api/me/audit` — this account's own security activity.
+///
+/// The reader for audit rows written with no org (`savvagent/otto-platform#22`):
+/// sign-ins and sign-in refusals, sign-outs, and passkey registration, removal
+/// and renaming. Before this, those rows had no reader at all, so an account
+/// with no org yet had no way to review any of its own security events.
+///
+/// Only the caller's **own global** rows — never an org's (those are
+/// [`crate::routes::usage::get_audit`]'s, behind the org-admin check) and never
+/// another account's. What "own" means, which rows are therefore not
+/// attributable to anybody (a failed sign-in that never identified an
+/// account), and how a returned row is narrowed so nothing about a second
+/// account reaches this one, are all `Db::audit_trail_for_user`'s to decide;
+/// see its doc comment.
+///
+/// Session-only, like every other `/api/me` route: [`CurrentUser`] resolves the
+/// console cookie and nothing else, so a PAT or an OAuth access token cannot
+/// read an account's sign-in history. Takes the same `actionPrefix` and
+/// `limit` query parameters as the org trail.
+pub async fn my_audit(
+    State(state): State<AppState>,
+    caller: CurrentUser,
+    axum::extract::Query(q): axum::extract::Query<AuditQuery>,
+) -> ApiResult<Json<Vec<AuditEvent>>> {
+    Ok(Json(
+        state
+            .db
+            .audit_trail_for_user(
+                caller.user.id,
+                q.action_prefix.as_deref(),
+                q.limit.unwrap_or(100),
+            )
+            .await?,
+    ))
 }
 
 #[derive(Debug, Serialize)]

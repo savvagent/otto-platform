@@ -3,8 +3,9 @@
 SvelteKit 2 · Svelte 5 (runes) · Tailwind v4 · TypeScript, strict.
 
 The account and organization console: signing in with a passkey (or enterprise SSO),
-creating an account, managing passkeys and sessions, and, per organization, members,
-invitations, teams, SSO, the usage meter and the audit log. It talks to
+creating an account, managing passkeys and sessions, reviewing the account's own security
+activity, and, per organization, members, invitations, teams, SSO, the usage meter and the
+audit log. It talks to
 `otto-platform-server`'s API (`crates/otto-web`; the contract is `GET /api/openapi.json`).
 
 What it does **not** hold is any product's own domain: queues, repositories, trackers and
@@ -58,6 +59,7 @@ that would fail; the server refuses them on every request.
 | `/invite/[org]`                                      | Redeem an invitation (needs a session).                                                                  |
 | `/orgs/new`                                          | Create an organization.                                                                                  |
 | `/settings`                                          | Profile and language, passkeys, browser sessions, linking an SSO identity.                               |
+| `/settings/activity`                                 | The account's own sign-ins and passkey changes (`GET /api/me/audit`); events outside any org only.       |
 | `/o/[org]`                                           | Overview: counts, plan, usage meter, links to services.                                                  |
 | `/o/[org]/members`, `teams`, `sso`, `usage`, `audit` | Admin-only: `sso`, `audit`.                                                                              |
 

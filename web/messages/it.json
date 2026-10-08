@@ -331,5 +331,17 @@
   "overview_services_description": "Altre console Otto che accedono con questo account.",
   "overview_services_empty_title": "Nessun servizio collegato",
   "overview_services_empty_hint": "I servizi compaiono qui quando la console è configurata con i loro indirizzi.",
-  "meter_unbilled_note": "Alcune chiamate, come le lunghe attese verso un servizio connesso, vengono registrate ma non fatturate: per questo le due cifre differiscono."
+  "meter_unbilled_note": "Alcune chiamate, come le lunghe attese verso un servizio connesso, vengono registrate ma non fatturate: per questo le due cifre differiscono.",
+  "settings_activity_title": "Attività di sicurezza",
+  "settings_activity_description": "Accessi e modifiche alle passkey su questo account.",
+  "settings_activity_link": "Visualizza l'attività di sicurezza",
+  "activity_page_title": "Attività di sicurezza · Otto",
+  "activity_title": "Attività di sicurezza",
+  "activity_subtitle": "Accessi, disconnessioni e modifiche alle passkey sul tuo account. Solo tu puoi vederlo.",
+  "activity_back": "Torna alle impostazioni",
+  "activity_loading": "Lettura della tua attività di sicurezza",
+  "activity_empty": "Non è stato ancora registrato nulla.",
+  "activity_error_load": "Non è stato possibile leggere la tua attività di sicurezza.",
+  "activity_col_address": "Indirizzo IP",
+  "activity_scope_note": "Gli accessi non riusciti che non hanno mai identificato il tuo account non sono elencati: non possono essere attribuiti a nessuno. Ciò che fai all'interno di un'organizzazione si trova nel registro di controllo di quell'organizzazione, consultato dai suoi amministratori."
 }

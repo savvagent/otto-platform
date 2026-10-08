@@ -194,6 +194,13 @@ export const api = {
   me: () => get<Me>('/api/me'),
   sessions: () => get<BrowserSession[]>('/api/me/sessions'),
   signOutEverywhere: () => del<{ revoked: number }>('/api/me/sessions'),
+  /**
+   * This account's own security activity: the audit rows written outside any
+   * org that it is the actor of. Not an org's trail — that is `audit` below,
+   * and admin-only.
+   */
+  myAudit: (limit = 100, actionPrefix?: string) =>
+    get<AuditEvent[]>(`/api/me/audit${query({ limit, actionPrefix })}`),
 
   /** Add another authenticator. One passkey is one device. */
   addPasskeyStart: () => post<RegistrationChallenge>('/api/me/passkeys/start'),
