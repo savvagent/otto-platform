@@ -65,6 +65,10 @@ pub struct PlanLimits {
     /// Whether exceeding the bucket stops billable work rather than metering
     /// overage.
     pub hard_stop: bool,
+    /// Capabilities the plan unlocks, as a JSON object keyed by capability
+    /// (`plans.features`). Opaque to the platform: the services that read a
+    /// key own its meaning.
+    pub features: serde_json::Value,
 }
 
 /// A usage event shipped by a resource server from its own outbox.
@@ -285,7 +289,7 @@ impl UsageExt for Tx<'_> {
         let limits: Option<PlanLimits> = sqlx::query_as(
             "SELECT p.plan, p.display_name, \
                     COALESCE(s.included_ops_override, p.included_ops) AS included_ops, \
-                    p.hard_stop \
+                    p.hard_stop, p.features \
              FROM orgs o \
              JOIN plans p ON p.plan = o.plan \
              LEFT JOIN subscriptions s ON s.org_id = o.id \

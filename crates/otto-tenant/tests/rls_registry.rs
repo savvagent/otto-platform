@@ -90,3 +90,49 @@ async fn tenant_pinned_code_cannot_read_the_cross_tenant_tables(pool: PgPool) {
     .unwrap();
     tx.rollback().await.unwrap();
 }
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn tenant_pinned_code_reads_plans_but_cannot_change_them(pool: PgPool) {
+    let db = Db::from_pool(pool.clone());
+
+    // Plans, and the capabilities they unlock, are readable from a tenant
+    // transaction (plan_limits joins them) ...
+    let mut tx = db.begin(OrgId::new()).await.unwrap();
+    let features: serde_json::Value =
+        sqlx::query_scalar("SELECT features FROM plans WHERE plan = 'team'")
+            .fetch_one(tx.conn())
+            .await
+            .unwrap();
+    assert_eq!(features, serde_json::json!({"auto_rollback": true}));
+    drop(tx);
+
+    // ... but not writable: one org's transaction must not grant a capability
+    // to every org on a tier.
+    for stmt in [
+        "UPDATE plans SET features = '{\"auto_rollback\": true}' WHERE plan = 'free'",
+        "INSERT INTO plans (plan, display_name, included_ops) VALUES ('free', 'x', 1)",
+        "DELETE FROM plans WHERE plan = 'free'",
+    ] {
+        let mut tx = db.begin(OrgId::new()).await.unwrap();
+        let err = sqlx::query(stmt).execute(tx.conn()).await.expect_err(stmt);
+        assert!(
+            err.to_string().contains("permission denied"),
+            "{stmt}: {err}"
+        );
+    }
+
+    // Features are always a JSON object, so a consumer never has to guess
+    // what an array or a scalar would mean.
+    for bad in ["[]", "true", "null"] {
+        let err = sqlx::query(&format!(
+            "UPDATE plans SET features = '{bad}'::jsonb WHERE plan = 'free'"
+        ))
+        .execute(&pool)
+        .await
+        .expect_err(bad);
+        assert!(
+            err.to_string().contains("check constraint") || err.to_string().contains("null value"),
+            "{bad}: {err}"
+        );
+    }
+}

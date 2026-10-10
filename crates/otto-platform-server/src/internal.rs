@@ -7,7 +7,7 @@
 //!
 //! ```text
 //!   POST /internal/usage                                     batch usage ingest
-//!   GET  /internal/orgs/{org}/usage-status                   period usage vs plan
+//!   GET  /internal/orgs/{org}/usage-status                   period usage vs plan, plan features
 //!   GET  /internal/orgs/{org}/members/{user}                 whoami: user + org + role
 //!   GET  /internal/orgs/{org}/members/by-email?email=        member lookup
 //!   GET  /internal/orgs/{org}/members/{user}/teams           the member's teams in the org
@@ -186,6 +186,10 @@ async fn usage_status(
         total_count: usage.total_count,
         included_ops: limits.included_ops,
         hard_stop: limits.hard_stop,
+        features: match limits.features {
+            serde_json::Value::Object(map) => map.into_iter().collect(),
+            _ => Default::default(),
+        },
     }))
 }
 

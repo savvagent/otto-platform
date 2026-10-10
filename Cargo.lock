@@ -1654,6 +1654,7 @@ dependencies = [
  "otto-tenant",
  "schemars",
  "serde",
+ "serde_json",
  "sqlx",
  "uuid",
 ]
