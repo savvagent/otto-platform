@@ -140,6 +140,7 @@ mod tests {
                 display_name: "Free".into(),
                 included_ops: included,
                 hard_stop: true,
+                features: serde_json::json!({}),
             },
             false,
         )

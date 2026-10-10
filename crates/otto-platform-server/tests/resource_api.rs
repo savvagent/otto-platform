@@ -438,7 +438,9 @@ async fn an_unknown_user_id_does_not_fail_the_event(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
-async fn usage_status_reports_the_plan_and_oversized_batches_are_refused(pool: PgPool) {
+async fn usage_status_reports_the_plan_and_its_features_and_oversized_batches_are_refused(
+    pool: PgPool,
+) {
     let w = world(pool).await;
     let auth = w.factory_basic();
 
@@ -453,6 +455,31 @@ async fn usage_status_reports_the_plan_and_oversized_batches_are_refused(pool: P
     assert_eq!(body["included_ops"], 500);
     assert_eq!(body["hard_stop"], true);
     assert_eq!(body["billable_count"], 0);
+    // The free plan unlocks nothing.
+    assert_eq!(body["features"], serde_json::json!({}));
+
+    // Every paid plan unlocks auto-rollback (0016_plan_features.sql).
+    for plan in ["team", "business", "enterprise"] {
+        sqlx::query("UPDATE orgs SET plan = $1::org_plan WHERE id = $2")
+            .bind(plan)
+            .bind(w.org.as_uuid())
+            .execute(w.db.pool())
+            .await
+            .unwrap();
+        let (status, body) = get(
+            &w.db,
+            &auth,
+            &format!("/internal/orgs/{}/usage-status", w.org),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{plan}");
+        assert_eq!(body["plan"], plan);
+        assert_eq!(
+            body["features"],
+            serde_json::json!({"auto_rollback": true}),
+            "{plan}"
+        );
+    }
 
     let (status, _) = get(
         &w.db,
@@ -1220,12 +1247,49 @@ fn usage_status_blocking_rules() {
         total_count: 600,
         included_ops: 500,
         hard_stop: true,
+        features: Default::default(),
     };
     assert!(!s.is_blocked());
     s.billable_count = 500;
     assert!(s.is_blocked());
     s.hard_stop = false;
     assert!(!s.is_blocked() && s.over_limit());
+}
+
+#[test]
+fn only_a_json_true_enables_a_feature() {
+    let s: otto_resource::UsageStatus = serde_json::from_value(serde_json::json!({
+        "org_id": Uuid::new_v4(),
+        "plan": "team",
+        "period_start": "2026-10-01",
+        "billable_count": 0,
+        "total_count": 0,
+        "included_ops": 10000,
+        "hard_stop": false,
+        "features": {"on": true, "off": false, "count": 20, "text": "true"},
+    }))
+    .unwrap();
+    assert!(s.feature_enabled("on"));
+    for off in ["off", "count", "text", "missing"] {
+        assert!(!s.feature_enabled(off), "{off}");
+    }
+}
+
+#[test]
+fn a_platform_without_features_grants_none() {
+    // The body an older platform sends: no `features` at all.
+    let s: otto_resource::UsageStatus = serde_json::from_value(serde_json::json!({
+        "org_id": Uuid::new_v4(),
+        "plan": "business",
+        "period_start": "2026-10-01",
+        "billable_count": 0,
+        "total_count": 0,
+        "included_ops": 100000,
+        "hard_stop": false,
+    }))
+    .unwrap();
+    assert!(s.features.is_empty());
+    assert!(!s.feature_enabled("auto_rollback"));
 }
 
 // ---------------------------------------------------------------------- CLI

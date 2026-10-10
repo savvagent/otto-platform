@@ -4,6 +4,8 @@
 //! cannot drift. Ids are plain [`Uuid`]s: this crate has no dependency on the
 //! platform's typed ids.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -174,9 +176,24 @@ pub struct UsageStatus {
     /// Whether exceeding `included_ops` stops billable work (free plans)
     /// rather than metering overage.
     pub hard_stop: bool,
+    /// Capabilities the org's plan unlocks, keyed by capability, as the
+    /// platform's `plans.features` holds them. Read them with
+    /// [`UsageStatus::feature_enabled`]. Defaults to empty when the platform
+    /// predates the field, so an older platform grants nothing.
+    #[serde(default)]
+    pub features: BTreeMap<String, serde_json::Value>,
 }
 
 impl UsageStatus {
+    /// Whether the plan includes `feature`: only a JSON `true` counts, so a
+    /// missing key, `false`, or any other value is off.
+    pub fn feature_enabled(&self, feature: &str) -> bool {
+        matches!(
+            self.features.get(feature),
+            Some(serde_json::Value::Bool(true))
+        )
+    }
+
     /// Whether the bucket is spent.
     pub fn over_limit(&self) -> bool {
         self.billable_count >= self.included_ops
