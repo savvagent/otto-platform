@@ -17,3 +17,16 @@ ALTER TABLE plans ADD COLUMN features jsonb NOT NULL DEFAULT '{}'::jsonb
 
 UPDATE plans SET features = '{"auto_rollback": true}'::jsonb
  WHERE plan IN ('team', 'business', 'enterprise');
+
+-- Plans are operator-maintained reference data, and with features they decide
+-- what every org on a tier may do in every otto-* service. Nothing in the
+-- application writes them, so `otto_app` keeps read access only: a write from
+-- a tenant transaction (a bug, or an injection) cannot grant capabilities to
+-- every org on a plan. Operators change plans as the migrating role.
+-- Conditional because a managed deployment has no such role (0004_rls.sql).
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'otto_app') THEN
+    EXECUTE 'REVOKE INSERT, UPDATE, DELETE ON plans FROM otto_app';
+  END IF;
+END $$;
