@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/savvagent/otto-platform/compare/v0.4.0...v0.5.0) (2026-10-10)
+
+
+### Features
+
+* add plan features and serve them to resource servers ([#31](https://github.com/savvagent/otto-platform/issues/31)) ([4e001e5](https://github.com/savvagent/otto-platform/commit/4e001e59931676602407fe71e0c3ef0461f11ccd)), closes [#30](https://github.com/savvagent/otto-platform/issues/30)
+
 ## [0.4.0](https://github.com/savvagent/otto-platform/compare/v0.3.0...v0.4.0) (2026-10-08)
 
 
