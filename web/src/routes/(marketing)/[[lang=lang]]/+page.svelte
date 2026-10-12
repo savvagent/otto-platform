@@ -82,7 +82,7 @@
         {#each SERVICES as service (service.slug)}
           {#if service.mcpUrl}
             <li>
-              <span class="text-faint">"{service.slug}":</span>
+              <span class="text-muted">"{service.slug}":</span>
               <span class="block pl-4 break-all text-accent">"{service.mcpUrl}"</span>
             </li>
           {/if}
@@ -98,7 +98,7 @@
     <p class="mt-2 max-w-2xl text-muted">{m.landing_products_intro()}</p>
     <ul class="mt-8 grid gap-4 sm:grid-cols-2">
       {#each SERVICES as service (service.slug)}
-        <li class="grid"><ProductCard {service} lang={data.lang} /></li>
+        <li class="grid"><ProductCard {service} lang={data.lang} level={3} /></li>
       {/each}
     </ul>
   </section>

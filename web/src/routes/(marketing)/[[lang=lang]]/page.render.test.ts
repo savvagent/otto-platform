@@ -16,6 +16,21 @@ import { session } from '$lib/session.svelte';
 import type { Me } from '$lib/types';
 import Page from './+page.svelte';
 
+/** Heading levels in document order, so a skip (h1 → h3) is visible as a jump of two. */
+function headingLevels(root: HTMLElement): number[] {
+  return Array.from(root.querySelectorAll('h1, h2, h3, h4, h5, h6')).map((h) =>
+    Number(h.tagName.slice(1))
+  );
+}
+
+function expectNoSkips(levels: number[]): void {
+  expect(levels[0]).toBe(1);
+  levels.reduce((previous, level) => {
+    expect(level - previous, `h${previous} → h${level}`).toBeLessThanOrEqual(1);
+    return level;
+  });
+}
+
 let container: HTMLElement;
 
 beforeEach(() => {
@@ -37,6 +52,7 @@ describe('the landing page', () => {
     const instance = mount(Page, { target: container, props: { data: { lang: 'en' } } });
 
     expect(container.querySelectorAll('h1')).toHaveLength(1);
+    expectNoSkips(headingLevels(container));
     expect(link('Create account')?.getAttribute('href')).toBe('/signup');
     expect(link('See pricing')?.getAttribute('href')).toBe('/pricing');
     expect(link('Open console')).toBeUndefined();

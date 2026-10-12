@@ -32,7 +32,7 @@
   const basePath = $derived(stripLocale(page.url.pathname).path);
 </script>
 
-<footer class="border-t border-edge/40 px-4 py-6 text-xs text-faint">
+<footer class="border-t border-edge/40 px-4 py-6 text-xs text-muted">
   <div class="mx-auto flex w-full max-w-6xl flex-col gap-4">
     <nav aria-label={m.marketing_footer_language()}>
       <ul class="flex flex-wrap gap-x-3 gap-y-2">
@@ -44,7 +44,7 @@
               lang={locale}
               data-sveltekit-reload
               aria-current={locale === lang ? 'true' : undefined}
-              class="hover:text-muted aria-[current=true]:font-medium aria-[current=true]:text-ink"
+              class="hover:text-ink aria-[current=true]:font-medium aria-[current=true]:text-ink"
             >
               {LOCALE_NAMES[locale]}
             </a>
@@ -54,12 +54,11 @@
     </nav>
 
     <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
-      <a class="hover:text-muted" href="/api/openapi.json" rel="external">{m.nav_api_reference()}</a
-      >
+      <a class="hover:text-ink" href="/api/openapi.json" rel="external">{m.nav_api_reference()}</a>
       <span aria-hidden="true">·</span>
       <span>
         {m.marketing_footer_contact()}:
-        <a class="hover:text-muted" href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a>
+        <a class="hover:text-ink" href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a>
       </span>
       <span aria-hidden="true">·</span>
       <span>v{APP_VERSION}</span>

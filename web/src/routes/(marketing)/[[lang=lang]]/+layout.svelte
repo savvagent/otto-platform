@@ -79,7 +79,7 @@
         </a>
         <button
           type="button"
-          class="ml-auto text-faint hover:text-ink"
+          class="ml-auto text-muted hover:text-ink"
           onclick={() => (hint = undefined)}
         >
           {m.marketing_locale_hint_dismiss({}, { locale: hint })}

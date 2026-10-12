@@ -106,7 +106,7 @@
       </h2>
       <ul class="mt-6 grid gap-4 sm:grid-cols-2">
         {#each others as other (other.slug)}
-          <li class="grid"><ProductCard service={other} lang={data.lang} /></li>
+          <li class="grid"><ProductCard service={other} lang={data.lang} level={3} /></li>
         {/each}
       </ul>
     </section>

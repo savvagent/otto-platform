@@ -40,13 +40,48 @@
 
   const consoleHref = $derived(session.homeOrg ? `/o/${session.homeOrg}` : '/orgs/new');
 
+  /**
+   * The small-screen menu's state, owned here rather than left to the
+   * `<details>` alone.
+   *
+   * Its links are client-side navigations, and a `<details>` has no idea a
+   * route changed: without this the next page would load under a menu still
+   * open over it. Reading `page.url` is what makes the effect re-run on every
+   * navigation; the value itself is not needed.
+   */
+  let menuOpen = $state(false);
+  let menuToggle = $state<HTMLElement>();
+
+  $effect(() => {
+    void page.url;
+    menuOpen = false;
+  });
+
+  /**
+   * Escape closes the menu, and focus goes back to the toggle that opened it.
+   *
+   * Listened for on the window rather than on the `<details>`: a key handler
+   * on a non-interactive element is invisible to assistive technology, and an
+   * open menu is the only thing on these pages Escape could mean.
+   */
+  function onMenuKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Escape' || !menuOpen) return;
+    event.preventDefault();
+    menuOpen = false;
+    menuToggle?.focus();
+  }
+
   function current(href: string): 'page' | undefined {
     return page.url.pathname === href ? 'page' : undefined;
   }
 
+  // The current page is underlined as well as brighter: colour alone is not
+  // a cue everyone can see (WCAG 1.4.1).
   const link =
-    'rounded-md px-2.5 py-1.5 text-muted transition hover:bg-raised hover:text-ink aria-[current=page]:text-ink';
+    'rounded-md px-2.5 py-1.5 text-muted transition hover:bg-raised hover:text-ink aria-[current=page]:text-ink aria-[current=page]:underline aria-[current=page]:decoration-accent aria-[current=page]:underline-offset-4';
 </script>
+
+<svelte:window onkeydown={onMenuKeydown} />
 
 <header class="border-b border-edge/60 bg-surface/40">
   <div class="mx-auto flex w-full max-w-6xl items-center gap-2 px-4 py-3 sm:gap-4">
@@ -93,8 +128,9 @@
         free. "Sign in" lives in here below `sm`, so the bar never has to fit
         three buttons in 360px.
       -->
-      <details class="relative md:hidden">
+      <details class="relative md:hidden" bind:open={menuOpen}>
         <summary
+          bind:this={menuToggle}
           class="cursor-pointer list-none rounded-md border border-edge px-2.5 py-1.5 text-muted transition select-none hover:bg-raised hover:text-ink [&::-webkit-details-marker]:hidden"
         >
           {m.marketing_nav_menu()}

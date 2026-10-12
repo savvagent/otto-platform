@@ -9,6 +9,21 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import Page from './+page.svelte';
 
+/** Heading levels in document order, so a skip (h1 → h3) is visible as a jump of two. */
+function headingLevels(root: HTMLElement): number[] {
+  return Array.from(root.querySelectorAll('h1, h2, h3, h4, h5, h6')).map((h) =>
+    Number(h.tagName.slice(1))
+  );
+}
+
+function expectNoSkips(levels: number[]): void {
+  expect(levels[0]).toBe(1);
+  levels.reduce((previous, level) => {
+    expect(level - previous, `h${previous} → h${level}`).toBeLessThanOrEqual(1);
+    return level;
+  });
+}
+
 let container: HTMLElement;
 
 beforeEach(() => {
@@ -31,6 +46,12 @@ describe('the product page', () => {
 
     const headings = container.querySelectorAll('h1');
     expect(headings).toHaveLength(1);
+    expectNoSkips(headingLevels(container));
+    // The cross-linked card's name is a real heading, one level under its section.
+    const card = Array.from(container.querySelectorAll('h3')).find((h) =>
+      h.textContent?.includes('Otto Flags')
+    );
+    expect(card).toBeDefined();
     expect(headings[0]?.textContent).toContain('Otto Factory');
     expect(container.textContent).toContain('https://otto-factory.savvagent.com/mcp');
 
