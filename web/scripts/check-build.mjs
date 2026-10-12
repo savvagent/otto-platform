@@ -23,7 +23,7 @@
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
+import { dirname, extname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { readCatalog, readSettings } from './check-messages.mjs';
@@ -133,18 +133,94 @@ export function checkPage(html, { file, lang, canonical }, messages) {
 }
 
 /**
+ * The `content` of every robots meta tag in `html` (`robots`, or a named
+ * crawler's such as `googlebot`), whatever the attribute order, quoting or
+ * case.
+ */
+function robotsDirectives(html) {
+  const directives = [];
+  for (const [tag] of html.matchAll(/<meta\b[^>]*>/gi)) {
+    const attr = (name) =>
+      new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`, 'i')
+        .exec(tag)
+        ?.slice(1)
+        .find((v) => v !== undefined);
+    const name = attr('name')?.toLowerCase();
+    if (name === 'robots' || name === 'googlebot' || name === 'bingbot') {
+      directives.push(attr('content') ?? '');
+    }
+  }
+  return directives;
+}
+
+/**
  * The console shell is English until script corrects it, and must never ask
  * to be indexed: it is served for every console URL.
+ *
+ * **The shell carries no robots meta tag on purpose** (see `src/app.html`):
+ * the template also renders the marketing pages, so the shell's `noindex` is
+ * the `X-Robots-Tag` header the server and the Worker put on it. So no tag is
+ * fine, and what is refused is a tag that does not say `noindex`: any robots
+ * meta without it — `index, follow`, `all`, or an empty one — would at best
+ * contradict the header.
  */
 export function checkShell(html, file = '200.html') {
   const errors = [];
   const found = langOf(html);
   if (found !== 'en') errors.push(`${file}: expected <html lang="en">, found ${found ?? 'none'}`);
-  if (html.includes(INDEXABLE)) errors.push(`${file}: must not be "index, follow"`);
+  for (const content of robotsDirectives(html)) {
+    if (!/(^|[\s,])noindex([\s,]|$)/i.test(content)) {
+      errors.push(`${file}: a robots meta tag says "${content}"; the shell must never be indexed`);
+    }
+  }
   return errors;
 }
 
-function* walk(dir) {
+/**
+ * Whether a `robots.txt` path rule matches `path`: a prefix match, with `*`
+ * matching any run of characters and a trailing `$` anchoring the end, as
+ * Google and RFC 9309 read it.
+ */
+function ruleMatches(rule, path) {
+  const anchored = rule.endsWith('$');
+  const body = anchored ? rule.slice(0, -1) : rule;
+  const pattern = body
+    .split('*')
+    .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
+    .join('.*');
+  return new RegExp(`^${pattern}${anchored ? '$' : ''}`).test(path);
+}
+
+/**
+ * What is wrong with `robots.txt`: a `Disallow` that would keep a crawler off
+ * a marketing page, or no `Sitemap` line naming ours. `paths` are the URL
+ * paths of every marketing page, in every locale.
+ */
+export function checkRobots(text, paths) {
+  const errors = [];
+  const rules = text
+    .split('\n')
+    .map((line) => /^\s*disallow\s*:\s*([^#\s]*)/i.exec(line)?.[1])
+    .filter((rule) => rule !== undefined && rule !== '');
+  for (const rule of rules) {
+    const blocked = paths.filter((path) => ruleMatches(rule, path));
+    if (blocked.length > 0) {
+      errors.push(`robots.txt: "Disallow: ${rule}" blocks marketing page(s) ${blocked.join(', ')}`);
+    }
+  }
+  const sitemap = `${SITE_ORIGIN}/sitemap.xml`;
+  const named = text
+    .split('\n')
+    .some((line) => /^\s*sitemap\s*:\s*(\S+)/i.exec(line)?.[1] === sitemap);
+  if (!named) errors.push(`robots.txt: expected "Sitemap: ${sitemap}"`);
+  return errors;
+}
+
+/** The files the placeholder scan reads; images and fonts are not text. */
+const TEXT_EXTENSIONS = new Set(['.html', '.xml', '.txt', '.js']);
+
+/** Every file under `dir`, recursively. */
+export function* walk(dir) {
   for (const name of readdirSync(dir)) {
     const path = join(dir, name);
     if (statSync(path).isDirectory()) yield* walk(path);
@@ -170,9 +246,15 @@ export function checkBuild(
     if (!existsSync(join(dir, file))) errors.push(`${file}: missing`);
   }
   if (existsSync(join(dir, '200.html'))) errors.push(...checkShell(read('200.html')));
+  if (existsSync(join(dir, 'robots.txt'))) {
+    const paths = expectedPages(settings).map((page) => page.canonical.slice(SITE_ORIGIN.length));
+    errors.push(...checkRobots(read('robots.txt'), paths));
+  }
 
   // The hook's placeholder surviving anywhere means a page skipped the hook.
+  // Text files only: an image read as UTF-8 is noise, not a page.
   for (const path of walk(dir)) {
+    if (!TEXT_EXTENSIONS.has(extname(path))) continue;
     if (readFileSync(path, 'utf8').includes('%otto.lang%')) {
       errors.push(`${relative(dir, path)}: still contains %otto.lang%`);
     }
