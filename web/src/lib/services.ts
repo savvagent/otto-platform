@@ -8,11 +8,13 @@
  * with OAuth. Each of those consoles links back to this one, so a person never
  * has to know a hostname.
  *
- * **It is deliberately a plain list.** A new service is one entry here, its
- * copy in the message catalogs, and nothing else: the marketing pages, the
- * sitemap and the build check all derive their product pages from it. The
- * console itself still knows nothing about what any of them *do* — it reads
- * only `name` and `url`.
+ * **It is deliberately a plain list.** A new service is one entry here plus its
+ * copy in the message catalogs: the marketing pages and the sitemap derive
+ * their product pages from it. The one exception is `scripts/check-build.mjs`,
+ * which runs in plain Node without `$lib` and so keeps its own copy of the
+ * slugs; `check-build.test.mjs` fails until that copy matches. The console
+ * itself still knows nothing about what any of them *do* — it reads only
+ * `name` and `url`.
  *
  * `url` is where the service's console lives, with no trailing slash. It is an
  * external origin: a link here is a full navigation, never a client-side route.
