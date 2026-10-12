@@ -7,7 +7,7 @@
  * writes pages something links to, and it is perfectly happy to write none:
  * a broken `entries`, a matcher that stops matching, or a hook that stops
  * running all produce a green build missing half the site, or a site whose
- * Spanish page says `lang="en"`. Every failure here is one a visitor or a
+ * Spanish page says `lang="en"` (or `lang="es"` over English text). Every failure here is one a visitor or a
  * crawler would see and the build would not.
  *
  * Run after `npm run build`: `npm run check:build` (or
@@ -25,7 +25,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { readSettings } from './check-messages.mjs';
+import { readCatalog, readSettings } from './check-messages.mjs';
 
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -69,9 +69,58 @@ function langOf(html) {
   return /<html\b[^>]*\blang="([^"]*)"/.exec(html)?.[1];
 }
 
-/** What is wrong with one marketing page, as sentences. Empty when nothing is. */
-export function checkPage(html, { file, lang, canonical }) {
+/** Undo the escaping Svelte applies to text and attribute values. */
+function decode(text) {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+/**
+ * The first and the last string the marketing layout renders: the skip link
+ * at the top of `<body>`, and the footer's language-switcher label at the
+ * bottom. Each is a key, a pattern that finds it in the HTML, and a name.
+ *
+ * **Why the body is checked, not only `<html lang>`.** The `lang` attribute
+ * comes from the URL, in a hook; the words come from Paraglide's
+ * process-wide locale override, which the layout installs while it renders.
+ * If that override ever belonged to another page — a `load` calling a
+ * message, an `await` in a component — the head would still be right and the
+ * text would not. Checking both ends of the render catches a switch part-way
+ * through as well as a wrong start.
+ */
+const LOCALE_MARKERS = [
+  {
+    key: 'marketing_skip_to_content',
+    pattern: /<a href="#main"[^>]*>\s*([^<]*?)\s*<\/a>/,
+    where: 'skip link'
+  },
+  {
+    key: 'marketing_footer_language',
+    pattern: /<footer[\s\S]*?<nav aria-label="([^"]*)"/,
+    where: 'footer language label'
+  }
+];
+
+/**
+ * What is wrong with one marketing page, as sentences. Empty when nothing is.
+ *
+ * `messages` is the page's own locale catalog; without it the body text is
+ * not checked.
+ */
+export function checkPage(html, { file, lang, canonical }, messages) {
   const errors = [];
+  for (const { key, pattern, where } of messages ? LOCALE_MARKERS : []) {
+    const want = messages[key];
+    const found = pattern.exec(html)?.[1];
+    if (found === undefined) errors.push(`${file}: no ${where} found`);
+    else if (decode(found) !== want) {
+      errors.push(`${file}: ${where} is "${decode(found)}", expected "${want}" (${lang})`);
+    }
+  }
   const found = langOf(html);
   if (found !== lang)
     errors.push(`${file}: expected <html lang="${lang}">, found ${found ?? 'none'}`);
@@ -103,13 +152,17 @@ function* walk(dir) {
 }
 
 /** Every problem with the bundle in `dir`. */
-export function checkBuild(dir, settings = readSettings(webRoot)) {
+export function checkBuild(
+  dir,
+  settings = readSettings(webRoot),
+  catalog = (lang) => readCatalog(lang, webRoot)
+) {
   const errors = [];
   const read = (file) => readFileSync(join(dir, file), 'utf8');
 
   for (const page of expectedPages(settings)) {
     if (!existsSync(join(dir, page.file))) errors.push(`${page.file}: missing`);
-    else errors.push(...checkPage(read(page.file), page));
+    else errors.push(...checkPage(read(page.file), page, catalog(page.lang)));
   }
 
   for (const file of ['200.html', 'sitemap.xml', 'robots.txt']) {

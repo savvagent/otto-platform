@@ -62,12 +62,43 @@ describe('expectedPages', () => {
 
 describe('checkPage', () => {
   const expected = { file: 'de.html', lang: 'de', canonical: 'https://otto.savvagent.com/de' };
-  const good =
+  const messages = {
+    marketing_skip_to_content: 'Zum Inhalt springen',
+    marketing_footer_language: 'Sprache'
+  };
+  const head =
     '<html lang="de" class="h-full"><head><meta name="robots" content="index, follow"/>' +
-    '<link rel="canonical" href="https://otto.savvagent.com/de"/></head></html>';
+    '<link rel="canonical" href="https://otto.savvagent.com/de"/></head>';
+  const body = (skip, language) =>
+    `<body><a href="#main" class="sr-only">${skip}</a><main></main>` +
+    `<footer><nav aria-label="${language}"></nav></footer></body></html>`;
+  const good = head + body('Zum Inhalt springen', 'Sprache');
 
   it('passes a correct page', () => {
-    expect(checkPage(good, expected)).toEqual([]);
+    expect(checkPage(good, expected, messages)).toEqual([]);
+  });
+
+  /**
+   * The failure this guards: `<html lang>` comes from the URL in a hook, but
+   * the text comes from Paraglide's process-wide locale override. If another
+   * page's override were in place while this one rendered, the head would be
+   * right and every word on the page wrong. The first and the last string
+   * the layout renders are both checked, so a switch part-way through shows.
+   */
+  it('catches body text in another language, at the top or the bottom', () => {
+    const englishTop = head + body('Skip to content', 'Sprache');
+    expect(checkPage(englishTop, expected, messages).join('\n')).toMatch(/Zum Inhalt springen/);
+    const englishBottom = head + body('Zum Inhalt springen', 'Language');
+    expect(checkPage(englishBottom, expected, messages).join('\n')).toMatch(/Sprache/);
+  });
+
+  it('compares text as the browser reads it, entities decoded', () => {
+    const fr = {
+      marketing_skip_to_content: 'Aller au contenu',
+      marketing_footer_language: 'L’idiome & co'
+    };
+    const page = head + body('Aller au contenu', 'L’idiome &amp; co');
+    expect(checkPage(page, expected, fr)).toEqual([]);
   });
 
   it('names each thing that is wrong', () => {
