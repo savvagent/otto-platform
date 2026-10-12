@@ -16,7 +16,9 @@ import { check, pluralCategories } from './check-messages.mjs';
 const settings = { baseLocale: 'en', locales: ['en', 'de', 'es'] };
 
 /**
- * A plural message, spelled the way the message-format plugin actually wants.
+ * A plural message, spelled the way the message-format plugin actually wants:
+ * the count as an explicit `{count}`. ICU's `#` shorthand is not part of the
+ * inlang format — Paraglide prints it literally (#34).
  *
  * @param {Record<string, string>} arms
  * @returns {unknown}
@@ -43,18 +45,22 @@ function catalogs() {
     en: {
       $schema: 'x',
       greeting: 'Hello {name}',
-      jobs: plural({ one: '# job', other: '# jobs' })
+      jobs: plural({ one: '{count} job', other: '{count} jobs' })
     },
     de: {
       $schema: 'x',
       greeting: 'Hallo {name}',
-      jobs: plural({ one: '# Auftrag', other: '# Aufträge' })
+      jobs: plural({ one: '{count} Auftrag', other: '{count} Aufträge' })
     },
     es: {
       $schema: 'x',
       greeting: 'Hola {name}',
       // Spanish needs `many`: 1 000 000 is "un millón *de* trabajos".
-      jobs: plural({ one: '# trabajo', many: '# de trabajos', other: '# trabajos' })
+      jobs: plural({
+        one: '{count} trabajo',
+        many: '{count} de trabajos',
+        other: '{count} trabajos'
+      })
     }
   };
 }
@@ -106,7 +112,7 @@ describe('message catalog completeness', () => {
 
   it('catches a plural category the locale never selects', () => {
     const c = catalogs();
-    c.de.jobs[0].match['countPlural=many'] = '# Aufträge';
+    c.de.jobs[0].match['countPlural=many'] = '{count} Aufträge';
     complains(c, /de\.json "jobs" selector "countPlural" declares many, which de never selects/);
   });
 
@@ -134,6 +140,53 @@ describe('message catalog completeness', () => {
     delete c.de.jobs;
     c.es.greeting = 'Hola';
     expect(check(settings, c)).toHaveLength(2);
+  });
+});
+
+describe('ICU # shorthand', () => {
+  it('catches # in a plural arm of the base locale', () => {
+    const c = catalogs();
+    c.en.jobs[0].match['countPlural=one'] = '# job';
+    complains(c, /en\.json "jobs" arm "countPlural=one" uses "#".*\{count\}/);
+  });
+
+  it('catches # in a plural arm of a translation', () => {
+    const c = catalogs();
+    c.es.jobs[0].match['countPlural=many'] = '# de trabajos';
+    complains(c, /es\.json "jobs" arm "countPlural=many" uses "#"/);
+  });
+
+  it('names the input the plural selects on', () => {
+    const c = catalogs();
+    const files = (/** @type {string} */ arm) => [
+      {
+        declarations: ['input total', 'local totalPlural = total: plural'],
+        selectors: ['totalPlural'],
+        match: { 'totalPlural=one': arm, 'totalPlural=other': '{total} files' }
+      }
+    ];
+    c.en.files = files('# file');
+    c.de.files = files('{total} Datei');
+    c.es.files = [
+      {
+        declarations: ['input total', 'local totalPlural = total: plural'],
+        selectors: ['totalPlural'],
+        match: {
+          'totalPlural=one': '{total} archivo',
+          'totalPlural=many': '{total} de archivos',
+          'totalPlural=other': '{total} archivos'
+        }
+      }
+    ];
+    const problems = check(settings, c);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toMatch(/en\.json "files" arm "totalPlural=one" uses "#".*\{total\}/);
+  });
+
+  it('leaves # alone outside a plural message', () => {
+    const c = catalogs();
+    for (const locale of ['en', 'de', 'es']) c[locale].tag = '#{name}';
+    expect(check(settings, c)).toEqual([]);
   });
 });
 

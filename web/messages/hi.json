@@ -8,8 +8,8 @@
       "declarations": ["input count", "local countPlural = count: plural"],
       "selectors": ["countPlural"],
       "match": {
-        "countPlural=one": "इस अवधि में # टूल कॉल दर्ज किया गया।",
-        "countPlural=other": "इस अवधि में # टूल कॉल दर्ज किए गए।"
+        "countPlural=one": "इस अवधि में {count} टूल कॉल दर्ज किया गया।",
+        "countPlural=other": "इस अवधि में {count} टूल कॉल दर्ज किए गए।"
       }
     }
   ],
@@ -18,8 +18,8 @@
       "declarations": ["input count", "local countPlural = count: plural"],
       "selectors": ["countPlural"],
       "match": {
-        "countPlural=one": "उनमें से # बिल-योग्य था।",
-        "countPlural=other": "उनमें से # बिल-योग्य थे।"
+        "countPlural=one": "उनमें से {count} बिल-योग्य था।",
+        "countPlural=other": "उनमें से {count} बिल-योग्य थे।"
       }
     }
   ],

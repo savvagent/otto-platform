@@ -8,8 +8,8 @@
       "declarations": ["input count", "local countPlural = count: plural"],
       "selectors": ["countPlural"],
       "match": {
-        "countPlural=one": "# Werkzeugaufruf in diesem Zeitraum erfasst.",
-        "countPlural=other": "# Werkzeugaufrufe in diesem Zeitraum erfasst."
+        "countPlural=one": "{count} Werkzeugaufruf in diesem Zeitraum erfasst.",
+        "countPlural=other": "{count} Werkzeugaufrufe in diesem Zeitraum erfasst."
       }
     }
   ],
@@ -18,8 +18,8 @@
       "declarations": ["input count", "local countPlural = count: plural"],
       "selectors": ["countPlural"],
       "match": {
-        "countPlural=one": "# davon war abrechenbar.",
-        "countPlural=other": "# davon waren abrechenbar."
+        "countPlural=one": "{count} davon war abrechenbar.",
+        "countPlural=other": "{count} davon waren abrechenbar."
       }
     }
   ],

@@ -8,8 +8,8 @@
       "declarations": ["input count", "local countPlural = count: plural"],
       "selectors": ["countPlural"],
       "match": {
-        "countPlural=one": "# tool call recorded this period.",
-        "countPlural=other": "# tool calls recorded this period."
+        "countPlural=one": "{count} tool call recorded this period.",
+        "countPlural=other": "{count} tool calls recorded this period."
       }
     }
   ],
@@ -18,8 +18,8 @@
       "declarations": ["input count", "local countPlural = count: plural"],
       "selectors": ["countPlural"],
       "match": {
-        "countPlural=one": "# of them was billable.",
-        "countPlural=other": "# of them were billable."
+        "countPlural=one": "{count} of them was billable.",
+        "countPlural=other": "{count} of them were billable."
       }
     }
   ],

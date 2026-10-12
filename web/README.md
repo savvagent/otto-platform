@@ -153,7 +153,9 @@ gets its plural categories wrong. Paraglide silently falls back to the base loca
 missing key, so without the check a half-translated release looks fine in development.
 
 Plurals use the variant form, not the ICU one-liner, and the required categories differ per
-locale (`es`, `fr`, `it` also need `many`). `--emit-ts-declarations` is what makes a
+locale (`es`, `fr`, `it` also need `many`). Write the count as `{count}`: ICU's `#` shorthand
+is not part of the format, Paraglide prints it literally, and `npm run check` rejects it in
+any plural arm. `--emit-ts-declarations` is what makes a
 misspelled key a type error. `src/lib/paraglide/` is generated, so `check` and `build` compile
 it first; a bare `npx svelte-check` in a fresh clone reports missing modules until
 `npm run paraglide:compile` has run once.

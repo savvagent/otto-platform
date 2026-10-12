@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * Every locale has every key, with the same placeholders and the right plural
- * categories.
+ * categories, and no plural arm uses ICU's `#` shorthand, which Paraglide
+ * prints literally.
  *
  * **This is the one gate the Paraglide compiler cannot be.** A key present in
  * `en` and missing from `hi` compiles clean and, at runtime, silently returns
@@ -90,14 +91,17 @@ function messagePlaceholders(value) {
  * A selector declared that way has to cover the locale's categories; any other
  * selector (`platform`, `userGender`) is an enumeration the locales must agree
  * on exactly, since its arms are not derivable from the locale.
+ *
+ * `plural` maps each plural selector to the input it counts (`countPlural` ->
+ * `count`), so an error can name the placeholder to write.
  */
 function selectorInfo(value) {
   const variant = value[0] ?? {};
   const declarations = variant.declarations ?? [];
-  const plural = new Set();
+  const plural = new Map();
   for (const declaration of declarations) {
-    const m = /^local\s+([\w$]+)\s*=\s*[\w$]+\s*:\s*plural$/.exec(String(declaration).trim());
-    if (m) plural.add(m[1]);
+    const m = /^local\s+([\w$]+)\s*=\s*([\w$]+)\s*:\s*plural$/.exec(String(declaration).trim());
+    if (m) plural.set(m[1], m[2]);
   }
   return { selectors: variant.selectors ?? [], plural };
 }
@@ -121,6 +125,46 @@ function armsBySelector(value) {
 const sorted = (set) => [...set].sort();
 const difference = (a, b) => new Set([...a].filter((x) => !b.has(x)));
 
+/**
+ * ICU's `#` shorthand inside a plural arm, which Paraglide does not implement.
+ *
+ * In ICU MessageFormat, `#` in a plural arm stands for the number being
+ * pluralized. The inlang format Paraglide compiles has no such shorthand: `#`
+ * is a literal character, so "# tool calls recorded" reached customers with
+ * the `#` in place of the count (#34). The compiler accepts it, and the
+ * placeholder comparison below has no placeholder to compare, so nothing else
+ * notices. The count has to be spelled out as `{count}`.
+ *
+ * Run on every locale, base included: the comparisons in `check()` measure
+ * translations against the base, so a `#` in the base would pass them all.
+ * Limited to plural messages, where `#` is the ICU shorthand; a `#` in a
+ * plain string ("#{name}") is ordinary text. Deliberately blunt inside a plural
+ * arm, a literal `#` included: none exists today, and the rule can be narrowed
+ * when one does.
+ */
+function pluralHashProblems(locale, catalog) {
+  const problems = [];
+  for (const [key, value] of Object.entries(catalog)) {
+    if (NOT_A_MESSAGE(key) || !isVariant(value)) continue;
+    const { plural } = selectorInfo(value);
+    if (plural.size === 0) continue;
+    const write = sorted(new Set(plural.values()))
+      .map((input) => `{${input}}`)
+      .join(' or ');
+    for (const variant of value) {
+      for (const [arm, pattern] of Object.entries(variant.match ?? {})) {
+        if (String(pattern).includes('#')) {
+          problems.push(
+            `messages/${locale}.json "${key}" arm "${arm}" uses "#", which Paraglide ` +
+              `prints literally — write ${write} instead.`
+          );
+        }
+      }
+    }
+  }
+  return problems;
+}
+
 export function check({ baseLocale, locales }, catalogs) {
   const problems = [];
   const base = catalogs[baseLocale];
@@ -128,6 +172,10 @@ export function check({ baseLocale, locales }, catalogs) {
 
   if (baseKeys.size === 0) {
     problems.push(`messages/${baseLocale}.json defines no messages at all.`);
+  }
+
+  for (const locale of locales) {
+    problems.push(...pluralHashProblems(locale, catalogs[locale]));
   }
 
   for (const locale of locales) {
