@@ -21,6 +21,14 @@ const captions = {
 };
 
 describe('usage meter captions', () => {
+  // The coverage claim above, enforced: if CLDR data moves a category out of
+  // reach of these counts, this fails instead of silently skipping an arm.
+  it.each(locales)('the counts reach every plural category in %s', (locale) => {
+    const rules = new Intl.PluralRules(locale);
+    const reached = new Set(counts.map((count) => rules.select(count)));
+    expect([...reached].sort()).toEqual([...rules.resolvedOptions().pluralCategories].sort());
+  });
+
   for (const locale of locales) {
     for (const [key, caption] of Object.entries(captions)) {
       it(`${key} shows the count in ${locale}`, () => {

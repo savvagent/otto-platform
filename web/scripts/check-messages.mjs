@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * Every locale has every key, with the same placeholders and the right plural
- * categories.
+ * categories, and no plural arm uses ICU's `#` shorthand, which Paraglide
+ * prints literally.
  *
  * **This is the one gate the Paraglide compiler cannot be.** A key present in
  * `en` and missing from `hi` compiles clean and, at runtime, silently returns
