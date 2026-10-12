@@ -50,7 +50,7 @@ use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Router;
 use otto_tenant::Db;
-use percent_encoding::percent_decode_str;
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use tower::ServiceExt;
 use tower_http::services::fs::ServeFileSystemResponseBody;
 use tower_http::services::{ServeDir, ServeFile};
@@ -97,9 +97,9 @@ pub fn app(db: Db, config: &Config) -> Result<Router> {
 /// Everything else goes to the console bundle (a prerendered page, or else the
 /// SPA shell), which is what makes a hard refresh of `/o/acme/members` work.
 /// It is matched on the decoded, slash-collapsed path, the way the Worker's
-/// `belongsToOrigin` matches. An unmatched path under one of these
-/// must not: a client that `GET`s `/api/orgs/nope` needs a `404` it can parse,
-/// and `200 text/html` is the shape that makes a client retry forever against a
+/// `belongsToOrigin` matches. An unmatched path under one of these must not: a
+/// client that `GET`s `/api/orgs/nope` needs a `404` it can parse, and
+/// `200 text/html` is the shape that makes a client retry forever against a
 /// route that will never exist.
 ///
 /// **`web/worker/index.ts` keeps the matching list for the Cloudflare
@@ -161,36 +161,51 @@ const SHELL: &str = "200.html";
 /// Every decision is made on the *decoded* path, because that is what
 /// `ServeDir` looks up: deciding on the raw one lets `/%32%30%30` reach
 /// `200.html` without its header, `/%69ndex.html` skip the redirect, and
-/// `/_app/missing%2Ejs` look extensionless and get HTML. A path that does not
-/// decode to UTF-8 names no file and no route, and is a `404`. The lookups
+/// `/_app/missing%2Ejs` look extensionless and get HTML. The lookups
 /// themselves get the raw path and leave decoding and sanitisation to
 /// tower-http; nothing here joins a request path onto the directory.
 ///
-/// 1. API-shaped paths answer a JSON `404` before anything can answer HTML.
-/// 2. `/index.html` (and `/index`) is `308`'d to `/`: one URL for the landing
+/// 1. A path that does not decode (a malformed escape such as `%zz`, or bytes
+///    that are not UTF-8) names no file and no route: a JSON `404`, as the
+///    Worker answers it.
+/// 2. So does a path with a `.` or `..` segment. hyper does not normalise
+///    them and tower-http skips `.`, so `/./200.html` would otherwise be
+///    `200.html` served as an asset, without its header, and `/./index.html`
+///    would skip step 4. A browser never sends one: URL parsing removes them.
+/// 3. API-shaped paths answer a JSON `404` before anything can answer HTML.
+/// 4. `/index.html` (and `/index`) is `308`'d to `/`: one URL for the landing
 ///    page.
-/// 3. `/200` and `/200.html` are the shell with its header, for any method.
-/// 4. A trailing slash is `308`'d away (`/pricing/` → `/pricing`), as
-///    Cloudflare's `auto-trailing-slash` and SvelteKit's `trailingSlash:
-///    'never'` both do.
-/// 5. An extensionless path is a page: `<path>.html`, or `index.html` for
+/// 5. `/200` and `/200.html` are the shell with its header, for any method.
+/// 6. A trailing slash is `308`'d away (`/pricing/` → `/pricing`, `///` →
+///    `/`), as Cloudflare's `auto-trailing-slash` and SvelteKit's
+///    `trailingSlash: 'never'` both do.
+/// 7. An extensionless path is a page: `<path>.html`, or `index.html` for
 ///    `/`. This runs before the plain lookup because `es/` is a directory as
 ///    well as `es.html` a file.
-/// 6. The path as given: the assets.
-/// 7. What is left: an extensionless `GET`/`HEAD` gets the shell, and
-///    anything else keeps its answer. A missing `/_app/x.js` answered with HTML
-///    is a syntax error in the browser.
+/// 8. A request for a page's own file, `/pricing.html`, is `308`'d to
+///    `/pricing`, as the Cloudflare binding does: one URL per page.
+/// 9. The path as given: the assets.
+/// 10. What is left: an extensionless `GET`/`HEAD` gets the shell, and
+///     anything else keeps its answer. A missing `/_app/x.js` answered with
+///     HTML is a syntax error in the browser.
 ///
 /// Only a `404` moves on to the next step. A `412`, `416` or `500` from a
 /// lookup is that file's real answer, and replacing it with the shell would
 /// hide it.
 async fn route(files: &ServeDir, shell: ServeFile, req: Request<Body>) -> Response {
-    let raw = collapse_slashes(req.uri().path());
-    let Ok(decoded) = percent_decode_str(&raw).decode_utf8() else {
+    let original = req.uri().path();
+    let raw = collapse_slashes(original);
+    let Some(decoded) = strict_decode(&raw) else {
         return not_found(&raw);
     };
     // Again after decoding: `%2F` is a slash to the file system too.
     let path = collapse_slashes(&decoded);
+    if path
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return not_found(&raw);
+    }
     if is_api_path(&path) {
         return not_found(&path);
     }
@@ -205,11 +220,14 @@ async fn route(files: &ServeDir, shell: ServeFile, req: Request<Body>) -> Respon
     }
 
     let page_method = req.method() == Method::GET || req.method() == Method::HEAD;
-    if page_method && raw != "/" && raw.ends_with('/') {
-        return without_trailing_slash(&raw, query);
+    // On the path as sent, so `///` redirects as it does at the edge rather
+    // than collapsing silently into `/`.
+    if page_method && original != "/" && original.ends_with('/') {
+        return redirect_on_site(bare, query);
     }
 
-    let extensionless = !path.rsplit('/').next().unwrap_or("").contains('.');
+    let last = path.rsplit('/').next().unwrap_or("");
+    let extensionless = !last.contains('.');
     if extensionless {
         let page = if path == "/" {
             "/index.html".to_owned()
@@ -223,10 +241,35 @@ async fn route(files: &ServeDir, shell: ServeFile, req: Request<Body>) -> Respon
     }
 
     let res = lookup(files, &req, &raw).await;
+    if page_method && last.ends_with(".html") && res.status() != StatusCode::NOT_FOUND {
+        if let Some(page) = path.strip_suffix(".html") {
+            return redirect_on_site(page, query);
+        }
+    }
     if res.status() != StatusCode::NOT_FOUND || !(extensionless && page_method) {
         return res;
     }
     serve_shell(shell, req).await
+}
+
+/// Percent-decoding that refuses what `percent_decode_str` lets through: a
+/// `%` not followed by two hex digits, and bytes that are not UTF-8. The
+/// Worker's `decodeURIComponent` throws on both, and the two sides must agree
+/// on what a path is.
+fn strict_decode(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let well_formed = bytes.iter().enumerate().all(|(i, &b)| {
+        b != b'%'
+            || (bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+                && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit))
+    });
+    if !well_formed {
+        return None;
+    }
+    percent_decode_str(raw)
+        .decode_utf8()
+        .ok()
+        .map(|decoded| decoded.into_owned())
 }
 
 /// `/index.html` → `/`, keeping the query. The target is a constant, so this
@@ -239,15 +282,34 @@ fn landing_redirect(query: Option<&str>) -> Response {
     Redirect::permanent(&location).into_response()
 }
 
-/// `/pricing/` → `/pricing`, keeping the query. Leading slashes and
-/// backslashes are stripped and exactly one put back, so the `Location` can
-/// never be `//host` (or `/\host`, which browsers read the same way): a
-/// redirect built from the request path must not be an open redirect.
-fn without_trailing_slash(raw: &str, query: Option<&str>) -> Response {
-    let trimmed = raw.trim_start_matches(['/', '\\']).trim_end_matches('/');
+/// What must be escaped to put a decoded path back into a `Location`: the
+/// characters a URI path cannot carry, plus `%` (so a decoded `%` stays
+/// literal) and `\` (which browsers read as `/`).
+const LOCATION_PATH: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+/// A `308` to the decoded, slash-collapsed `path` on this site, keeping the
+/// query. Leading slashes are stripped and exactly one put back, and `\` is
+/// escaped, so the `Location` can never be `//host` (or `/\host`, which
+/// browsers read the same way): a redirect built from the request path must
+/// not be an open redirect.
+fn redirect_on_site(path: &str, query: Option<&str>) -> Response {
+    let encoded = utf8_percent_encode(path.trim_start_matches('/'), LOCATION_PATH);
     let location = match query {
-        Some(q) => format!("/{trimmed}?{q}"),
-        None => format!("/{trimmed}"),
+        Some(q) => format!("/{encoded}?{q}"),
+        None => format!("/{encoded}"),
     };
     Redirect::permanent(&location).into_response()
 }
@@ -648,10 +710,29 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body.contains("\"not_found\""), "{body}");
 
-        // Not UTF-8 once decoded: no file, no route.
-        let (status, body) = status_and_body(make(), "/%FF").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(body.contains("\"not_found\""), "{body}");
+        // Not UTF-8 once decoded, or not an escape at all: no file, no
+        // route, and the same JSON 404 the Worker gives.
+        for path in ["/%FF", "/%zz", "/o/acme/%E0%A4%A", "/trailing%"] {
+            let (status, body) = status_and_body(make(), path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            assert!(body.contains("\"not_found\""), "{path}: {body}");
+        }
+
+        // Dot segments, raw or encoded. hyper keeps them and tower-http skips
+        // `.`, so each of these would otherwise reach a file by a name the
+        // decisions above never saw.
+        for path in [
+            "/./200",
+            "/./200.html",
+            "/%2e/200",
+            "/./index.html",
+            "/a/../200",
+            "/a%2F..%2F200",
+        ] {
+            let (status, body) = status_and_body(make(), path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            assert!(body.contains("\"not_found\""), "{path}: {body}");
+        }
     }
 
     /// A trailing slash is redirected away, as Cloudflare and SvelteKit do,
@@ -668,6 +749,8 @@ mod tests {
             ("/o/acme/", "/o/acme"),
             ("//evil.com/", "/evil.com"),
             ("///evil.com//", "/evil.com"),
+            ("//", "/"),
+            ("///", "/"),
         ] {
             let res = get(make(), path).await;
             assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT, "{path}");
@@ -680,6 +763,31 @@ mod tests {
         let res = get(make(), "/_app").await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(robots(&res), Some("noindex, nofollow"));
+    }
+
+    /// A page's own file is a second URL for it; the binding at the edge
+    /// redirects it, and so does the server.
+    #[tokio::test]
+    async fn a_page_file_redirects_to_its_page() {
+        let bundle = bundle("page-file");
+        let make = || console_app(&bundle);
+
+        for (path, to) in [
+            ("/pricing.html", "/pricing"),
+            ("/pricing.html?a=1", "/pricing?a=1"),
+            ("/pricing%2Ehtml", "/pricing"),
+            ("/es/pricing.html", "/es/pricing"),
+            ("/es.html", "/es"),
+        ] {
+            let res = get(make(), path).await;
+            assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT, "{path}");
+            assert_eq!(location(&res), Some(to), "{path}");
+        }
+
+        // No such page: a missing file, not a redirect to a client route.
+        let res = get(make(), "/nope.html").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(location(&res), None);
     }
 
     /// Only a `404` falls through to the shell. Any other answer from a file
