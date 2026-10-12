@@ -3,6 +3,12 @@ import type { Handle } from '@sveltejs/kit';
 import { isSupported } from '$lib/locale';
 
 /**
+ * The whole opening of the root element, not the bare placeholder, so the
+ * replacement can only ever land on `<html lang>`.
+ */
+const PLACEHOLDER = '<html lang="%otto.lang%"';
+
+/**
  * Write the page's language into `<html lang>`.
  *
  * `<html lang>` cannot be set from `<svelte:head>`, which only reaches inside
@@ -21,12 +27,6 @@ import { isSupported } from '$lib/locale';
  * `$lib/locale`), since its language comes from the account and the browser,
  * which no build step can know.
  */
-/**
- * The whole opening of the root element, not the bare placeholder, so the
- * replacement can only ever land on `<html lang>`.
- */
-const PLACEHOLDER = '<html lang="%otto.lang%"';
-
 export const handle: Handle = ({ event, resolve }) => {
   const param = event.params.lang;
   const lang = isSupported(param) ? param : 'en';

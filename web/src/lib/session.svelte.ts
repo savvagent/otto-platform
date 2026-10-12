@@ -22,7 +22,7 @@ class Session {
   me = $state<Me | undefined>(undefined);
   /** False until the first resolution attempt finishes, success or not. */
   ready = $state(false);
-  /** The org slug the user was last looking at, so `/` can go somewhere useful. */
+  /** The org slug the user was last looking at, so `/home` can go somewhere useful. */
   lastOrg = $state<string | undefined>(undefined);
 
   get signedIn(): boolean {
@@ -72,7 +72,7 @@ class Session {
   }
 
   /**
-   * Where `/` should land.
+   * Where `/home`, the console's entry point, should land.
    *
    * The last org visited, else the first membership, else nowhere — a brand new
    * account with no orgs is sent to create one rather than to an empty shell.
@@ -90,7 +90,7 @@ export const session = new Session();
  *
  * `signup` reads "Create account"; `console` reads "Open console" and goes to
  * the home org, or to creating one for an account that has none — the same
- * place `/` would send them, so the marketing pages and the console agree.
+ * place `/home` would send them, so the marketing pages and the console agree.
  */
 export type ConsoleEntry = { kind: 'signup'; href: '/signup' } | { kind: 'console'; href: string };
 
