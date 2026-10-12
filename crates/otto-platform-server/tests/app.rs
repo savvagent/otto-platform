@@ -57,7 +57,7 @@ async fn health_and_discovery_share_one_router(pool: PgPool) {
 async fn the_console_served_directly_keeps_csrf_and_json_404s(pool: PgPool) {
     let dir = std::env::temp_dir().join(format!("otto-app-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("index.html"), "<html>shell</html>").unwrap();
+    std::fs::write(dir.join("200.html"), "<html>shell</html>").unwrap();
     let mut cfg = config();
     cfg.static_dir = Some(dir);
     let call = |req: Request<Body>| {
@@ -104,6 +104,18 @@ async fn the_console_served_directly_keeps_csrf_and_json_404s(pool: PgPool) {
     // Console routes get the shell; real server routes are untouched.
     let (status, body) = call(Request::get("/o/acme/members").body(Body::empty()).unwrap()).await;
     assert_eq!((status, body.contains("shell")), (StatusCode::OK, true));
+    // ...and the shell is never indexed: it is the same page for every route.
+    let res = app(Db::from_pool(pool.clone()), &cfg)
+        .expect("app")
+        .oneshot(Request::get("/o/acme/members").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        res.headers()
+            .get("x-robots-tag")
+            .and_then(|v| v.to_str().ok()),
+        Some("noindex, nofollow")
+    );
     let (status, _) = call(Request::get("/readyz").body(Body::empty()).unwrap()).await;
     assert_eq!(status, StatusCode::OK);
 }
