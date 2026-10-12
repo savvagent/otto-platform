@@ -18,7 +18,55 @@
 
 import { m } from '$lib/paraglide/messages';
 import type { Locale } from '$lib/locale';
-import type { Plan } from '$lib/types';
+import type { Plan, PlanTier } from '$lib/types';
+
+const TIERS: readonly PlanTier[] = ['free', 'team', 'business', 'enterprise'];
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const isCount = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+
+/**
+ * The plans in a `GET /api/plans` body, or a thrown `Error` naming the first
+ * field that is not what `Plan` promises.
+ *
+ * The page renders straight from these fields, so a contract drift that
+ * reached it unchecked would not fail; it would mislead. A missing
+ * `monthlyCents` prints `$NaN`, a missing `hardStop` reads as "keeps working
+ * past the limit", and an unknown tier would be priced as if it were
+ * self-serve. Refusing the whole answer turns any of those into the page's
+ * existing "could not be loaded" state, and the error says which field.
+ *
+ * `features` is the exception: it only ever adds a line, so a value that is
+ * not an object is read as no features (see `featureLabels`) rather than
+ * failing the page.
+ */
+export function parsePlans(body: unknown): Plan[] {
+  if (!isRecord(body) || !Array.isArray(body.plans)) {
+    throw new Error('GET /api/plans answered without a plans array');
+  }
+  return body.plans.map((raw: unknown, i): Plan => {
+    const bad = (field: string) =>
+      new Error(`GET /api/plans: plans[${i}].${field} is missing or the wrong type`);
+    if (!isRecord(raw)) throw bad('(plan)');
+    const { plan, displayName, includedOps, hardStop, monthlyCents, features } = raw;
+    if (typeof plan !== 'string' || !TIERS.includes(plan as PlanTier)) throw bad('plan');
+    if (typeof displayName !== 'string' || displayName.trim() === '') throw bad('displayName');
+    if (!isCount(includedOps)) throw bad('includedOps');
+    if (typeof hardStop !== 'boolean') throw bad('hardStop');
+    if (!isCount(monthlyCents)) throw bad('monthlyCents');
+    return {
+      plan: plan as PlanTier,
+      displayName,
+      includedOps,
+      hardStop,
+      monthlyCents,
+      features: (isRecord(features) ? features : {}) as Plan['features']
+    };
+  });
+}
 
 /**
  * What a plan's price slot says.
@@ -80,8 +128,10 @@ const FEATURE_LABELS: ReadonlyArray<readonly [key: string, label: () => string]>
  * message reads the locale when it is called, and only the component's render
  * is guaranteed to run under this page's locale override. Only a value that is
  * literally `true` counts — the schema's rule, and the safe reading of
- * anything else.
+ * anything else. `features` that are not an object at all (`null`, an array)
+ * name nothing.
  */
-export function featureLabels(features: Plan['features']): Array<() => string> {
+export function featureLabels(features: Plan['features'] | null | undefined): Array<() => string> {
+  if (!isRecord(features)) return [];
   return FEATURE_LABELS.filter(([key]) => features[key] === true).map(([, label]) => label);
 }

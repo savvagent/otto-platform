@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { m } from '$lib/paraglide/messages';
 import { getLocale, locales, overwriteGetLocale } from '$lib/paraglide/runtime';
 
-import { featureLabels, formatOps, priceLabel } from './pricing';
+import { featureLabels, formatOps, parsePlans, priceLabel } from './pricing';
 import type { Plan } from './types';
 
 /** A plan with the seeded Team values, overridden per test. */
@@ -100,6 +100,61 @@ describe('featureLabels', () => {
 
   it('ignores a value that is not literally true', () => {
     expect(featureLabels({ auto_rollback: 'yes' as unknown as boolean })).toEqual([]);
+  });
+
+  it('names nothing when features is not an object at all', () => {
+    for (const features of [null, undefined, [], 'auto_rollback', 1, true]) {
+      expect(featureLabels(features as never), JSON.stringify(features)).toEqual([]);
+    }
+  });
+});
+
+describe('parsePlans', () => {
+  it('accepts the contract as the server sends it', () => {
+    const team = plan();
+    expect(parsePlans({ plans: [team] })).toEqual([team]);
+    expect(parsePlans({ plans: [] })).toEqual([]);
+  });
+
+  it('refuses a body without a plans array', () => {
+    for (const body of [null, undefined, [], 'plans', { plans: {} }, { unexpected: true }]) {
+      expect(() => parsePlans(body), JSON.stringify(body)).toThrow(/plans array/);
+    }
+  });
+
+  it('refuses a plan with a missing or mistyped field, naming it', () => {
+    const cases: Array<[field: string, value: unknown]> = [
+      ['plan', undefined],
+      ['plan', 'platinum'],
+      ['plan', 3],
+      ['displayName', undefined],
+      ['displayName', ''],
+      ['displayName', 7],
+      ['includedOps', undefined],
+      ['includedOps', '10000'],
+      ['includedOps', -1],
+      ['includedOps', 1.5],
+      ['hardStop', undefined],
+      ['hardStop', 'false'],
+      ['monthlyCents', undefined],
+      ['monthlyCents', null],
+      ['monthlyCents', '2900'],
+      ['monthlyCents', Number.NaN]
+    ];
+    for (const [field, value] of cases) {
+      const bad = { ...plan(), [field]: value };
+      expect(() => parsePlans({ plans: [plan(), bad] }), `${field}=${String(value)}`).toThrow(
+        `plans[1].${field}`
+      );
+    }
+    expect(() => parsePlans({ plans: [null] })).toThrow('plans[0]');
+  });
+
+  it('reads features that are not an object as none, rather than failing', () => {
+    for (const features of [null, undefined, [], 'x']) {
+      const [parsed] = parsePlans({ plans: [{ ...plan(), features }] });
+      expect(parsed?.features, JSON.stringify(features)).toEqual({});
+    }
   });
 });
 

@@ -270,7 +270,40 @@ describe('the pricing page', () => {
     );
     expect(container.querySelectorAll('article')).toHaveLength(0);
     expect(consoleError).toHaveBeenCalledTimes(1);
-    expect(String(consoleError.mock.calls[0]?.[0])).toContain('plans array');
+    // The error object itself, not only its message, so its stack survives.
+    const logged = consoleError.mock.calls[0]?.[1];
+    expect(logged).toBeInstanceOf(Error);
+    expect((logged as Error).message).toContain('plans array');
+
+    unmount(instance);
+  });
+
+  it('treats a plan with a missing field as a failure, never $NaN', async () => {
+    const { monthlyCents: _dropped, ...withoutPrice } = SEEDED[1]!;
+    plans.mockResolvedValue({ plans: [SEEDED[0]!, withoutPrice as Plan] });
+    const instance = mountPage();
+    await settle();
+
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      'Pricing could not be loaded.'
+    );
+    expect(container.querySelectorAll('article')).toHaveLength(0);
+    expect(container.textContent).not.toContain('NaN');
+    expect(consoleError).toHaveBeenCalledTimes(1);
+    expect((consoleError.mock.calls[0]?.[1] as Error).message).toContain('plans[1].monthlyCents');
+
+    unmount(instance);
+  });
+
+  it('renders a plan whose features are null, with no feature lines', async () => {
+    plans.mockResolvedValue({ plans: [{ ...SEEDED[1]!, features: null as never }] });
+    const instance = mountPage();
+    await settle();
+
+    const team = card('Team');
+    expect(team.textContent).toContain('$29');
+    expect(team.textContent).not.toContain('Automatic rollback in Otto Flags');
+    expect(consoleError).not.toHaveBeenCalled();
 
     unmount(instance);
   });
@@ -294,10 +327,16 @@ describe('the pricing page', () => {
     expect(consoleError).not.toHaveBeenCalled();
   });
 
-  it('points to sales when no plan is listed', async () => {
+  it('points to sales when no plan is listed, and warns', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     plans.mockResolvedValue({ plans: [] });
     const instance = mountPage();
     await settle();
+
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0]?.[0])).toContain('no plans');
+    expect(consoleError).not.toHaveBeenCalled();
+    warn.mockRestore();
 
     expect(region().textContent).toContain('No plans are listed right now.');
     expect(region().querySelector(MAILTO)).not.toBeNull();

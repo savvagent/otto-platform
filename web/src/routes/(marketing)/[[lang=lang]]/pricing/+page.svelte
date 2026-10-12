@@ -3,8 +3,9 @@
 
   import { api } from '$lib/api';
   import { m } from '$lib/paraglide/messages';
+  import { parsePlans } from '$lib/pricing';
   import { CONTACT_EMAIL } from '$lib/site';
-  import type { Plan, PlansResponse } from '$lib/types';
+  import type { Plan } from '$lib/types';
   import Alert from '$lib/components/Alert.svelte';
   import Button from '$lib/components/Button.svelte';
   import Seo from '$lib/components/Seo.svelte';
@@ -60,21 +61,19 @@
   let sequence = 0;
   let destroyed = false;
 
-  function isPlansBody(body: unknown): body is PlansResponse {
-    return (
-      typeof body === 'object' && body !== null && Array.isArray((body as PlansResponse).plans)
-    );
-  }
-
   /**
    * Fetch, or fetch again after a failure.
    *
    * Any failure is the same "could not be loaded" with a retry: a visitor
    * cannot act on the difference between an outage and a dropped connection,
    * and the server's message is written in English for the console, not for
-   * this page's language. A 200 whose body has no `plans` array is a failure
-   * too, rather than a render that throws. The cause still goes to the
-   * console, so a real bug is not mistaken for an outage by whoever debugs it.
+   * this page's language. A 200 whose body does not match the contract — no
+   * `plans` array, or a plan with a missing or mistyped field (see
+   * `parsePlans`) — is a failure too, rather than a render that throws or
+   * prints `$NaN`. The error itself still goes to the console, so a real bug
+   * is not mistaken for an outage by whoever debugs it. An empty list is not
+   * a failure (the page points to sales), but it is warned about: the seeded
+   * tiers should never all be gone.
    *
    * `focus` is set by the Retry button. The button unmounts the moment the
    * load starts, so without it focus would fall to `<body>`; once the answer
@@ -85,13 +84,11 @@
     plans = { status: 'loading' };
     let next: PlansState;
     try {
-      const body: unknown = await api.plans();
-      if (!isPlansBody(body)) throw new Error('GET /api/plans answered without a plans array');
-      next = { status: 'loaded', plans: body.plans };
+      const loaded = parsePlans(await api.plans());
+      if (loaded.length === 0) console.warn('pricing: GET /api/plans listed no plans');
+      next = { status: 'loaded', plans: loaded };
     } catch (error) {
-      console.error(
-        `pricing: could not load plans: ${error instanceof Error ? error.message : String(error)}`
-      );
+      console.error('pricing: could not load plans', error);
       next = { status: 'error' };
     }
     if (destroyed || mine !== sequence) return;
