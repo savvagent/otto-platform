@@ -22,7 +22,7 @@ class Session {
   me = $state<Me | undefined>(undefined);
   /** False until the first resolution attempt finishes, success or not. */
   ready = $state(false);
-  /** The org slug the user was last looking at, so `/` can go somewhere useful. */
+  /** The org slug the user was last looking at, so `/home` can go somewhere useful. */
   lastOrg = $state<string | undefined>(undefined);
 
   get signedIn(): boolean {
@@ -72,7 +72,7 @@ class Session {
   }
 
   /**
-   * Where `/` should land.
+   * Where `/home`, the console's entry point, should land.
    *
    * The last org visited, else the first membership, else nowhere — a brand new
    * account with no orgs is sent to create one rather than to an empty shell.
@@ -84,6 +84,27 @@ class Session {
 }
 
 export const session = new Session();
+
+/**
+ * Where a "way into the console" link goes, and so what it says.
+ *
+ * `signup` reads "Create account"; `console` reads "Open console" and goes to
+ * the home org, or to creating one for an account that has none — the same
+ * place `/home` would send them, so the marketing pages and the console agree.
+ */
+export type ConsoleEntry = { kind: 'signup'; href: '/signup' } | { kind: 'console'; href: string };
+
+/**
+ * The one rule for that link, beside `homeOrg` because it is a reading of it.
+ *
+ * Takes the two fields rather than reading `session` itself so it can be
+ * tested with plain objects; callers pass `session`. Called inside a
+ * `$derived` or the markup, it re-runs when the session resolves.
+ */
+export function consoleEntry(who: Pick<Session, 'signedIn' | 'homeOrg'>): ConsoleEntry {
+  if (!who.signedIn) return { kind: 'signup', href: '/signup' };
+  return { kind: 'console', href: who.homeOrg ? `/o/${who.homeOrg}` : '/orgs/new' };
+}
 
 /** `owner` and `admin` may change the org; `member` may only look. */
 export function isAdmin(role: Role | undefined): boolean {

@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
 
+  import { buttonClass, type ButtonTone } from './button';
+
   /**
    * Every button that calls the API is `type="button"` unless it submits a
    * form, and every one of them can be `pending`. A destructive action that
@@ -9,7 +11,7 @@
    */
   interface Props {
     children: Snippet;
-    tone?: 'primary' | 'quiet' | 'danger';
+    tone?: ButtonTone;
     type?: 'button' | 'submit';
     disabled?: boolean;
     pending?: boolean;
@@ -26,12 +28,6 @@
     title,
     onclick
   }: Props = $props();
-
-  const tones = {
-    primary: 'bg-accent text-accent-ink hover:brightness-110',
-    quiet: 'border border-edge bg-raised/60 text-ink hover:bg-raised',
-    danger: 'border border-bad/50 bg-transparent text-bad hover:bg-bad/10'
-  } as const;
 </script>
 
 <button
@@ -39,8 +35,7 @@
   {title}
   disabled={disabled || pending}
   {onclick}
-  class="inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm
-         font-medium transition disabled:cursor-not-allowed disabled:opacity-50 {tones[tone]}"
+  class="{buttonClass(tone)} disabled:cursor-not-allowed disabled:opacity-50"
 >
   {#if pending}
     <span

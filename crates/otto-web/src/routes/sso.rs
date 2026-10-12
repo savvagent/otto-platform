@@ -74,7 +74,21 @@ fn txt_instructions(domain: &str, token: &str) -> (String, String) {
 
 #[cfg(test)]
 mod dns_instructions_tests {
-    use super::{safe_next, txt_instructions};
+    use super::{safe_next, sso_landing, txt_instructions};
+
+    #[test]
+    fn an_sso_sign_in_lands_on_the_console_home_for_no_next_or_slash() {
+        assert_eq!(sso_landing(None), "/home");
+        assert_eq!(sso_landing(Some("/")), "/home");
+        assert_eq!(sso_landing(Some("//evil.test")), "/home");
+        assert_eq!(sso_landing(Some("/o/acme")), "/o/acme");
+        assert_eq!(
+            sso_landing(Some("/?a=1")),
+            "/?a=1",
+            "only exactly `/` is remapped"
+        );
+        assert_eq!(safe_next("/"), Some("/"), "safe_next itself is unchanged");
+    }
 
     #[test]
     fn next_accepts_only_same_origin_relative_paths() {
@@ -160,6 +174,25 @@ pub(crate) fn safe_next(next: &str) -> Option<&str> {
         && next.len() <= 2048
         && !next.chars().any(|c| c == '\\' || c.is_control());
     ok.then_some(next)
+}
+
+/// The console's own home. `/` is the public marketing page.
+const CONSOLE_HOME: &str = "/home";
+
+/// Where a completed SSO sign-in lands: a [`safe_next`], else the console
+/// home.
+///
+/// An explicit `next=/` lands on the console home too, as the web client's
+/// `consoleNext` reads it. `/home` forwards to the user's org, while `/` is the
+/// public marketing page and would leave a fresh sign-in looking signed out; a
+/// `next=/` can only come from a link written before `/` stopped being the
+/// console. This is the SSO landing only: [`safe_next`] itself is unchanged,
+/// so every other path keeps its exact value.
+fn sso_landing(next: Option<&str>) -> &str {
+    match next.and_then(safe_next) {
+        None | Some("/") => CONSOLE_HOME,
+        Some(path) => path,
+    }
 }
 
 /// `POST /api/auth/sso/start` — the anonymous "sign in with SSO" entry point.
@@ -367,8 +400,8 @@ pub async fn callback(
 
             // The destination was validated when the ceremony started and is
             // checked again here; it comes from the ceremony row, never from
-            // this request's query string.
-            let landing = next.as_deref().and_then(safe_next).unwrap_or("/");
+            // this request's query string. See `sso_landing`.
+            let landing = sso_landing(next.as_deref());
             let mut response = Redirect::to(&state.config.url(landing)).into_response();
             response = session::with_cookie(response, session::set_cookie(&token));
             session::with_cookie(response, session::clear_binding_cookie())

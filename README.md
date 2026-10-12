@@ -38,8 +38,12 @@ platform beyond registering itself.
 authorization server, sign-in (passkeys and enterprise SSO), and the
 account/org API — for every registered resource server, plus the
 resource-server API (introspection, usage ingest, member lookup, lifecycle
-webhooks) and the account/org console built from `web/` (see
-`web/README.md`). See "What's not here yet" below for what is still to come.
+webhooks) and the public plan catalog, `GET /api/plans` (no credential;
+allowlisted features only; cached in-process for a minute and sent with
+`max-age=300`). With `OTTO_STATIC_DIR` set, as on Fly, it also serves the
+bundle built from `web/` (see `web/README.md`): the public marketing pages,
+prerendered (`/`, `/pricing`, a page per product, each in every language),
+and the account/org console, whose home is `/home`.
 
 ## Crate layout
 
@@ -65,8 +69,9 @@ crates/
 │                         otto-tenant and otto-core.
 ├── otto-web/             the HTTP surface as a library: OAuth discovery,
 │                         /oauth/*, /sso/callback, /api/auth/*, /api/me*,
-│                         and the org API (members, invites, teams, SSO
-│                         admin, tokens, usage, audit). Routes and the
+│                         the org API (members, invites, teams, SSO
+│                         admin, tokens, usage, audit), and the public
+│                         plan catalog (/api/plans). Routes and the
 │                         OpenAPI document come from one catalog. Built on
 │                         otto-tenant, otto-core, otto-billing, otto-auth.
 ├── otto-resource/        what a resource server (otto-factory, otto-flags)
@@ -75,9 +80,10 @@ crates/
 │                         No database dependency.
 └── otto-platform-server/ binary: loads config, connects, runs migrations,
                           verifies tenant isolation, then serves /healthz,
-                          /readyz, otto-web's router, and the
+                          /readyz, otto-web's router, the
                           resource-server API (`POST /oauth/introspect`,
-                          `/internal/*`). Delivers lifecycle webhooks and
+                          `/internal/*`), and, with OTTO_STATIC_DIR, the
+                          web/ bundle. Delivers lifecycle webhooks and
                           provisions resource servers and first-party
                           OAuth clients
                           (`otto-platform-server resource ...`, `client ...`).
@@ -104,12 +110,6 @@ use otto_tenant::Db;
 let user = db.get_user(user_id).await?;
 ```
 
-## What's not here yet
-
-- **No `plans.features` JSONB column.** Design doc §4 proposes one to gate
-  per-service capabilities from a shared plan; not added here since no
-  extracted code reads or writes it yet.
-
 ## Running it locally
 
 Requires a local Postgres. Point `DATABASE_URL` at it and set the two
@@ -131,6 +131,7 @@ Configuration is all `OTTO_*` (plus `DATABASE_URL` and `RUST_LOG`):
 | `OTTO_PUBLIC_URL` | required | Public origin, e.g. `https://otto.savvagent.com`. The OAuth issuer and every link are built from it, and its **host is the WebAuthn relying party id** — changing it invalidates every passkey. |
 | `OTTO_ENCRYPTION_KEY` | required | 32 bytes, base64. Encrypts secrets at rest (SSO IdP client secrets). |
 | `OTTO_BIND` | `0.0.0.0:8080` | Listen address. |
+| `OTTO_STATIC_DIR` | unset | The built `web/` bundle (`/srv/console` in the image). Set, the server serves the marketing pages and the console beside the API; the bundle must contain `200.html` or it refuses to start. |
 | `OTTO_CLIENT_IP_HEADER` | unset | Header a trusted proxy *overwrites* with the client address (`fly-client-ip` on Fly). Keys rate limits and audit IPs; leave unset without such a proxy. |
 | `OTTO_ENFORCE_QUOTAS` | `0` | Reporting only: whether resource servers enforce hard-stop plans, echoed as `enforced` by the usage endpoint. |
 | `OTTO_RUN_MIGRATIONS` | `1` | Apply migrations at startup. |

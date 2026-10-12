@@ -1419,6 +1419,102 @@ async fn usage_reports_the_orgs_period_and_plan(pool: PgPool) {
     );
 }
 
+// ------------------------------------------------------------------ plans
+
+/// The plan catalog is what a pricing page reads, so it has to answer a
+/// visitor who has no account, in the camelCase every other wire type uses,
+/// cheapest tier first, and with a cache lifetime a CDN can honour.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_plan_catalog_is_public_ordered_and_cacheable(pool: PgPool) {
+    let h = harness(pool).await;
+    let reply = Call::get("/api/plans").send(&h.router).await;
+    reply.expect(StatusCode::OK);
+
+    assert_eq!(
+        reply
+            .headers
+            .get(http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=300")
+    );
+
+    let plans = reply.body["plans"].as_array().unwrap();
+    let order: Vec<&str> = plans.iter().map(|p| p["plan"].as_str().unwrap()).collect();
+    assert_eq!(order, ["free", "team", "business", "enterprise"]);
+
+    let team = &plans[1];
+    assert_eq!(team["displayName"], "Team");
+    assert_eq!(team["includedOps"], 10_000);
+    assert_eq!(team["hardStop"], false);
+    assert_eq!(team["monthlyCents"], 2900);
+    assert_eq!(team["features"]["auto_rollback"], true);
+    assert_eq!(plans[0]["hardStop"], true);
+
+    let doc = Call::get("/api/openapi.json").send(&h.router).await;
+    doc.expect(StatusCode::OK);
+    assert!(
+        doc.body["paths"]["/api/plans"]["get"].is_object(),
+        "the catalog route is documented"
+    );
+    assert_eq!(doc.body["paths"]["/api/plans"]["get"]["tags"][0], "billing");
+}
+
+/// `plans.features` keys belong to the services that read them (migration
+/// 0016), so a gate a service adds must not reach anonymous callers just
+/// because it was written. Only allowlisted keys are published. Written as the
+/// test pool's superuser: `otto_app` has no write grant on `plans`.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_plan_catalog_publishes_only_advertised_features(pool: PgPool) {
+    let h = harness(pool).await;
+    sqlx::query(
+        "UPDATE plans SET features = '{\"auto_rollback\": true, \"secret_gate\": true}' \
+         WHERE plan = 'team'",
+    )
+    .execute(h.db.pool())
+    .await
+    .unwrap();
+
+    let reply = Call::get("/api/plans").send(&h.router).await;
+    reply.expect(StatusCode::OK);
+    let team = &reply.body["plans"][1];
+    assert_eq!(team["plan"], "team");
+    assert_eq!(
+        team["features"],
+        serde_json::json!({ "auto_rollback": true })
+    );
+}
+
+/// The catalog is held in-process for a minute, so an anonymous caller
+/// hammering it does not reach the database each time. A change to `plans`
+/// therefore shows up only once the cached copy expires (covered with a
+/// paused clock in `routes::plans`'s unit tests), not on the next request.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_plan_catalog_is_served_from_cache_within_its_ttl(pool: PgPool) {
+    let h = harness(pool).await;
+    let first = Call::get("/api/plans").send(&h.router).await;
+    first.expect(StatusCode::OK);
+    assert_eq!(first.body["plans"][1]["monthlyCents"], 2900);
+
+    sqlx::query("UPDATE plans SET monthly_cents = 3900 WHERE plan = 'team'")
+        .execute(h.db.pool())
+        .await
+        .unwrap();
+
+    let second = Call::get("/api/plans").send(&h.router).await;
+    second.expect(StatusCode::OK);
+    assert_eq!(
+        second.body, first.body,
+        "within the TTL the cached catalog is served, not a fresh read"
+    );
+    assert_eq!(
+        second
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+}
+
 // ---------------------------------------------------------------- openapi
 
 /// The document is served, describes the routes that exist, and needs no

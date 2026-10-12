@@ -18,20 +18,32 @@
     // _app/immutable, so the bundle is safe to cache hard and the HTML is not.
     "directory": "./build",
     "binding": "ASSETS",
-    // Client-side routing: an unknown path is a route the SPA renders, not a
-    // 404. The server's optional static fallback does the same thing for
-    // self-hosters.
-    "not_found_handling": "single-page-application",
+    // No SPA mode, on purpose. Cloudflare's "single-page-application" handling
+    // always answers an unknown path with /index.html, which is now the
+    // prerendered landing page, not the shell; and it answers a missing
+    // /_app/x.js with HTML too. The Worker chooses instead (worker/index.ts):
+    // an extensionless 404 becomes the shell from 200.html, marked
+    // `X-Robots-Tag: noindex, nofollow`, and a missing asset stays a 404. The
+    // server does the same for self-hosters. The bundle must contain 200.html
+    // (adapter-static `fallback: '200.html'`), or every deep link is a 404.
+    "not_found_handling": "none",
+
+    // Cloudflare's default, stated because the Worker depends on it: under
+    // auto-trailing-slash, /200 returns 200.html, and the Worker fetches the
+    // SPA shell by that name (SHELL in worker/index.ts). /200.html itself is a
+    // 307 to /200, and with another mode /200 would be a 404 and every deep
+    // link a 500. It also lets /pricing find pricing.html.
+    "html_handling": "auto-trailing-slash",
 
     // Every request enters the Worker, including asset requests.
     //
     // The alternative is a glob list, which is cheaper because assets would be
     // served without an invocation. It is also a second, differently-shaped copy
     // of a rule that already exists in the server, and when the glob is wrong
-    // the failure is silent and specific: the asset router answers with
-    // index.html and a 200. It would also have to express an exception
-    // (/oauth/introspect and /internal are carved out of /oauth and refused),
-    // which a glob list cannot do.
+    // the failure is silent: a path the glob misses is answered by the asset
+    // router before the Worker's rule ever sees it. It would also have to
+    // express an exception (/oauth/introspect and /internal are carved out of
+    // /oauth and refused), which a glob list cannot do.
     //
     // One rule, in TypeScript, matching the server's.
     "run_worker_first": true
@@ -64,7 +76,12 @@
       // `custom_domain` makes Cloudflare create the DNS record and certificate
       // itself, which needs the savvagent.com zone to be on this Cloudflare
       // account. See docs/deploy/cloudflare.md before the first deploy.
-      "routes": [{ "pattern": "otto.savvagent.com", "custom_domain": true }]
+      "routes": [{ "pattern": "otto.savvagent.com", "custom_domain": true }],
+      // No second public way in. A `*.workers.dev` hostname or preview URL would
+      // reach the same origin without this zone's normalization and WAF rules,
+      // and nothing a browser needs lives there.
+      "workers_dev": false,
+      "preview_urls": false
     }
   },
 

@@ -56,8 +56,10 @@ pub struct Config {
     /// `otto_web::Config::enforce_quotas`.
     pub enforce_quotas: bool,
 
-    /// The built console bundle (`OTTO_STATIC_DIR`), served with an
-    /// `index.html` fallback. The hosted deployment sets it (`fly.toml`);
+    /// The built console bundle (`OTTO_STATIC_DIR`): prerendered pages as
+    /// themselves and the SPA shell, `200.html`, for every other client route.
+    /// The bundle must contain `200.html`; `app` refuses to build without it.
+    /// The hosted deployment sets it (`fly.toml`);
     /// `None` serves no console at all, for a deployment that puts the optional
     /// Worker in `web/worker/` in front instead.
     pub static_dir: Option<PathBuf>,

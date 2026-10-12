@@ -7,9 +7,9 @@ import worker, { belongsToOrigin, isNeverProxied, type Env } from './index';
  * different language, that nothing forces to agree with the first.
  *
  * Drift here is silent in the worst direction. If the edge stops recognising a
- * path as the origin's, the asset router answers it from `index.html` with a
- * `200`, and a client calling `/api/orgs/nope` gets HTML forever instead of the
- * `404` it can parse.
+ * path as the origin's, the Worker answers it with the SPA shell (`200.html`)
+ * and a `200`, and a client calling `/api/orgs/nope` gets HTML forever instead
+ * of the `404` it can parse.
  */
 describe('belongsToOrigin', () => {
   it('claims the browser-facing API surfaces, bare and nested', () => {
@@ -116,6 +116,30 @@ describe('the Worker', () => {
     upstream.mockRestore();
   });
 
+  it('never proxies to a host taken from the request path', async () => {
+    // `//api%2F@evil.test/x` decodes and collapses to `/api/@evil.test/x`, which
+    // is an origin path; resolved against the origin as a relative URL it would
+    // be the protocol-relative `//api%2F@evil.test/x`, host `evil.test`, with the
+    // visitor's cookie attached.
+    const upstream = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('{}', { status: 200 }));
+
+    for (const path of ['//api%2F@evil.test/x', '//oauth%2f@evil.test/', '//api/x', '//sso/x']) {
+      upstream.mockClear();
+      await call(
+        new Request(`https://otto.test${path}`, {
+          headers: { cookie: '__Host-otto_session=otto_ss_abc' }
+        })
+      );
+      for (const [forwarded] of upstream.mock.calls) {
+        expect(new URL((forwarded as Request).url).origin, path).toBe('https://origin.test');
+      }
+    }
+
+    upstream.mockRestore();
+  });
+
   it('serves a console route from the asset bundle', async () => {
     assets.mockClear();
     const response = await call(new Request('https://otto.test/o/acme/members'));
@@ -167,5 +191,276 @@ describe('the Worker', () => {
     const response = await call(new Request('https://otto.test/api/me'), env(''));
     expect(response.status).toBe(500);
     expect(await response.text()).toContain('OTTO_ORIGIN');
+  });
+});
+
+/**
+ * The asset bundle, as Cloudflare's asset binding would answer it with
+ * `not_found_handling: "none"` and `html_handling: "auto-trailing-slash"`
+ * (both set in wrangler.jsonc): `/pricing` finds `pricing.html`, `/200` finds
+ * the shell, `/pricing.html` is a `307` to `/pricing`, and anything else is a
+ * bare `404`. Headers are immutable, as on the real
+ * binding, so a Worker that mutates them in place fails here too.
+ */
+describe('the Worker in front of the asset bundle', () => {
+  const pages: Record<string, string> = {
+    '/': '<html>landing</html>',
+    '/pricing': '<html>pricing</html>',
+    '/es/pricing': '<html>es pricing</html>',
+    '/%5Cevil': '<html>backslash</html>',
+    '/200': '<html>shell</html>',
+    '/_app/app.js': 'console.log(1)'
+  };
+  const immutable = (body: string | null, status: number) => {
+    const response = new Response(body, {
+      status,
+      headers: { 'content-type': 'text/html', etag: '"v1"' }
+    });
+    Object.defineProperty(response, 'headers', {
+      value: new Proxy(response.headers, {
+        get(target, prop) {
+          if (prop === 'set' || prop === 'append' || prop === 'delete') {
+            return () => {
+              throw new TypeError("Can't modify immutable headers.");
+            };
+          }
+          const value = Reflect.get(target, prop, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        }
+      })
+    });
+    return response;
+  };
+  const assets = vi.fn(async (input: RequestInfo | URL) => {
+    const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+    const page = pages[path];
+    if (path === '/broken') return immutable('upstream trouble', 500);
+    const htmlFor = path.endsWith('.html') ? path.slice(0, -'.html'.length) : undefined;
+    if (htmlFor !== undefined && pages[htmlFor] !== undefined) {
+      return new Response(null, { status: 307, headers: { location: htmlFor } });
+    }
+    return page === undefined ? immutable(null, 404) : immutable(page, 200);
+  });
+  const env = {
+    ASSETS: { fetch: assets } as unknown as Fetcher,
+    OTTO_ORIGIN: 'https://origin.test'
+  } as Env;
+  const call = (path: string, init?: RequestInit) =>
+    worker.fetch(new Request(`https://otto.test${path}`, init), env);
+  const askedFor = () =>
+    assets.mock.calls.map(
+      ([input]) => new URL(input instanceof Request ? input.url : input.toString()).pathname
+    );
+
+  it('answers a deep link with the shell, marked noindex', async () => {
+    assets.mockClear();
+    const response = await call('/o/acme/members');
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('<html>shell</html>');
+    expect(response.headers.get('x-robots-tag')).toBe('noindex, nofollow');
+    // The shell's own headers survive the copy.
+    expect(response.headers.get('etag')).toBe('"v1"');
+    // `/200`, never `/200.html`: the latter is a 307 under auto-trailing-slash.
+    expect(askedFor()).toContain('/200');
+    expect(askedFor()).not.toContain('/200.html');
+  });
+
+  it('answers a HEAD deep link with the shell too', async () => {
+    const response = await call('/o/acme/members', { method: 'HEAD' });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('x-robots-tag')).toBe('noindex, nofollow');
+  });
+
+  it('leaves a missing asset a 404, never HTML', async () => {
+    assets.mockClear();
+    const response = await call('/_app/missing.js');
+    expect(response.status).toBe(404);
+    expect(response.headers.has('x-robots-tag')).toBe(false);
+    expect(askedFor()).toEqual(['/_app/missing.js']);
+  });
+
+  it('does not answer a write to an unknown page with the shell', async () => {
+    const response = await call('/o/acme/members', { method: 'POST' });
+    expect(response.status).toBe(404);
+  });
+
+  it('passes a page that exists through untouched', async () => {
+    for (const path of ['/', '/pricing', '/_app/app.js']) {
+      assets.mockClear();
+      const response = await call(path);
+      expect(response.status, path).toBe(200);
+      expect(await response.text(), path).toBe(pages[path]);
+      expect(response.headers.has('x-robots-tag'), path).toBe(false);
+      expect(askedFor(), path).toEqual([path]);
+    }
+  });
+
+  it('redirects /index.html to the one URL the landing page has', async () => {
+    for (const [path, to] of [
+      ['/index.html', '/'],
+      ['/index', '/'],
+      ['/index.html?a=1', '/?a=1']
+    ]) {
+      assets.mockClear();
+      const response = await call(path!);
+      expect(response.status, path).toBe(308);
+      // Exactly, not resolved: a resolved check passes on `//evil.com/`.
+      expect(response.headers.get('location'), path).toBe(to);
+      expect(assets, path).not.toHaveBeenCalled();
+    }
+  });
+
+  it('decides on the decoded path, so encoding changes nothing', async () => {
+    for (const path of ['/%32%30%30', '/200%2Ehtml', '/200%2ehtml']) {
+      const response = await call(path);
+      expect(response.status, path).toBe(200);
+      expect(response.headers.get('x-robots-tag'), path).toBe('noindex, nofollow');
+      expect(await response.text(), path).toBe('<html>shell</html>');
+    }
+    for (const path of ['/%69ndex.html', '/index%2Ehtml', '/%69ndex']) {
+      const response = await call(path);
+      expect(response.status, path).toBe(308);
+      expect(response.headers.get('location'), path).toBe('/');
+    }
+    for (const path of ['/x%2Ejs', '/_app/missing%2Ejs']) {
+      assets.mockClear();
+      const response = await call(path);
+      expect(response.status, path).toBe(404);
+      expect(response.headers.has('x-robots-tag'), path).toBe(false);
+      expect(askedFor(), path).not.toContain('/200');
+    }
+  });
+
+  it("answers a path that does not decode with the origin's JSON 404", async () => {
+    for (const path of ['/%E0%A4%A', '/%zz', '/%FF', '/trailing%', '/api/%zz']) {
+      assets.mockClear();
+      const response = await call(path);
+      expect(response.status, path).toBe(404);
+      expect(response.headers.get('content-type'), path).toContain('application/json');
+      expect(((await response.json()) as { error: string }).error, path).toBe('not_found');
+      expect(assets, path).not.toHaveBeenCalled();
+    }
+  });
+
+  it('lets URL parsing resolve dot segments, and refuses the ones it cannot see', async () => {
+    // Literal and `%2e` dot segments are gone before the Worker runs, so these
+    // are `/200` and `/200.html`: the shell, with its header.
+    for (const path of ['/./200', '/./200.html', '/%2e/200', '/a/../200']) {
+      const response = await call(path);
+      expect(response.status, path).toBe(200);
+      expect(response.headers.get('x-robots-tag'), path).toBe('noindex, nofollow');
+    }
+    const landing = await call('/./index.html');
+    expect(landing.status).toBe(308);
+    expect(landing.headers.get('location')).toBe('/');
+
+    // Behind an encoded slash, a `..` survives parsing; the server refuses
+    // it, and so does the edge.
+    assets.mockClear();
+    const response = await call('/a%2F..%2F200');
+    expect(response.status).toBe(404);
+    expect(response.headers.get('content-type')).toContain('application/json');
+    expect(assets).not.toHaveBeenCalled();
+  });
+
+  it('redirects a trailing slash away, and never off-site', async () => {
+    for (const [path, to] of [
+      ['/pricing/', '/pricing'],
+      ['/pricing/?a=1', '/pricing?a=1'],
+      ['/o/acme/', '/o/acme'],
+      ['//evil.com/', '/evil.com'],
+      ['///evil.com//', '/evil.com'],
+      ['//', '/'],
+      ['///', '/']
+    ]) {
+      const response = await call(path!);
+      expect(response.status, path).toBe(308);
+      expect(response.headers.get('location'), path).toBe(to);
+    }
+  });
+
+  it('returns any answer but a 404 as is, never the shell', async () => {
+    assets.mockClear();
+    const response = await call('/broken');
+    expect(response.status).toBe(500);
+    expect(response.headers.has('x-robots-tag')).toBe(false);
+    expect(askedFor()).toEqual(['/broken']);
+  });
+
+  it('does not let a write to the shell reach the binding without the header', async () => {
+    for (const path of ['/200', '/200.html']) {
+      assets.mockClear();
+      const response = await call(path, { method: 'POST' });
+      expect(response.status, path).toBe(405);
+      expect(response.headers.get('x-robots-tag'), path).toBe('noindex, nofollow');
+      expect(assets, path).not.toHaveBeenCalled();
+    }
+  });
+
+  it('serves the shell under its own names with the header', async () => {
+    for (const path of ['/200', '/200.html']) {
+      assets.mockClear();
+      const response = await call(path);
+      expect(response.status, path).toBe(200);
+      expect(await response.text(), path).toBe('<html>shell</html>');
+      expect(response.headers.get('x-robots-tag'), path).toBe('noindex, nofollow');
+      expect(askedFor(), path).not.toContain('/200.html');
+    }
+  });
+
+  it("redirects a page's own file to its page with a 308, as the server does", async () => {
+    for (const [path, to] of [
+      ['/pricing.html', '/pricing'],
+      ['/pricing.html?a=1', '/pricing?a=1'],
+      ['/pricing%2Ehtml', '/pricing'],
+      ['/es/pricing.html', '/es/pricing'],
+      // A decoded backslash is escaped again, never `/\evil`.
+      ['/%5Cevil.html', '/%5Cevil']
+    ]) {
+      const response = await call(path!);
+      expect(response.status, path).toBe(308);
+      expect(response.headers.get('location'), path).toBe(to);
+    }
+
+    // No such page: a missing file, not a redirect.
+    const missing = await call('/nope.html');
+    expect(missing.status).toBe(404);
+    expect(missing.headers.has('location')).toBe(false);
+
+    // A write is not a page view, and is not redirected.
+    const write = await call('/pricing.html', { method: 'POST' });
+    expect(write.status).not.toBe(308);
+  });
+
+  it('answers a named 500, and logs, when the shell cannot be fetched', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const broken = {
+      ASSETS: { fetch: vi.fn(async () => new Response(null, { status: 404 })) },
+      OTTO_ORIGIN: 'https://origin.test'
+    } as unknown as Env;
+
+    for (const path of ['/o/acme/members', '/200']) {
+      error.mockClear();
+      const response = await worker.fetch(new Request(`https://otto.test${path}`), broken);
+      expect(response.status, path).toBe(500);
+      expect(response.headers.get('content-type'), path).toContain('application/json');
+      expect(((await response.json()) as { error: string }).error, path).toBe('misconfigured');
+      expect(error, path).toHaveBeenCalledOnce();
+      expect(String(error.mock.calls[0]![0]), path).toContain('404');
+    }
+    error.mockRestore();
+  });
+
+  it('still proxies origin paths without touching the bundle', async () => {
+    assets.mockClear();
+    const upstream = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('{}', { status: 404 }));
+    const response = await call('/api/no/such');
+    expect(response.status).toBe(404);
+    expect(response.headers.has('x-robots-tag')).toBe(false);
+    expect(upstream).toHaveBeenCalledOnce();
+    expect(assets).not.toHaveBeenCalled();
+    upstream.mockRestore();
   });
 });

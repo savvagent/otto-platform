@@ -1,17 +1,15 @@
 /**
- * The console renders entirely in the browser.
+ * Only what both route groups share.
  *
- * `ssr = false` is not a performance choice. The session is an `HttpOnly`,
- * `__Host-`-prefixed cookie; a SvelteKit server rendering these pages would
- * have to hold that credential to fetch on the user's behalf, which means a
- * second process with the keys to every console session, for pages that are
- * behind a login and cannot be cached. Keeping the fetch in the browser keeps
- * the cookie in exactly one place.
+ * `ssr` and `prerender` are deliberately *not* set here: the two groups want
+ * opposite answers. `(console)` renders only in the browser because its pages
+ * are behind a session cookie that must never reach a rendering server, while
+ * `(marketing)` is prerendered at build time because its pages are public,
+ * identical for every visitor, and should be indexable. Each group's own
+ * `+layout.ts` says which it is.
  *
- * `prerender = false` follows: there is no page here whose content is knowable
- * without a session. The static adapter still emits the shell, and its
- * `fallback` serves it for any deep link.
+ * `trailingSlash = 'never'` does belong to both: `/pricing` and `/pricing/`
+ * must not be two URLs, and the prerendered files are written as
+ * `pricing.html` rather than `pricing/index.html` so the server can find them.
  */
-export const ssr = false;
-export const prerender = false;
 export const trailingSlash = 'never';

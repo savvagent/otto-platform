@@ -4,7 +4,7 @@
 
   import { api, ApiError } from '$lib/api';
   import { messageFor } from '$lib/errors';
-  import { isServerRoute, safeNext } from '$lib/next';
+  import { CONSOLE_HOME, consoleNext, isServerRoute } from '$lib/next';
   import { m } from '$lib/paraglide/messages';
   import { session } from '$lib/session.svelte';
   import * as webauthn from '$lib/webauthn';
@@ -57,7 +57,7 @@
     ssoPending = true;
     ssoError = undefined;
     try {
-      const started = await api.ssoStart(ssoEmail.trim(), safeNext(next));
+      const started = await api.ssoStart(ssoEmail.trim(), consoleNext(next));
       window.location.assign(started.redirectUrl);
     } catch (e) {
       ssoError = messageFor(e, m.error_could_not_sign_in());
@@ -89,9 +89,9 @@
       if (session.me) await webauthn.signalAccount(session.me);
       // Same rule as the layout guard: `next` is attacker-supplied, and a
       // server route such as `/oauth/authorize` needs a real navigation.
-      const dest = safeNext(next);
+      const dest = consoleNext(next);
       if (dest && isServerRoute(dest)) location.assign(dest);
-      else await goto(dest ?? '/', { replaceState: true });
+      else await goto(dest ?? CONSOLE_HOME, { replaceState: true });
     } catch (e) {
       // The message is set first. `signalUnknownCredential` cannot throw today,
       // but if it ever could, awaiting it before this line would leave someone

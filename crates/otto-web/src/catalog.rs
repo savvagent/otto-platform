@@ -22,7 +22,7 @@
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post, put, MethodRouter};
 
-use crate::routes::{auth, orgs, sso, teams, tokens, usage};
+use crate::routes::{auth, orgs, plans, sso, teams, tokens, usage};
 use crate::state::AppState;
 use crate::{oauth, openapi};
 
@@ -701,6 +701,25 @@ pub fn catalog() -> Vec<Endpoint> {
                  path would lock every passkey-only member out with no way back in. Once on, \
                  no member of this org can complete a passkey sign-in; they must authenticate \
                  through the org's IdP.",
+            ),
+        // ----------------------------------------------------------- plans
+        Endpoint::get("/api/plans", plans::list)
+            .auth(Auth::Public)
+            .returns("PlansResponse")
+            .summary("Public plan catalog")
+            .describe(
+                "Every plan on offer, cheapest tier first: what a pricing page reads. \
+                 Public because plans are operator-maintained reference data, not tenant \
+                 data — they belong to no org, and a visitor deciding whether to sign up \
+                 has no credential to present. Read live from the `plans` table, so the \
+                 prices shown are the ones billed against; each instance reuses what it \
+                 read for a minute, and the response is cacheable for five more \
+                 (`Cache-Control: public, max-age=300`). `features` lists only the \
+                 capabilities chosen for advertising, not every key a plan carries. \
+                 A `monthlyCents` of 0 on \
+                 enterprise means negotiated, not free. Lists the published bucket, not \
+                 any org's negotiated override; an org's own figure is \
+                 /api/orgs/{org}/usage.",
             ),
         // -------------------------------------------------- tokens & usage
         Endpoint::get("/api/orgs/{org}/tokens", tokens::list_tokens)

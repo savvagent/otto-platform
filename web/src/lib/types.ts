@@ -192,6 +192,40 @@ export interface UsageStatus {
   enforced: boolean;
 }
 
+/** The tiers, cheapest first — the order `GET /api/plans` lists them in. */
+export type PlanTier = 'free' | 'team' | 'business' | 'enterprise';
+
+/**
+ * One tier as offered (`PublicPlan`): the list price, before any org's
+ * negotiated override, read live from the `plans` table.
+ *
+ * `monthlyCents` is US cents, and `0` means two different things: free on
+ * `free`, *negotiated* on `enterprise`. Read it through `$lib/pricing`'s
+ * `priceLabel`, which knows the difference, rather than formatting it
+ * directly.
+ *
+ * `features` holds only the capabilities chosen for advertising, never every
+ * key the plan carries. A capability is on only where its value is `true`;
+ * a missing key is off *or* simply not advertised, so the page lists what is
+ * there and infers nothing from what is not.
+ */
+export interface Plan {
+  plan: PlanTier;
+  /** A name, so it is shown as given and never translated. */
+  displayName: string;
+  /** Billable operations included each month. */
+  includedOps: number;
+  /** Whether going over the bucket stops billable work rather than metering overage. */
+  hardStop: boolean;
+  monthlyCents: number;
+  features: Record<string, boolean>;
+}
+
+/** `GET /api/plans`: every plan on offer, cheapest tier first. Public, no session. */
+export interface PlansResponse {
+  plans: Plan[];
+}
+
 export interface BrowserSession {
   id: string;
   userId: string;

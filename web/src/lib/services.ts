@@ -1,5 +1,6 @@
 /**
- * The other Otto consoles, linked from this one's header.
+ * The Otto products: linked from the console's header, and described on the
+ * public marketing pages.
  *
  * Otto is split across hostnames: this console owns the account and the
  * organization (sign-in, passkeys, members, teams, SSO, usage, audit), and each
@@ -7,35 +8,132 @@
  * with OAuth. Each of those consoles links back to this one, so a person never
  * has to know a hostname.
  *
- * **This is the placeholder hook, and it is deliberately a plain list.** A new
- * service is one entry. Nothing else in the bundle knows what any of them do,
- * which keeps this console from learning about a product it does not serve.
+ * **It is deliberately a plain list.** A new service is one entry here plus its
+ * copy in the message catalogs: the marketing pages and the sitemap derive
+ * their product pages from it. The one exception is `scripts/check-build.mjs`,
+ * which runs in plain Node without `$lib` and so keeps its own copy of the
+ * slugs; `check-build.test.mjs` fails until that copy matches. The console
+ * itself still knows nothing about what any of them *do* — it reads only
+ * `name` and `url`.
  *
  * `url` is where the service's console lives, with no trailing slash. It is an
  * external origin: a link here is a full navigation, never a client-side route.
  * https only — `servicesIn` drops anything else, so a typo cannot put a
  * plaintext or `javascript:` link in the header.
  */
+
+import { m } from '$lib/paraglide/messages';
+
+/**
+ * A product's marketing copy, as functions.
+ *
+ * **Called at render time, never at module load.** Paraglide's `m.*()` read
+ * the locale when they are called; this module is evaluated once per build (or
+ * once per page load), so a string captured at import would be frozen in
+ * whichever language happened to be current then — every prerendered page
+ * would say the same thing in the same language.
+ */
+export interface ServiceCopy {
+  /**
+   * The product page's `<title>` after the name: a phrase, with no closing
+   * punctuation, because it is joined to the name as `{name}: {title}` and a
+   * title that ends in a full stop reads as a sentence in a search result.
+   */
+  title(): string;
+  /**
+   * The product page's meta description: at most 160 characters in every
+   * locale (`services.test.ts` checks), which is roughly what a search result
+   * shows before it truncates. `summary` is the longer, on-page version.
+   */
+  description(): string;
+  /** One short line, under the name. */
+  tagline(): string;
+  /** One or two sentences. */
+  summary(): string;
+  /** Four to six bullets. */
+  features(): string[];
+}
+
 export interface Service {
+  /** The product page's path segment: `/products/{slug}`. Lowercase, digits and `-`. */
+  slug: string;
   /** Product name. A name, so it is never translated. */
   name: string;
   /** The service console's origin, e.g. `https://otto-factory.savvagent.com`. */
   url: string;
+  /** The MCP endpoint an agent is pointed at, if the service has one. */
+  mcpUrl?: string;
+  copy: ServiceCopy;
 }
 
 const CONFIGURED: readonly Service[] = [
-  { name: 'Otto Factory', url: 'https://otto-factory.savvagent.com' }
+  {
+    slug: 'factory',
+    name: 'Otto Factory',
+    url: 'https://otto-factory.savvagent.com',
+    // `OF_RESOURCE_URI` in otto-factory's `fly.toml`: the MCP endpoint is
+    // `/mcp` on the service's own origin.
+    mcpUrl: 'https://otto-factory.savvagent.com/mcp',
+    copy: {
+      title: () => m.product_factory_title(),
+      description: () => m.product_factory_description(),
+      tagline: () => m.product_factory_tagline(),
+      summary: () => m.product_factory_summary(),
+      features: () => [
+        m.product_factory_feature_jobs(),
+        m.product_factory_feature_visibility(),
+        m.product_factory_feature_leases(),
+        m.product_factory_feature_trackers(),
+        m.product_factory_feature_install()
+      ]
+    }
+  },
+  {
+    slug: 'flags',
+    name: 'Otto Flags',
+    url: 'https://otto-flags.savvagent.com',
+    mcpUrl: 'https://otto-flags.savvagent.com/mcp',
+    copy: {
+      title: () => m.product_flags_title(),
+      description: () => m.product_flags_description(),
+      tagline: () => m.product_flags_tagline(),
+      summary: () => m.product_flags_summary(),
+      features: () => [
+        m.product_flags_feature_manage(),
+        m.product_flags_feature_risk(),
+        m.product_flags_feature_rollback(),
+        m.product_flags_feature_evaluate(),
+        m.product_flags_feature_auto_rollback()
+      ]
+    }
+  }
 ];
 
-/** Keep only entries that are safe to render as an external link. */
+/** A slug is one path segment and one file name: no case, no separators. */
+const SLUG = /^[a-z0-9-]+$/;
+
+function isHttps(raw: string): boolean {
+  try {
+    return new URL(raw).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/** Keep only entries that are safe to render as an external link and a page path. */
 export function servicesIn(candidates: readonly Service[]): Service[] {
-  return candidates.filter((service) => {
-    try {
-      return new URL(service.url).protocol === 'https:' && service.name.trim().length > 0;
-    } catch {
-      return false;
-    }
-  });
+  return candidates.filter(
+    (service) =>
+      isHttps(service.url) &&
+      service.name.trim().length > 0 &&
+      SLUG.test(service.slug) &&
+      (service.mcpUrl === undefined || isHttps(service.mcpUrl))
+  );
 }
 
 export const SERVICES: readonly Service[] = servicesIn(CONFIGURED);
+
+/** The service a product page's slug names, or `undefined` if none does. */
+export function serviceBySlug(slug: string): Service | undefined {
+  return SERVICES.find((service) => service.slug === slug);
+}

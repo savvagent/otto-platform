@@ -1,15 +1,24 @@
 <!doctype html>
-<html lang="en" class="h-full">
+<html lang="%otto.lang%" class="h-full">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <!--
-      No indexing, and no referrer. Every page here is behind a session, and the
-      URLs carry org slugs, repo slugs, and — on the verification and invitation
-      pages — single-use tokens in the query string. A referrer header would
-      hand those to whatever a page links out to.
+      No referrer, on every page. Console URLs carry org slugs, repo slugs, and
+      — on the verification and invitation pages — single-use tokens in the
+      query string, and a referrer header would hand those to whatever a page
+      links out to. The marketing pages lose nothing by sending none either.
+
+      No robots meta here, because this template now renders the public
+      marketing pages too, and those should be indexed. Console pages emit
+      `noindex` from `(console)/+layout.svelte`; the fallback shell (`200.html`)
+      is served by the server and the Worker with an `X-Robots-Tag` header.
+
+      The `lang` placeholder on the root element is filled in by
+      `src/hooks.server.ts` at build time: the page's locale for a prerendered
+      page, the base locale for the shell. (Not spelled out here, since the hook
+      replaces only its first occurrence and a second would ship verbatim.)
     -->
-    <meta name="robots" content="noindex, nofollow" />
     <meta name="referrer" content="no-referrer" />
     <link rel="icon" href="%sveltekit.assets%/favicon.svg" type="image/svg+xml" />
     <link rel="icon" href="%sveltekit.assets%/favicon.ico" sizes="any" type="image/x-icon" />

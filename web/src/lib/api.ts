@@ -39,6 +39,7 @@ import type {
   Membership,
   Org,
   OrgMember,
+  PlansResponse,
   Role,
   SessionOpened,
   SsoStartResponse,
@@ -303,6 +304,17 @@ export const api = {
   /** Refused with `sso_lockout` when turning this on with no working SSO path yet. */
   setEnforceSso: (org: string, enforceSso: boolean) =>
     put<Org>(`/api/orgs/${seg(org)}/sso/enforce`, { enforceSso }),
+
+  // ---------------------------------------------------------------- plans
+  /**
+   * Every plan on offer, for the public pricing page.
+   *
+   * Public and unauthenticated: a plain GET through the same `request` as
+   * everything else, so a visitor with no session gets the list (there is no
+   * cookie to send, and nothing here needs one) and a failure is the same
+   * `ApiError` every page already knows how to show.
+   */
+  plans: () => get<PlansResponse>('/api/plans'),
 
   // ---------------------------------------------------------- usage & audit
   usage: (org: string) => get<UsageStatus>(`/api/orgs/${seg(org)}/usage`),

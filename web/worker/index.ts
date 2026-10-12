@@ -24,7 +24,7 @@
  * console's own client-side routing. **This list mirrors `API_PREFIXES` in
  * `crates/otto-platform-server/src/lib.rs`, minus the server-to-server paths in
  * `NEVER_PROXIED`** and must not drift from it: the server keeps the same list
- * to decide what gets a JSON `404` instead of `index.html`, and a prefix that
+ * to decide what gets a JSON `404` instead of the SPA shell, and a prefix that
  * exists on one side only is a route that behaves differently depending on
  * whether Cloudflare is in front.
  *
@@ -53,20 +53,31 @@ export const ORIGIN_PREFIXES = ['/api', '/oauth', '/sso', '/.well-known', '/heal
 export const NEVER_PROXIED = ['/internal', '/oauth/introspect'];
 
 /**
- * A path as the origin's router would see it after the proxy and the browser
- * have both had their way with it: percent-decoded, with repeated slashes
- * collapsed. `/oauth//introspect` and `/oauth/%69ntrospect` are the same
- * request as `/oauth/introspect` to anything that normalises, and a guard that
- * compares the raw string is a guard with two doors.
+ * The one path every decision in this Worker is made on: percent-decoded, with
+ * repeated slashes collapsed, as the origin's router and the asset binding both
+ * see it. `/oauth//introspect` and `/oauth/%69ntrospect` are the same request
+ * as `/oauth/introspect` to anything that normalises, and a guard that compares
+ * the raw string is a guard with two doors.
+ *
+ * `undefined` when the path does not decode (a malformed escape such as `%zz`,
+ * or bytes that are not UTF-8): no route and no file has that name, and the
+ * server's `strict_decode` refuses exactly the same paths.
  */
-function normalise(path: string): string {
-  let decoded = path;
+export function decodePath(path: string): string | undefined {
   try {
-    decoded = decodeURIComponent(path);
+    return decodeURIComponent(path).replace(/\/{2,}/g, '/');
   } catch {
-    // A malformed escape cannot be decoded; compare it as written.
+    return undefined;
   }
-  return decoded.replace(/\/{2,}/g, '/');
+}
+
+/**
+ * A `.` or `..` segment, which only an encoded slash can produce here: URL
+ * parsing has already removed the literal and `%2e` ones. The server refuses
+ * them, because tower-http resolves them where its routing decisions do not.
+ */
+function hasDotSegment(path: string): boolean {
+  return path.split('/').some((segment) => segment === '.' || segment === '..');
 }
 
 function underPrefix(path: string, prefixes: readonly string[]): boolean {
@@ -78,16 +89,18 @@ function underPrefix(path: string, prefixes: readonly string[]): boolean {
  *
  * `startsWith` alone is wrong and quietly so: `/apiary` is a legal org slug and
  * belongs to the console. Sending it to the origin would answer a JSON `404` for
- * a route the SPA was going to render.
+ * a route the SPA was going to render. Takes the raw path; `false` when it does
+ * not decode, which the Worker answers with a `404` before asking.
  */
 export function belongsToOrigin(path: string): boolean {
-  const p = normalise(path);
-  return underPrefix(p, ORIGIN_PREFIXES) && !isNeverProxied(p);
+  const p = decodePath(path);
+  return p !== undefined && underPrefix(p, ORIGIN_PREFIXES) && !underPrefix(p, NEVER_PROXIED);
 }
 
 /** True for the server-to-server paths this Worker refuses to carry. */
 export function isNeverProxied(path: string): boolean {
-  return underPrefix(normalise(path), NEVER_PROXIED);
+  const p = decodePath(path);
+  return p !== undefined && underPrefix(p, NEVER_PROXIED);
 }
 
 export interface Env {
@@ -103,22 +116,173 @@ const json = (status: number, body: unknown) =>
     headers: { 'content-type': 'application/json' }
   });
 
+/** The origin's JSON `404`, word for word, so the answer does not depend on
+ * whether Cloudflare is in front. */
+const notFound = (path: string) =>
+  json(404, {
+    error: 'not_found',
+    error_description: `no route serves ${path}. See /api/openapi.json for the API.`
+  });
+
+/**
+ * The SPA shell, as the asset binding names it.
+ *
+ * adapter-static writes it to `200.html`, but the binding's
+ * `html_handling: "auto-trailing-slash"` (set explicitly in wrangler.jsonc for
+ * this reason) answers `/200.html` with a `307` to `/200`, so `/200` is the
+ * name that returns the file.
+ */
+const SHELL = '/200';
+
+const NOINDEX = 'noindex, nofollow';
+
+/**
+ * The shell, answering with a `200` and `X-Robots-Tag: noindex, nofollow`.
+ *
+ * It is the same HTML for every route it stands in for, so an indexed copy is
+ * a search result for `/o/acme/members` that renders a login prompt. The
+ * prerendered pages are the ones meant to be found, and they pass through
+ * without the header.
+ *
+ * The header goes on a copy: responses from the asset binding have immutable
+ * headers, and setting one in place throws.
+ *
+ * A shell the binding will not return is a broken deployment, not a missing
+ * page: the bundle has no `200.html`, or `html_handling` no longer maps `/200`
+ * to it. Every client route depends on it, so it is logged and answered with a
+ * named JSON `500`, like a missing `OTTO_ORIGIN`, rather than a bare `404`
+ * that looks like an ordinary miss.
+ */
+async function shell(request: Request, env: Env): Promise<Response> {
+  const found = await env.ASSETS.fetch(
+    new Request(new URL(SHELL, request.url), { method: request.method })
+  );
+  if (!found.ok) {
+    console.error(
+      `the asset binding answered ${found.status} for the SPA shell (${SHELL}); ` +
+        'every client route is failing. Check that the bundle has 200.html and that ' +
+        'html_handling is "auto-trailing-slash".'
+    );
+    return json(500, {
+      error: 'misconfigured',
+      error_description:
+        'this Worker could not load the console shell (200.html) from its asset bundle.'
+    });
+  }
+  const headers = new Headers(found.headers);
+  headers.set('x-robots-tag', NOINDEX);
+  return new Response(found.body, { status: 200, headers });
+}
+
+/**
+ * True when the last path segment has no `.`: a page route rather than a file.
+ * A missing `/_app/x.js` must stay a `404`; answered with HTML it is a syntax
+ * error in the browser and a cache entry nobody can explain.
+ */
+function extensionless(path: string): boolean {
+  return !(path.split('/').pop() ?? '').includes('.');
+}
+
+/**
+ * A `308` to a path on this site. Leading slashes and backslashes are stripped
+ * and exactly one put back, so a request for `//evil.com/` can never become
+ * `Location: //evil.com` (or `/\evil.com`, which browsers read the same way).
+ */
+function redirectOnSite(path: string, search: string): Response {
+  const location = `/${path.replace(/^[/\\]+/, '')}${search}`;
+  return new Response(null, { status: 308, headers: { location } });
+}
+
+/**
+ * The bundle side of the Worker: prerendered pages and assets as themselves,
+ * and the shell for any page route that has no file. The same steps, in the
+ * same order, as `route` in `crates/otto-platform-server/src/lib.rs`.
+ *
+ * `not_found_handling` is `"none"` (see wrangler.jsonc), so the binding's
+ * `404` reaches this function and the shell is chosen here, where the rule can
+ * tell a page route from a missing asset. Only a `404` falls through: any
+ * other answer is that file's own.
+ */
+async function fromBundle(request: Request, env: Env, url: URL, path: string): Promise<Response> {
+  const page = request.method === 'GET' || request.method === 'HEAD';
+
+  // Trailing slashes trimmed so `/200/` is the shell with its header and not
+  // a page, and `/index/` is not a second URL for the landing page.
+  const bare = path.replace(/\/+$/, '');
+  if (bare === '/index.html' || bare === '/index') {
+    return new Response(null, { status: 308, headers: { location: `/${url.search}` } });
+  }
+  // The shell's own names, for every method: a write must not reach the
+  // binding and come back as the shell without its header.
+  if (bare === '/200' || bare === '/200.html') {
+    if (!page) {
+      return new Response(null, {
+        status: 405,
+        headers: { allow: 'GET, HEAD', 'x-robots-tag': NOINDEX }
+      });
+    }
+    return shell(request, env);
+  }
+  // `/pricing/` → `/pricing`, as the server does and SvelteKit's
+  // `trailingSlash: 'never'` expects. The binding's own `auto-trailing-slash`
+  // only does this for files that exist, and with a `307`.
+  const raw = url.pathname;
+  if (page && raw !== '/' && raw.endsWith('/')) {
+    return redirectOnSite(raw.replace(/\/+$/, ''), url.search);
+  }
+
+  // `/pricing.html` → `/pricing`: one URL per page, with the same `308` the
+  // server sends, rather than the binding's own `307`. `/200.html` and
+  // `/index.html` were answered above. Only when the page exists, so
+  // `/nope.html` stays a `404`; looked up by its decoded name, so
+  // `/pricing%2Ehtml` is the same request.
+  if (page && path.endsWith('.html')) {
+    const target = encodePath(path.slice(0, -'.html'.length));
+    const found = await env.ASSETS.fetch(
+      new Request(new URL(target, url.origin), { method: request.method })
+    );
+    if (found.status !== 404) {
+      return redirectOnSite(target, url.search);
+    }
+  }
+
+  const response = await env.ASSETS.fetch(request);
+  if (response.status !== 404 || !page || !extensionless(path)) {
+    return response;
+  }
+  return shell(request, env);
+}
+
+/**
+ * A decoded path made safe to put back into a `Location`, escaping what the
+ * server's `LOCATION_PATH` escapes: `encodeURI` covers `%`, `\`, spaces and
+ * non-ASCII, and leaves `?` and `#`, which would end the path.
+ */
+function encodePath(path: string): string {
+  return encodeURI(path).replace(/\?/g, '%3F').replace(/#/g, '%23');
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    if (isNeverProxied(url.pathname)) {
-      return json(404, {
-        error: 'not_found',
-        error_description: `no route serves ${url.pathname}.`
-      });
+    // Decided once, on the decoded path; see `decodePath`.
+    const path = decodePath(url.pathname);
+    if (path === undefined || hasDotSegment(path)) {
+      return notFound(url.pathname);
     }
 
-    if (!belongsToOrigin(url.pathname)) {
-      // `not_found_handling: "single-page-application"` turns an unknown path
-      // into `index.html`, which is what makes a hard refresh of
+    // Refused with the origin's JSON 404, so the answer does not advertise
+    // that the route exists.
+    if (underPrefix(path, NEVER_PROXIED)) {
+      return notFound(path);
+    }
+
+    if (!underPrefix(path, ORIGIN_PREFIXES)) {
+      // A prerendered page or asset as itself, and anything else that looks
+      // like a page as the shell, which is what makes a hard refresh of
       // `/o/acme/members` work.
-      return env.ASSETS.fetch(request);
+      return fromBundle(request, env, url, path);
     }
 
     if (!env.OTTO_ORIGIN) {
@@ -133,7 +297,21 @@ export default {
       });
     }
 
-    const target = new URL(url.pathname + url.search, env.OTTO_ORIGIN);
+    // The target is the origin with the request's path *assigned*, never the
+    // request's path *resolved against* the origin. `new URL(path, base)` reads a
+    // path beginning with `//` as protocol-relative and discards the base, so
+    // `//api%2F@evil.test/x` — whose decoded, collapsed form `/api/@evil.test/x`
+    // passes every prefix check above — would resolve to host `evil.test`, and
+    // this Worker would forward the visitor's session cookie there and serve the
+    // reply on our origin. A pathname setter cannot change the host. The origin
+    // comparison below is the backstop: nothing leaves for any other host.
+    const origin = new URL(env.OTTO_ORIGIN);
+    const target = new URL(origin.origin);
+    target.pathname = url.pathname;
+    target.search = url.search;
+    if (target.origin !== origin.origin) {
+      return notFound(path);
+    }
     const headers = new Headers(request.headers);
 
     // The origin keys every per-IP throttle on this header

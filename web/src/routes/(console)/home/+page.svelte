@@ -5,7 +5,11 @@
   import Loading from '$lib/components/Loading.svelte';
 
   /**
-   * `/` has no content of its own: it forwards.
+   * `/home` has no content of its own: it forwards.
+   *
+   * It used to be `/`, which is now the public marketing page. The console's
+   * own "home" — the logo, the default after signing in, an SSO sign-in with
+   * no `next` — points here instead.
    *
    * Everything this console shows is scoped to an organization, so a signed-in
    * visitor goes to the last org they looked at (else their first), and a brand

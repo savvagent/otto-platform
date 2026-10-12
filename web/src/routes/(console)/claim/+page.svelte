@@ -4,6 +4,7 @@
 
   import { api } from '$lib/api';
   import { messageFor } from '$lib/errors';
+  import { CONSOLE_HOME } from '$lib/next';
   import { m } from '$lib/paraglide/messages';
   import { session } from '$lib/session.svelte';
   import * as webauthn from '$lib/webauthn';
@@ -43,7 +44,7 @@
       // signal attached to two of the three registration paths is the one that
       // gets forgotten when a fourth is added.
       if (session.me) await webauthn.signalAccount(session.me);
-      await goto('/', { replaceState: true });
+      await goto(CONSOLE_HOME, { replaceState: true });
     } catch (e) {
       error = messageFor(e, m.claim_error_fallback());
     } finally {

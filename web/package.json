@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "npm run paraglide:compile && vite dev",
-    "build": "npm run paraglide:compile && vite build",
+    "build": "npm run paraglide:compile && vite build && npm run check:build",
     "preview": "vite preview",
     "check": "npm run paraglide:compile && npm run check:messages && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && npm run check:worker",
     "check:worker": "tsc -p worker/tsconfig.json --noEmit",
@@ -15,7 +15,8 @@
     "lint": "prettier --check .",
     "deploy": "npm run build && wrangler deploy --env production",
     "paraglide:compile": "paraglide-js compile --project ./project.inlang --outdir ./src/lib/paraglide --emit-ts-declarations",
-    "check:messages": "node scripts/check-messages.mjs"
+    "check:messages": "node scripts/check-messages.mjs",
+    "check:build": "node scripts/check-build.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260902.1",

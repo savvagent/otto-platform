@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod orgs;
+pub mod plans;
 pub mod sso;
 pub mod teams;
 pub mod tokens;
