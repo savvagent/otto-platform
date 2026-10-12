@@ -13,12 +13,15 @@
  * `//` case is the one worth naming: `//evil.test/` is a protocol-relative URL
  * that a browser resolves to another origin, and it passes a naive
  * "starts with `/`" check. A back-slash is rejected for the same reason —
- * browsers normalize `/\evil.test` the same way.
+ * browsers normalize `/\evil.test` the same way. So are control characters,
+ * matching the server's `safe_next`: browsers strip a tab or newline from a URL
+ * before resolving it, which turns `/\t/evil.test` into `//evil.test`.
  */
 export function safeNext(raw: string | null): string | undefined {
   if (!raw) return undefined;
   if (!raw.startsWith('/')) return undefined;
   if (raw.startsWith('//') || raw.startsWith('/\\')) return undefined;
+  if (/[\u0000-\u001f\u007f\\]/.test(raw)) return undefined;
   return raw;
 }
 

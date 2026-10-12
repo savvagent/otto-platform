@@ -116,6 +116,30 @@ describe('the Worker', () => {
     upstream.mockRestore();
   });
 
+  it('never proxies to a host taken from the request path', async () => {
+    // `//api%2F@evil.test/x` decodes and collapses to `/api/@evil.test/x`, which
+    // is an origin path; resolved against the origin as a relative URL it would
+    // be the protocol-relative `//api%2F@evil.test/x`, host `evil.test`, with the
+    // visitor's cookie attached.
+    const upstream = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('{}', { status: 200 }));
+
+    for (const path of ['//api%2F@evil.test/x', '//oauth%2f@evil.test/', '//api/x', '//sso/x']) {
+      upstream.mockClear();
+      await call(
+        new Request(`https://otto.test${path}`, {
+          headers: { cookie: '__Host-otto_session=otto_ss_abc' }
+        })
+      );
+      for (const [forwarded] of upstream.mock.calls) {
+        expect(new URL((forwarded as Request).url).origin, path).toBe('https://origin.test');
+      }
+    }
+
+    upstream.mockRestore();
+  });
+
   it('serves a console route from the asset bundle', async () => {
     assets.mockClear();
     const response = await call(new Request('https://otto.test/o/acme/members'));

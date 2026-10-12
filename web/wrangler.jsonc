@@ -69,7 +69,12 @@
       // `custom_domain` makes Cloudflare create the DNS record and certificate
       // itself, which needs the savvagent.com zone to be on this Cloudflare
       // account. See docs/deploy/cloudflare.md before the first deploy.
-      "routes": [{ "pattern": "otto.savvagent.com", "custom_domain": true }]
+      "routes": [{ "pattern": "otto.savvagent.com", "custom_domain": true }],
+      // No second public way in. A `*.workers.dev` hostname or preview URL would
+      // reach the same origin without this zone's normalization and WAF rules,
+      // and nothing a browser needs lives there.
+      "workers_dev": false,
+      "preview_urls": false
     }
   },
 

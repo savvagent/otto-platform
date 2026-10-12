@@ -3,12 +3,19 @@ import { describe, expect, it } from 'vitest';
 import { consoleNext, safeNext } from './next';
 
 describe('safeNext', () => {
-  it.each([null, '', 'dashboard', 'https://evil.test/', '//evil.test', '/\\evil.test'])(
-    'refuses %j',
-    (raw) => {
-      expect(safeNext(raw)).toBeUndefined();
-    }
-  );
+  it.each([
+    null,
+    '',
+    'dashboard',
+    'https://evil.test/',
+    '//evil.test',
+    '/\\evil.test',
+    '/\t/evil.test',
+    '/\n/evil.test',
+    '/a\\b'
+  ])('refuses %j', (raw) => {
+    expect(safeNext(raw)).toBeUndefined();
+  });
 
   it('keeps a same-origin path, `/` included', () => {
     expect(safeNext('/o/acme?tab=1')).toBe('/o/acme?tab=1');

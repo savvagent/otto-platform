@@ -255,7 +255,21 @@ export default {
       });
     }
 
-    const target = new URL(url.pathname + url.search, env.OTTO_ORIGIN);
+    // The target is the origin with the request's path *assigned*, never the
+    // request's path *resolved against* the origin. `new URL(path, base)` reads a
+    // path beginning with `//` as protocol-relative and discards the base, so
+    // `//api%2F@evil.test/x` — whose decoded, collapsed form `/api/@evil.test/x`
+    // passes every prefix check above — would resolve to host `evil.test`, and
+    // this Worker would forward the visitor's session cookie there and serve the
+    // reply on our origin. A pathname setter cannot change the host. The origin
+    // comparison below is the backstop: nothing leaves for any other host.
+    const origin = new URL(env.OTTO_ORIGIN);
+    const target = new URL(origin.origin);
+    target.pathname = url.pathname;
+    target.search = url.search;
+    if (target.origin !== origin.origin) {
+      return notFound(path);
+    }
     const headers = new Headers(request.headers);
 
     // The origin keys every per-IP throttle on this header
