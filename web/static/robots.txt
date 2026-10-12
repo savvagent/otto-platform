@@ -1,0 +1,20 @@
+# The public marketing pages are indexable; the console, the API and the
+# OAuth/SSO endpoints are not. Console pages also say `noindex` themselves, and
+# the shell is served with an `X-Robots-Tag` header, so this is a crawl budget
+# hint as much as a rule.
+User-agent: *
+Allow: /
+Disallow: /o/
+Disallow: /settings
+Disallow: /orgs/
+Disallow: /invite/
+Disallow: /claim
+Disallow: /home
+Disallow: /login
+Disallow: /signup
+Disallow: /api/
+Disallow: /oauth/
+Disallow: /sso/
+Disallow: /internal/
+
+Sitemap: https://otto.savvagent.com/sitemap.xml

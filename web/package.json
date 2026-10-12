@@ -15,7 +15,8 @@
     "lint": "prettier --check .",
     "deploy": "npm run build && wrangler deploy --env production",
     "paraglide:compile": "paraglide-js compile --project ./project.inlang --outdir ./src/lib/paraglide --emit-ts-declarations",
-    "check:messages": "node scripts/check-messages.mjs"
+    "check:messages": "node scripts/check-messages.mjs",
+    "check:build": "node scripts/check-build.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260902.1",

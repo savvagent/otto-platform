@@ -20,6 +20,7 @@ npm run check    # compile messages, check completeness, then svelte-check + tsc
 npm run lint     # prettier --check
 npm test         # vitest: the Worker's routing rule, locale resolution, the error map, pages
 npm run build    # static bundle in build/
+npm run check:build  # after build: every marketing page exists, in its language, indexable
 npm run deploy   # build, then deploy the production Worker — docs/deploy/cloudflare.md
 ```
 
