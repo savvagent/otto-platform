@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/savvagent/otto-platform/compare/v0.5.0...v0.6.0) (2026-10-12)
+
+
+### Features
+
+* **web:** market the otto-* services from otto.savvagent.com ([#35](https://github.com/savvagent/otto-platform/issues/35)) ([7b70e8a](https://github.com/savvagent/otto-platform/commit/7b70e8a156feb30a39289591755a16b82a51acae))
+
 ## [0.5.0](https://github.com/savvagent/otto-platform/compare/v0.4.0...v0.5.0) (2026-10-10)
 
 
