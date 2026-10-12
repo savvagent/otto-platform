@@ -66,7 +66,7 @@
         <h2 id="features-title" class="text-2xl font-semibold tracking-tight text-ink">
           {m.product_features_heading()}
         </h2>
-        <ul class="mt-6 flex flex-col gap-4">
+        <ul role="list" class="mt-6 flex flex-col gap-4">
           {#each service.copy.features() as feature, i (i)}
             <li class="flex gap-3 text-muted">
               <span class="mt-2 size-1.5 shrink-0 rounded-full bg-accent" aria-hidden="true"></span>
@@ -103,7 +103,7 @@
         <h2 id="others-title" class="text-2xl font-semibold tracking-tight text-ink">
           {m.product_others_heading()}
         </h2>
-        <ul class="mt-6 grid gap-4 sm:grid-cols-2">
+        <ul role="list" class="mt-6 grid gap-4 sm:grid-cols-2">
           {#each others as other (other.slug)}
             <li class="grid"><ProductCard service={other} lang={data.lang} level={3} /></li>
           {/each}

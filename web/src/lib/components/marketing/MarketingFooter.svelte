@@ -35,7 +35,7 @@
 <footer class="border-t border-edge/40 px-4 py-6 text-xs text-muted">
   <div class="mx-auto flex w-full max-w-6xl flex-col gap-4">
     <nav aria-label={m.marketing_footer_language()}>
-      <ul class="flex flex-wrap gap-x-3 gap-y-2">
+      <ul role="list" class="flex flex-wrap gap-x-3 gap-y-2">
         {#each MARKETING_LOCALES as locale (locale)}
           <li>
             <a

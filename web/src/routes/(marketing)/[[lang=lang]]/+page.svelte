@@ -22,6 +22,10 @@
    * — OIDC SSO (there is no SAML), one plan and one usage bucket per org,
    * audience-bound tokens — so a translation can be checked against the code
    * rather than against a slogan.
+   *
+   * Lists drawn without bullets carry `role="list"`: Safari drops list
+   * semantics from a `<ul>`/`<ol>` whose markers are removed by CSS, and
+   * VoiceOver then stops announcing "list, 3 items".
    */
   let { data }: { data: PageData } = $props();
 
@@ -66,10 +70,12 @@
     </div>
 
     <!--
-      The endpoints themselves, as an agent's config would list them: the
-      quickest way to say "this is a URL you paste into a tool". Decorative —
-      each one is on its product page with a copy button — so hidden from
-      assistive technology rather than read out twice.
+      The endpoints themselves, in config-file monospace: the quickest way to
+      say "this is a URL you paste into a tool". It is not any particular
+      client's config format (each agent spells that differently), only the
+      service-to-URL pairs. Decorative — each URL is on its product page with
+      a copy button — so hidden from assistive technology rather than read
+      out twice.
     -->
     <div class="otto-card relative overflow-hidden p-5" aria-hidden="true">
       <Logo class="absolute -right-8 -bottom-10 size-40 text-accent/10" />
@@ -96,7 +102,7 @@
       {m.landing_products_heading()}
     </h2>
     <p class="mt-2 max-w-2xl text-muted">{m.landing_products_intro()}</p>
-    <ul class="mt-8 grid gap-4 sm:grid-cols-2">
+    <ul role="list" class="mt-8 grid gap-4 sm:grid-cols-2">
       {#each SERVICES as service (service.slug)}
         <li class="grid"><ProductCard {service} lang={data.lang} level={3} /></li>
       {/each}
@@ -110,7 +116,7 @@
       </h2>
       <p class="mt-3 text-muted">{m.landing_family_intro()}</p>
     </div>
-    <ul class="grid gap-x-8 gap-y-8 sm:grid-cols-2">
+    <ul role="list" class="grid gap-x-8 gap-y-8 sm:grid-cols-2">
       {#each family as item, i (i)}
         <li class="border-l-2 border-accent/60 pl-4">
           <h3 class="font-semibold text-ink">{item.title()}</h3>
@@ -124,7 +130,7 @@
     <h2 id="how-title" class="text-2xl font-semibold tracking-tight text-ink">
       {m.landing_how_heading()}
     </h2>
-    <ol class="mt-8 grid gap-4 md:grid-cols-3">
+    <ol role="list" class="mt-8 grid gap-4 md:grid-cols-3">
       {#each steps as step, i (i)}
         <li class="otto-card flex flex-col gap-3 p-5">
           <span
