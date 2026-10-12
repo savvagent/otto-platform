@@ -266,7 +266,9 @@ fn sso_schemas() -> Value {
                     "description":
                         "Optional. A path on this origin (one leading `/`, not `//` or `/\\`) \
                          to land on after signing in, such as the /oauth/authorize URL the \
-                         login page was reached from. Anything else is ignored.",
+                         login page was reached from. Anything else is ignored. Without \
+                         one, or with exactly `/`, the sign-in lands on the console home, \
+                         `/home`.",
                 },
             },
             "required": ["email"],
