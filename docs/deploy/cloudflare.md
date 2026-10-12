@@ -6,8 +6,8 @@
 > Cloudflare. Using it means switching `OTTO_CLIENT_IP_HEADER` to `cf-connecting-ip` and
 > unsetting `OTTO_STATIC_DIR`. Nothing in the primary path depends on it.
 
-**One Worker serves the built SPA and proxies everything dynamic to
-`otto-platform-server`.** The browser sees one hostname, `otto.savvagent.com`.
+**One Worker serves the built bundle (the prerendered marketing pages and the console's SPA
+shell) and proxies everything dynamic to `otto-platform-server`.** The browser sees one hostname, `otto.savvagent.com`.
 `web/wrangler.jsonc` and `web/worker/index.ts` are the whole of it; this file is the
 account-side setup neither can express, and the traps a first deploy hits.
 
@@ -70,7 +70,7 @@ one is a change to both.
 
 ```bash
 cd web
-npm run build                          # adapter-static -> web/build
+npm run build                          # adapter-static -> web/build, then check:build
 npx wrangler deploy --env production   # or: npm run deploy, which does both
 ```
 
@@ -168,7 +168,8 @@ npx wrangler dev --port 8788 --var OTTO_ORIGIN:http://127.0.0.1:8080
 
 What that run established:
 
-- **Routing.** `/`, `/o/acme/members` and `/apiary` render the SPA; `/readyz` answers JSON
+- **Routing.** `/o/acme/members` and `/apiary` render the SPA (so did `/`, before it became
+  the prerendered landing page); `/readyz` answers JSON
   from the origin; `/.well-known/oauth-authorization-server` names the edge as the issuer
   (`http://localhost:8788`); `/api/auth/webauthn` reports `rpId: localhost`, the host the
   browser is on.

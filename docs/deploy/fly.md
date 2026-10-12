@@ -2,7 +2,8 @@
 
 `otto.savvagent.com` resolves straight to the Fly app `otto-platform`, and
 `otto-platform-server` serves everything: the API, the OAuth authorization server, and the
-console (`web/build`, baked into the image at `/srv/console`). There is no edge in front,
+`web/` bundle, which is the prerendered marketing pages and the console (`web/build`, baked
+into the image at `/srv/console`). There is no edge in front,
 which is also how `otto-factory.savvagent.com` runs. An optional Cloudflare Worker
 alternative is in [`cloudflare.md`](cloudflare.md).
 
