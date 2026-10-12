@@ -327,6 +327,20 @@ async fn sso_sign_in_ignores_an_unsafe_next(pool: PgPool) {
         assert_eq!(landing(&reply), home, "case {i}: {bad}");
     }
 
+    // An explicit `next=/` is the console home too, not the marketing page:
+    // a fresh sign-in there would look signed out.
+    let (state, nonce, binding) = start_anonymous_with_next(&h, "alice@acme.test", "/").await;
+    let id_token = support::sign_id_token(&id_token_claims(
+        &idp.server.base_url,
+        "alice-sub",
+        "alice@acme.test",
+        true,
+        &nonce,
+    ));
+    let reply = complete_callback(&h, &idp, &state, Some(&binding), &id_token).await;
+    reply.expect(StatusCode::SEE_OTHER);
+    assert_eq!(landing(&reply), home, "next=/");
+
     // A `next` smuggled onto the callback itself is not read, and a ceremony
     // started with no `next` at all lands on the console home too.
     let (state, nonce, binding) = start_anonymous(&h, "alice@acme.test").await;
