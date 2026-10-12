@@ -21,6 +21,8 @@ http.workspace = true
 url.workspace = true
 anyhow.workspace = true
 schemars.workspace = true
+# `sync` for the plan catalog's in-process cache (`routes::plans::PlansCache`).
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 # Integration tests link otto-web as an external crate, so anything they name

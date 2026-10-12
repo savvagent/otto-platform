@@ -1459,6 +1459,31 @@ async fn the_plan_catalog_is_public_ordered_and_cacheable(pool: PgPool) {
     assert_eq!(doc.body["paths"]["/api/plans"]["get"]["tags"][0], "billing");
 }
 
+/// `plans.features` keys belong to the services that read them (migration
+/// 0016), so a gate a service adds must not reach anonymous callers just
+/// because it was written. Only allowlisted keys are published. Written as the
+/// test pool's superuser: `otto_app` has no write grant on `plans`.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_plan_catalog_publishes_only_advertised_features(pool: PgPool) {
+    let h = harness(pool).await;
+    sqlx::query(
+        "UPDATE plans SET features = '{\"auto_rollback\": true, \"secret_gate\": true}' \
+         WHERE plan = 'team'",
+    )
+    .execute(h.db.pool())
+    .await
+    .unwrap();
+
+    let reply = Call::get("/api/plans").send(&h.router).await;
+    reply.expect(StatusCode::OK);
+    let team = &reply.body["plans"][1];
+    assert_eq!(team["plan"], "team");
+    assert_eq!(
+        team["features"],
+        serde_json::json!({ "auto_rollback": true })
+    );
+}
+
 // ---------------------------------------------------------------- openapi
 
 /// The document is served, describes the routes that exist, and needs no

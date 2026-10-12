@@ -712,8 +712,11 @@ pub fn catalog() -> Vec<Endpoint> {
                  Public because plans are operator-maintained reference data, not tenant \
                  data — they belong to no org, and a visitor deciding whether to sign up \
                  has no credential to present. Read live from the `plans` table, so the \
-                 prices shown are the ones billed against, and cacheable for five minutes \
-                 (`Cache-Control: public, max-age=300`). A `monthlyCents` of 0 on \
+                 prices shown are the ones billed against; each instance reuses what it \
+                 read for a minute, and the response is cacheable for five more \
+                 (`Cache-Control: public, max-age=300`). `features` lists only the \
+                 capabilities chosen for advertising, not every key a plan carries. \
+                 A `monthlyCents` of 0 on \
                  enterprise means negotiated, not free. Lists the published bucket, not \
                  any org's negotiated override; an org's own figure is \
                  /api/orgs/{org}/usage.",

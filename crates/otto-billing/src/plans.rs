@@ -15,15 +15,13 @@
 use otto_core::error::Result;
 use otto_core::orgs::Plan;
 use otto_tenant::Unpinned;
-use serde::Serialize;
 use sqlx::FromRow;
 
 /// One tier as offered, before any org-specific override.
 ///
 /// Not called `Plan`: that name is the enum in [`otto_core::orgs`], which this
 /// struct (and `usage.rs`) carries as its `plan` field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, FromRow)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct PlanOffer {
     pub plan: Plan,
     pub display_name: String,

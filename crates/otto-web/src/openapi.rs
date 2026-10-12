@@ -594,8 +594,11 @@ fn plan_schemas() -> Value {
                 "features": {
                     "type": "object",
                     "description":
-                        "Capabilities the plan unlocks, keyed by capability. A capability \
-                         is on only where its value is `true`; a missing key is off.",
+                        "Capabilities the plan unlocks, keyed by capability. Only the \
+                         capabilities chosen for advertising are listed, not every key the \
+                         plan carries; today that is `auto_rollback`. A capability is on \
+                         only where its value is `true`; a missing key is off or not \
+                         advertised.",
                 },
             },
             "required": [

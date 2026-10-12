@@ -114,6 +114,10 @@ pub struct AppState {
     /// once at startup and shared by every request.
     pub cipher: Arc<Cipher>,
     pub config: Arc<Config>,
+    /// The assembled `GET /api/plans` answer, held briefly so an anonymous,
+    /// unauthenticated endpoint does not reach the database on every call.
+    /// See [`crate::routes::plans`].
+    pub plans: Arc<crate::routes::plans::PlansCache>,
 }
 
 impl AppState {
@@ -128,6 +132,7 @@ impl AppState {
             webauthn,
             cipher: Arc::new(cipher),
             config: Arc::new(config),
+            plans: Arc::default(),
         }
     }
 }
