@@ -593,6 +593,7 @@ fn plan_schemas() -> Value {
                 },
                 "features": {
                     "type": "object",
+                    "additionalProperties": { "type": "boolean" },
                     "description":
                         "Capabilities the plan unlocks, keyed by capability. Only the \
                          capabilities chosen for advertising are listed, not every key the \
