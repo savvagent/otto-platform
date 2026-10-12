@@ -165,7 +165,7 @@ fn tag_for(path: &str) -> &'static str {
         "tokens"
     } else if path.contains("/invites") {
         "invites"
-    } else if path.contains("/usage") || path.contains("/audit") {
+    } else if path.contains("/usage") || path.contains("/audit") || path == "/api/plans" {
         "billing"
     } else {
         "orgs"
@@ -184,6 +184,7 @@ fn components() -> Value {
     for group in [
         entity_schemas(),
         sso_schemas(),
+        plan_schemas(),
         response_schemas(),
         request_schemas(),
     ] {
@@ -548,6 +549,59 @@ fn entity_schemas() -> Value {
             "required": ["id", "action", "createdAt"],
         },
         "AuditEventList": { "type": "array", "items": reference("AuditEvent") },
+    })
+}
+
+/// The public plan catalog. Its own group for the recursion-limit reason
+/// [`components`] gives, and because it is the one set of schemas a reader
+/// with no account sees.
+fn plan_schemas() -> Value {
+    json!({
+        "PlansResponse": {
+            "type": "object",
+            "description": "Every plan on offer, cheapest tier first.",
+            "properties": {
+                "plans": { "type": "array", "items": reference("PublicPlan") },
+            },
+            "required": ["plans"],
+        },
+        "PublicPlan": {
+            "type": "object",
+            "description":
+                "One tier as offered, before any org's negotiated override. Live from the \
+                 `plans` table.",
+            "properties": {
+                "plan": {
+                    "type": "string",
+                    "enum": ["free", "team", "business", "enterprise"],
+                },
+                "displayName": { "type": "string" },
+                "includedOps": {
+                    "type": "integer",
+                    "description": "Billable operations included each month.",
+                },
+                "hardStop": {
+                    "type": "boolean",
+                    "description":
+                        "Whether exceeding the bucket stops billable work rather than \
+                         metering overage.",
+                },
+                "monthlyCents": {
+                    "type": "integer",
+                    "description":
+                        "List price in US cents. 0 on enterprise means negotiated, not free.",
+                },
+                "features": {
+                    "type": "object",
+                    "description":
+                        "Capabilities the plan unlocks, keyed by capability. A capability \
+                         is on only where its value is `true`; a missing key is off.",
+                },
+            },
+            "required": [
+                "plan", "displayName", "includedOps", "hardStop", "monthlyCents", "features",
+            ],
+        },
     })
 }
 

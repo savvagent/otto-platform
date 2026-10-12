@@ -1419,6 +1419,46 @@ async fn usage_reports_the_orgs_period_and_plan(pool: PgPool) {
     );
 }
 
+// ------------------------------------------------------------------ plans
+
+/// The plan catalog is what a pricing page reads, so it has to answer a
+/// visitor who has no account, in the camelCase every other wire type uses,
+/// cheapest tier first, and with a cache lifetime a CDN can honour.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_plan_catalog_is_public_ordered_and_cacheable(pool: PgPool) {
+    let h = harness(pool).await;
+    let reply = Call::get("/api/plans").send(&h.router).await;
+    reply.expect(StatusCode::OK);
+
+    assert_eq!(
+        reply
+            .headers
+            .get(http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=300")
+    );
+
+    let plans = reply.body["plans"].as_array().unwrap();
+    let order: Vec<&str> = plans.iter().map(|p| p["plan"].as_str().unwrap()).collect();
+    assert_eq!(order, ["free", "team", "business", "enterprise"]);
+
+    let team = &plans[1];
+    assert_eq!(team["displayName"], "Team");
+    assert_eq!(team["includedOps"], 10_000);
+    assert_eq!(team["hardStop"], false);
+    assert_eq!(team["monthlyCents"], 2900);
+    assert_eq!(team["features"]["auto_rollback"], true);
+    assert_eq!(plans[0]["hardStop"], true);
+
+    let doc = Call::get("/api/openapi.json").send(&h.router).await;
+    doc.expect(StatusCode::OK);
+    assert!(
+        doc.body["paths"]["/api/plans"]["get"].is_object(),
+        "the catalog route is documented"
+    );
+    assert_eq!(doc.body["paths"]["/api/plans"]["get"]["tags"][0], "billing");
+}
+
 // ---------------------------------------------------------------- openapi
 
 /// The document is served, describes the routes that exist, and needs no
