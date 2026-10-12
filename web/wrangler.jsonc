@@ -18,18 +18,23 @@
     // _app/immutable, so the bundle is safe to cache hard and the HTML is not.
     "directory": "./build",
     "binding": "ASSETS",
-    // Client-side routing: an unknown path is a route the SPA renders, not a
-    // 404. The server's optional static fallback does the same thing for
-    // self-hosters.
-    "not_found_handling": "single-page-application",
+    // No SPA mode, on purpose. Cloudflare's "single-page-application" handling
+    // always answers an unknown path with /index.html, which is now the
+    // prerendered landing page, not the shell; and it answers a missing
+    // /_app/x.js with HTML too. The Worker chooses instead (worker/index.ts):
+    // an extensionless 404 becomes the shell from 200.html, marked
+    // `X-Robots-Tag: noindex, nofollow`, and a missing asset stays a 404. The
+    // server does the same for self-hosters.
+    "not_found_handling": "none",
 
     // Every request enters the Worker, including asset requests.
     //
     // The alternative is a glob list, which is cheaper because assets would be
     // served without an invocation. It is also a second, differently-shaped copy
     // of a rule that already exists in the server, and when the glob is wrong
-    // the failure is silent and specific: the asset router answers with
-    // index.html and a 200. It would also have to express an exception
+    // the failure is silent: a path the glob misses is answered by the asset
+    // router before the Worker's rule ever sees it. It would also have to
+    // express an exception
     // (/oauth/introspect and /internal are carved out of /oauth and refused),
     // which a glob list cannot do.
     //

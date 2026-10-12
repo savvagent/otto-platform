@@ -24,7 +24,7 @@
  * console's own client-side routing. **This list mirrors `API_PREFIXES` in
  * `crates/otto-platform-server/src/lib.rs`, minus the server-to-server paths in
  * `NEVER_PROXIED`** and must not drift from it: the server keeps the same list
- * to decide what gets a JSON `404` instead of `index.html`, and a prefix that
+ * to decide what gets a JSON `404` instead of the SPA shell, and a prefix that
  * exists on one side only is a route that behaves differently depending on
  * whether Cloudflare is in front.
  *
@@ -103,6 +103,73 @@ const json = (status: number, body: unknown) =>
     headers: { 'content-type': 'application/json' }
   });
 
+/**
+ * The SPA shell, as the asset binding names it.
+ *
+ * adapter-static writes it to `200.html`, but the binding's default
+ * `html_handling: "auto-trailing-slash"` answers `/200.html` with a `307` to
+ * `/200`, so `/200` is the name that returns the file.
+ */
+const SHELL = '/200';
+
+/**
+ * The shell, answering with a `200` and `X-Robots-Tag: noindex, nofollow`.
+ *
+ * It is the same HTML for every route it stands in for, so an indexed copy is
+ * a search result for `/o/acme/members` that renders a login prompt. The
+ * prerendered pages are the ones meant to be found, and they pass through
+ * without the header.
+ *
+ * The header goes on a copy: responses from the asset binding have immutable
+ * headers, and setting one in place throws.
+ */
+async function shell(request: Request, env: Env): Promise<Response | undefined> {
+  const found = await env.ASSETS.fetch(
+    new Request(new URL(SHELL, request.url), { method: request.method })
+  );
+  if (!found.ok) return undefined;
+  const headers = new Headers(found.headers);
+  headers.set('x-robots-tag', 'noindex, nofollow');
+  return new Response(found.body, { status: 200, headers });
+}
+
+/**
+ * True when the last path segment has no `.`: a page route rather than a file.
+ * A missing `/_app/x.js` must stay a `404`; answered with HTML it is a syntax
+ * error in the browser and a cache entry nobody can explain.
+ */
+function extensionless(path: string): boolean {
+  return !(path.split('/').pop() ?? '').includes('.');
+}
+
+/**
+ * The bundle side of the Worker: prerendered pages and assets as themselves,
+ * and the shell for any page route that has no file.
+ *
+ * `not_found_handling` is `"none"` (see wrangler.jsonc), so the binding's
+ * `404` reaches this function and the shell is chosen here, where the rule can
+ * tell a page route from a missing asset.
+ */
+async function fromBundle(request: Request, env: Env, url: URL): Promise<Response> {
+  const path = url.pathname;
+  // Trailing slashes trimmed so `/200/` is the shell with its header and not
+  // a page, and `/index` is not a second URL for the landing page.
+  const bare = path.replace(/\/+$/, '');
+  if (bare === '/index.html' || bare === '/index') {
+    return new Response(null, { status: 308, headers: { location: `/${url.search}` } });
+  }
+  const page = request.method === 'GET' || request.method === 'HEAD';
+  if (page && (bare === '/200' || bare === '/200.html')) {
+    return (await shell(request, env)) ?? new Response(null, { status: 404 });
+  }
+
+  const response = await env.ASSETS.fetch(request);
+  if (response.status !== 404 || !page || !extensionless(path)) {
+    return response;
+  }
+  return (await shell(request, env)) ?? response;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -115,10 +182,10 @@ export default {
     }
 
     if (!belongsToOrigin(url.pathname)) {
-      // `not_found_handling: "single-page-application"` turns an unknown path
-      // into `index.html`, which is what makes a hard refresh of
+      // A prerendered page or asset as itself, and anything else that looks
+      // like a page as the shell, which is what makes a hard refresh of
       // `/o/acme/members` work.
-      return env.ASSETS.fetch(request);
+      return fromBundle(request, env, url);
     }
 
     if (!env.OTTO_ORIGIN) {

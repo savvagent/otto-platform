@@ -7,9 +7,9 @@ import worker, { belongsToOrigin, isNeverProxied, type Env } from './index';
  * different language, that nothing forces to agree with the first.
  *
  * Drift here is silent in the worst direction. If the edge stops recognising a
- * path as the origin's, the asset router answers it from `index.html` with a
- * `200`, and a client calling `/api/orgs/nope` gets HTML forever instead of the
- * `404` it can parse.
+ * path as the origin's, the Worker answers it with the SPA shell (`200.html`)
+ * and a `200`, and a client calling `/api/orgs/nope` gets HTML forever instead
+ * of the `404` it can parse.
  */
 describe('belongsToOrigin', () => {
   it('claims the browser-facing API surfaces, bare and nested', () => {
@@ -167,5 +167,130 @@ describe('the Worker', () => {
     const response = await call(new Request('https://otto.test/api/me'), env(''));
     expect(response.status).toBe(500);
     expect(await response.text()).toContain('OTTO_ORIGIN');
+  });
+});
+
+/**
+ * The asset bundle, as Cloudflare's asset binding would answer it with
+ * `not_found_handling: "none"` and the default `auto-trailing-slash` HTML
+ * handling: `/pricing` finds `pricing.html`, `/200` finds the shell, and
+ * anything else is a bare `404`. Headers are immutable, as on the real
+ * binding, so a Worker that mutates them in place fails here too.
+ */
+describe('the Worker in front of the asset bundle', () => {
+  const pages: Record<string, string> = {
+    '/': '<html>landing</html>',
+    '/pricing': '<html>pricing</html>',
+    '/200': '<html>shell</html>',
+    '/_app/app.js': 'console.log(1)'
+  };
+  const immutable = (body: string | null, status: number) => {
+    const response = new Response(body, {
+      status,
+      headers: { 'content-type': 'text/html', etag: '"v1"' }
+    });
+    Object.defineProperty(response, 'headers', {
+      value: new Proxy(response.headers, {
+        get(target, prop) {
+          if (prop === 'set' || prop === 'append' || prop === 'delete') {
+            return () => {
+              throw new TypeError("Can't modify immutable headers.");
+            };
+          }
+          const value = Reflect.get(target, prop, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        }
+      })
+    });
+    return response;
+  };
+  const assets = vi.fn(async (input: RequestInfo | URL) => {
+    const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+    const page = pages[path];
+    return page === undefined ? immutable(null, 404) : immutable(page, 200);
+  });
+  const env = {
+    ASSETS: { fetch: assets } as unknown as Fetcher,
+    OTTO_ORIGIN: 'https://origin.test'
+  } as Env;
+  const call = (path: string, init?: RequestInit) =>
+    worker.fetch(new Request(`https://otto.test${path}`, init), env);
+  const askedFor = () =>
+    assets.mock.calls.map(
+      ([input]) => new URL(input instanceof Request ? input.url : input.toString()).pathname
+    );
+
+  it('answers a deep link with the shell, marked noindex', async () => {
+    assets.mockClear();
+    const response = await call('/o/acme/members');
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('<html>shell</html>');
+    expect(response.headers.get('x-robots-tag')).toBe('noindex, nofollow');
+    // The shell's own headers survive the copy.
+    expect(response.headers.get('etag')).toBe('"v1"');
+    // `/200`, not `/200.html`: the latter is a 307 under auto-trailing-slash.
+    expect(askedFor()).toEqual(['/o/acme/members', '/200']);
+  });
+
+  it('answers a HEAD deep link with the shell too', async () => {
+    const response = await call('/o/acme/members', { method: 'HEAD' });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('x-robots-tag')).toBe('noindex, nofollow');
+  });
+
+  it('leaves a missing asset a 404, never HTML', async () => {
+    assets.mockClear();
+    const response = await call('/_app/missing.js');
+    expect(response.status).toBe(404);
+    expect(response.headers.has('x-robots-tag')).toBe(false);
+    expect(askedFor()).toEqual(['/_app/missing.js']);
+  });
+
+  it('does not answer a write to an unknown page with the shell', async () => {
+    const response = await call('/o/acme/members', { method: 'POST' });
+    expect(response.status).toBe(404);
+  });
+
+  it('passes a page that exists through untouched', async () => {
+    for (const path of ['/', '/pricing', '/_app/app.js']) {
+      assets.mockClear();
+      const response = await call(path);
+      expect(response.status, path).toBe(200);
+      expect(await response.text(), path).toBe(pages[path]);
+      expect(response.headers.has('x-robots-tag'), path).toBe(false);
+      expect(askedFor(), path).toEqual([path]);
+    }
+  });
+
+  it('redirects /index.html to the one URL the landing page has', async () => {
+    assets.mockClear();
+    const response = await call('/index.html');
+    expect(response.status).toBe(308);
+    expect(new URL(response.headers.get('location')!, 'https://otto.test').pathname).toBe('/');
+    expect(assets).not.toHaveBeenCalled();
+  });
+
+  it('serves the shell under its own names with the header', async () => {
+    for (const path of ['/200', '/200.html']) {
+      assets.mockClear();
+      const response = await call(path);
+      expect(response.status, path).toBe(200);
+      expect(await response.text(), path).toBe('<html>shell</html>');
+      expect(response.headers.get('x-robots-tag'), path).toBe('noindex, nofollow');
+      expect(askedFor(), path).toEqual(['/200']);
+    }
+  });
+
+  it('still proxies origin paths without touching the bundle', async () => {
+    assets.mockClear();
+    const upstream = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('{}', { status: 404 }));
+    const response = await call('/api/no/such');
+    expect(response.status).toBe(404);
+    expect(response.headers.has('x-robots-tag')).toBe(false);
+    expect(upstream).toHaveBeenCalledOnce();
+    expect(assets).not.toHaveBeenCalled();
+    upstream.mockRestore();
   });
 });
