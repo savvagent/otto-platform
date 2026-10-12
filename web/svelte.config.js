@@ -34,6 +34,23 @@ export default {
   preprocess: vitePreprocess(),
   kit: {
     adapter: adapter({ fallback: '200.html', strict: false }),
+    prerender: {
+      /**
+       * TEMPORARY, until the pricing and product pages exist: the marketing
+       * header links to them on every page, and the crawler fails the build on
+       * a 404. Only those exact paths are tolerated — any other broken link
+       * still fails — and `npm run check:build` reports them as missing. Delete
+       * this once both pages are built.
+       */
+      handleHttpError({ status, path, referrer, message }) {
+        const pending = /^(\/(es|de|fr|it|hi))?\/(pricing|products\/[a-z0-9-]+)$/;
+        if (status === 404 && pending.test(path)) {
+          console.warn(`not built yet: ${path} (linked from ${referrer})`);
+          return;
+        }
+        throw new Error(message);
+      }
+    },
     typescript: {
       config(config) {
         // `strict` is set here rather than in tsconfig.json because SvelteKit
