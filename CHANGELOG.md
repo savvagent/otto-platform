@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/savvagent/otto-platform/compare/v0.6.0...v0.6.1) (2026-10-12)
+
+
+### Bug Fixes
+
+* **web:** show the call count in the usage meter captions ([#37](https://github.com/savvagent/otto-platform/issues/37)) ([9d90b60](https://github.com/savvagent/otto-platform/commit/9d90b608659566f20c0f0c238c4990237a724eac))
+
 ## [0.6.0](https://github.com/savvagent/otto-platform/compare/v0.5.0...v0.6.0) (2026-10-12)
 
 
