@@ -4,7 +4,7 @@
 
   import { api } from '$lib/api';
   import { messageFor } from '$lib/errors';
-  import { isServerRoute, safeNext } from '$lib/next';
+  import { CONSOLE_HOME, consoleNext, isServerRoute } from '$lib/next';
   import { m } from '$lib/paraglide/messages';
   import { session } from '$lib/session.svelte';
   import * as webauthn from '$lib/webauthn';
@@ -78,9 +78,9 @@
       if (session.me) await webauthn.signalAccount(session.me);
       // Carry `next` through, so an account created mid-OAuth-flow lands back
       // on `/oauth/authorize` rather than on the console home.
-      const dest = safeNext(next);
+      const dest = consoleNext(next);
       if (dest && isServerRoute(dest)) location.assign(dest);
-      else await goto(dest ?? '/home', { replaceState: true });
+      else await goto(dest ?? CONSOLE_HOME, { replaceState: true });
     } catch (e) {
       error = messageFor(e, m.error_could_not_save());
     } finally {

@@ -26,3 +26,20 @@ export function safeNext(raw: string | null): string | undefined {
 export function isServerRoute(next: string): boolean {
   return next.startsWith('/oauth/') || next.startsWith('/api/') || next.startsWith('/.well-known/');
 }
+
+/** Where the console's own home is. `/` is the public landing page. */
+export const CONSOLE_HOME = '/home';
+
+/**
+ * `safeNext`, read the way the console means it.
+ *
+ * Inside the console an explicit `next=/` can only mean "the console home": it
+ * comes from a link written before `/` became the public landing page, or from
+ * someone who typed it. Following it literally would sign a visitor in and
+ * then drop them on a marketing page that looks signed out. Anything else is
+ * `safeNext`'s answer unchanged, so the same-origin rule still holds.
+ */
+export function consoleNext(raw: string | null): string | undefined {
+  const next = safeNext(raw);
+  return next === '/' ? CONSOLE_HOME : next;
+}

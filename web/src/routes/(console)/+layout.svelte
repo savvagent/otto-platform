@@ -7,7 +7,7 @@
   import { messageFor } from '$lib/errors';
   import { m } from '$lib/paraglide/messages';
   import { reconcile, resolveAtBoot } from '$lib/locale';
-  import { isServerRoute, safeNext } from '$lib/next';
+  import { guard } from '$lib/routing';
   import { session } from '$lib/session.svelte';
   import { SERVICES } from '$lib/services';
   import { APP_VERSION } from '$lib/version';
@@ -103,43 +103,18 @@
     // to "sign in to continue" and sent back where they left.
     if (!session.ready || fatal || signingOut) return;
 
-    if (!session.signedIn) {
-      if (!isPublic) {
-        // The console home has no content of its own, so there is nothing to
-        // come back to. `/` is the marketing page now and never reaches this
-        // guard, but an old bookmark or a `next=/` minted before the split
-        // still means "the console home", so both spellings are treated alike.
-        const next = page.url.pathname + page.url.search;
-        const home = next === '/' || next === '/home';
-        const target = home ? '/login' : `/login?next=${encodeURIComponent(next)}`;
-        void goto(target, { replaceState: true });
-      }
-      return;
-    }
-
     // No enrollment gate any more: a session only exists for an account that
     // already registered a passkey, because the passkey is what creates the
-    // account.
-    //
-    // One exception, and it is not a half-signed-in state so much as a
-    // half-*introduced* one. Signup creates the account from the passkey and
-    // asks for an address on the step after, so between those two the account
-    // is signed in and sitting on `/signup` on purpose. Bouncing it to `/home` the
-    // moment the session appears makes that second step unreachable — which is
-    // exactly what it did until a browser test caught it.
-    const needsProfile = session.me != null && session.me.user.email == null;
-    if (isPublic && !needsProfile) {
-      // Honour `next` rather than always landing on `/home`. A language change
-      // detected at sign-in reloads this page, and the reload lands back here
-      // signed in — so without this, arriving with a stored locale that differs
-      // from the browser's silently costs the visitor their destination.
-      // `safeNext` is what makes an attacker-supplied `next` safe to follow;
-      // a server route needs a real navigation because the client router has
-      // no `/oauth/authorize` to render.
-      const next = safeNext(page.url.searchParams.get('next'));
-      if (next && isServerRoute(next)) location.assign(next);
-      else void goto(next ?? '/home', { replaceState: true });
-    }
+    // account. The rules themselves, and why, are in `$lib/routing`.
+    const move = guard({
+      signedIn: session.signedIn,
+      needsProfile: session.me != null && session.me.user.email == null,
+      isPublic,
+      path: page.url.pathname + page.url.search,
+      next: page.url.searchParams.get('next')
+    });
+    if (move?.kind === 'assign') location.assign(move.to);
+    else if (move) void goto(move.to, { replaceState: true });
   });
 
   async function signOut() {
