@@ -367,8 +367,10 @@ pub async fn callback(
 
             // The destination was validated when the ceremony started and is
             // checked again here; it comes from the ceremony row, never from
-            // this request's query string.
-            let landing = next.as_deref().and_then(safe_next).unwrap_or("/");
+            // this request's query string. With no `next`, the console home:
+            // `/home` forwards to the user's org, while `/` is the public
+            // marketing page and would leave a fresh sign-in looking signed out.
+            let landing = next.as_deref().and_then(safe_next).unwrap_or("/home");
             let mut response = Redirect::to(&state.config.url(landing)).into_response();
             response = session::with_cookie(response, session::set_cookie(&token));
             session::with_cookie(response, session::clear_binding_cookie())
