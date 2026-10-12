@@ -63,8 +63,14 @@ that would fail; the server refuses them on every request.
 | `/o/[org]`                                           | Overview: counts, plan, usage meter, links to services.                                                  |
 | `/o/[org]/members`, `teams`, `sso`, `usage`, `audit` | Admin-only: `sso`, `audit`.                                                                              |
 
-Org pages live under `/o/[org]` so no org slug can collide with a page name. `/` forwards to
-the last org visited.
+Org pages live under `/o/[org]` so no org slug can collide with a page name. `/home` forwards
+to the last org visited; `/` is the public landing page.
+
+These are the `src/routes/(console)` group: rendered only in the browser, behind the session
+guard, and marked `noindex`. The public pages are the `src/routes/(marketing)` group,
+prerendered at build time to `.html` files, English unprefixed and every other locale under
+its code (`/es`, matched by `src/params/lang.ts`). Anything without a prerendered file gets the
+SPA shell, `200.html`.
 
 ## Messages, and what a new string costs
 

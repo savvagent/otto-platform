@@ -80,7 +80,7 @@
       // on `/oauth/authorize` rather than on the console home.
       const dest = safeNext(next);
       if (dest && isServerRoute(dest)) location.assign(dest);
-      else await goto(dest ?? '/', { replaceState: true });
+      else await goto(dest ?? '/home', { replaceState: true });
     } catch (e) {
       error = messageFor(e, m.error_could_not_save());
     } finally {

@@ -43,7 +43,7 @@
       // signal attached to two of the three registration paths is the one that
       // gets forgotten when a fourth is added.
       if (session.me) await webauthn.signalAccount(session.me);
-      await goto('/', { replaceState: true });
+      await goto('/home', { replaceState: true });
     } catch (e) {
       error = messageFor(e, m.claim_error_fallback());
     } finally {

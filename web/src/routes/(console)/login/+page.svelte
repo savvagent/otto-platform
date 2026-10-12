@@ -91,7 +91,7 @@
       // server route such as `/oauth/authorize` needs a real navigation.
       const dest = safeNext(next);
       if (dest && isServerRoute(dest)) location.assign(dest);
-      else await goto(dest ?? '/', { replaceState: true });
+      else await goto(dest ?? '/home', { replaceState: true });
     } catch (e) {
       // The message is set first. `signalUnknownCredential` cannot throw today,
       // but if it ever could, awaiting it before this line would leave someone
