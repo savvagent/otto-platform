@@ -57,7 +57,7 @@
       <a class="hover:text-ink" href="/api/openapi.json" rel="external">{m.nav_api_reference()}</a>
       <span aria-hidden="true">·</span>
       <span>
-        {m.marketing_footer_contact()}:
+        {m.marketing_footer_contact()}
         <a class="hover:text-ink" href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a>
       </span>
       <span aria-hidden="true">·</span>

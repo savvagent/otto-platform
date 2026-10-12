@@ -364,7 +364,7 @@
   "marketing_create_account": "खाता बनाएँ",
   "marketing_open_console": "कंसोल खोलें",
   "marketing_footer_language": "भाषा",
-  "marketing_footer_contact": "संपर्क",
+  "marketing_footer_contact": "संपर्क:",
   "marketing_locale_hint": "{language} में पढ़ें",
   "marketing_locale_hint_dismiss": "बंद करें",
   "marketing_product_more": "{name} के बारे में और जानें",
@@ -406,5 +406,6 @@
   "product_factory_title": "कोडिंग एजेंटों की टीमों के लिए तालमेल",
   "product_factory_description": "होस्ट किया गया MCP सर्वर: आपकी टीम के कोडिंग एजेंटों के लिए साझा जॉब कतार, ब्रांचों पर लीज़, और GitHub Issues व JIRA के साथ सिंक।",
   "product_flags_title": "फ़ीचर फ़्लैग, जिन्हें आपके कोडिंग एजेंट संभालते हैं",
-  "product_flags_description": "फ़ीचर फ़्लैग जिन्हें आपके एजेंट MCP से बनाते, टारगेट करते, रोल आउट और रोल बैक करते हैं, जबकि आपके ऐप उन्हें SDK और REST से जाँचते हैं।"
+  "product_flags_description": "फ़ीचर फ़्लैग जिन्हें आपके एजेंट MCP से बनाते, टारगेट करते, रोल आउट और रोल बैक करते हैं, जबकि आपके ऐप उन्हें SDK और REST से जाँचते हैं।",
+  "marketing_og_image_alt": "Otto का लोगो"
 }

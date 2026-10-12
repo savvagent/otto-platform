@@ -366,7 +366,7 @@
   "marketing_create_account": "Créer un compte",
   "marketing_open_console": "Ouvrir la console",
   "marketing_footer_language": "Langue",
-  "marketing_footer_contact": "Contact",
+  "marketing_footer_contact": "Contact :",
   "marketing_locale_hint": "Lire en {language}",
   "marketing_locale_hint_dismiss": "Fermer",
   "marketing_product_more": "En savoir plus sur {name}",
@@ -408,5 +408,6 @@
   "product_factory_title": "La coordination pour les équipes d’agents de code",
   "product_factory_description": "Un serveur MCP hébergé : une file de tâches partagée pour les agents de votre équipe, des leases sur les branches, la synchro GitHub Issues et JIRA.",
   "product_flags_title": "Des feature flags gérés par vos agents de code",
-  "product_flags_description": "Des feature flags que vos agents créent, ciblent, déploient et annulent via MCP, pendant que vos apps les évaluent via SDK et REST."
+  "product_flags_description": "Des feature flags que vos agents créent, ciblent, déploient et annulent via MCP, pendant que vos apps les évaluent via SDK et REST.",
+  "marketing_og_image_alt": "Le logo d’Otto"
 }

@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Locale } from '$lib/locale';
-  import { OG_LOCALES, SITE_ORIGIN, alternates, localizedPath } from '$lib/site';
+  import { m } from '$lib/paraglide/messages';
+  import { MARKETING_LOCALES, OG_LOCALES, SITE_ORIGIN, alternates, localizedPath } from '$lib/site';
 
   /**
    * A marketing page's head: title, description, canonical URL, every
@@ -15,6 +16,9 @@
    * `index, follow` is spelled out rather than left as the default because
    * the console emits `noindex` from its own layout, and an explicit value
    * here is what `scripts/check-build.mjs` asserts on.
+   *
+   * `og:locale:alternate` lists every *other* language this page exists in,
+   * so a link preview can pick the reader's; the page's own is `og:locale`.
    */
   interface Props {
     title: string;
@@ -27,6 +31,7 @@
 
   const canonical = $derived(SITE_ORIGIN + localizedPath(lang, path));
   const links = $derived(alternates(path));
+  const otherLocales = $derived(MARKETING_LOCALES.filter((locale) => locale !== lang));
 </script>
 
 <svelte:head>
@@ -43,6 +48,10 @@
   <meta property="og:description" content={description} />
   <meta property="og:url" content={canonical} />
   <meta property="og:image" content="{SITE_ORIGIN}/favicon-512x512.png" />
+  <meta property="og:image:alt" content={m.marketing_og_image_alt()} />
   <meta property="og:locale" content={OG_LOCALES[lang]} />
+  {#each otherLocales as locale (locale)}
+    <meta property="og:locale:alternate" content={OG_LOCALES[locale]} />
+  {/each}
   <meta name="twitter:card" content="summary" />
 </svelte:head>

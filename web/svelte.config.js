@@ -40,7 +40,7 @@ export default {
        * to it on every page, and the crawler fails the build on a 404. Only
        * that exact path, in each locale, is tolerated — any other broken link
        * (a product page included) still fails — and `npm run check:build`
-       * reports it as missing. Delete this once the pricing page is built.
+       * reports it as missing. Removed in Task 6 (#33), with the pricing page.
        */
       handleHttpError({ status, path, referrer, message }) {
         const pending = /^(\/(es|de|fr|it|hi))?\/pricing$/;

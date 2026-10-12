@@ -7,8 +7,9 @@
  * writes pages something links to, and it is perfectly happy to write none:
  * a broken `entries`, a matcher that stops matching, or a hook that stops
  * running all produce a green build missing half the site, or a site whose
- * Spanish page says `lang="en"` (or `lang="es"` over English text). Every failure here is one a visitor or a
- * crawler would see and the build would not.
+ * Spanish page says `lang="en"` (or `lang="es"` over English text). Every
+ * failure here is one a visitor or a crawler would see and the build would
+ * not.
  *
  * Run after `npm run build`: `npm run check:build` (or
  * `node scripts/check-build.mjs [dir]`, default `build/`).

@@ -61,6 +61,15 @@ describe('the product page', () => {
     const description = document.head.querySelector('meta[name="description"]');
     expect(description?.getAttribute('content')?.length).toBeLessThanOrEqual(160);
 
+    // A link preview gets the image's alt text, and every other language.
+    expect(
+      document.head.querySelector('meta[property="og:image:alt"]')?.getAttribute('content')
+    ).toBe('The Otto logo');
+    const others = Array.from(
+      document.head.querySelectorAll('meta[property="og:locale:alternate"]')
+    ).map((meta) => meta.getAttribute('content'));
+    expect(others).toEqual(['es_ES', 'de_DE', 'fr_FR', 'it_IT', 'hi_IN']);
+
     const open = Array.from(container.querySelectorAll('a')).find(
       (a) => a.getAttribute('href') === 'https://otto-factory.savvagent.com'
     );

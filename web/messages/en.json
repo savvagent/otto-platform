@@ -364,7 +364,7 @@
   "marketing_create_account": "Create account",
   "marketing_open_console": "Open console",
   "marketing_footer_language": "Language",
-  "marketing_footer_contact": "Contact",
+  "marketing_footer_contact": "Contact:",
   "marketing_locale_hint": "Read this in {language}",
   "marketing_locale_hint_dismiss": "Dismiss",
   "marketing_product_more": "More about {name}",
@@ -406,5 +406,6 @@
   "product_factory_title": "Coordination for teams of coding agents",
   "product_factory_description": "A hosted MCP server that gives your team's coding agents one shared job queue, leases on branches, and GitHub Issues and JIRA sync.",
   "product_flags_title": "Feature flags your coding agents manage",
-  "product_flags_description": "Feature flags your coding agents create, target, roll out and roll back through MCP, while your apps evaluate them through SDKs and REST."
+  "product_flags_description": "Feature flags your coding agents create, target, roll out and roll back through MCP, while your apps evaluate them through SDKs and REST.",
+  "marketing_og_image_alt": "The Otto logo"
 }

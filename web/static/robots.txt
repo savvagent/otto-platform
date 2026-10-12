@@ -1,9 +1,12 @@
-# The public marketing pages are indexable; the console, the API and the
-# OAuth/SSO endpoints are not. Console pages also say `noindex` themselves, and
-# the shell is served with an `X-Robots-Tag` header, so this is a crawl budget
-# hint as much as a rule.
+# Asks well-behaved crawlers not to fetch the console, the API and the
+# OAuth/SSO endpoints, which have nothing to index and cost crawl budget.
+# Disallow is a request about crawling, not indexing: a crawler that obeys it
+# never fetches these URLs, so it never sees the console's `noindex` meta or
+# the shell's `X-Robots-Tag: noindex` header either, and a URL linked from
+# elsewhere can still be listed as a bare link with no content. Nothing here
+# is secret; the console needs a session for everything it shows.
+# Everything not listed may be crawled.
 User-agent: *
-Allow: /
 Disallow: /o/
 Disallow: /settings
 Disallow: /orgs/

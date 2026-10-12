@@ -28,6 +28,15 @@
    * In the browser the closure reads the current prop, and a language change
    * is a full document load anyway (`data-sveltekit-reload` on every link that
    * changes it).
+   *
+   * **This replaces the getter `resolveAtBoot` installed, and never puts it
+   * back.** That is safe only because nothing crosses between the console and
+   * these pages without a full document load: every console link here, and
+   * every marketing link in the console, carries `data-sveltekit-reload`, so
+   * each side boots with its own getter. A client-side link from one to the
+   * other would leave the console speaking this page's URL language (or these
+   * pages the account's), so any new link across that line needs the
+   * attribute too.
    */
   overwriteGetLocale(() => data.lang);
 
@@ -47,7 +56,10 @@
     session.refresh().catch(() => {});
 
     // English pages only, and only an offer: nothing is stored, and the next
-    // page asks again. The visitor's own choice of URL wins.
+    // page asks again. The visitor's own choice of URL wins. It appears after
+    // mount, so it is pinned to the bottom of the viewport rather than put in
+    // the flow: in the flow it would push the page down under a reader who had
+    // already started reading.
     if (data.lang === 'en') {
       const preferred = readCached() ?? detect();
       if (preferred !== 'en') hint = preferred;
@@ -57,7 +69,7 @@
   const basePath = $derived(stripLocale(page.url.pathname).path);
 </script>
 
-<div class="flex min-h-full flex-col">
+<div class="flex min-h-full flex-col" class:pb-14={hint !== undefined}>
   <a
     href="#main"
     class="sr-only z-20 rounded-md bg-accent px-3 py-2 text-sm font-medium text-accent-ink focus:not-sr-only focus:absolute focus:top-2 focus:left-2"
@@ -67,7 +79,10 @@
 
   {#if hint}
     <!-- In the suggested language, since it is addressed to someone who reads it. -->
-    <div class="border-b border-edge/40 bg-raised/50 px-4 py-2 text-sm" lang={hint}>
+    <div
+      class="fixed inset-x-0 bottom-0 z-30 border-t border-edge/60 bg-raised px-4 py-3 text-sm shadow-lg"
+      lang={hint}
+    >
       <div class="mx-auto flex w-full max-w-6xl items-center gap-3">
         <a
           href={localizedPath(hint, basePath)}
