@@ -219,8 +219,10 @@ failed build, not a quiet gap. The prerender crawler writes only what something 
 and is content to write nothing, so a broken `entries`, a matcher that stops matching or a
 hook that stops running would otherwise ship. It checks that every page exists in every
 language, with the right `<html lang>`, body text in that language, its canonical URL and
-`index, follow`; that `200.html`, `sitemap.xml` and `robots.txt` exist; and that the shell
-is English and not indexable.
+`index, follow`; that `200.html`, `sitemap.xml` and `robots.txt` exist; that `robots.txt`
+names the sitemap and disallows no marketing page; and that the shell is English and has no
+robots meta tag that is not `noindex` (it has none: its `noindex` is the `X-Robots-Tag`
+header).
 
 `worker/index.ts` and `wrangler.jsonc` are an **optional** Cloudflare Worker alternative
 (`npm run deploy`, `--env production`; a bare `wrangler deploy` lands on the separate
