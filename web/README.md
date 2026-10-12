@@ -211,8 +211,8 @@ URL. Anything else extensionless is a console route and gets the shell, `200.htm
 `X-Robots-Tag: noindex, nofollow`: it is the same empty HTML for every route it stands in
 for, and an indexed shell is a search result that renders a login prompt. The shell is
 `200.html` rather than adapter-static's usual `index.html` because `index.html` is the
-landing page; without `200.html` every deep link is a `404`, and the server refuses to
-start. A missing asset stays a `404`.
+landing page; without `200.html` the server refuses to start, and the Worker answers every
+deep link with a JSON `500` (`misconfigured`). A missing asset stays a `404`.
 
 `npm run build` ends with `check:build`, so a bundle that would deploy without a page is a
 failed build, not a quiet gap. The prerender crawler writes only what something links to
