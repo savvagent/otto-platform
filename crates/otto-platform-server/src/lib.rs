@@ -77,8 +77,11 @@ pub fn app(db: Db, config: &Config) -> Result<Router> {
     let web = otto_web::router(web_state(db.clone(), config)?);
 
     let app = router(db).merge(web);
-    // Either way an unmatched path answers JSON, never an empty body: a client
-    // that guessed a route needs something it can parse.
+    // Either way an unmatched API-shaped or undecodable path answers JSON: a
+    // client that guessed a route needs something it can parse. The exception
+    // is a miss under the bundle that is not a page route, such as a missing
+    // `/_app/x.js` or a `POST` to a page: that keeps tower-http's own answer,
+    // an empty-bodied `404` or `405` (see `route`, step 10).
     let app = match &config.static_dir {
         Some(dir) => app.fallback_service(console(dir)?),
         None => app.fallback(|uri: axum::http::Uri| async move { not_found(uri.path()) }),
@@ -122,9 +125,18 @@ fn is_api_path(path: &str) -> bool {
 /// shell at `200.html`, which client-side routing needs for every path that
 /// has no file. [`route`] decides which answers.
 ///
-/// Refuses to build without `200.html`. Every client route is served from it,
-/// so a bundle without one is a console whose every deep link is a `404`, and
-/// that is a failure to name at startup, not to discover from a user.
+/// Refuses to build without a readable `200.html`. Every client route is
+/// served from it, so a bundle without one is a console whose every deep link
+/// is a `404`, and that is a failure to name at startup, not to discover from
+/// a user.
+///
+/// **Readable, not just present**, because tower-http answers a file it may
+/// not open (`PermissionDenied`) with `404`, exactly as if it were missing
+/// (documented on `ServeDir::try_call`). For a prerendered page that means an
+/// unreadable `pricing.html` is a miss, and the visitor gets the noindex shell
+/// in its place: a deploy-time permissions mistake that degrades the page
+/// rather than breaking it. For the shell there is nothing behind it, so
+/// opening it here is the guard; [`serve_shell`] logs if it fails later.
 fn console(
     static_dir: &Path,
 ) -> Result<
@@ -134,11 +146,19 @@ fn console(
         + 'static,
 > {
     let shell_path = static_dir.join(SHELL);
+    // Opened, not just stat'ed: see the doc comment. `File::open` succeeds on
+    // a directory, hence the metadata check as well.
+    let readable = std::fs::File::open(&shell_path).and_then(|f| f.metadata());
     anyhow::ensure!(
-        shell_path.is_file(),
-        "OTTO_STATIC_DIR is {}, which has no {SHELL}: the console bundle must carry the SPA \
-         shell there (adapter-static `fallback: '{SHELL}'`)",
-        static_dir.display()
+        readable.as_ref().is_ok_and(|meta| meta.is_file()),
+        "OTTO_STATIC_DIR is {}, which has no readable {SHELL} ({}): the console bundle must \
+         carry the SPA shell there (adapter-static `fallback: '{SHELL}'`), readable by this \
+         process",
+        static_dir.display(),
+        match &readable {
+            Ok(_) => "not a file".to_owned(),
+            Err(err) => err.to_string(),
+        }
     );
     // Directory appending off, and no fallback: a directory is not a page
     // (`/_app` is not a `307` to `/_app/`, which the trailing-slash rule would
@@ -347,8 +367,24 @@ fn lookup(
 /// It is the same HTML for every route it stands in for, and an indexed shell
 /// is a search result for `/o/acme/members` that renders a login prompt.
 /// Prerendered pages are the ones meant to be found, and go without it.
+///
+/// A `404` or `5xx` here means the shell checked at startup has since gone
+/// missing or become unreadable (tower-http reports `PermissionDenied` as
+/// `404`), so every client route is now broken: logged as an error. Other
+/// non-`2xx` answers are the request's own doing (`304` for a conditional
+/// `GET`, `405` for a `POST` to `/200`, `412`, `416`) and are not.
 async fn serve_shell(shell: ServeFile, req: Request<Body>) -> Response {
-    noindex(serve(shell, req).await)
+    let path = req.uri().path().to_owned();
+    let res = serve(shell, req).await;
+    let status = res.status();
+    if status == StatusCode::NOT_FOUND || status.is_server_error() {
+        tracing::error!(
+            %status,
+            path,
+            "the SPA shell ({SHELL}) could not be served; every client route is failing"
+        );
+    }
+    noindex(res)
 }
 
 fn collapse_slashes(path: &str) -> String {
@@ -765,6 +801,49 @@ mod tests {
         assert_eq!(robots(&res), Some("noindex, nofollow"));
     }
 
+    /// Characters that decode to something meaningful in a URL are escaped
+    /// again in the `Location`, so the redirect lands on the path that was
+    /// asked for and never off the site: a decoded `\` would make `/\host`,
+    /// which browsers read as `//host`.
+    #[tokio::test]
+    async fn a_redirect_escapes_what_the_path_decoded_to() {
+        let bundle = bundle("escape");
+        // A page whose name starts with a backslash, so the `<page>.html`
+        // redirect below is taken rather than missed.
+        std::fs::write(bundle.0.join("\\evil.com.html"), "<html>evil</html>").expect("write");
+        let make = || console_app(&bundle);
+
+        for (path, to) in [
+            ("/%5Cevil.com/", "/%5Cevil.com"),
+            ("/%2F%2Fevil.com/", "/evil.com"),
+            ("/a%3Fb/", "/a%3Fb"),
+            ("/a%25b/", "/a%25b"),
+        ] {
+            let res = get(make(), path).await;
+            assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT, "{path}");
+            assert_eq!(location(&res), Some(to), "{path}");
+        }
+
+        let res = get(make(), "/%5Cevil.com.html").await;
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(location(&res), Some("/%5Cevil.com"));
+
+        // Whatever these answer, a redirect among them stays on the site.
+        for path in [
+            "/%5Cevil.com.html",
+            "/%5C%5Cevil.com.html",
+            "/%2F%5Cevil.com.html",
+        ] {
+            let res = get(make(), path).await;
+            if let Some(to) = location(&res) {
+                assert!(
+                    to.starts_with('/') && !to.starts_with("//") && !to.starts_with("/\\"),
+                    "{path} redirected off-site to {to}"
+                );
+            }
+        }
+    }
+
     /// A page's own file is a second URL for it; the binding at the edge
     /// redirects it, and so does the server.
     #[tokio::test]
@@ -867,6 +946,40 @@ mod tests {
             msg.contains("OTTO_STATIC_DIR") && msg.contains("200.html"),
             "{msg}"
         );
+    }
+
+    /// A shell that exists but cannot be read would be a `404` on every
+    /// client route (tower-http reports `PermissionDenied` as a miss), so it
+    /// is refused at startup like a missing one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_shell_is_refused_at_startup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bundle = bundle("unreadable-shell");
+        let shell = bundle.0.join("200.html");
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::File::open(&shell).is_ok() {
+            // Running as root, which reads it anyway: nothing to test.
+            return;
+        }
+        let mut config = Config::for_test();
+        config.static_dir = Some(bundle.0.clone());
+        let err = app(lazy_db(), &config).expect_err("unreadable shell, no app");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("readable 200.html"), "{msg}");
+    }
+
+    /// A directory named `200.html` opens, but is not a shell.
+    #[tokio::test]
+    async fn a_shell_that_is_a_directory_is_refused_at_startup() {
+        let bundle = bundle("dir-shell");
+        let shell = bundle.0.join("200.html");
+        std::fs::remove_file(&shell).expect("rm");
+        std::fs::create_dir(&shell).expect("mkdir");
+        let mut config = Config::for_test();
+        config.static_dir = Some(bundle.0.clone());
+        assert!(app(lazy_db(), &config).is_err());
     }
 
     fn robots(res: &Response) -> Option<&str> {
