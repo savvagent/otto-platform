@@ -446,15 +446,28 @@
   "pricing_ops_title": "Ce qui compte comme une opération",
   "pricing_ops_body": "Les opérations sont les appels facturables que vos agents adressent aux services Otto. Chaque forfait en inclut un certain nombre chaque mois.",
   "pricing_overage_title": "Quand vous atteignez la limite",
-  "pricing_overage_body": "Le forfait Free arrête les appels facturables à sa limite jusqu’au renouvellement de l’enveloppe le mois suivant. Les forfaits payants continuent de fonctionner, et l’usage au-delà de l’enveloppe est décompté comme dépassement.",
+  "pricing_overage_body": "Les forfaits à limite stricte suspendent les appels facturables à la limite jusqu’au mois suivant. Les autres continuent de fonctionner et décomptent le dépassement. Chaque forfait ci-dessus indique son cas.",
   "pricing_faq_heading": "Questions",
   "pricing_faq_change_q": "Pouvons-nous changer de forfait ?",
-  "pricing_faq_change_a": "Oui. Écrivez-nous et nous passerons votre organisation à un autre forfait. La nouvelle enveloppe s’applique à tous les services Otto à la fois.",
+  "pricing_faq_change_a": "Oui. Écrivez-nous et nous changerons votre forfait.",
   "pricing_faq_limit_q": "Que se passe-t-il quand nous atteignons la limite ?",
-  "pricing_faq_limit_a": "Avec Free, les appels facturables s’arrêtent jusqu’au renouvellement de l’enveloppe le mois suivant. Avec un forfait payant, rien ne s’arrête : l’usage au-delà de l’enveloppe est décompté comme dépassement.",
+  "pricing_faq_limit_a": "Cela dépend du forfait. Avec un forfait à limite stricte, les appels facturables sont suspendus jusqu’au renouvellement de l’enveloppe le mois suivant. Avec les autres, le travail continue et l’usage au-delà de l’enveloppe est décompté comme dépassement. Chaque forfait ci-dessus indique ce qui s’applique.",
   "pricing_faq_enterprise_q": "Qu’est-ce que l’offre Enterprise ?",
   "pricing_faq_enterprise_a": "Un forfait avec une enveloppe plus large et un prix convenu avec vous, pour les organisations dont les agents travaillent beaucoup. Écrivez-nous pour le mettre en place.",
   "pricing_faq_shared_q": "L’usage est-il compté séparément pour chaque service ?",
   "pricing_faq_shared_a": "Non. Les appels à tous les services Otto sont décomptés de la même enveloppe : un seul forfait couvre toute votre organisation.",
-  "pricing_faq_more": "Une autre question ? Écrivez-nous :"
+  "pricing_faq_more": "Une autre question ? Écrivez-nous :",
+  "pricing_loaded": "Forfaits chargés",
+  "pricing_free": "Gratuit",
+  "pricing_included_ops_from": [
+    {
+      "declarations": ["input count", "input ops", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "À partir de {ops} opération par mois",
+        "countPlural=many": "À partir de {ops} d’opérations par mois",
+        "countPlural=other": "À partir de {ops} opérations par mois"
+      }
+    }
+  ]
 }

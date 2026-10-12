@@ -443,15 +443,27 @@
   "pricing_ops_title": "Was als Operation zählt",
   "pricing_ops_body": "Operationen sind die abrechenbaren Aufrufe, die deine Agenten an Otto-Dienste senden. Jeder Tarif enthält eine bestimmte Anzahl davon pro Monat.",
   "pricing_overage_title": "Wenn du das Limit erreichst",
-  "pricing_overage_body": "Im Free-Tarif stoppen abrechenbare Aufrufe am Limit, bis sich das Kontingent im nächsten Monat erneuert. Bezahlte Tarife laufen weiter, und die Nutzung über das Kontingent hinaus wird als Mehrverbrauch erfasst.",
+  "pricing_overage_body": "Tarife mit hartem Limit pausieren abrechenbare Aufrufe am Limit bis zum nächsten Monat. Die anderen laufen weiter und erfassen den Mehrverbrauch. Bei jedem Tarif oben steht, was für ihn gilt.",
   "pricing_faq_heading": "Fragen",
   "pricing_faq_change_q": "Können wir den Tarif wechseln?",
-  "pricing_faq_change_a": "Ja. Schreib uns, und wir stellen deine Organisation auf einen anderen Tarif um. Das neue Kontingent gilt für alle Otto-Dienste zugleich.",
+  "pricing_faq_change_a": "Ja. Schreib uns, und wir ändern deinen Tarif.",
   "pricing_faq_limit_q": "Was passiert, wenn wir das Limit erreichen?",
-  "pricing_faq_limit_a": "Im Free-Tarif stoppen abrechenbare Aufrufe, bis sich das Kontingent im nächsten Monat erneuert. In einem bezahlten Tarif stoppt nichts: Die Nutzung über das Kontingent hinaus wird als Mehrverbrauch erfasst.",
+  "pricing_faq_limit_a": "Das hängt vom Tarif ab. In einem Tarif mit hartem Limit pausieren abrechenbare Aufrufe, bis sich das Kontingent im nächsten Monat erneuert. In den anderen läuft die Arbeit weiter, und die Nutzung über das Kontingent hinaus wird als Mehrverbrauch erfasst. Bei jedem Tarif oben steht, was gilt.",
   "pricing_faq_enterprise_q": "Was ist Enterprise?",
   "pricing_faq_enterprise_a": "Ein Tarif mit einem größeren Kontingent und einem mit dir vereinbarten Preis, für Organisationen, deren Agenten viel arbeiten. Schreib uns, um ihn einzurichten.",
   "pricing_faq_shared_q": "Wird die Nutzung für jeden Dienst getrennt gezählt?",
   "pricing_faq_shared_a": "Nein. Aufrufe an alle Otto-Dienste werden auf dasselbe Kontingent angerechnet, sodass ein Tarif deine ganze Organisation abdeckt.",
-  "pricing_faq_more": "Noch Fragen? Schreib uns:"
+  "pricing_faq_more": "Noch Fragen? Schreib uns:",
+  "pricing_loaded": "Tarife geladen",
+  "pricing_free": "Kostenlos",
+  "pricing_included_ops_from": [
+    {
+      "declarations": ["input count", "input ops", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Ab {ops} Operation pro Monat",
+        "countPlural=other": "Ab {ops} Operationen pro Monat"
+      }
+    }
+  ]
 }

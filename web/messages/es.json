@@ -446,15 +446,28 @@
   "pricing_ops_title": "Qué cuenta como operación",
   "pricing_ops_body": "Las operaciones son las llamadas facturables que tus agentes hacen a los servicios Otto. Cada plan incluye un número de ellas cada mes.",
   "pricing_overage_title": "Cuando llegas al límite",
-  "pricing_overage_body": "El plan Free detiene las llamadas facturables al llegar a su límite hasta que la cuota se renueva el mes siguiente. Los planes de pago siguen funcionando, y el uso por encima de la cuota se contabiliza como excedente.",
+  "pricing_overage_body": "Los planes con tope estricto pausan las llamadas facturables al llegar al límite hasta el mes siguiente. Los demás siguen funcionando y contabilizan el excedente. Cada plan de arriba indica cuál es su caso.",
   "pricing_faq_heading": "Preguntas",
   "pricing_faq_change_q": "¿Podemos cambiar de plan?",
-  "pricing_faq_change_a": "Sí. Escríbenos y pasaremos tu organización a otro plan. La nueva cuota se aplica a todos los servicios Otto a la vez.",
+  "pricing_faq_change_a": "Sí. Escríbenos y cambiaremos tu plan.",
   "pricing_faq_limit_q": "¿Qué pasa cuando llegamos al límite?",
-  "pricing_faq_limit_a": "En Free, las llamadas facturables se detienen hasta que la cuota se renueva el mes siguiente. En un plan de pago no se detiene nada: el uso por encima de la cuota se contabiliza como excedente.",
+  "pricing_faq_limit_a": "Depende del plan. En un plan con tope estricto, las llamadas facturables se pausan hasta que la cuota se renueva el mes siguiente. En los demás, el trabajo continúa y el uso por encima de la cuota se contabiliza como excedente. Cada plan de arriba indica cuál se aplica.",
   "pricing_faq_enterprise_q": "¿Qué es Enterprise?",
   "pricing_faq_enterprise_a": "Un plan con una cuota mayor y un precio acordado contigo, para organizaciones cuyos agentes trabajan mucho. Escríbenos para configurarlo.",
   "pricing_faq_shared_q": "¿El uso se cuenta por separado para cada servicio?",
   "pricing_faq_shared_a": "No. Las llamadas a todos los servicios Otto se descuentan de la misma cuota, así que un plan cubre toda tu organización.",
-  "pricing_faq_more": "¿Algo más? Escríbenos:"
+  "pricing_faq_more": "¿Algo más? Escríbenos:",
+  "pricing_loaded": "Planes cargados",
+  "pricing_free": "Gratis",
+  "pricing_included_ops_from": [
+    {
+      "declarations": ["input count", "input ops", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Desde {ops} operación al mes",
+        "countPlural=many": "Desde {ops} de operaciones al mes",
+        "countPlural=other": "Desde {ops} operaciones al mes"
+      }
+    }
+  ]
 }

@@ -20,6 +20,10 @@
    * tiers get `ConsoleLink`, which follows the session like every other way
    * into the console; Enterprise is agreed with sales, so it is a `mailto:`.
    *
+   * **Enterprise's allowance reads "from".** Its list figure is the floor a
+   * contract starts at, and a negotiated allowance can be larger; printing it
+   * bare would understate what a customer is actually offered.
+   *
    * `level` is the name's heading level, as on `ProductCard`: one under the
    * plans section's `<h2>` is an `h3`.
    */
@@ -33,6 +37,7 @@
 
   const price = $derived(priceLabel(plan, lang));
   const features = $derived(featureLabels(plan.features));
+  const ops = $derived({ count: plan.includedOps, ops: formatOps(plan.includedOps, lang) });
 </script>
 
 <article class="otto-card flex flex-col gap-5 p-5">
@@ -43,6 +48,8 @@
   <p class="flex flex-wrap items-baseline gap-x-2">
     {#if price.kind === 'contact'}
       <span class="text-2xl font-semibold tracking-tight text-ink">{m.pricing_contact_us()}</span>
+    {:else if price.kind === 'free'}
+      <span class="text-3xl font-semibold tracking-tight text-ink">{m.pricing_free()}</span>
     {:else}
       <span class="text-3xl font-semibold tracking-tight text-ink">{price.amount}</span>
       <span class="text-sm text-muted">{m.pricing_per_month()}</span>
@@ -51,7 +58,7 @@
 
   <div class="flex flex-col gap-1.5 text-sm">
     <p class="font-medium text-ink">
-      {m.pricing_included_ops({ count: plan.includedOps, ops: formatOps(plan.includedOps, lang) })}
+      {plan.plan === 'enterprise' ? m.pricing_included_ops_from(ops) : m.pricing_included_ops(ops)}
     </p>
     <p class="text-muted">
       {plan.hardStop ? m.pricing_overage_hard_stop() : m.pricing_overage_metered()}

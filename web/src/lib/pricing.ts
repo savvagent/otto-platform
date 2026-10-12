@@ -23,11 +23,13 @@ import type { Plan } from '$lib/types';
 /**
  * What a plan's price slot says.
  *
- * `contact` carries no amount on purpose: Enterprise is negotiated, and its
- * `monthlyCents` (`0` in the seed) is not a price to show anyone.
+ * Only `monthly` carries an amount. `contact` has none on purpose: Enterprise
+ * is negotiated, and its `monthlyCents` (`0` in the seed) is not a price to
+ * show anyone. `free` has none because the page says the word, which reads
+ * better than "$0 per month" and needs no currency at all.
  */
 export type PriceLabel =
-  { kind: 'contact' } | { kind: 'free'; amount: string } | { kind: 'monthly'; amount: string };
+  { kind: 'contact' } | { kind: 'free' } | { kind: 'monthly'; amount: string };
 
 function dollars(cents: number, locale: Locale): string {
   // Whole dollars drop the `.00` a list price never shows; anything else keeps
@@ -50,8 +52,8 @@ function dollars(cents: number, locale: Locale): string {
  */
 export function priceLabel(plan: Pick<Plan, 'plan' | 'monthlyCents'>, locale: Locale): PriceLabel {
   if (plan.plan === 'enterprise') return { kind: 'contact' };
-  const amount = dollars(plan.monthlyCents, locale);
-  return plan.monthlyCents === 0 ? { kind: 'free', amount } : { kind: 'monthly', amount };
+  if (plan.monthlyCents === 0) return { kind: 'free' };
+  return { kind: 'monthly', amount: dollars(plan.monthlyCents, locale) };
 }
 
 /** An operation count with the page language's digit grouping (`10,000`, `10.000`, `10,00,000`). */

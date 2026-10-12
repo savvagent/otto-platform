@@ -48,11 +48,20 @@ describe('priceLabel', () => {
     expect(JSON.stringify(label)).not.toContain('€');
   });
 
-  it('calls a zero price free, on every tier but enterprise', () => {
-    expect(priceLabel(plan({ plan: 'free', monthlyCents: 0 }), 'en')).toEqual({
-      kind: 'free',
-      amount: '$0'
+  it('keeps the cents in the page language too', () => {
+    const label = priceLabel(plan({ monthlyCents: 1999 }), 'es');
+    expect(label.kind === 'monthly' && label.amount).toMatch(/^19,99\sUS\$$/);
+  });
+
+  it('writes dollars the Hindi way, symbol first', () => {
+    expect(priceLabel(plan({ monthlyCents: 19_900 }), 'hi')).toEqual({
+      kind: 'monthly',
+      amount: '$199'
     });
+  });
+
+  it('calls a zero price free, on every tier but enterprise', () => {
+    expect(priceLabel(plan({ plan: 'free', monthlyCents: 0 }), 'en')).toEqual({ kind: 'free' });
   });
 
   /** `0` on enterprise is "negotiated", not "free" — the schema says so. */

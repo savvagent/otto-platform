@@ -20,7 +20,8 @@ vi.mock('$lib/api', async (importOriginal) => {
 import { ApiError, api } from '$lib/api';
 import { getLocale, overwriteGetLocale } from '$lib/paraglide/runtime';
 import { session } from '$lib/session.svelte';
-import type { Plan } from '$lib/types';
+import { CONTACT_EMAIL } from '$lib/site';
+import type { Me, Plan } from '$lib/types';
 import Page from './+page.svelte';
 
 const SEEDED: Plan[] = [
@@ -79,14 +80,18 @@ function expectNoSkips(levels: number[]): void {
 const defaultGetLocale = getLocale;
 
 let container: HTMLElement;
+let consoleError: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
   container = document.createElement('div');
   document.body.appendChild(container);
   plans.mockReset();
+  // The page logs every failed load; a test that expects one asserts on it.
+  consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
 });
 
 afterEach(() => {
+  consoleError.mockRestore();
   container.remove();
   session.clear();
   overwriteGetLocale(defaultGetLocale);
@@ -102,6 +107,15 @@ function mountPage(lang: 'en' | 'es' = 'en') {
 function region(): HTMLElement {
   return container.querySelector('#plans') as HTMLElement;
 }
+
+/** The page's one live region. */
+function status(): HTMLElement {
+  const found = container.querySelectorAll('[role="status"]');
+  expect(found).toHaveLength(1);
+  return found[0] as HTMLElement;
+}
+
+const MAILTO = `a[href="mailto:${CONTACT_EMAIL}"]`;
 
 /** The card whose heading is `name`. */
 function card(name: string): HTMLElement {
@@ -125,9 +139,10 @@ describe('the pricing page', () => {
 
     expect(container.querySelectorAll('h1')).toHaveLength(1);
     expect(region().getAttribute('aria-busy')).toBe('true');
-    const status = region().querySelector('[role="status"]');
     // Announced as text, not only labelled: a live region speaks its content.
-    expect(status?.textContent?.trim()).toBe('Loading plans');
+    // It sits outside the busy region, which would otherwise mute it.
+    expect(status().textContent?.trim()).toBe('Loading plans');
+    expect(status().closest('[aria-busy]')).toBeNull();
     const skeletons = region().querySelectorAll('.otto-card');
     expect(skeletons).toHaveLength(4);
     expect(skeletons[0]?.closest('[aria-hidden="true"]')).not.toBeNull();
@@ -144,8 +159,12 @@ describe('the pricing page', () => {
     expect(container.querySelectorAll('h1')).toHaveLength(1);
     expectNoSkips(headingLevels(container));
 
+    expect(status().textContent?.trim()).toBe('Plans loaded');
+
     const free = card('Free');
-    expect(free.textContent).toContain('$0');
+    // The price slot says the word; there is no "$0 per month".
+    expect(free.querySelector('p')?.textContent?.trim()).toBe('Free');
+    expect(free.textContent).not.toContain('$0');
     expect(free.textContent).toContain('500 operations included per month');
     expect(free.textContent).toContain('Billable calls stop at the limit');
     expect(free.textContent).not.toContain('Automatic rollback in Otto Flags');
@@ -165,8 +184,9 @@ describe('the pricing page', () => {
     const enterprise = card('Enterprise');
     expect(enterprise.textContent).toContain('Contact us');
     expect(enterprise.textContent).not.toContain('$0');
-    expect(enterprise.textContent).toContain('1,000,000 operations included per month');
-    expect(enterprise.querySelector('a[href="mailto:sales@savvagent.com"]')).not.toBeNull();
+    // A floor, since a contract can include more.
+    expect(enterprise.textContent).toContain('From 1,000,000 operations per month');
+    expect(enterprise.querySelector(MAILTO)).not.toBeNull();
     expect(enterprise.querySelector('a[href="/signup"]')).toBeNull();
 
     unmount(instance);
@@ -181,7 +201,7 @@ describe('the pricing page', () => {
       orgs: [
         { orgId: 'o1', userId: 'u1', role: 'owner', orgSlug: 'acme', orgName: 'Acme', plan: 'free' }
       ]
-    } as unknown as import('$lib/types').Me;
+    } as unknown as Me;
     flushSync();
 
     for (const name of ['Free', 'Team', 'Business']) {
@@ -213,8 +233,65 @@ describe('the pricing page', () => {
     expect(plans).toHaveBeenCalledTimes(2);
     expect(container.querySelector('[role="alert"]')).toBeNull();
     expect(card('Team').textContent).toContain('$29');
+    // The button is gone; focus went to what replaced it, not to <body>.
+    await vi.waitFor(() => expect(document.activeElement).toBe(region()));
+    expect(consoleError).toHaveBeenCalledTimes(1);
 
     unmount(instance);
+  });
+
+  it('keeps focus on the plans region when a retry fails again', async () => {
+    plans.mockRejectedValue(new ApiError(503, 'unavailable', 'down'));
+    const instance = mountPage();
+    await settle();
+
+    (
+      Array.from(container.querySelectorAll('button')).find(
+        (b) => b.textContent?.trim() === 'Retry'
+      ) as HTMLButtonElement
+    ).click();
+    flushSync();
+    await settle();
+
+    expect(plans).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[role="alert"]')).not.toBeNull();
+    await vi.waitFor(() => expect(document.activeElement).toBe(region()));
+
+    unmount(instance);
+  });
+
+  it('treats a 200 with no plans array as a failure, not a crash', async () => {
+    plans.mockResolvedValue({ unexpected: true } as never);
+    const instance = mountPage();
+    await settle();
+
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      'Pricing could not be loaded.'
+    );
+    expect(container.querySelectorAll('article')).toHaveLength(0);
+    expect(consoleError).toHaveBeenCalledTimes(1);
+    expect(String(consoleError.mock.calls[0]?.[0])).toContain('plans array');
+
+    unmount(instance);
+  });
+
+  /**
+   * The sequence token's other half: a page torn down mid-request. (Two
+   * requests cannot overlap through the UI today — Retry exists only once the
+   * first has failed — so the token guards a future caller, and this checks
+   * the path that is reachable.)
+   */
+  it('ignores an answer that arrives after the page is gone', async () => {
+    let answer!: (value: { plans: Plan[] }) => void;
+    plans.mockReturnValueOnce(new Promise((resolve) => (answer = resolve)));
+    const instance = mountPage();
+    unmount(instance);
+
+    answer({ plans: SEEDED });
+    await vi.waitFor(() => expect(plans).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(container.innerHTML).toBe('');
+    expect(consoleError).not.toHaveBeenCalled();
   });
 
   it('points to sales when no plan is listed', async () => {
@@ -223,7 +300,9 @@ describe('the pricing page', () => {
     await settle();
 
     expect(region().textContent).toContain('No plans are listed right now.');
-    expect(region().querySelector('a[href="mailto:sales@savvagent.com"]')).not.toBeNull();
+    expect(region().querySelector(MAILTO)).not.toBeNull();
+    // Nothing to announce as loaded; the visible message says it.
+    expect(status().textContent?.trim()).toBe('');
     expect(container.querySelectorAll('article')).toHaveLength(0);
 
     unmount(instance);
@@ -247,7 +326,8 @@ describe('the pricing page', () => {
     expect(team.textContent).toContain('10.000 operaciones incluidas al mes');
     expect(team.textContent).toContain('Reversión automática en Otto Flags');
     expect(card('Enterprise').textContent).toContain('Contáctanos');
-    expect(card('Enterprise').textContent).toContain('1.000.000 de operaciones incluidas al mes');
+    expect(card('Enterprise').textContent).toContain('Desde 1.000.000 de operaciones al mes');
+    expect(card('Free').querySelector('p')?.textContent?.trim()).toBe('Gratis');
 
     unmount(instance);
   });

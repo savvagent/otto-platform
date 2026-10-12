@@ -443,15 +443,27 @@
   "pricing_ops_title": "What counts as an operation",
   "pricing_ops_body": "Operations are the billable calls your agents make to Otto services. Each plan includes a number of them every month.",
   "pricing_overage_title": "When you reach the limit",
-  "pricing_overage_body": "The Free plan stops billable calls at its limit until the allowance renews the next month. Paid plans keep working, and usage beyond the allowance is metered as overage.",
+  "pricing_overage_body": "Plans with a hard stop pause billable calls at the limit until the next month. The others keep working and meter the overage. Each plan above says which it is.",
   "pricing_faq_heading": "Questions",
   "pricing_faq_change_q": "Can we change plans?",
-  "pricing_faq_change_a": "Yes. Write to us and we will move your organization to another plan. The new allowance applies to every Otto service at once.",
+  "pricing_faq_change_a": "Yes. Write to us and we’ll change your plan.",
   "pricing_faq_limit_q": "What happens when we reach our limit?",
-  "pricing_faq_limit_a": "On Free, billable calls stop until the allowance renews the next month. On a paid plan nothing stops: usage beyond the allowance is metered as overage.",
+  "pricing_faq_limit_a": "It depends on the plan. On a plan with a hard stop, billable calls pause until the allowance renews the next month. On the others, work continues and usage beyond the allowance is metered as overage. Each plan above says which applies.",
   "pricing_faq_enterprise_q": "What is Enterprise?",
   "pricing_faq_enterprise_a": "A plan with a larger allowance and a price agreed with you, for organizations whose agents do a lot of work. Write to us to set it up.",
   "pricing_faq_shared_q": "Is usage counted separately for each service?",
   "pricing_faq_shared_a": "No. Calls to every Otto service count against the same allowance, so one plan covers your whole organization.",
-  "pricing_faq_more": "Anything else? Write to us:"
+  "pricing_faq_more": "Anything else? Write to us:",
+  "pricing_loaded": "Plans loaded",
+  "pricing_free": "Free",
+  "pricing_included_ops_from": [
+    {
+      "declarations": ["input count", "input ops", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "From {ops} operation per month",
+        "countPlural=other": "From {ops} operations per month"
+      }
+    }
+  ]
 }

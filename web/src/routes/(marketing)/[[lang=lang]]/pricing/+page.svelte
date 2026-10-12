@@ -1,10 +1,10 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
 
   import { api } from '$lib/api';
   import { m } from '$lib/paraglide/messages';
   import { CONTACT_EMAIL } from '$lib/site';
-  import type { Plan } from '$lib/types';
+  import type { Plan, PlansResponse } from '$lib/types';
   import Alert from '$lib/components/Alert.svelte';
   import Button from '$lib/components/Button.svelte';
   import Seo from '$lib/components/Seo.svelte';
@@ -20,8 +20,8 @@
    * server bills against — so a price change is a database change, not a
    * rebuild, and this page cannot advertise a number the meter does not
    * charge. The prerendered file holds the explanation (which is what a
-   * crawler indexes) and the loading placeholders; a visitor without
-   * JavaScript gets a `<noscript>` line pointing at sales instead.
+   * crawler indexes); a visitor without JavaScript gets a `<noscript>` line
+   * pointing at sales instead.
    *
    * The explanation is deliberately generic: one plan and one usage bucket
    * per org, what an operation is, and hard stop versus metered overage —
@@ -40,22 +40,87 @@
   let plans = $state<PlansState>({ status: 'loading' });
 
   /**
-   * Fetch, or fetch again after a failure. Any failure is the same "could
-   * not be loaded" with a retry: a visitor cannot act on the difference
-   * between an outage and a dropped connection, and the server's message is
-   * written in English for the console, not for this page's language.
+   * False in the prerendered file and during hydration, true from `onMount`.
+   *
+   * The placeholders and "Loading plans" exist only once script is running.
+   * Built into the HTML, they would pulse forever for a visitor without
+   * JavaScript, beside a status claiming a load that is never coming; without
+   * them the file holds the static copy and the `<noscript>` line. Flipped in
+   * `onMount`, after hydration, so the first client render matches the file.
    */
-  async function load(): Promise<void> {
+  let mounted = $state(false);
+
+  /** The plans region, focused after a retry so focus is not dropped on `<body>`. */
+  let region = $state<HTMLElement | undefined>(undefined);
+
+  /**
+   * Bumped by every `load`, so only the newest request may write `plans`: a
+   * slow first answer arriving after a retry's must not overwrite it.
+   */
+  let sequence = 0;
+  let destroyed = false;
+
+  function isPlansBody(body: unknown): body is PlansResponse {
+    return (
+      typeof body === 'object' && body !== null && Array.isArray((body as PlansResponse).plans)
+    );
+  }
+
+  /**
+   * Fetch, or fetch again after a failure.
+   *
+   * Any failure is the same "could not be loaded" with a retry: a visitor
+   * cannot act on the difference between an outage and a dropped connection,
+   * and the server's message is written in English for the console, not for
+   * this page's language. A 200 whose body has no `plans` array is a failure
+   * too, rather than a render that throws. The cause still goes to the
+   * console, so a real bug is not mistaken for an outage by whoever debugs it.
+   *
+   * `focus` is set by the Retry button. The button unmounts the moment the
+   * load starts, so without it focus would fall to `<body>`; once the answer
+   * is in — plans or the error again — focus moves to the region holding it.
+   */
+  async function load({ focus = false }: { focus?: boolean } = {}): Promise<void> {
+    const mine = ++sequence;
     plans = { status: 'loading' };
+    let next: PlansState;
     try {
-      plans = { status: 'loaded', plans: (await api.plans()).plans };
-    } catch {
-      plans = { status: 'error' };
+      const body: unknown = await api.plans();
+      if (!isPlansBody(body)) throw new Error('GET /api/plans answered without a plans array');
+      next = { status: 'loaded', plans: body.plans };
+    } catch (error) {
+      console.error(
+        `pricing: could not load plans: ${error instanceof Error ? error.message : String(error)}`
+      );
+      next = { status: 'error' };
+    }
+    if (destroyed || mine !== sequence) return;
+    plans = next;
+    if (focus) {
+      await tick();
+      region?.focus();
     }
   }
 
   onMount(() => {
+    mounted = true;
     void load();
+    return () => {
+      destroyed = true;
+    };
+  });
+
+  /**
+   * What the one live region says. It is always in the document, outside the
+   * branches below, so a screen reader is already watching it when its text
+   * changes; a region created together with its text is often not announced.
+   * The error has its own `role="alert"`, so it is not repeated here.
+   */
+  const status = $derived.by(() => {
+    if (!mounted) return '';
+    if (plans.status === 'loading') return m.pricing_loading();
+    if (plans.status === 'loaded' && plans.plans.length > 0) return m.pricing_loaded();
+    return '';
   });
 
   const how = [
@@ -106,26 +171,36 @@
       <p class="mt-4 text-muted">{m.pricing_noscript()} {@render contact()}</p>
     </noscript>
 
-    <div id="plans" class="mt-8" aria-busy={plans.status === 'loading' ? 'true' : 'false'}>
-      {#if plans.status === 'loading'}
-        <div role="status">
-          <span class="sr-only">{m.pricing_loading()}</span>
-          <ul role="list" class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4" aria-hidden="true">
-            {#each [0, 1, 2, 3] as i (i)}
-              <li class="otto-card flex animate-pulse flex-col gap-4 p-5">
-                <span class="h-5 w-24 rounded bg-edge/60"></span>
-                <span class="h-8 w-20 rounded bg-edge/60"></span>
-                <span class="h-4 w-full rounded bg-edge/40"></span>
-                <span class="h-4 w-3/4 rounded bg-edge/40"></span>
-                <span class="mt-6 h-9 w-32 rounded-md bg-edge/50"></span>
-              </li>
-            {/each}
-          </ul>
-        </div>
+    <div role="status" class="sr-only">{status}</div>
+
+    <div
+      id="plans"
+      bind:this={region}
+      tabindex="-1"
+      aria-labelledby="plans-title"
+      class="mt-8 outline-none"
+      aria-busy={mounted && plans.status === 'loading' ? 'true' : 'false'}
+    >
+      {#if !mounted}
+        <!-- Prerendered and hydrating: nothing until script can fetch. -->
+      {:else if plans.status === 'loading'}
+        <ul role="list" class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4" aria-hidden="true">
+          {#each [0, 1, 2, 3] as i (i)}
+            <li class="otto-card flex animate-pulse flex-col gap-4 p-5">
+              <span class="h-5 w-24 rounded bg-edge/60"></span>
+              <span class="h-8 w-20 rounded bg-edge/60"></span>
+              <span class="h-4 w-full rounded bg-edge/40"></span>
+              <span class="h-4 w-3/4 rounded bg-edge/40"></span>
+              <span class="mt-6 h-9 w-32 rounded-md bg-edge/50"></span>
+            </li>
+          {/each}
+        </ul>
       {:else if plans.status === 'error'}
         <div class="flex flex-col items-start gap-3">
           <Alert>{m.pricing_error()}</Alert>
-          <Button tone="quiet" onclick={() => void load()}>{m.pricing_retry()}</Button>
+          <Button tone="quiet" onclick={() => void load({ focus: true })}>
+            {m.pricing_retry()}
+          </Button>
         </div>
       {:else if plans.plans.length === 0}
         <p class="text-muted">{m.pricing_empty()} {@render contact()}</p>
