@@ -408,5 +408,50 @@
   "product_flags_description": "Feature-Flags, die deine Agenten per MCP anlegen, targeten, ausrollen und zurückrollen, während deine Apps sie über SDKs und REST auswerten.",
   "marketing_og_image_alt": "Das Otto-Logo",
   "product_open_console": "Die {name}-Konsole öffnen",
-  "product_eyebrow": "Ein otto-*-Dienst"
+  "product_eyebrow": "Ein otto-*-Dienst",
+  "pricing_title": "Otto-Preise: ein Tarif für jeden Dienst",
+  "pricing_description": "Ein Tarif deckt Otto Factory, Otto Flags und alle künftigen Otto-Dienste ab, mit einem gemeinsamen monatlichen Kontingent an Operationen. Starte mit Free.",
+  "pricing_eyebrow": "Preise",
+  "pricing_heading": "Preise für jeden Otto-Dienst",
+  "pricing_lead": "Starte mit dem Free-Tarif und wechsle in einen größeren, wenn deine Agenten mehr Spielraum brauchen. Preise in US-Dollar, pro Organisation.",
+  "pricing_plans_heading": "Tarife",
+  "pricing_loading": "Tarife werden geladen",
+  "pricing_error": "Die Preise konnten nicht geladen werden.",
+  "pricing_retry": "Erneut versuchen",
+  "pricing_empty": "Gerade sind keine Tarife verfügbar. Schreib uns, und wir helfen dir bei der Wahl:",
+  "pricing_noscript": "Live-Preise brauchen JavaScript. Für aktuelle Preise schreib uns:",
+  "pricing_per_month": "pro Monat",
+  "pricing_contact_us": "Kontaktiere uns",
+  "pricing_contact_sales": "Vertrieb kontaktieren",
+  "pricing_included_ops": [
+    {
+      "declarations": ["input count", "input ops", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{ops} Operation pro Monat inklusive",
+        "countPlural=other": "{ops} Operationen pro Monat inklusive"
+      }
+    }
+  ],
+  "pricing_overage_hard_stop": "Abrechenbare Aufrufe stoppen am Limit",
+  "pricing_overage_metered": "Läuft über das Limit hinaus weiter; Mehrverbrauch wird erfasst",
+  "pricing_features_label": "Funktionen",
+  "pricing_feature_auto_rollback": "Automatisches Zurückrollen in Otto Flags",
+  "pricing_how_heading": "So funktionieren die Tarife",
+  "pricing_shared_title": "Ein Tarif für jeden Otto-Dienst",
+  "pricing_shared_body": "Der Tarif und das Nutzungskontingent deiner Organisation gelten gemeinsam für Otto Factory, Otto Flags und künftige Dienste. Du kaufst nichts pro Dienst.",
+  "pricing_ops_title": "Was als Operation zählt",
+  "pricing_ops_body": "Operationen sind die abrechenbaren Aufrufe, die deine Agenten an Otto-Dienste senden. Jeder Tarif enthält eine bestimmte Anzahl davon pro Monat.",
+  "pricing_overage_title": "Wenn du das Limit erreichst",
+  "pricing_overage_body": "Im Free-Tarif stoppen abrechenbare Aufrufe am Limit, bis sich das Kontingent im nächsten Monat erneuert. Bezahlte Tarife laufen weiter, und die Nutzung über das Kontingent hinaus wird als Mehrverbrauch erfasst.",
+  "pricing_faq_heading": "Fragen",
+  "pricing_faq_change_q": "Können wir den Tarif wechseln?",
+  "pricing_faq_change_a": "Ja. Schreib uns, und wir stellen deine Organisation auf einen anderen Tarif um. Das neue Kontingent gilt für alle Otto-Dienste zugleich.",
+  "pricing_faq_limit_q": "Was passiert, wenn wir das Limit erreichen?",
+  "pricing_faq_limit_a": "Im Free-Tarif stoppen abrechenbare Aufrufe, bis sich das Kontingent im nächsten Monat erneuert. In einem bezahlten Tarif stoppt nichts: Die Nutzung über das Kontingent hinaus wird als Mehrverbrauch erfasst.",
+  "pricing_faq_enterprise_q": "Was ist Enterprise?",
+  "pricing_faq_enterprise_a": "Ein Tarif mit einem größeren Kontingent und einem mit dir vereinbarten Preis, für Organisationen, deren Agenten viel arbeiten. Schreib uns, um ihn einzurichten.",
+  "pricing_faq_shared_q": "Wird die Nutzung für jeden Dienst getrennt gezählt?",
+  "pricing_faq_shared_a": "Nein. Aufrufe an alle Otto-Dienste werden auf dasselbe Kontingent angerechnet, sodass ein Tarif deine ganze Organisation abdeckt.",
+  "pricing_faq_more": "Noch Fragen? Schreib uns:"
 }

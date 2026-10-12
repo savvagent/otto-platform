@@ -410,5 +410,51 @@
   "product_flags_description": "Feature flag che i tuoi agenti creano, indirizzano, rilasciano e annullano via MCP, mentre le tue app li valutano tramite SDK e REST.",
   "marketing_og_image_alt": "Il logo di Otto",
   "product_open_console": "Apri la console di {name}",
-  "product_eyebrow": "Un servizio otto-*"
+  "product_eyebrow": "Un servizio otto-*",
+  "pricing_title": "Prezzi di Otto: un piano per ogni servizio",
+  "pricing_description": "Un solo piano copre Otto Factory, Otto Flags e i futuri servizi Otto, con un’unica quota mensile di operazioni condivisa. Inizia con il piano Free.",
+  "pricing_eyebrow": "Prezzi",
+  "pricing_heading": "Prezzi che coprono ogni servizio Otto",
+  "pricing_lead": "Inizia con il piano Free e passa a un piano superiore quando i tuoi agenti hanno bisogno di più spazio. Prezzi in dollari statunitensi, per organizzazione.",
+  "pricing_plans_heading": "Piani",
+  "pricing_loading": "Caricamento dei piani",
+  "pricing_error": "Impossibile caricare i prezzi.",
+  "pricing_retry": "Riprova",
+  "pricing_empty": "Al momento non ci sono piani disponibili. Scrivici e ti aiuteremo a sceglierne uno:",
+  "pricing_noscript": "I prezzi aggiornati richiedono JavaScript. Per conoscere i prezzi attuali, scrivici:",
+  "pricing_per_month": "al mese",
+  "pricing_contact_us": "Contattaci",
+  "pricing_contact_sales": "Contatta il team commerciale",
+  "pricing_included_ops": [
+    {
+      "declarations": ["input count", "input ops", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{ops} operazione inclusa al mese",
+        "countPlural=many": "{ops} di operazioni incluse al mese",
+        "countPlural=other": "{ops} operazioni incluse al mese"
+      }
+    }
+  ],
+  "pricing_overage_hard_stop": "Le chiamate fatturabili si fermano al limite",
+  "pricing_overage_metered": "Continua a funzionare oltre il limite; l’eccedenza viene conteggiata",
+  "pricing_features_label": "Funzionalità",
+  "pricing_feature_auto_rollback": "Ripristino automatico in Otto Flags",
+  "pricing_how_heading": "Come funzionano i piani",
+  "pricing_shared_title": "Un piano per ogni servizio Otto",
+  "pricing_shared_body": "Il piano e la quota di utilizzo della tua organizzazione sono condivisi tra Otto Factory, Otto Flags e i servizi futuri. Non c’è nulla da acquistare per singolo servizio.",
+  "pricing_ops_title": "Cosa conta come operazione",
+  "pricing_ops_body": "Le operazioni sono le chiamate fatturabili che i tuoi agenti fanno ai servizi Otto. Ogni piano ne include un certo numero ogni mese.",
+  "pricing_overage_title": "Quando raggiungi il limite",
+  "pricing_overage_body": "Il piano Free blocca le chiamate fatturabili al raggiungimento del limite, finché la quota non si rinnova il mese successivo. I piani a pagamento continuano a funzionare, e l’utilizzo oltre la quota viene conteggiato come eccedenza.",
+  "pricing_faq_heading": "Domande",
+  "pricing_faq_change_q": "Possiamo cambiare piano?",
+  "pricing_faq_change_a": "Sì. Scrivici e sposteremo la tua organizzazione su un altro piano. La nuova quota vale per tutti i servizi Otto contemporaneamente.",
+  "pricing_faq_limit_q": "Cosa succede quando raggiungiamo il limite?",
+  "pricing_faq_limit_a": "Con Free, le chiamate fatturabili si fermano finché la quota non si rinnova il mese successivo. Con un piano a pagamento non si ferma nulla: l’utilizzo oltre la quota viene conteggiato come eccedenza.",
+  "pricing_faq_enterprise_q": "Che cos’è Enterprise?",
+  "pricing_faq_enterprise_a": "Un piano con una quota più ampia e un prezzo concordato con te, per le organizzazioni i cui agenti lavorano molto. Scrivici per attivarlo.",
+  "pricing_faq_shared_q": "L’utilizzo viene conteggiato separatamente per ogni servizio?",
+  "pricing_faq_shared_a": "No. Le chiamate a tutti i servizi Otto vengono scalate dalla stessa quota, quindi un solo piano copre tutta la tua organizzazione.",
+  "pricing_faq_more": "Altre domande? Scrivici:"
 }

@@ -408,5 +408,50 @@
   "product_flags_description": "Feature flags your coding agents create, target, roll out and roll back through MCP, while your apps evaluate them through SDKs and REST.",
   "marketing_og_image_alt": "The Otto logo",
   "product_open_console": "Open the {name} console",
-  "product_eyebrow": "An otto-* service"
+  "product_eyebrow": "An otto-* service",
+  "pricing_title": "Otto pricing: one plan for every service",
+  "pricing_description": "One plan covers Otto Factory, Otto Flags and every Otto service to come, with one shared monthly allowance of operations. Start on the Free plan.",
+  "pricing_eyebrow": "Pricing",
+  "pricing_heading": "Pricing that covers every Otto service",
+  "pricing_lead": "Start on the Free plan and move up when your agents need more room. Prices are in US dollars, per organization.",
+  "pricing_plans_heading": "Plans",
+  "pricing_loading": "Loading plans",
+  "pricing_error": "Pricing could not be loaded.",
+  "pricing_retry": "Retry",
+  "pricing_empty": "No plans are listed right now. Write to us and we will help you choose one:",
+  "pricing_noscript": "Live pricing needs JavaScript. For current prices, write to us:",
+  "pricing_per_month": "per month",
+  "pricing_contact_us": "Contact us",
+  "pricing_contact_sales": "Contact sales",
+  "pricing_included_ops": [
+    {
+      "declarations": ["input count", "input ops", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{ops} operation included per month",
+        "countPlural=other": "{ops} operations included per month"
+      }
+    }
+  ],
+  "pricing_overage_hard_stop": "Billable calls stop at the limit",
+  "pricing_overage_metered": "Keeps working past the limit; overage is metered",
+  "pricing_features_label": "Features",
+  "pricing_feature_auto_rollback": "Automatic rollback in Otto Flags",
+  "pricing_how_heading": "How plans work",
+  "pricing_shared_title": "One plan for every Otto service",
+  "pricing_shared_body": "Your organization’s plan and usage allowance are shared across Otto Factory, Otto Flags and future services. There is nothing to buy per service.",
+  "pricing_ops_title": "What counts as an operation",
+  "pricing_ops_body": "Operations are the billable calls your agents make to Otto services. Each plan includes a number of them every month.",
+  "pricing_overage_title": "When you reach the limit",
+  "pricing_overage_body": "The Free plan stops billable calls at its limit until the allowance renews the next month. Paid plans keep working, and usage beyond the allowance is metered as overage.",
+  "pricing_faq_heading": "Questions",
+  "pricing_faq_change_q": "Can we change plans?",
+  "pricing_faq_change_a": "Yes. Write to us and we will move your organization to another plan. The new allowance applies to every Otto service at once.",
+  "pricing_faq_limit_q": "What happens when we reach our limit?",
+  "pricing_faq_limit_a": "On Free, billable calls stop until the allowance renews the next month. On a paid plan nothing stops: usage beyond the allowance is metered as overage.",
+  "pricing_faq_enterprise_q": "What is Enterprise?",
+  "pricing_faq_enterprise_a": "A plan with a larger allowance and a price agreed with you, for organizations whose agents do a lot of work. Write to us to set it up.",
+  "pricing_faq_shared_q": "Is usage counted separately for each service?",
+  "pricing_faq_shared_a": "No. Calls to every Otto service count against the same allowance, so one plan covers your whole organization.",
+  "pricing_faq_more": "Anything else? Write to us:"
 }

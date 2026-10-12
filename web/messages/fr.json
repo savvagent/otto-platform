@@ -410,5 +410,51 @@
   "product_flags_description": "Des feature flags que vos agents créent, ciblent, déploient et annulent via MCP, pendant que vos apps les évaluent via SDK et REST.",
   "marketing_og_image_alt": "Le logo d’Otto",
   "product_open_console": "Ouvrir la console {name}",
-  "product_eyebrow": "Un service otto-*"
+  "product_eyebrow": "Un service otto-*",
+  "pricing_title": "Tarifs Otto : un forfait pour tous les services",
+  "pricing_description": "Un seul forfait couvre Otto Factory, Otto Flags et les futurs services Otto, avec une enveloppe mensuelle d’opérations partagée. Commencez avec Free.",
+  "pricing_eyebrow": "Tarifs",
+  "pricing_heading": "Des tarifs qui couvrent tous les services Otto",
+  "pricing_lead": "Commencez avec le forfait Free et passez à un forfait supérieur quand vos agents ont besoin de plus de marge. Prix en dollars américains, par organisation.",
+  "pricing_plans_heading": "Forfaits",
+  "pricing_loading": "Chargement des forfaits",
+  "pricing_error": "Impossible de charger les tarifs.",
+  "pricing_retry": "Réessayer",
+  "pricing_empty": "Aucun forfait n’est proposé pour le moment. Écrivez-nous et nous vous aiderons à choisir :",
+  "pricing_noscript": "Les tarifs en direct nécessitent JavaScript. Pour connaître les prix actuels, écrivez-nous :",
+  "pricing_per_month": "par mois",
+  "pricing_contact_us": "Contactez-nous",
+  "pricing_contact_sales": "Contacter l’équipe commerciale",
+  "pricing_included_ops": [
+    {
+      "declarations": ["input count", "input ops", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{ops} opération incluse par mois",
+        "countPlural=many": "{ops} d’opérations incluses par mois",
+        "countPlural=other": "{ops} opérations incluses par mois"
+      }
+    }
+  ],
+  "pricing_overage_hard_stop": "Les appels facturables s’arrêtent à la limite",
+  "pricing_overage_metered": "Continue au-delà de la limite ; le dépassement est décompté",
+  "pricing_features_label": "Fonctionnalités",
+  "pricing_feature_auto_rollback": "Retour arrière automatique dans Otto Flags",
+  "pricing_how_heading": "Comment fonctionnent les forfaits",
+  "pricing_shared_title": "Un forfait pour tous les services Otto",
+  "pricing_shared_body": "Le forfait et l’enveloppe d’usage de votre organisation sont partagés entre Otto Factory, Otto Flags et les services à venir. Rien à acheter service par service.",
+  "pricing_ops_title": "Ce qui compte comme une opération",
+  "pricing_ops_body": "Les opérations sont les appels facturables que vos agents adressent aux services Otto. Chaque forfait en inclut un certain nombre chaque mois.",
+  "pricing_overage_title": "Quand vous atteignez la limite",
+  "pricing_overage_body": "Le forfait Free arrête les appels facturables à sa limite jusqu’au renouvellement de l’enveloppe le mois suivant. Les forfaits payants continuent de fonctionner, et l’usage au-delà de l’enveloppe est décompté comme dépassement.",
+  "pricing_faq_heading": "Questions",
+  "pricing_faq_change_q": "Pouvons-nous changer de forfait ?",
+  "pricing_faq_change_a": "Oui. Écrivez-nous et nous passerons votre organisation à un autre forfait. La nouvelle enveloppe s’applique à tous les services Otto à la fois.",
+  "pricing_faq_limit_q": "Que se passe-t-il quand nous atteignons la limite ?",
+  "pricing_faq_limit_a": "Avec Free, les appels facturables s’arrêtent jusqu’au renouvellement de l’enveloppe le mois suivant. Avec un forfait payant, rien ne s’arrête : l’usage au-delà de l’enveloppe est décompté comme dépassement.",
+  "pricing_faq_enterprise_q": "Qu’est-ce que l’offre Enterprise ?",
+  "pricing_faq_enterprise_a": "Un forfait avec une enveloppe plus large et un prix convenu avec vous, pour les organisations dont les agents travaillent beaucoup. Écrivez-nous pour le mettre en place.",
+  "pricing_faq_shared_q": "L’usage est-il compté séparément pour chaque service ?",
+  "pricing_faq_shared_a": "Non. Les appels à tous les services Otto sont décomptés de la même enveloppe : un seul forfait couvre toute votre organisation.",
+  "pricing_faq_more": "Une autre question ? Écrivez-nous :"
 }

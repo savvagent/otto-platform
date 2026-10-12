@@ -408,5 +408,50 @@
   "product_flags_description": "फ़ीचर फ़्लैग जिन्हें आपके एजेंट MCP से बनाते, टारगेट करते, रोल आउट और रोल बैक करते हैं, जबकि आपके ऐप उन्हें SDK और REST से जाँचते हैं।",
   "marketing_og_image_alt": "Otto का लोगो",
   "product_open_console": "{name} कंसोल खोलें",
-  "product_eyebrow": "एक otto-* सेवा"
+  "product_eyebrow": "एक otto-* सेवा",
+  "pricing_title": "Otto की कीमतें: हर सेवा के लिए एक प्लान",
+  "pricing_description": "एक प्लान Otto Factory, Otto Flags और आने वाली हर Otto सेवा को कवर करता है, ऑपरेशनों के एक साझा मासिक कोटे के साथ। Free प्लान से शुरू करें।",
+  "pricing_eyebrow": "कीमतें",
+  "pricing_heading": "हर Otto सेवा को कवर करने वाली कीमतें",
+  "pricing_lead": "Free प्लान से शुरू करें, और जब आपके एजेंटों को ज़्यादा गुंजाइश चाहिए तो बड़े प्लान पर जाएँ। कीमतें अमेरिकी डॉलर में, प्रति संगठन हैं।",
+  "pricing_plans_heading": "प्लान",
+  "pricing_loading": "प्लान लोड हो रहे हैं",
+  "pricing_error": "कीमतें लोड नहीं हो सकीं।",
+  "pricing_retry": "फिर से कोशिश करें",
+  "pricing_empty": "अभी कोई प्लान उपलब्ध नहीं है। हमें लिखें, हम आपको प्लान चुनने में मदद करेंगे:",
+  "pricing_noscript": "लाइव कीमतों के लिए JavaScript ज़रूरी है। मौजूदा कीमतों के लिए हमें लिखें:",
+  "pricing_per_month": "प्रति माह",
+  "pricing_contact_us": "हमसे संपर्क करें",
+  "pricing_contact_sales": "सेल्स से संपर्क करें",
+  "pricing_included_ops": [
+    {
+      "declarations": ["input count", "input ops", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "हर महीने {ops} ऑपरेशन शामिल",
+        "countPlural=other": "हर महीने {ops} ऑपरेशन शामिल"
+      }
+    }
+  ],
+  "pricing_overage_hard_stop": "सीमा पर बिल योग्य कॉल रुक जाती हैं",
+  "pricing_overage_metered": "सीमा के बाद भी काम चलता रहता है; अतिरिक्त उपयोग मापा जाता है",
+  "pricing_features_label": "सुविधाएँ",
+  "pricing_feature_auto_rollback": "Otto Flags में स्वचालित रोलबैक",
+  "pricing_how_heading": "प्लान कैसे काम करते हैं",
+  "pricing_shared_title": "हर Otto सेवा के लिए एक प्लान",
+  "pricing_shared_body": "आपके संगठन का प्लान और उपयोग कोटा Otto Factory, Otto Flags और आने वाली सेवाओं में साझा होता है। हर सेवा के लिए अलग से कुछ नहीं खरीदना पड़ता।",
+  "pricing_ops_title": "ऑपरेशन किसे गिना जाता है",
+  "pricing_ops_body": "ऑपरेशन वे बिल योग्य कॉल हैं जो आपके एजेंट Otto सेवाओं को करते हैं। हर प्लान में हर महीने इनकी एक तय संख्या शामिल होती है।",
+  "pricing_overage_title": "सीमा पूरी होने पर",
+  "pricing_overage_body": "Free प्लान में सीमा पूरी होते ही बिल योग्य कॉल अगले महीने कोटा नया होने तक रुक जाती हैं। पेड प्लान चलते रहते हैं, और कोटे से ज़्यादा उपयोग को अतिरिक्त उपयोग के रूप में मापा जाता है।",
+  "pricing_faq_heading": "सवाल",
+  "pricing_faq_change_q": "क्या हम प्लान बदल सकते हैं?",
+  "pricing_faq_change_a": "हाँ। हमें लिखें, हम आपके संगठन को दूसरे प्लान पर ले जाएँगे। नया कोटा एक साथ हर Otto सेवा पर लागू होता है।",
+  "pricing_faq_limit_q": "सीमा पूरी होने पर क्या होता है?",
+  "pricing_faq_limit_a": "Free पर, अगले महीने कोटा नया होने तक बिल योग्य कॉल रुक जाती हैं। पेड प्लान पर कुछ नहीं रुकता: कोटे से ज़्यादा उपयोग अतिरिक्त उपयोग के रूप में मापा जाता है।",
+  "pricing_faq_enterprise_q": "Enterprise क्या है?",
+  "pricing_faq_enterprise_a": "बड़े कोटे और आपके साथ तय की गई कीमत वाला प्लान, उन संगठनों के लिए जिनके एजेंट बहुत काम करते हैं। इसे शुरू करने के लिए हमें लिखें।",
+  "pricing_faq_shared_q": "क्या हर सेवा का उपयोग अलग से गिना जाता है?",
+  "pricing_faq_shared_a": "नहीं। हर Otto सेवा की कॉल एक ही कोटे से गिनी जाती हैं, इसलिए एक प्लान आपके पूरे संगठन को कवर करता है।",
+  "pricing_faq_more": "कुछ और पूछना है? हमें लिखें:"
 }
