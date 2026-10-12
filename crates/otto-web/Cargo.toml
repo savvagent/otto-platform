@@ -22,12 +22,13 @@ url.workspace = true
 anyhow.workspace = true
 schemars.workspace = true
 # `sync` for the plan catalog's in-process cache (`routes::plans::PlansCache`).
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 # Integration tests link otto-web as an external crate, so anything they name
 # directly has to be declared here too.
-tokio = { workspace = true, features = ["full"] }
+# `test-util` for the plan cache's paused-clock tests.
+tokio = { workspace = true, features = ["full", "test-util"] }
 # test-support relaxes otto-auth::oidc's SSRF guard for loopback addresses
 # only, so this crate's own mock-IdP tests (tests/sso.rs) can run against a
 # local server — never enabled by the production dependency above. See that

@@ -1484,6 +1484,37 @@ async fn the_plan_catalog_publishes_only_advertised_features(pool: PgPool) {
     );
 }
 
+/// The catalog is held in-process for a minute, so an anonymous caller
+/// hammering it does not reach the database each time. A change to `plans`
+/// therefore shows up only once the cached copy expires (covered with a
+/// paused clock in `routes::plans`'s unit tests), not on the next request.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_plan_catalog_is_served_from_cache_within_its_ttl(pool: PgPool) {
+    let h = harness(pool).await;
+    let first = Call::get("/api/plans").send(&h.router).await;
+    first.expect(StatusCode::OK);
+    assert_eq!(first.body["plans"][1]["monthlyCents"], 2900);
+
+    sqlx::query("UPDATE plans SET monthly_cents = 3900 WHERE plan = 'team'")
+        .execute(h.db.pool())
+        .await
+        .unwrap();
+
+    let second = Call::get("/api/plans").send(&h.router).await;
+    second.expect(StatusCode::OK);
+    assert_eq!(
+        second.body, first.body,
+        "within the TTL the cached catalog is served, not a fresh read"
+    );
+    assert_eq!(
+        second
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+}
+
 // ---------------------------------------------------------------- openapi
 
 /// The document is served, describes the routes that exist, and needs no
