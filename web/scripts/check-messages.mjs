@@ -137,7 +137,9 @@ const difference = (a, b) => new Set([...a].filter((x) => !b.has(x)));
  * Run on every locale, base included: the comparisons in `check()` measure
  * translations against the base, so a `#` in the base would pass them all.
  * Limited to plural messages, where `#` is the ICU shorthand; a `#` in a
- * plain string ("#{name}") is ordinary text.
+ * plain string ("#{name}") is ordinary text. Deliberately blunt inside a plural
+ * arm, a literal `#` included: none exists today, and the rule can be narrowed
+ * when one does.
  */
 function pluralHashProblems(locale, catalog) {
   const problems = [];
