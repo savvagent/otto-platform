@@ -808,9 +808,6 @@ mod tests {
     #[tokio::test]
     async fn a_redirect_escapes_what_the_path_decoded_to() {
         let bundle = bundle("escape");
-        // A page whose name starts with a backslash, so the `<page>.html`
-        // redirect below is taken rather than missed.
-        std::fs::write(bundle.0.join("\\evil.com.html"), "<html>evil</html>").expect("write");
         let make = || console_app(&bundle);
 
         for (path, to) in [
@@ -824,9 +821,18 @@ mod tests {
             assert_eq!(location(&res), Some(to), "{path}");
         }
 
-        let res = get(make(), "/%5Cevil.com.html").await;
-        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
-        assert_eq!(location(&res), Some("/%5Cevil.com"));
+        // A page whose name starts with a backslash, so the `<page>.html`
+        // redirect is taken rather than missed. Unix only: elsewhere `\\` is
+        // a separator, which is also what the lint is about.
+        #[cfg(unix)]
+        {
+            #[allow(clippy::join_absolute_paths)]
+            let page = bundle.0.join("\\evil.com.html");
+            std::fs::write(page, "<html>evil</html>").expect("write");
+            let res = get(make(), "/%5Cevil.com.html").await;
+            assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(location(&res), Some("/%5Cevil.com"));
+        }
 
         // Whatever these answer, a redirect among them stays on the site.
         for path in [
