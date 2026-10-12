@@ -357,7 +357,7 @@
   "product_flags_feature_evaluate": "ऐप SDK और REST से फ़्लैग जाँचते हैं, इसलिए प्रोडक्शन का कोई अनुरोध कभी LLM का इंतज़ार नहीं करता।",
   "product_flags_feature_auto_rollback": "Team प्लान और उससे ऊपर स्वचालित रोलबैक।",
   "marketing_skip_to_content": "सामग्री पर जाएँ",
-  "marketing_nav_label": "मुख्य",
+  "marketing_nav_label": "मुख्य नेविगेशन",
   "marketing_nav_products": "उत्पाद",
   "marketing_nav_pricing": "कीमतें",
   "marketing_nav_menu": "मेनू",
