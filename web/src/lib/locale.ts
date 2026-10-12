@@ -149,14 +149,15 @@ export function resolveAtBoot(): Locale {
 /**
  * Set `<html lang>`.
  *
- * `app.html` ships `lang="en"` and is *not* templated per locale — under
- * `adapter-static` there is one `index.html` shell for every route and no
- * server to pick a language for it. So the attribute is corrected from script,
- * in the same synchronous step that resolves the locale. The served markup says
- * `en` for the instant between parse and hydration, which is unavoidable
- * without reintroducing a server and is the same trade the SPA already makes
- * for every other piece of content: the shell is empty until JS runs, so there
- * is nothing yet to mispronounce.
+ * `src/hooks.server.ts` writes the attribute at build time: the route's
+ * locale into each prerendered marketing page, and `en` into the `200.html`
+ * shell that every console route is served from. The console's language comes
+ * from the account and the browser, which no build step can know, so for the
+ * shell the attribute is corrected from script, in the same synchronous step
+ * that resolves the locale. The served shell says `en` for the instant between
+ * parse and hydration, which is unavoidable without a rendering server and is
+ * the same trade the SPA already makes for every other piece of content: the
+ * shell is empty until JS runs, so there is nothing yet to mispronounce.
  */
 function applyLang(locale: Locale): void {
   document.documentElement.lang = locale;

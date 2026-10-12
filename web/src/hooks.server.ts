@@ -6,7 +6,7 @@ import { isSupported } from '$lib/locale';
  * Write the page's language into `<html lang>`.
  *
  * `<html lang>` cannot be set from `<svelte:head>`, which only reaches inside
- * `<head>`, so `app.html` carries a `%otto.lang%` placeholder and this replaces
+ * `<head>`, so `app.html` carries a placeholder there and this replaces
  * it. There is no server at runtime: this hook runs during `vite build`, once
  * for each prerendered marketing page — so `/es` is written as Spanish to the
  * file itself, which is what a crawler and a screen reader see before any
@@ -21,10 +21,16 @@ import { isSupported } from '$lib/locale';
  * `$lib/locale`), since its language comes from the account and the browser,
  * which no build step can know.
  */
+/**
+ * The whole opening of the root element, not the bare placeholder, so the
+ * replacement can only ever land on `<html lang>`.
+ */
+const PLACEHOLDER = '<html lang="%otto.lang%"';
+
 export const handle: Handle = ({ event, resolve }) => {
   const param = event.params.lang;
   const lang = isSupported(param) ? param : 'en';
   return resolve(event, {
-    transformPageChunk: ({ html }) => html.replace('%otto.lang%', lang)
+    transformPageChunk: ({ html }) => html.replace(PLACEHOLDER, `<html lang="${lang}"`)
   });
 };
