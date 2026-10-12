@@ -17,6 +17,11 @@
 //! bound how stale a price change may look at about six minutes; a tier
 //! changes a few times a year.
 //!
+//! **An outage serves the last good catalog.** A failed or timed-out refresh
+//! is remembered for a few seconds, and meanwhile callers get the last
+//! catalog this instance read, or `503` with `Retry-After` if it has none,
+//! without each making its own attempt. See [`PlansCache`].
+//!
 //! **Features are allowlisted, not passed through.** See
 //! [`ADVERTISED_FEATURES`].
 
@@ -114,6 +119,21 @@ fn advertised(features: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(all)
 }
 
+/// How long a failed refresh is remembered. While it is, callers get the last
+/// good catalog (or, with none, a `503`) at once instead of each making their
+/// own [`REFRESH_TIMEOUT`] attempt against a database that just failed.
+const FAILURE_BACKOFF: Duration = Duration::from_secs(5);
+
+/// What [`PlansCache`] holds.
+#[derive(Debug, Default)]
+struct Entry {
+    /// The last catalog read successfully, already serialized, and when.
+    good: Option<(Instant, Bytes)>,
+    /// When the last refresh failed, if it failed more recently than `good`
+    /// was read. Cleared by the next successful refresh.
+    failed_at: Option<Instant>,
+}
+
 /// The last catalog this instance read, already serialized, and when.
 ///
 /// Holds the response body rather than the [`PlansResponse`] so a hit costs a
@@ -125,66 +145,135 @@ fn advertised(features: serde_json::Value) -> serde_json::Value {
 /// the lock, then finds it fresh and serves it, instead of each one issuing
 /// its own query.
 ///
-/// **Bounded refreshes.** A failed refresh caches nothing, so the next caller
-/// in line tries again, which during a database outage means the waiting
-/// callers retry one after another under the lock. Each attempt is therefore
-/// cut off at [`REFRESH_TIMEOUT`] and answered `503 temporarily_unavailable`,
-/// so a caller's wait is bounded by the timeout times the callers ahead of it
-/// rather than by however long a connection attempt to a dead database hangs.
+/// **Bounded refreshes.** Each refresh is cut off at [`REFRESH_TIMEOUT`], so
+/// a refresh against a dead database cannot hang for as long as a connection
+/// attempt does.
+///
+/// **A failure is remembered, not retried by every waiter.** When a refresh
+/// fails or times out, the failure is held for [`FAILURE_BACKOFF`]. Callers
+/// queued behind the failed refresh, and callers arriving during the backoff,
+/// do not make attempts of their own; they are answered from what is held:
+///
+/// - **With a last good catalog**, they get it, stale or not, and the failed
+///   refresh is logged with `tracing::warn!`. A tier changes a few times a
+///   year, so a catalog older than [`CACHE_TTL`] is a far better answer than
+///   an error page during an outage.
+/// - **With none** (the instance has never read the catalog), they get
+///   `503 temporarily_unavailable` with `Retry-After`.
+///
+/// So during a database outage the database sees at most one attempt per
+/// instance per [`FAILURE_BACKOFF`], and no caller waits longer than one
+/// [`REFRESH_TIMEOUT`] however many are queued.
 ///
 /// Timed with `tokio::time::Instant` so tests can pause and advance the clock.
 #[derive(Debug)]
 pub struct PlansCache {
-    entry: RwLock<Option<(Instant, Bytes)>>,
+    entry: RwLock<Entry>,
     ttl: Duration,
     refresh_timeout: Duration,
+    failure_backoff: Duration,
 }
 
 impl Default for PlansCache {
     fn default() -> Self {
         Self {
-            entry: RwLock::new(None),
+            entry: RwLock::new(Entry::default()),
             ttl: CACHE_TTL,
             refresh_timeout: REFRESH_TIMEOUT,
+            failure_backoff: FAILURE_BACKOFF,
         }
     }
 }
 
+/// The catalog could not be read. `503` with `Retry-After`, because it is a
+/// "try again" condition. Built directly rather than through
+/// [`ApiError::unavailable`], which logs: the failure it reports was already
+/// logged when it happened.
+fn catalog_unavailable(retry_after: Duration) -> ApiError {
+    let mut e = ApiError::new(
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+        "could not reach the database right now; retry shortly",
+    );
+    e.retry_after = Some(retry_after.as_secs().max(1) as i64);
+    e
+}
+
 impl PlansCache {
-    fn fresh(&self, entry: &Option<(Instant, Bytes)>) -> Option<Bytes> {
-        entry
-            .as_ref()
-            .filter(|(at, _)| at.elapsed() < self.ttl)
-            .map(|(_, body)| body.clone())
+    /// The answer `entry` already gives without a refresh, if any: a fresh
+    /// catalog, or, while a recent failure is held, the last good catalog or
+    /// a `503`.
+    fn cached(&self, entry: &Entry) -> Option<ApiResult<Bytes>> {
+        if let Some((at, body)) = &entry.good {
+            if at.elapsed() < self.ttl {
+                return Some(Ok(body.clone()));
+            }
+        }
+        let failed_at = entry.failed_at?;
+        let since = failed_at.elapsed();
+        if since >= self.failure_backoff {
+            return None;
+        }
+        Some(match &entry.good {
+            Some((_, body)) => Ok(body.clone()),
+            None => Err(catalog_unavailable(self.failure_backoff - since)),
+        })
     }
 
-    /// The cached body, or `load`'s, which is then cached. See the type docs.
+    /// The cached body, or `load`'s, which is then cached. On a failed
+    /// refresh, the last good body if there is one. See the type docs.
     async fn get_or_load<F, Fut>(&self, load: F) -> ApiResult<Bytes>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = ApiResult<Bytes>>,
     {
-        if let Some(body) = self.fresh(&*self.entry.read().await) {
-            return Ok(body);
+        if let Some(answer) = self.cached(&*self.entry.read().await) {
+            return answer;
         }
 
         let mut entry = self.entry.write().await;
         // Re-checked under the write lock: whoever held it before us may have
-        // just refilled it.
-        if let Some(body) = self.fresh(&entry) {
-            return Ok(body);
+        // just refilled it, or just failed to.
+        if let Some(answer) = self.cached(&entry) {
+            return answer;
         }
 
-        let body = tokio::time::timeout(self.refresh_timeout, load())
-            .await
-            .map_err(|_| {
-                ApiError::unavailable(
-                    "plan catalog",
-                    format!("refresh exceeded {:?}", self.refresh_timeout),
-                )
-            })??;
-        *entry = Some((Instant::now(), body.clone()));
-        Ok(body)
+        let loaded = match tokio::time::timeout(self.refresh_timeout, load()).await {
+            Ok(loaded) => loaded,
+            Err(_) => {
+                tracing::warn!(
+                    timeout = ?self.refresh_timeout,
+                    "plan catalog refresh timed out"
+                );
+                Err(catalog_unavailable(self.failure_backoff))
+            }
+        };
+
+        match loaded {
+            Ok(body) => {
+                *entry = Entry {
+                    good: Some((Instant::now(), body.clone())),
+                    failed_at: None,
+                };
+                Ok(body)
+            }
+            Err(mut e) => {
+                entry.failed_at = Some(Instant::now());
+                if let Some((at, body)) = &entry.good {
+                    tracing::warn!(
+                        status = %e.status,
+                        code = e.code,
+                        age = ?at.elapsed(),
+                        "plan catalog refresh failed; serving the last good catalog"
+                    );
+                    return Ok(body.clone());
+                }
+                if e.status == http::StatusCode::SERVICE_UNAVAILABLE && e.retry_after.is_none() {
+                    e.retry_after = Some(self.failure_backoff.as_secs().max(1) as i64);
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -200,11 +289,35 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<impl IntoResponse>
     ))
 }
 
-async fn load(state: &AppState) -> ApiResult<Bytes> {
-    let mut tx = state.db.begin_unpinned().await?;
-    let rows = list_plans(&mut tx).await?;
-    tx.commit().await?;
+/// A database failure is `503 temporarily_unavailable`, not the `500` the
+/// generic conversions give it: the catalog is public and its failure must
+/// read as "retry", and it is what lets [`PlansCache`] attach `Retry-After`.
+fn tenant_error(e: otto_tenant::Error) -> ApiError {
+    match e {
+        otto_tenant::Error::Db(inner) => ApiError::unavailable("plan catalog", inner),
+        other => ApiError::from(other),
+    }
+}
 
+/// See [`tenant_error`].
+fn core_error(e: otto_core::Error) -> ApiError {
+    match e {
+        otto_core::Error::Db(inner) => ApiError::unavailable("plan catalog", inner),
+        otto_core::Error::Tenant(inner) => tenant_error(inner),
+        other => ApiError::from(other),
+    }
+}
+
+async fn load(state: &AppState) -> ApiResult<Bytes> {
+    let mut tx = state.db.begin_unpinned().await.map_err(tenant_error)?;
+    let rows = list_plans(&mut tx).await.map_err(core_error)?;
+    tx.commit().await.map_err(tenant_error)?;
+
+    if rows.is_empty() {
+        // Not an error — the pricing page has an empty state — but the
+        // seeded tiers are gone, which an operator should hear about.
+        tracing::warn!("plan catalog is empty");
+    }
     let response = PlansResponse {
         plans: rows.into_iter().map(PublicPlan::from).collect(),
     };
@@ -218,6 +331,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn only_advertised_boolean_features_are_published() {
@@ -232,6 +346,19 @@ mod tests {
         );
         assert_eq!(advertised(json!({})), json!({}));
         assert_eq!(advertised(json!(null)), json!({}));
+    }
+
+    #[test]
+    fn a_database_failure_in_the_loader_is_unavailable() {
+        let db = || sqlx::Error::PoolTimedOut;
+        for err in [
+            tenant_error(otto_tenant::Error::Db(db())),
+            core_error(otto_core::Error::Db(db())),
+            core_error(otto_core::Error::Tenant(otto_tenant::Error::Db(db()))),
+        ] {
+            assert_eq!(err.status, http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(err.code, "temporarily_unavailable");
+        }
     }
 
     /// A loader that counts its calls and answers with the call number.
@@ -258,32 +385,162 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_failure_is_not_cached() {
-        let cache = PlansCache::default();
+    /// A loader that counts its calls and fails with a database outage.
+    async fn failing(calls: &AtomicUsize) -> ApiResult<Bytes> {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err(ApiError::unavailable("test", "connection refused"))
+    }
 
-        let failed = cache
-            .get_or_load(|| async { Err(ApiError::internal("test", "boom")) })
-            .await;
-        assert!(failed.is_err());
-
-        let calls = AtomicUsize::new(0);
-        assert_eq!(cache.get_or_load(|| counting(&calls)).await.unwrap(), "1");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    fn assert_unavailable(err: &ApiError) {
+        assert_eq!(err.status, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code, "temporarily_unavailable");
+        assert!(
+            err.retry_after.is_some_and(|s| s >= 1),
+            "a 503 without Retry-After leaves a client guessing"
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_hung_refresh_times_out_as_unavailable_and_is_not_cached() {
+    async fn with_no_good_body_a_failure_is_held_briefly_then_retried() {
+        let cache = PlansCache::default();
+        let calls = AtomicUsize::new(0);
+
+        assert_unavailable(&cache.get_or_load(|| failing(&calls)).await.unwrap_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(FAILURE_BACKOFF - Duration::from_secs(1)).await;
+        let held = cache.get_or_load(|| failing(&calls)).await.unwrap_err();
+        assert_unavailable(&held);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "during the backoff a caller is answered without a new attempt"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let ok = AtomicUsize::new(0);
+        assert_eq!(cache.get_or_load(|| counting(&ok)).await.unwrap(), "1");
+        assert_eq!(ok.load(Ordering::SeqCst), 1, "after the backoff it retries");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_refresh_times_out_as_unavailable_and_is_held_briefly() {
         let cache = PlansCache::default();
 
         let err = cache
             .get_or_load(std::future::pending::<ApiResult<Bytes>>)
             .await
             .unwrap_err();
-        assert_eq!(err.status, http::StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(err.code, "temporarily_unavailable");
+        assert_unavailable(&err);
 
         let calls = AtomicUsize::new(0);
+        assert_unavailable(&cache.get_or_load(|| counting(&calls)).await.unwrap_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        tokio::time::advance(FAILURE_BACKOFF).await;
         assert_eq!(cache.get_or_load(|| counting(&calls)).await.unwrap(), "1");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_refresh_serves_the_last_good_body() {
+        let cache = PlansCache::default();
+        let calls = AtomicUsize::new(0);
+        assert_eq!(cache.get_or_load(|| counting(&calls)).await.unwrap(), "1");
+
+        tokio::time::advance(CACHE_TTL).await;
+        let failures = AtomicUsize::new(0);
+        assert_eq!(
+            cache.get_or_load(|| failing(&failures)).await.unwrap(),
+            "1",
+            "a stale catalog beats an error page"
+        );
+        assert_eq!(cache.get_or_load(|| failing(&failures)).await.unwrap(), "1");
+        assert_eq!(
+            failures.load(Ordering::SeqCst),
+            1,
+            "during the backoff the stale body is served without a new attempt"
+        );
+
+        tokio::time::advance(FAILURE_BACKOFF).await;
+        assert_eq!(cache.get_or_load(|| counting(&calls)).await.unwrap(), "2");
+        tokio::time::advance(CACHE_TTL - Duration::from_secs(1)).await;
+        assert_eq!(
+            cache.get_or_load(|| failing(&failures)).await.unwrap(),
+            "2",
+            "a successful refresh clears the failure and restarts the TTL"
+        );
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_refresh_serves_the_last_good_body() {
+        let cache = PlansCache::default();
+        let calls = AtomicUsize::new(0);
+        assert_eq!(cache.get_or_load(|| counting(&calls)).await.unwrap(), "1");
+
+        tokio::time::advance(CACHE_TTL).await;
+        assert_eq!(
+            cache
+                .get_or_load(std::future::pending::<ApiResult<Bytes>>)
+                .await
+                .unwrap(),
+            "1"
+        );
+    }
+
+    /// Runs `n` concurrent `get_or_load` calls whose loader takes a second.
+    async fn concurrent(
+        cache: &Arc<PlansCache>,
+        n: usize,
+        fail: bool,
+    ) -> (usize, Vec<ApiResult<Bytes>>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..n {
+            let cache = Arc::clone(cache);
+            let calls = Arc::clone(&calls);
+            set.spawn(async move {
+                cache
+                    .get_or_load(|| async move {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        if fail {
+                            failing(&calls).await
+                        } else {
+                            counting(&calls).await
+                        }
+                    })
+                    .await
+            });
+        }
+        let results = set.join_all().await;
+        (calls.load(Ordering::SeqCst), results)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_misses_make_one_load_and_share_its_body() {
+        let cache = Arc::new(PlansCache::default());
+        let (calls, results) = concurrent(&cache, 10, false).await;
+
+        assert_eq!(calls, 1, "one database read however many callers miss");
+        assert_eq!(results.len(), 10);
+        for r in results {
+            assert_eq!(r.unwrap(), "1");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_callers_behind_a_failed_load_do_not_retry() {
+        let cache = Arc::new(PlansCache::default());
+        let started = Instant::now();
+        let (calls, results) = concurrent(&cache, 10, true).await;
+
+        assert_eq!(calls, 1, "the queued callers get the held failure");
+        for r in &results {
+            assert_unavailable(r.as_ref().unwrap_err());
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "no caller waits for more than the one attempt"
+        );
     }
 }
