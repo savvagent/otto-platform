@@ -45,7 +45,9 @@ setting, so the console and the ceremonies cannot disagree.
 
 Matching is on **segment boundaries**, after percent-decoding and collapsing repeated
 slashes. `/apiary` is a legal org slug and stays with the console; `/oauth//introspect` and
-`/oauth/%69ntrospect` are `/oauth/introspect` and are refused.
+`/oauth/%69ntrospect` are `/oauth/introspect` and are refused. A path that does not decode
+(`%zz`, or bytes that are not UTF-8), or that hides a `..` segment behind an encoded slash,
+is the origin's JSON `404`, so the answer is the same with or without Cloudflare in front.
 
 **Why `/internal/*` and `/oauth/introspect` are refused rather than proxied** (Worker
 deployment only; served directly they are reachable on the public hostname, which is fine

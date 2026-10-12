@@ -299,10 +299,35 @@ describe('the Worker in front of the asset bundle', () => {
     }
   });
 
-  it('answers a path that does not decode with a 404', async () => {
+  it("answers a path that does not decode with the origin's JSON 404", async () => {
+    for (const path of ['/%E0%A4%A', '/%zz', '/%FF', '/trailing%', '/api/%zz']) {
+      assets.mockClear();
+      const response = await call(path);
+      expect(response.status, path).toBe(404);
+      expect(response.headers.get('content-type'), path).toContain('application/json');
+      expect(((await response.json()) as { error: string }).error, path).toBe('not_found');
+      expect(assets, path).not.toHaveBeenCalled();
+    }
+  });
+
+  it('lets URL parsing resolve dot segments, and refuses the ones it cannot see', async () => {
+    // Literal and `%2e` dot segments are gone before the Worker runs, so these
+    // are `/200` and `/200.html`: the shell, with its header.
+    for (const path of ['/./200', '/./200.html', '/%2e/200', '/a/../200']) {
+      const response = await call(path);
+      expect(response.status, path).toBe(200);
+      expect(response.headers.get('x-robots-tag'), path).toBe('noindex, nofollow');
+    }
+    const landing = await call('/./index.html');
+    expect(landing.status).toBe(308);
+    expect(landing.headers.get('location')).toBe('/');
+
+    // Behind an encoded slash, a `..` survives parsing; the server refuses
+    // it, and so does the edge.
     assets.mockClear();
-    const response = await call('/%E0%A4%A');
+    const response = await call('/a%2F..%2F200');
     expect(response.status).toBe(404);
+    expect(response.headers.get('content-type')).toContain('application/json');
     expect(assets).not.toHaveBeenCalled();
   });
 
@@ -312,7 +337,9 @@ describe('the Worker in front of the asset bundle', () => {
       ['/pricing/?a=1', '/pricing?a=1'],
       ['/o/acme/', '/o/acme'],
       ['//evil.com/', '/evil.com'],
-      ['///evil.com//', '/evil.com']
+      ['///evil.com//', '/evil.com'],
+      ['//', '/'],
+      ['///', '/']
     ]) {
       const response = await call(path!);
       expect(response.status, path).toBe(308);

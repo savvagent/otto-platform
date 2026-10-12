@@ -53,20 +53,31 @@ export const ORIGIN_PREFIXES = ['/api', '/oauth', '/sso', '/.well-known', '/heal
 export const NEVER_PROXIED = ['/internal', '/oauth/introspect'];
 
 /**
- * A path as the origin's router would see it after the proxy and the browser
- * have both had their way with it: percent-decoded, with repeated slashes
- * collapsed. `/oauth//introspect` and `/oauth/%69ntrospect` are the same
- * request as `/oauth/introspect` to anything that normalises, and a guard that
- * compares the raw string is a guard with two doors.
+ * The one path every decision in this Worker is made on: percent-decoded, with
+ * repeated slashes collapsed, as the origin's router and the asset binding both
+ * see it. `/oauth//introspect` and `/oauth/%69ntrospect` are the same request
+ * as `/oauth/introspect` to anything that normalises, and a guard that compares
+ * the raw string is a guard with two doors.
+ *
+ * `undefined` when the path does not decode (a malformed escape such as `%zz`,
+ * or bytes that are not UTF-8): no route and no file has that name, and the
+ * server's `strict_decode` refuses exactly the same paths.
  */
-function normalise(path: string): string {
-  let decoded = path;
+export function decodePath(path: string): string | undefined {
   try {
-    decoded = decodeURIComponent(path);
+    return decodeURIComponent(path).replace(/\/{2,}/g, '/');
   } catch {
-    // A malformed escape cannot be decoded; compare it as written.
+    return undefined;
   }
-  return decoded.replace(/\/{2,}/g, '/');
+}
+
+/**
+ * A `.` or `..` segment, which only an encoded slash can produce here: URL
+ * parsing has already removed the literal and `%2e` ones. The server refuses
+ * them, because tower-http resolves them where its routing decisions do not.
+ */
+function hasDotSegment(path: string): boolean {
+  return path.split('/').some((segment) => segment === '.' || segment === '..');
 }
 
 function underPrefix(path: string, prefixes: readonly string[]): boolean {
@@ -78,16 +89,18 @@ function underPrefix(path: string, prefixes: readonly string[]): boolean {
  *
  * `startsWith` alone is wrong and quietly so: `/apiary` is a legal org slug and
  * belongs to the console. Sending it to the origin would answer a JSON `404` for
- * a route the SPA was going to render.
+ * a route the SPA was going to render. Takes the raw path; `false` when it does
+ * not decode, which the Worker answers with a `404` before asking.
  */
 export function belongsToOrigin(path: string): boolean {
-  const p = normalise(path);
-  return underPrefix(p, ORIGIN_PREFIXES) && !isNeverProxied(p);
+  const p = decodePath(path);
+  return p !== undefined && underPrefix(p, ORIGIN_PREFIXES) && !underPrefix(p, NEVER_PROXIED);
 }
 
 /** True for the server-to-server paths this Worker refuses to carry. */
 export function isNeverProxied(path: string): boolean {
-  return underPrefix(normalise(path), NEVER_PROXIED);
+  const p = decodePath(path);
+  return p !== undefined && underPrefix(p, NEVER_PROXIED);
 }
 
 export interface Env {
@@ -101,6 +114,14 @@ const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), {
     status,
     headers: { 'content-type': 'application/json' }
+  });
+
+/** The origin's JSON `404`, word for word, so the answer does not depend on
+ * whether Cloudflare is in front. */
+const notFound = (path: string) =>
+  json(404, {
+    error: 'not_found',
+    error_description: `no route serves ${path}. See /api/openapi.json for the API.`
   });
 
 /**
@@ -136,21 +157,6 @@ async function shell(request: Request, env: Env): Promise<Response | undefined> 
 }
 
 /**
- * The path every decision is made on: percent-decoded, repeated slashes
- * collapsed, which is what the asset binding resolves too. Deciding on the raw
- * path lets `/%32%30%30` reach the shell without its header, `/%69ndex.html`
- * skip the redirect, and `/_app/missing%2Ejs` look extensionless and get HTML.
- * `undefined` when it does not decode: no file and no route has that name.
- */
-function decodedPath(path: string): string | undefined {
-  try {
-    return decodeURIComponent(path).replace(/\/{2,}/g, '/');
-  } catch {
-    return undefined;
-  }
-}
-
-/**
  * True when the last path segment has no `.`: a page route rather than a file.
  * A missing `/_app/x.js` must stay a `404`; answered with HTML it is a syntax
  * error in the browser and a cache entry nobody can explain.
@@ -179,9 +185,7 @@ function redirectOnSite(path: string, search: string): Response {
  * tell a page route from a missing asset. Only a `404` falls through: any
  * other answer is that file's own.
  */
-async function fromBundle(request: Request, env: Env, url: URL): Promise<Response> {
-  const path = decodedPath(url.pathname);
-  if (path === undefined) return new Response(null, { status: 404 });
+async function fromBundle(request: Request, env: Env, url: URL, path: string): Promise<Response> {
   const page = request.method === 'GET' || request.method === 'HEAD';
 
   // Trailing slashes trimmed so `/200/` is the shell with its header and not
@@ -220,18 +224,23 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    if (isNeverProxied(url.pathname)) {
-      return json(404, {
-        error: 'not_found',
-        error_description: `no route serves ${url.pathname}.`
-      });
+    // Decided once, on the decoded path; see `decodePath`.
+    const path = decodePath(url.pathname);
+    if (path === undefined || hasDotSegment(path)) {
+      return notFound(url.pathname);
     }
 
-    if (!belongsToOrigin(url.pathname)) {
+    // Refused with the origin's JSON 404, so the answer does not advertise
+    // that the route exists.
+    if (underPrefix(path, NEVER_PROXIED)) {
+      return notFound(path);
+    }
+
+    if (!underPrefix(path, ORIGIN_PREFIXES)) {
       // A prerendered page or asset as itself, and anything else that looks
       // like a page as the shell, which is what makes a hard refresh of
       // `/o/acme/members` work.
-      return fromBundle(request, env, url);
+      return fromBundle(request, env, url, path);
     }
 
     if (!env.OTTO_ORIGIN) {
