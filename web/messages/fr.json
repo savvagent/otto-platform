@@ -8,9 +8,9 @@
       "declarations": ["input count", "local countPlural = count: plural"],
       "selectors": ["countPlural"],
       "match": {
-        "countPlural=one": "# appel d'outil enregistré sur cette période.",
-        "countPlural=many": "# d'appels d'outils enregistrés sur cette période.",
-        "countPlural=other": "# appels d'outils enregistrés sur cette période."
+        "countPlural=one": "{count} appel d'outil enregistré sur cette période.",
+        "countPlural=many": "{count} d'appels d'outils enregistrés sur cette période.",
+        "countPlural=other": "{count} appels d'outils enregistrés sur cette période."
       }
     }
   ],
@@ -19,9 +19,9 @@
       "declarations": ["input count", "local countPlural = count: plural"],
       "selectors": ["countPlural"],
       "match": {
-        "countPlural=one": "# d'entre eux était facturable.",
-        "countPlural=many": "# d'entre eux étaient facturables.",
-        "countPlural=other": "# d'entre eux étaient facturables."
+        "countPlural=one": "{count} d'entre eux était facturable.",
+        "countPlural=many": "{count} d'entre eux étaient facturables.",
+        "countPlural=other": "{count} d'entre eux étaient facturables."
       }
     }
   ],
