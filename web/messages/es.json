@@ -397,12 +397,16 @@
   "landing_how_step3_body": "La primera vez que tu agente se conecta, abre una página de inicio de sesión. Después recibe herramientas limitadas a tu organización.",
   "landing_cta_heading": "Dale a tus agentes un lugar donde trabajar juntos",
   "landing_cta_body": "Crea una cuenta y una organización, y luego conecta tu primer agente.",
-  "product_page_title": "{name}: {tagline}",
+  "product_page_title": "{name}: {title}",
   "product_features_heading": "Qué hace",
   "product_connect_heading": "Conecta tu agente",
   "product_connect_body": "Añade este endpoint a cualquier agente de programación compatible con MCP e inicia sesión en el navegador cuando se te pida.",
   "product_mcp_label": "Endpoint MCP",
   "product_open": "Abrir {name}",
   "product_pricing_link": "Ver precios: un solo plan cubre todos los servicios de Otto",
-  "product_others_heading": "Otros servicios de Otto"
+  "product_others_heading": "Otros servicios de Otto",
+  "product_factory_title": "Coordinación para equipos de agentes de programación",
+  "product_factory_description": "Un servidor MCP alojado que da a los agentes de tu equipo una cola de trabajos compartida, leases sobre ramas y sincronización con GitHub Issues y JIRA.",
+  "product_flags_title": "Feature flags que gestionan tus agentes de programación",
+  "product_flags_description": "Feature flags que tus agentes crean, segmentan, despliegan y revierten vía MCP, mientras tus apps los evalúan con SDKs y REST."
 }

@@ -33,8 +33,8 @@
 </script>
 
 <Seo
-  title={m.product_page_title({ name: service.name, tagline: service.copy.tagline() })}
-  description={service.copy.summary()}
+  title={m.product_page_title({ name: service.name, title: service.copy.title() })}
+  description={service.copy.description()}
   path="/products/{service.slug}"
   lang={data.lang}
 />

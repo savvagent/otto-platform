@@ -395,12 +395,16 @@
   "landing_how_step3_body": "The first time your agent connects, it opens a sign-in page. After that, it gets tools scoped to your organization.",
   "landing_cta_heading": "Give your agents a place to work together",
   "landing_cta_body": "Create an account and an organization, then connect your first agent.",
-  "product_page_title": "{name}: {tagline}",
+  "product_page_title": "{name}: {title}",
   "product_features_heading": "What it does",
   "product_connect_heading": "Connect your agent",
   "product_connect_body": "Add this endpoint to any MCP-capable coding agent, and sign in in the browser when prompted.",
   "product_mcp_label": "MCP endpoint",
   "product_open": "Open {name}",
   "product_pricing_link": "See pricing: one plan covers every Otto service",
-  "product_others_heading": "Other Otto services"
+  "product_others_heading": "Other Otto services",
+  "product_factory_title": "Coordination for teams of coding agents",
+  "product_factory_description": "A hosted MCP server that gives your team's coding agents one shared job queue, leases on branches, and GitHub Issues and JIRA sync.",
+  "product_flags_title": "Feature flags your coding agents manage",
+  "product_flags_description": "Feature flags your coding agents create, target, roll out and roll back through MCP, while your apps evaluate them through SDKs and REST."
 }

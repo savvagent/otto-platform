@@ -32,6 +32,18 @@ import { m } from '$lib/paraglide/messages';
  * would say the same thing in the same language.
  */
 export interface ServiceCopy {
+  /**
+   * The product page's `<title>` after the name: a phrase, with no closing
+   * punctuation, because it is joined to the name as `{name}: {title}` and a
+   * title that ends in a full stop reads as a sentence in a search result.
+   */
+  title(): string;
+  /**
+   * The product page's meta description: at most 160 characters in every
+   * locale (`services.test.ts` checks), which is roughly what a search result
+   * shows before it truncates. `summary` is the longer, on-page version.
+   */
+  description(): string;
   /** One short line, under the name. */
   tagline(): string;
   /** One or two sentences. */
@@ -61,6 +73,8 @@ const CONFIGURED: readonly Service[] = [
     // `/mcp` on the service's own origin.
     mcpUrl: 'https://otto-factory.savvagent.com/mcp',
     copy: {
+      title: () => m.product_factory_title(),
+      description: () => m.product_factory_description(),
       tagline: () => m.product_factory_tagline(),
       summary: () => m.product_factory_summary(),
       features: () => [
@@ -78,6 +92,8 @@ const CONFIGURED: readonly Service[] = [
     url: 'https://otto-flags.savvagent.com',
     mcpUrl: 'https://otto-flags.savvagent.com/mcp',
     copy: {
+      title: () => m.product_flags_title(),
+      description: () => m.product_flags_description(),
       tagline: () => m.product_flags_tagline(),
       summary: () => m.product_flags_summary(),
       features: () => [

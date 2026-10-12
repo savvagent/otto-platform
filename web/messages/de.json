@@ -395,12 +395,16 @@
   "landing_how_step3_body": "Beim ersten Verbinden öffnet dein Agent eine Anmeldeseite. Danach erhält er Tools, die auf deine Organisation beschränkt sind.",
   "landing_cta_heading": "Gib deinen Agenten einen Ort für die Zusammenarbeit",
   "landing_cta_body": "Erstelle ein Konto und eine Organisation und verbinde dann deinen ersten Agenten.",
-  "product_page_title": "{name}: {tagline}",
+  "product_page_title": "{name}: {title}",
   "product_features_heading": "Was es kann",
   "product_connect_heading": "Verbinde deinen Agenten",
   "product_connect_body": "Füge diesen Endpunkt zu einem beliebigen MCP-fähigen Coding-Agenten hinzu und melde dich im Browser an, wenn du dazu aufgefordert wirst.",
   "product_mcp_label": "MCP-Endpunkt",
   "product_open": "{name} öffnen",
   "product_pricing_link": "Preise ansehen: Ein Tarif gilt für alle Otto-Dienste",
-  "product_others_heading": "Weitere Otto-Dienste"
+  "product_others_heading": "Weitere Otto-Dienste",
+  "product_factory_title": "Koordination für Teams von Coding-Agenten",
+  "product_factory_description": "Ein gehosteter MCP-Server: eine gemeinsame Job-Warteschlange für die Coding-Agenten deines Teams, Leases auf Branches, Sync mit GitHub Issues und JIRA.",
+  "product_flags_title": "Feature-Flags, die deine Coding-Agenten verwalten",
+  "product_flags_description": "Feature-Flags, die deine Agenten per MCP anlegen, targeten, ausrollen und zurückrollen, während deine Apps sie über SDKs und REST auswerten."
 }

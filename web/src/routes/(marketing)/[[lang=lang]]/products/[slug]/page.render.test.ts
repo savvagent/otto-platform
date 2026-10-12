@@ -4,7 +4,7 @@
  * and the MCP endpoint an agent is pointed at, as text that can be copied.
  */
 
-import { mount, unmount } from 'svelte';
+import { flushSync, mount, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import Page from './+page.svelte';
@@ -27,10 +27,18 @@ describe('the product page', () => {
       props: { data: { lang: 'en', slug: 'factory' } }
     });
 
+    flushSync();
+
     const headings = container.querySelectorAll('h1');
     expect(headings).toHaveLength(1);
     expect(headings[0]?.textContent).toContain('Otto Factory');
     expect(container.textContent).toContain('https://otto-factory.savvagent.com/mcp');
+
+    // The page title is the name and the product's own title phrase, with no
+    // closing full stop; the description is the short SEO one, not the summary.
+    expect(document.title).toBe('Otto Factory: Coordination for teams of coding agents');
+    const description = document.head.querySelector('meta[name="description"]');
+    expect(description?.getAttribute('content')?.length).toBeLessThanOrEqual(160);
 
     const open = Array.from(container.querySelectorAll('a')).find(
       (a) => a.getAttribute('href') === 'https://otto-factory.savvagent.com'

@@ -1,14 +1,27 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+
+import { getLocale, locales, overwriteGetLocale } from '$lib/paraglide/runtime';
 
 import { SERVICES, servicesIn, type Service } from './services';
 
 /** A candidate with throwaway copy, so a test names only what it is about. */
 function candidate(fields: Pick<Service, 'slug' | 'name' | 'url'> & Partial<Service>): Service {
   return {
-    copy: { tagline: () => 't', summary: () => 's', features: () => ['f'] },
+    copy: {
+      title: () => 'T',
+      description: () => 'd',
+      tagline: () => 't',
+      summary: () => 's',
+      features: () => ['f']
+    },
     ...fields
   };
 }
+
+/** The runtime's own getter, put back after a test overrides it. */
+const defaultGetLocale = getLocale;
+
+afterEach(() => overwriteGetLocale(defaultGetLocale));
 
 describe('the services list', () => {
   it('ships Otto Factory and Otto Flags, over https', () => {
@@ -29,6 +42,33 @@ describe('the services list', () => {
       const features = service.copy.features();
       expect(features.length).toBeGreaterThanOrEqual(4);
       expect(features.length).toBeLessThanOrEqual(6);
+    }
+  });
+
+  /**
+   * A meta description longer than this is cut off in a search result, and
+   * the cut lands mid-word in whichever language ran long — so every locale
+   * is measured, not just English. Counted in code points, as a reader sees
+   * them, so Hindi's combining marks are not each charged as a character
+   * twice over.
+   */
+  it('keeps every product description within 160 characters, in every locale', () => {
+    for (const locale of locales) {
+      overwriteGetLocale(() => locale);
+      for (const service of SERVICES) {
+        const description = service.copy.description();
+        expect(description.length, `${service.slug} (${locale})`).toBeGreaterThan(0);
+        expect([...description].length, `${service.slug} (${locale})`).toBeLessThanOrEqual(160);
+      }
+    }
+  });
+
+  it('has a page title with no closing punctuation, in every locale', () => {
+    for (const locale of locales) {
+      overwriteGetLocale(() => locale);
+      for (const service of SERVICES) {
+        expect(service.copy.title(), `${service.slug} (${locale})`).toMatch(/[^\s.!?।:;]$/u);
+      }
     }
   });
 
