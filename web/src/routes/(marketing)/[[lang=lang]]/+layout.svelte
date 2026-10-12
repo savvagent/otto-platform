@@ -46,14 +46,18 @@
   onMount(() => {
     /**
      * Signed in? Asked only in the browser, after the prerendered page is
-     * showing. Any failure — no server in `vite dev`, an outage, a network
-     * error — leaves the signed-out links, which still work.
+     * showing. A signed-out visitor is not a failure (`refresh` resolves on a
+     * `401`), so what reaches the catch is a real fault: a `5xx`, a network
+     * error, no server in `vite dev`, a bug. It is logged, and the page keeps
+     * the signed-out links, which still work.
      *
      * `$lib/session.svelte` and `$lib/api` are imported statically: neither
      * touches a browser global at module scope (one builds a `$state` object,
      * the other defines functions), so both are safe in the build's render.
      */
-    session.refresh().catch(() => {});
+    session.refresh().catch((error: unknown) => {
+      console.warn('could not check the session; showing the signed-out links', error);
+    });
 
     // English pages only, and only an offer: nothing is stored, and the next
     // page asks again. The visitor's own choice of URL wins. It appears after
