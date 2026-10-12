@@ -1,7 +1,7 @@
 import { error } from '@sveltejs/kit';
 
 import { baseLocale, locales } from '$lib/paraglide/runtime';
-import { SERVICES } from '$lib/services';
+import { SERVICES, serviceBySlug } from '$lib/services';
 
 import type { EntryGenerator, PageLoad } from './$types';
 
@@ -28,7 +28,7 @@ export const entries: EntryGenerator = () =>
  * place the locale is guaranteed to be this page's.
  */
 export const load: PageLoad = ({ params }) => {
-  const service = SERVICES.find((candidate) => candidate.slug === params.slug);
+  const service = serviceBySlug(params.slug);
   if (service === undefined) error(404, 'Not found');
   return { slug: service.slug };
 };

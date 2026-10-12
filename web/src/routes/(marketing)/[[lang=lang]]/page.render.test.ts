@@ -12,6 +12,7 @@
 import { flushSync, mount, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { getLocale, overwriteGetLocale } from '$lib/paraglide/runtime';
 import { session } from '$lib/session.svelte';
 import type { Me } from '$lib/types';
 import Page from './+page.svelte';
@@ -31,6 +32,9 @@ function expectNoSkips(levels: number[]): void {
   });
 }
 
+/** The runtime's own getter, put back after a test speaks another language. */
+const defaultGetLocale = getLocale;
+
 let container: HTMLElement;
 
 beforeEach(() => {
@@ -41,47 +45,97 @@ beforeEach(() => {
 afterEach(() => {
   container.remove();
   session.clear();
+  overwriteGetLocale(defaultGetLocale);
 });
 
-function link(text: string): HTMLAnchorElement | undefined {
-  return Array.from(container.querySelectorAll('a')).find((a) => a.textContent?.trim() === text);
+/** Every link with exactly this text: the hero and the closing CTA each have one. */
+function links(text: string): HTMLAnchorElement[] {
+  return Array.from(container.querySelectorAll('a')).filter((a) => a.textContent?.trim() === text);
+}
+
+function signInAs(orgSlugs: string[]): void {
+  session.me = {
+    orgs: orgSlugs.map((orgSlug) => ({
+      orgId: orgSlug,
+      userId: 'u1',
+      role: 'owner',
+      orgSlug,
+      orgName: orgSlug,
+      plan: 'free'
+    }))
+  } as unknown as Me;
+  flushSync();
 }
 
 describe('the landing page', () => {
-  it('offers "Create account" to a signed-out visitor', () => {
+  it('offers "Create account" to a signed-out visitor, in every call to action', () => {
     const instance = mount(Page, { target: container, props: { data: { lang: 'en' } } });
 
     expect(container.querySelectorAll('h1')).toHaveLength(1);
     expectNoSkips(headingLevels(container));
-    expect(link('Create account')?.getAttribute('href')).toBe('/signup');
-    expect(link('See pricing')?.getAttribute('href')).toBe('/pricing');
-    expect(link('Open console')).toBeUndefined();
+
+    const create = links('Create account');
+    expect(create).toHaveLength(2);
+    for (const a of create) {
+      expect(a.getAttribute('href')).toBe('/signup');
+      expect(a.hasAttribute('data-sveltekit-reload')).toBe(true);
+    }
+    const pricing = links('See pricing');
+    expect(pricing).toHaveLength(2);
+    for (const a of pricing) expect(a.getAttribute('href')).toBe('/pricing');
+    expect(links('Open console')).toHaveLength(0);
 
     unmount(instance);
   });
 
-  it('offers "Open console" once the session resolves to a member of an org', () => {
+  it('offers "Open console" everywhere once the session resolves to a member of an org', () => {
     const instance = mount(Page, { target: container, props: { data: { lang: 'en' } } });
 
-    session.me = {
-      orgs: [
-        {
-          orgId: 'o1',
-          userId: 'u1',
-          role: 'owner',
-          orgSlug: 'acme',
-          orgName: 'Acme',
-          plan: 'free'
-        }
-      ]
-    } as unknown as Me;
-    flushSync();
+    signInAs(['acme']);
 
-    const open = link('Open console');
-    expect(open?.getAttribute('href')).toBe('/o/acme');
-    // A full load into the browser-only console, never a client-side route.
-    expect(open?.hasAttribute('data-sveltekit-reload')).toBe(true);
-    expect(link('Create account')).toBeUndefined();
+    const open = links('Open console');
+    expect(open).toHaveLength(2);
+    for (const a of open) {
+      expect(a.getAttribute('href')).toBe('/o/acme');
+      // A full load into the browser-only console, never a client-side route.
+      expect(a.hasAttribute('data-sveltekit-reload')).toBe(true);
+    }
+    expect(links('Create account')).toHaveLength(0);
+
+    unmount(instance);
+  });
+
+  it('sends a signed-in account with no org to create one', () => {
+    const instance = mount(Page, { target: container, props: { data: { lang: 'en' } } });
+
+    signInAs([]);
+
+    const open = links('Open console');
+    expect(open).toHaveLength(2);
+    for (const a of open) expect(a.getAttribute('href')).toBe('/orgs/new');
+
+    unmount(instance);
+  });
+
+  /**
+   * The layout installs the URL's locale as Paraglide's getter before any
+   * child renders; this does the same, then checks the two things a
+   * language changes: the words, and every marketing link's prefix. The
+   * console link is the one link that must *not* be prefixed.
+   */
+  it('speaks Spanish and links to Spanish pages under /es', () => {
+    overwriteGetLocale(() => 'es');
+    const instance = mount(Page, { target: container, props: { data: { lang: 'es' } } });
+
+    expect(container.querySelector('#how-title')?.textContent?.trim()).toBe('Cómo funciona');
+    const pricing = links('Ver precios');
+    expect(pricing).toHaveLength(2);
+    for (const a of pricing) expect(a.getAttribute('href')).toBe('/es/pricing');
+    for (const slug of ['factory', 'flags']) {
+      expect(container.querySelector(`a[href="/es/products/${slug}"]`)).not.toBeNull();
+    }
+    expect(container.querySelector('a[href^="/products/"]')).toBeNull();
+    for (const a of links('Crear cuenta')) expect(a.getAttribute('href')).toBe('/signup');
 
     unmount(instance);
   });

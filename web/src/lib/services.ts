@@ -130,3 +130,8 @@ export function servicesIn(candidates: readonly Service[]): Service[] {
 }
 
 export const SERVICES: readonly Service[] = servicesIn(CONFIGURED);
+
+/** The service a product page's slug names, or `undefined` if none does. */
+export function serviceBySlug(slug: string): Service | undefined {
+  return SERVICES.find((service) => service.slug === slug);
+}

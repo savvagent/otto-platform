@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { getLocale, locales, overwriteGetLocale } from '$lib/paraglide/runtime';
 
-import { SERVICES, servicesIn, type Service } from './services';
+import { SERVICES, serviceBySlug, servicesIn, type Service } from './services';
 
 /** A candidate with throwaway copy, so a test names only what it is about. */
 function candidate(fields: Pick<Service, 'slug' | 'name' | 'url'> & Partial<Service>): Service {
@@ -70,6 +70,12 @@ describe('the services list', () => {
         expect(service.copy.title(), `${service.slug} (${locale})`).toMatch(/[^\s.!?।:;]$/u);
       }
     }
+  });
+
+  it('finds a service by its slug, and nothing for a slug no service owns', () => {
+    expect(serviceBySlug('flags')?.name).toBe('Otto Flags');
+    expect(serviceBySlug('nope')).toBeUndefined();
+    expect(serviceBySlug('')).toBeUndefined();
   });
 
   it('drops anything that is not an https link', () => {

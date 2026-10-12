@@ -400,12 +400,13 @@
   "product_connect_heading": "Verbinde deinen Agenten",
   "product_connect_body": "Füge diesen Endpunkt zu einem beliebigen MCP-fähigen Coding-Agenten hinzu und melde dich im Browser an, wenn du dazu aufgefordert wirst.",
   "product_mcp_label": "MCP-Endpunkt",
-  "product_open": "{name} öffnen",
   "product_pricing_link": "Preise ansehen: Ein Tarif gilt für alle Otto-Dienste",
   "product_others_heading": "Weitere Otto-Dienste",
   "product_factory_title": "Koordination für Teams von Coding-Agenten",
   "product_factory_description": "Ein gehosteter MCP-Server: eine gemeinsame Job-Warteschlange für die Coding-Agenten deines Teams, Leases auf Branches, Sync mit GitHub Issues und JIRA.",
   "product_flags_title": "Feature-Flags, die deine Coding-Agenten verwalten",
   "product_flags_description": "Feature-Flags, die deine Agenten per MCP anlegen, targeten, ausrollen und zurückrollen, während deine Apps sie über SDKs und REST auswerten.",
-  "marketing_og_image_alt": "Das Otto-Logo"
+  "marketing_og_image_alt": "Das Otto-Logo",
+  "product_open_console": "Die {name}-Konsole öffnen",
+  "product_eyebrow": "Ein otto-*-Dienst"
 }

@@ -85,6 +85,27 @@ class Session {
 
 export const session = new Session();
 
+/**
+ * Where a "way into the console" link goes, and so what it says.
+ *
+ * `signup` reads "Create account"; `console` reads "Open console" and goes to
+ * the home org, or to creating one for an account that has none — the same
+ * place `/` would send them, so the marketing pages and the console agree.
+ */
+export type ConsoleEntry = { kind: 'signup'; href: '/signup' } | { kind: 'console'; href: string };
+
+/**
+ * The one rule for that link, beside `homeOrg` because it is a reading of it.
+ *
+ * Takes the two fields rather than reading `session` itself so it can be
+ * tested with plain objects; callers pass `session`. Called inside a
+ * `$derived` or the markup, it re-runs when the session resolves.
+ */
+export function consoleEntry(who: Pick<Session, 'signedIn' | 'homeOrg'>): ConsoleEntry {
+  if (!who.signedIn) return { kind: 'signup', href: '/signup' };
+  return { kind: 'console', href: who.homeOrg ? `/o/${who.homeOrg}` : '/orgs/new' };
+}
+
 /** `owner` and `admin` may change the org; `member` may only look. */
 export function isAdmin(role: Role | undefined): boolean {
   return role === 'owner' || role === 'admin';

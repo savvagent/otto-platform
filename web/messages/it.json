@@ -402,12 +402,13 @@
   "product_connect_heading": "Collega il tuo agente",
   "product_connect_body": "Aggiungi questo endpoint a qualsiasi agente di programmazione compatibile con MCP e accedi nel browser quando richiesto.",
   "product_mcp_label": "Endpoint MCP",
-  "product_open": "Apri {name}",
   "product_pricing_link": "Vedi i prezzi: un solo piano copre tutti i servizi Otto",
   "product_others_heading": "Altri servizi Otto",
   "product_factory_title": "Coordinamento per team di agenti di programmazione",
   "product_factory_description": "Un server MCP ospitato: una coda di job condivisa per gli agenti del tuo team, lease sui branch e sincronizzazione con GitHub Issues e JIRA.",
   "product_flags_title": "Feature flag gestiti dai tuoi agenti di programmazione",
   "product_flags_description": "Feature flag che i tuoi agenti creano, indirizzano, rilasciano e annullano via MCP, mentre le tue app li valutano tramite SDK e REST.",
-  "marketing_og_image_alt": "Il logo di Otto"
+  "marketing_og_image_alt": "Il logo di Otto",
+  "product_open_console": "Apri la console di {name}",
+  "product_eyebrow": "Un servizio otto-*"
 }

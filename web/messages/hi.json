@@ -400,12 +400,13 @@
   "product_connect_heading": "अपना एजेंट जोड़ें",
   "product_connect_body": "यह एंडपॉइंट MCP सपोर्ट करने वाले किसी भी कोडिंग एजेंट में जोड़ें, और कहे जाने पर ब्राउज़र में साइन इन करें।",
   "product_mcp_label": "MCP एंडपॉइंट",
-  "product_open": "{name} खोलें",
   "product_pricing_link": "कीमतें देखें: एक प्लान में Otto की सभी सेवाएँ शामिल हैं",
   "product_others_heading": "Otto की अन्य सेवाएँ",
   "product_factory_title": "कोडिंग एजेंटों की टीमों के लिए तालमेल",
   "product_factory_description": "होस्ट किया गया MCP सर्वर: आपकी टीम के कोडिंग एजेंटों के लिए साझा जॉब कतार, ब्रांचों पर लीज़, और GitHub Issues व JIRA के साथ सिंक।",
   "product_flags_title": "फ़ीचर फ़्लैग, जिन्हें आपके कोडिंग एजेंट संभालते हैं",
   "product_flags_description": "फ़ीचर फ़्लैग जिन्हें आपके एजेंट MCP से बनाते, टारगेट करते, रोल आउट और रोल बैक करते हैं, जबकि आपके ऐप उन्हें SDK और REST से जाँचते हैं।",
-  "marketing_og_image_alt": "Otto का लोगो"
+  "marketing_og_image_alt": "Otto का लोगो",
+  "product_open_console": "{name} कंसोल खोलें",
+  "product_eyebrow": "एक otto-* सेवा"
 }

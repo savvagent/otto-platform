@@ -402,12 +402,13 @@
   "product_connect_heading": "Connectez votre agent",
   "product_connect_body": "Ajoutez cet endpoint à n’importe quel agent de code compatible MCP, puis connectez-vous dans le navigateur lorsque cela vous est demandé.",
   "product_mcp_label": "Endpoint MCP",
-  "product_open": "Ouvrir {name}",
   "product_pricing_link": "Voir les tarifs : un seul forfait couvre tous les services Otto",
   "product_others_heading": "Autres services Otto",
   "product_factory_title": "La coordination pour les équipes d’agents de code",
   "product_factory_description": "Un serveur MCP hébergé : une file de tâches partagée pour les agents de votre équipe, des leases sur les branches, la synchro GitHub Issues et JIRA.",
   "product_flags_title": "Des feature flags gérés par vos agents de code",
   "product_flags_description": "Des feature flags que vos agents créent, ciblent, déploient et annulent via MCP, pendant que vos apps les évaluent via SDK et REST.",
-  "marketing_og_image_alt": "Le logo d’Otto"
+  "marketing_og_image_alt": "Le logo d’Otto",
+  "product_open_console": "Ouvrir la console {name}",
+  "product_eyebrow": "Un service otto-*"
 }

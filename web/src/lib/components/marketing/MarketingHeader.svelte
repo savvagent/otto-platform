@@ -7,6 +7,7 @@
   import { session } from '$lib/session.svelte';
   import { localizedPath } from '$lib/site';
   import Logo from '$lib/components/Logo.svelte';
+  import ConsoleLink from './ConsoleLink.svelte';
 
   /**
    * The marketing pages' header: the logo, the products and pricing, and a
@@ -37,8 +38,6 @@
     }))
   );
   const pricing = $derived(localizedPath(lang, '/pricing'));
-
-  const consoleHref = $derived(session.homeOrg ? `/o/${session.homeOrg}` : '/orgs/new');
 
   /**
    * The small-screen menu's state, owned here rather than left to the
@@ -101,26 +100,12 @@
     </nav>
 
     <div class="ml-auto flex items-center gap-2 text-sm">
-      {#if session.signedIn}
-        <a
-          href={consoleHref}
-          data-sveltekit-reload
-          class="rounded-md bg-accent px-3 py-1.5 font-medium text-accent-ink transition hover:brightness-110"
-        >
-          {m.marketing_open_console()}
-        </a>
-      {:else}
+      {#if !session.signedIn}
         <a href="/login" data-sveltekit-reload class="hidden sm:inline-block {link}">
           {m.nav_sign_in()}
         </a>
-        <a
-          href="/signup"
-          data-sveltekit-reload
-          class="rounded-md bg-accent px-3 py-1.5 font-medium whitespace-nowrap text-accent-ink transition hover:brightness-110"
-        >
-          {m.marketing_create_account()}
-        </a>
       {/if}
+      <ConsoleLink size="sm" />
 
       <!--
         The small-screen menu. A `<details>` rather than a scripted toggle, so
