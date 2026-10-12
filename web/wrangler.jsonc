@@ -24,7 +24,8 @@
     // /_app/x.js with HTML too. The Worker chooses instead (worker/index.ts):
     // an extensionless 404 becomes the shell from 200.html, marked
     // `X-Robots-Tag: noindex, nofollow`, and a missing asset stays a 404. The
-    // server does the same for self-hosters.
+    // server does the same for self-hosters. The bundle must contain 200.html
+    // (adapter-static `fallback: '200.html'`), or every deep link is a 404.
     "not_found_handling": "none",
 
     // Every request enters the Worker, including asset requests.
@@ -34,9 +35,8 @@
     // of a rule that already exists in the server, and when the glob is wrong
     // the failure is silent: a path the glob misses is answered by the asset
     // router before the Worker's rule ever sees it. It would also have to
-    // express an exception
-    // (/oauth/introspect and /internal are carved out of /oauth and refused),
-    // which a glob list cannot do.
+    // express an exception (/oauth/introspect and /internal are carved out of
+    // /oauth and refused), which a glob list cannot do.
     //
     // One rule, in TypeScript, matching the server's.
     "run_worker_first": true

@@ -112,6 +112,8 @@ const json = (status: number, body: unknown) =>
  */
 const SHELL = '/200';
 
+const NOINDEX = 'noindex, nofollow';
+
 /**
  * The shell, answering with a `200` and `X-Robots-Tag: noindex, nofollow`.
  *
@@ -129,8 +131,23 @@ async function shell(request: Request, env: Env): Promise<Response | undefined> 
   );
   if (!found.ok) return undefined;
   const headers = new Headers(found.headers);
-  headers.set('x-robots-tag', 'noindex, nofollow');
+  headers.set('x-robots-tag', NOINDEX);
   return new Response(found.body, { status: 200, headers });
+}
+
+/**
+ * The path every decision is made on: percent-decoded, repeated slashes
+ * collapsed, which is what the asset binding resolves too. Deciding on the raw
+ * path lets `/%32%30%30` reach the shell without its header, `/%69ndex.html`
+ * skip the redirect, and `/_app/missing%2Ejs` look extensionless and get HTML.
+ * `undefined` when it does not decode: no file and no route has that name.
+ */
+function decodedPath(path: string): string | undefined {
+  try {
+    return decodeURIComponent(path).replace(/\/{2,}/g, '/');
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -143,24 +160,53 @@ function extensionless(path: string): boolean {
 }
 
 /**
+ * A `308` to a path on this site. Leading slashes and backslashes are stripped
+ * and exactly one put back, so a request for `//evil.com/` can never become
+ * `Location: //evil.com` (or `/\evil.com`, which browsers read the same way).
+ */
+function redirectOnSite(path: string, search: string): Response {
+  const location = `/${path.replace(/^[/\\]+/, '')}${search}`;
+  return new Response(null, { status: 308, headers: { location } });
+}
+
+/**
  * The bundle side of the Worker: prerendered pages and assets as themselves,
- * and the shell for any page route that has no file.
+ * and the shell for any page route that has no file. The same steps, in the
+ * same order, as `route` in `crates/otto-platform-server/src/lib.rs`.
  *
  * `not_found_handling` is `"none"` (see wrangler.jsonc), so the binding's
  * `404` reaches this function and the shell is chosen here, where the rule can
- * tell a page route from a missing asset.
+ * tell a page route from a missing asset. Only a `404` falls through: any
+ * other answer is that file's own.
  */
 async function fromBundle(request: Request, env: Env, url: URL): Promise<Response> {
-  const path = url.pathname;
+  const path = decodedPath(url.pathname);
+  if (path === undefined) return new Response(null, { status: 404 });
+  const page = request.method === 'GET' || request.method === 'HEAD';
+
   // Trailing slashes trimmed so `/200/` is the shell with its header and not
-  // a page, and `/index` is not a second URL for the landing page.
+  // a page, and `/index/` is not a second URL for the landing page.
   const bare = path.replace(/\/+$/, '');
   if (bare === '/index.html' || bare === '/index') {
     return new Response(null, { status: 308, headers: { location: `/${url.search}` } });
   }
-  const page = request.method === 'GET' || request.method === 'HEAD';
-  if (page && (bare === '/200' || bare === '/200.html')) {
+  // The shell's own names, for every method: a write must not reach the
+  // binding and come back as the shell without its header.
+  if (bare === '/200' || bare === '/200.html') {
+    if (!page) {
+      return new Response(null, {
+        status: 405,
+        headers: { allow: 'GET, HEAD', 'x-robots-tag': NOINDEX }
+      });
+    }
     return (await shell(request, env)) ?? new Response(null, { status: 404 });
+  }
+  // `/pricing/` → `/pricing`, as the server does and SvelteKit's
+  // `trailingSlash: 'never'` expects. The binding's own `auto-trailing-slash`
+  // only does this for files that exist, and with a `307`.
+  const raw = url.pathname;
+  if (page && raw !== '/' && raw.endsWith('/')) {
+    return redirectOnSite(raw.replace(/\/+$/, ''), url.search);
   }
 
   const response = await env.ASSETS.fetch(request);

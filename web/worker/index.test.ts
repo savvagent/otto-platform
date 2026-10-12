@@ -207,6 +207,7 @@ describe('the Worker in front of the asset bundle', () => {
   const assets = vi.fn(async (input: RequestInfo | URL) => {
     const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
     const page = pages[path];
+    if (path === '/broken') return immutable('upstream trouble', 500);
     return page === undefined ? immutable(null, 404) : immutable(page, 200);
   });
   const env = {
@@ -263,11 +264,78 @@ describe('the Worker in front of the asset bundle', () => {
   });
 
   it('redirects /index.html to the one URL the landing page has', async () => {
+    for (const [path, to] of [
+      ['/index.html', '/'],
+      ['/index', '/'],
+      ['/index.html?a=1', '/?a=1']
+    ]) {
+      assets.mockClear();
+      const response = await call(path!);
+      expect(response.status, path).toBe(308);
+      // Exactly, not resolved: a resolved check passes on `//evil.com/`.
+      expect(response.headers.get('location'), path).toBe(to);
+      expect(assets, path).not.toHaveBeenCalled();
+    }
+  });
+
+  it('decides on the decoded path, so encoding changes nothing', async () => {
+    for (const path of ['/%32%30%30', '/200%2Ehtml', '/200%2ehtml']) {
+      const response = await call(path);
+      expect(response.status, path).toBe(200);
+      expect(response.headers.get('x-robots-tag'), path).toBe('noindex, nofollow');
+      expect(await response.text(), path).toBe('<html>shell</html>');
+    }
+    for (const path of ['/%69ndex.html', '/index%2Ehtml', '/%69ndex']) {
+      const response = await call(path);
+      expect(response.status, path).toBe(308);
+      expect(response.headers.get('location'), path).toBe('/');
+    }
+    for (const path of ['/x%2Ejs', '/_app/missing%2Ejs']) {
+      assets.mockClear();
+      const response = await call(path);
+      expect(response.status, path).toBe(404);
+      expect(response.headers.has('x-robots-tag'), path).toBe(false);
+      expect(askedFor(), path).not.toContain('/200');
+    }
+  });
+
+  it('answers a path that does not decode with a 404', async () => {
     assets.mockClear();
-    const response = await call('/index.html');
-    expect(response.status).toBe(308);
-    expect(new URL(response.headers.get('location')!, 'https://otto.test').pathname).toBe('/');
+    const response = await call('/%E0%A4%A');
+    expect(response.status).toBe(404);
     expect(assets).not.toHaveBeenCalled();
+  });
+
+  it('redirects a trailing slash away, and never off-site', async () => {
+    for (const [path, to] of [
+      ['/pricing/', '/pricing'],
+      ['/pricing/?a=1', '/pricing?a=1'],
+      ['/o/acme/', '/o/acme'],
+      ['//evil.com/', '/evil.com'],
+      ['///evil.com//', '/evil.com']
+    ]) {
+      const response = await call(path!);
+      expect(response.status, path).toBe(308);
+      expect(response.headers.get('location'), path).toBe(to);
+    }
+  });
+
+  it('returns any answer but a 404 as is, never the shell', async () => {
+    assets.mockClear();
+    const response = await call('/broken');
+    expect(response.status).toBe(500);
+    expect(response.headers.has('x-robots-tag')).toBe(false);
+    expect(askedFor()).toEqual(['/broken']);
+  });
+
+  it('does not let a write to the shell reach the binding without the header', async () => {
+    for (const path of ['/200', '/200.html']) {
+      assets.mockClear();
+      const response = await call(path, { method: 'POST' });
+      expect(response.status, path).toBe(405);
+      expect(response.headers.get('x-robots-tag'), path).toBe('noindex, nofollow');
+      expect(assets, path).not.toHaveBeenCalled();
+    }
   });
 
   it('serves the shell under its own names with the header', async () => {
