@@ -12,17 +12,28 @@ import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
  * anyway. Building to static files that `otto-platform-server` serves on the same origin
  * as `/api` keeps the cookie in exactly one place: the browser.
  *
- * `fallback` is what makes deep links work. Every route below `/` is resolved
- * by the client router, so the server answers any unmatched path with the same
- * shell — `/o/acme/members` typed into the address bar has to load the app, not a
- * 404 from a static file server.
+ * The public marketing pages are the exception, and a safe one: they read no
+ * session, so they are prerendered to `.html` files at build time
+ * (`src/routes/(marketing)`), while the console stays browser-only
+ * (`src/routes/(console)`).
+ *
+ * `fallback` is what makes deep links into the console work. Its routes are
+ * resolved by the client router, so the server answers any path with no
+ * prerendered file with the same shell — `/o/acme/members` typed into the
+ * address bar has to load the app, not a 404 from a static file server.
+ *
+ * The shell is `200.html`, not `index.html`, because `index.html` is now the
+ * prerendered landing page; writing the fallback there would overwrite it.
+ * `otto-platform-server` and the Worker both serve `200.html` for unmatched
+ * paths, with an `X-Robots-Tag: noindex` header, and the server refuses to
+ * start without it.
  *
  * @type {import('@sveltejs/kit').Config}
  */
 export default {
   preprocess: vitePreprocess(),
   kit: {
-    adapter: adapter({ fallback: 'index.html', strict: false }),
+    adapter: adapter({ fallback: '200.html', strict: false }),
     typescript: {
       config(config) {
         // `strict` is set here rather than in tsconfig.json because SvelteKit
