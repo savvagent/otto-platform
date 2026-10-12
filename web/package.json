@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "npm run paraglide:compile && vite dev",
-    "build": "npm run paraglide:compile && vite build",
+    "build": "npm run paraglide:compile && vite build && npm run check:build",
     "preview": "vite preview",
     "check": "npm run paraglide:compile && npm run check:messages && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && npm run check:worker",
     "check:worker": "tsc -p worker/tsconfig.json --noEmit",
