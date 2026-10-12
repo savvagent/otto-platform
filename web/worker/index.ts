@@ -127,9 +127,10 @@ const notFound = (path: string) =>
 /**
  * The SPA shell, as the asset binding names it.
  *
- * adapter-static writes it to `200.html`, but the binding's default
- * `html_handling: "auto-trailing-slash"` answers `/200.html` with a `307` to
- * `/200`, so `/200` is the name that returns the file.
+ * adapter-static writes it to `200.html`, but the binding's
+ * `html_handling: "auto-trailing-slash"` (set explicitly in wrangler.jsonc for
+ * this reason) answers `/200.html` with a `307` to `/200`, so `/200` is the
+ * name that returns the file.
  */
 const SHELL = '/200';
 
@@ -145,12 +146,29 @@ const NOINDEX = 'noindex, nofollow';
  *
  * The header goes on a copy: responses from the asset binding have immutable
  * headers, and setting one in place throws.
+ *
+ * A shell the binding will not return is a broken deployment, not a missing
+ * page: the bundle has no `200.html`, or `html_handling` no longer maps `/200`
+ * to it. Every client route depends on it, so it is logged and answered with a
+ * named JSON `500`, like a missing `OTTO_ORIGIN`, rather than a bare `404`
+ * that looks like an ordinary miss.
  */
-async function shell(request: Request, env: Env): Promise<Response | undefined> {
+async function shell(request: Request, env: Env): Promise<Response> {
   const found = await env.ASSETS.fetch(
     new Request(new URL(SHELL, request.url), { method: request.method })
   );
-  if (!found.ok) return undefined;
+  if (!found.ok) {
+    console.error(
+      `the asset binding answered ${found.status} for the SPA shell (${SHELL}); ` +
+        'every client route is failing. Check that the bundle has 200.html and that ' +
+        'html_handling is "auto-trailing-slash".'
+    );
+    return json(500, {
+      error: 'misconfigured',
+      error_description:
+        'this Worker could not load the console shell (200.html) from its asset bundle.'
+    });
+  }
   const headers = new Headers(found.headers);
   headers.set('x-robots-tag', NOINDEX);
   return new Response(found.body, { status: 200, headers });
@@ -203,7 +221,7 @@ async function fromBundle(request: Request, env: Env, url: URL, path: string): P
         headers: { allow: 'GET, HEAD', 'x-robots-tag': NOINDEX }
       });
     }
-    return (await shell(request, env)) ?? new Response(null, { status: 404 });
+    return shell(request, env);
   }
   // `/pricing/` → `/pricing`, as the server does and SvelteKit's
   // `trailingSlash: 'never'` expects. The binding's own `auto-trailing-slash`
@@ -213,11 +231,35 @@ async function fromBundle(request: Request, env: Env, url: URL, path: string): P
     return redirectOnSite(raw.replace(/\/+$/, ''), url.search);
   }
 
+  // `/pricing.html` → `/pricing`: one URL per page, with the same `308` the
+  // server sends, rather than the binding's own `307`. `/200.html` and
+  // `/index.html` were answered above. Only when the page exists, so
+  // `/nope.html` stays a `404`; looked up by its decoded name, so
+  // `/pricing%2Ehtml` is the same request.
+  if (page && path.endsWith('.html')) {
+    const target = encodePath(path.slice(0, -'.html'.length));
+    const found = await env.ASSETS.fetch(
+      new Request(new URL(target, url.origin), { method: request.method })
+    );
+    if (found.status !== 404) {
+      return redirectOnSite(target, url.search);
+    }
+  }
+
   const response = await env.ASSETS.fetch(request);
   if (response.status !== 404 || !page || !extensionless(path)) {
     return response;
   }
-  return (await shell(request, env)) ?? response;
+  return shell(request, env);
+}
+
+/**
+ * A decoded path made safe to put back into a `Location`, escaping what the
+ * server's `LOCATION_PATH` escapes: `encodeURI` covers `%`, `\`, spaces and
+ * non-ASCII, and leaves `?` and `#`, which would end the path.
+ */
+function encodePath(path: string): string {
+  return encodeURI(path).replace(/\?/g, '%3F').replace(/#/g, '%23');
 }
 
 export default {

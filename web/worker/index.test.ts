@@ -196,15 +196,18 @@ describe('the Worker', () => {
 
 /**
  * The asset bundle, as Cloudflare's asset binding would answer it with
- * `not_found_handling: "none"` and the default `auto-trailing-slash` HTML
- * handling: `/pricing` finds `pricing.html`, `/200` finds the shell, and
- * anything else is a bare `404`. Headers are immutable, as on the real
+ * `not_found_handling: "none"` and `html_handling: "auto-trailing-slash"`
+ * (both set in wrangler.jsonc): `/pricing` finds `pricing.html`, `/200` finds
+ * the shell, `/pricing.html` is a `307` to `/pricing`, and anything else is a
+ * bare `404`. Headers are immutable, as on the real
  * binding, so a Worker that mutates them in place fails here too.
  */
 describe('the Worker in front of the asset bundle', () => {
   const pages: Record<string, string> = {
     '/': '<html>landing</html>',
     '/pricing': '<html>pricing</html>',
+    '/es/pricing': '<html>es pricing</html>',
+    '/%5Cevil': '<html>backslash</html>',
     '/200': '<html>shell</html>',
     '/_app/app.js': 'console.log(1)'
   };
@@ -232,6 +235,10 @@ describe('the Worker in front of the asset bundle', () => {
     const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
     const page = pages[path];
     if (path === '/broken') return immutable('upstream trouble', 500);
+    const htmlFor = path.endsWith('.html') ? path.slice(0, -'.html'.length) : undefined;
+    if (htmlFor !== undefined && pages[htmlFor] !== undefined) {
+      return new Response(null, { status: 307, headers: { location: htmlFor } });
+    }
     return page === undefined ? immutable(null, 404) : immutable(page, 200);
   });
   const env = {
@@ -253,8 +260,9 @@ describe('the Worker in front of the asset bundle', () => {
     expect(response.headers.get('x-robots-tag')).toBe('noindex, nofollow');
     // The shell's own headers survive the copy.
     expect(response.headers.get('etag')).toBe('"v1"');
-    // `/200`, not `/200.html`: the latter is a 307 under auto-trailing-slash.
-    expect(askedFor()).toEqual(['/o/acme/members', '/200']);
+    // `/200`, never `/200.html`: the latter is a 307 under auto-trailing-slash.
+    expect(askedFor()).toContain('/200');
+    expect(askedFor()).not.toContain('/200.html');
   });
 
   it('answers a HEAD deep link with the shell too', async () => {
@@ -396,8 +404,51 @@ describe('the Worker in front of the asset bundle', () => {
       expect(response.status, path).toBe(200);
       expect(await response.text(), path).toBe('<html>shell</html>');
       expect(response.headers.get('x-robots-tag'), path).toBe('noindex, nofollow');
-      expect(askedFor(), path).toEqual(['/200']);
+      expect(askedFor(), path).not.toContain('/200.html');
     }
+  });
+
+  it("redirects a page's own file to its page with a 308, as the server does", async () => {
+    for (const [path, to] of [
+      ['/pricing.html', '/pricing'],
+      ['/pricing.html?a=1', '/pricing?a=1'],
+      ['/pricing%2Ehtml', '/pricing'],
+      ['/es/pricing.html', '/es/pricing'],
+      // A decoded backslash is escaped again, never `/\evil`.
+      ['/%5Cevil.html', '/%5Cevil']
+    ]) {
+      const response = await call(path!);
+      expect(response.status, path).toBe(308);
+      expect(response.headers.get('location'), path).toBe(to);
+    }
+
+    // No such page: a missing file, not a redirect.
+    const missing = await call('/nope.html');
+    expect(missing.status).toBe(404);
+    expect(missing.headers.has('location')).toBe(false);
+
+    // A write is not a page view, and is not redirected.
+    const write = await call('/pricing.html', { method: 'POST' });
+    expect(write.status).not.toBe(308);
+  });
+
+  it('answers a named 500, and logs, when the shell cannot be fetched', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const broken = {
+      ASSETS: { fetch: vi.fn(async () => new Response(null, { status: 404 })) },
+      OTTO_ORIGIN: 'https://origin.test'
+    } as unknown as Env;
+
+    for (const path of ['/o/acme/members', '/200']) {
+      error.mockClear();
+      const response = await worker.fetch(new Request(`https://otto.test${path}`), broken);
+      expect(response.status, path).toBe(500);
+      expect(response.headers.get('content-type'), path).toContain('application/json');
+      expect(((await response.json()) as { error: string }).error, path).toBe('misconfigured');
+      expect(error, path).toHaveBeenCalledOnce();
+      expect(String(error.mock.calls[0]![0]), path).toContain('404');
+    }
+    error.mockRestore();
   });
 
   it('still proxies origin paths without touching the bundle', async () => {

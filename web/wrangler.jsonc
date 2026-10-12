@@ -28,6 +28,13 @@
     // (adapter-static `fallback: '200.html'`), or every deep link is a 404.
     "not_found_handling": "none",
 
+    // Cloudflare's default, stated because the Worker depends on it: under
+    // auto-trailing-slash, /200 returns 200.html, and the Worker fetches the
+    // SPA shell by that name (SHELL in worker/index.ts). /200.html itself is a
+    // 307 to /200, and with another mode /200 would be a 404 and every deep
+    // link a 500. It also lets /pricing find pricing.html.
+    "html_handling": "auto-trailing-slash",
+
     // Every request enters the Worker, including asset requests.
     //
     // The alternative is a glob list, which is cheaper because assets would be
