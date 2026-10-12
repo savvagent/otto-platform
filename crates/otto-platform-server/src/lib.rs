@@ -50,6 +50,7 @@ use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Router;
 use otto_tenant::Db;
+use percent_encoding::percent_decode_str;
 use tower::ServiceExt;
 use tower_http::services::fs::ServeFileSystemResponseBody;
 use tower_http::services::{ServeDir, ServeFile};
@@ -79,7 +80,7 @@ pub fn app(db: Db, config: &Config) -> Result<Router> {
     // Either way an unmatched path answers JSON, never an empty body: a client
     // that guessed a route needs something it can parse.
     let app = match &config.static_dir {
-        Some(dir) => app.fallback_service(console(dir)),
+        Some(dir) => app.fallback_service(console(dir)?),
         None => app.fallback(|uri: axum::http::Uri| async move { not_found(uri.path()) }),
     };
 
@@ -93,8 +94,10 @@ pub fn app(db: Db, config: &Config) -> Result<Router> {
 
 /// Path prefixes that belong to an API rather than to the console's routing.
 ///
-/// Everything else falls through to the single-page app, which is what makes a
-/// hard refresh of `/o/acme/members` work. An unmatched path under one of these
+/// Everything else goes to the console bundle (a prerendered page, or else the
+/// SPA shell), which is what makes a hard refresh of `/o/acme/members` work.
+/// It is matched on the decoded, slash-collapsed path, the way the Worker's
+/// `belongsToOrigin` matches. An unmatched path under one of these
 /// must not: a client that `GET`s `/api/orgs/nope` needs a `404` it can parse,
 /// and `200 text/html` is the shape that makes a client retry forever against a
 /// route that will never exist.
@@ -117,87 +120,183 @@ fn is_api_path(path: &str) -> bool {
 /// (`index.html` is the landing page at `/`, other pages are `<route>.html`
 /// because adapter-static runs with `trailingSlash: 'never'`) and the SPA
 /// shell at `200.html`, which client-side routing needs for every path that
-/// has no file. Order matters, and each step is here because the one after it
-/// gets that case wrong:
+/// has no file. [`route`] decides which answers.
 ///
-/// 1. API-shaped paths answer a JSON `404` before anything can answer HTML.
-/// 2. `/index.html` (and `/index`) is `308`'d to `/`, so the landing page
-///    has one URL.
-/// 3. `/200` and `/200.html` are the shell with its header, never a page.
-/// 4. An extensionless path tries `<path>.html` with directory appending
-///    *off*. It runs before step 5 because `es/` is a directory as well as
-///    `es.html` a file, and a directory-appending lookup answers `/es` with a
-///    `307` to `/es/` that then finds no `es/index.html`.
-/// 5. The path as given, which serves `/` and the assets.
-/// 6. What is left: an extensionless `GET`/`HEAD` gets the shell, and
-///    anything with an extension keeps its `404`. A missing `/_app/x.js`
-///    answered with HTML is a syntax error in the browser, and the shell
-///    answered with a `404` is a client route a crawler drops.
-///
-/// Every file goes through `ServeDir`/`ServeFile`, so path sanitisation stays
-/// tower-http's; nothing here joins a request path onto the directory.
-///
-/// The shell carries `X-Robots-Tag: noindex, nofollow` wherever it answers.
-/// It is the same HTML for every route it stands in for, and an indexed shell
-/// is a search result for `/o/acme/members` that renders a login prompt.
+/// Refuses to build without `200.html`. Every client route is served from it,
+/// so a bundle without one is a console whose every deep link is a `404`, and
+/// that is a failure to name at startup, not to discover from a user.
 fn console(
     static_dir: &Path,
-) -> impl tower::Service<Request<Body>, Response = Response, Error = Infallible, Future = impl Send>
-       + Clone
-       + Send
-       + 'static {
-    // No fallbacks on either: each step decides for itself what a miss means.
-    let pages = ServeDir::new(static_dir).append_index_html_on_directories(false);
-    let files = ServeDir::new(static_dir).append_index_html_on_directories(true);
-    let shell = ServeFile::new(static_dir.join("200.html"));
+) -> Result<
+    impl tower::Service<Request<Body>, Response = Response, Error = Infallible, Future = impl Send>
+        + Clone
+        + Send
+        + 'static,
+> {
+    let shell_path = static_dir.join(SHELL);
+    anyhow::ensure!(
+        shell_path.is_file(),
+        "OTTO_STATIC_DIR is {}, which has no {SHELL}: the console bundle must carry the SPA \
+         shell there (adapter-static `fallback: '{SHELL}'`)",
+        static_dir.display()
+    );
+    // Directory appending off, and no fallback: a directory is not a page
+    // (`/_app` is not a `307` to `/_app/`, which the trailing-slash rule would
+    // send straight back), and each step in `route` decides what a miss means.
+    let files = ServeDir::new(static_dir).append_index_html_on_directories(false);
+    let shell = ServeFile::new(shell_path);
 
-    tower::service_fn(move |req: Request<Body>| {
-        let (pages, files, shell) = (pages.clone(), files.clone(), shell.clone());
-        async move {
-            let path = req.uri().path().to_owned();
-            if is_api_path(&path) {
-                return Ok(not_found(&path));
-            }
-            // Trailing slashes trimmed because step 4 would otherwise turn
-            // `/200/` into `200.html` served as a page, header and all missing,
-            // and `/index` into a second URL for the landing page.
-            let bare = path.trim_end_matches('/');
-            if bare == "/index.html" || bare == "/index" {
-                let location = match req.uri().query() {
-                    Some(q) => format!("/?{q}"),
-                    None => "/".to_owned(),
-                };
-                return Ok(Redirect::permanent(&location).into_response());
-            }
-            if bare == "/200" || bare == "/200.html" {
-                return Ok(noindex(serve(shell, req).await));
-            }
+    Ok(tower::service_fn(move |req: Request<Body>| {
+        let (files, shell) = (files.clone(), shell.clone());
+        async move { Ok(route(&files, shell, req).await) }
+    }))
+}
 
-            let extensionless = !path.rsplit('/').next().unwrap_or("").contains('.');
-            if extensionless && path != "/" {
-                let html = format!("{}.html", path.strip_suffix('/').unwrap_or(&path));
-                let uri = match req.uri().query() {
-                    Some(q) => format!("{html}?{q}"),
-                    None => html,
-                };
-                if let Ok(uri) = uri.parse::<Uri>() {
-                    let res = serve(pages, with_uri(&req, uri)).await;
-                    let status = res.status();
-                    if status.is_success() || status == StatusCode::NOT_MODIFIED {
-                        return Ok(res);
-                    }
-                }
-            }
+/// Where adapter-static writes the SPA shell.
+const SHELL: &str = "200.html";
 
-            let page_route =
-                extensionless && (req.method() == Method::GET || req.method() == Method::HEAD);
-            let res = serve(files, with_uri(&req, req.uri().clone())).await;
-            if res.status().is_success() || res.status().is_redirection() || !page_route {
-                return Ok(res);
-            }
-            Ok(noindex(serve(shell, req).await))
+/// One console request. Order matters, and each step is here because the one
+/// after it gets that case wrong.
+///
+/// Every decision is made on the *decoded* path, because that is what
+/// `ServeDir` looks up: deciding on the raw one lets `/%32%30%30` reach
+/// `200.html` without its header, `/%69ndex.html` skip the redirect, and
+/// `/_app/missing%2Ejs` look extensionless and get HTML. A path that does not
+/// decode to UTF-8 names no file and no route, and is a `404`. The lookups
+/// themselves get the raw path and leave decoding and sanitisation to
+/// tower-http; nothing here joins a request path onto the directory.
+///
+/// 1. API-shaped paths answer a JSON `404` before anything can answer HTML.
+/// 2. `/index.html` (and `/index`) is `308`'d to `/`: one URL for the landing
+///    page.
+/// 3. `/200` and `/200.html` are the shell with its header, for any method.
+/// 4. A trailing slash is `308`'d away (`/pricing/` → `/pricing`), as
+///    Cloudflare's `auto-trailing-slash` and SvelteKit's `trailingSlash:
+///    'never'` both do.
+/// 5. An extensionless path is a page: `<path>.html`, or `index.html` for
+///    `/`. This runs before the plain lookup because `es/` is a directory as
+///    well as `es.html` a file.
+/// 6. The path as given: the assets.
+/// 7. What is left: an extensionless `GET`/`HEAD` gets the shell, and
+///    anything else keeps its answer. A missing `/_app/x.js` answered with HTML
+///    is a syntax error in the browser.
+///
+/// Only a `404` moves on to the next step. A `412`, `416` or `500` from a
+/// lookup is that file's real answer, and replacing it with the shell would
+/// hide it.
+async fn route(files: &ServeDir, shell: ServeFile, req: Request<Body>) -> Response {
+    let raw = collapse_slashes(req.uri().path());
+    let Ok(decoded) = percent_decode_str(&raw).decode_utf8() else {
+        return not_found(&raw);
+    };
+    // Again after decoding: `%2F` is a slash to the file system too.
+    let path = collapse_slashes(&decoded);
+    if is_api_path(&path) {
+        return not_found(&path);
+    }
+
+    let query = req.uri().query();
+    let bare = path.trim_end_matches('/');
+    if bare == "/index.html" || bare == "/index" {
+        return landing_redirect(query);
+    }
+    if bare == "/200" || bare == "/200.html" {
+        return serve_shell(shell, req).await;
+    }
+
+    let page_method = req.method() == Method::GET || req.method() == Method::HEAD;
+    if page_method && raw != "/" && raw.ends_with('/') {
+        return without_trailing_slash(&raw, query);
+    }
+
+    let extensionless = !path.rsplit('/').next().unwrap_or("").contains('.');
+    if extensionless {
+        let page = if path == "/" {
+            "/index.html".to_owned()
+        } else {
+            format!("{raw}.html")
+        };
+        let res = lookup(files, &req, &page).await;
+        if res.status() != StatusCode::NOT_FOUND {
+            return res;
         }
-    })
+    }
+
+    let res = lookup(files, &req, &raw).await;
+    if res.status() != StatusCode::NOT_FOUND || !(extensionless && page_method) {
+        return res;
+    }
+    serve_shell(shell, req).await
+}
+
+/// `/index.html` → `/`, keeping the query. The target is a constant, so this
+/// cannot be steered off-site.
+fn landing_redirect(query: Option<&str>) -> Response {
+    let location = match query {
+        Some(q) => format!("/?{q}"),
+        None => "/".to_owned(),
+    };
+    Redirect::permanent(&location).into_response()
+}
+
+/// `/pricing/` → `/pricing`, keeping the query. Leading slashes and
+/// backslashes are stripped and exactly one put back, so the `Location` can
+/// never be `//host` (or `/\host`, which browsers read the same way): a
+/// redirect built from the request path must not be an open redirect.
+fn without_trailing_slash(raw: &str, query: Option<&str>) -> Response {
+    let trimmed = raw.trim_start_matches(['/', '\\']).trim_end_matches('/');
+    let location = match query {
+        Some(q) => format!("/{trimmed}?{q}"),
+        None => format!("/{trimmed}"),
+    };
+    Redirect::permanent(&location).into_response()
+}
+
+/// One file from the bundle, by (still encoded) path and nothing else: the
+/// query means nothing to a file lookup.
+///
+/// Not an `async fn`: the request copy is built before the returned future
+/// exists, because a `Request<Body>` is not `Sync`, and a reference to one
+/// held across an `await` would make the whole service's future not `Send`.
+fn lookup(
+    files: &ServeDir,
+    req: &Request<Body>,
+    path: &str,
+) -> impl std::future::Future<Output = Response> + Send + 'static {
+    let copy = path
+        .parse::<Uri>()
+        .map(|uri| with_uri(req, uri))
+        .map_err(|err| {
+            // Built from a path that was already a valid URI plus `.html`, so
+            // this should not happen; if it does, it is a miss, said out loud.
+            tracing::warn!(%err, path, "console lookup path is not a valid URI");
+            not_found(path)
+        });
+    let files = files.clone();
+    async move {
+        match copy {
+            Ok(copy) => serve(files, copy).await,
+            Err(res) => res,
+        }
+    }
+}
+
+/// The shell, marked `X-Robots-Tag: noindex, nofollow` wherever it answers.
+/// It is the same HTML for every route it stands in for, and an indexed shell
+/// is a search result for `/o/acme/members` that renders a login prompt.
+/// Prerendered pages are the ones meant to be found, and go without it.
+async fn serve_shell(shell: ServeFile, req: Request<Body>) -> Response {
+    noindex(serve(shell, req).await)
+}
+
+fn collapse_slashes(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if !(c == '/' && out.ends_with('/')) {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// A body-less copy of `req` at `uri`. Safe because only `GET` and `HEAD`
@@ -338,16 +437,26 @@ mod tests {
     /// `<route>.html` (trailingSlash `never`), and the SPA shell at `200.html`.
     /// `es/` is a directory *and* `es.html` a file, the shape that a
     /// directory-appending lookup gets wrong. Every file says something
-    /// different, so a test can tell which one answered. One directory per
-    /// test: tests in one binary share a pid and run concurrently.
-    fn bundle(test: &str) -> std::path::PathBuf {
+    /// different, so a test can tell which one answered.
+    ///
+    /// One directory per test, because tests in one binary share a pid and run
+    /// concurrently, and removed on drop. (No `tempfile` in the workspace.)
+    struct Bundle(std::path::PathBuf);
+
+    impl Drop for Bundle {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn bundle(test: &str) -> Bundle {
         let dir =
             std::env::temp_dir().join(format!("otto-console-test-{}-{test}", std::process::id()));
         for sub in ["_app", "es", "products"] {
             std::fs::create_dir_all(dir.join(sub)).expect("mkdir");
         }
         for (file, body) in [
-            ("200.html", "<html>shell</html>"),
+            ("200.html", SHELL_HTML),
             ("index.html", "<html>landing</html>"),
             ("pricing.html", "<html>pricing</html>"),
             ("es.html", "<html>es landing</html>"),
@@ -357,7 +466,24 @@ mod tests {
         ] {
             std::fs::write(dir.join(file), body).expect(file);
         }
-        dir
+        Bundle(dir)
+    }
+
+    const SHELL_HTML: &str = "<html>shell</html>";
+
+    /// A router over a fresh bundle; the bundle must outlive the router.
+    fn console_app(bundle: &Bundle) -> Router {
+        let mut config = Config::for_test();
+        config.static_dir = Some(bundle.0.clone());
+        app(lazy_db(), &config).expect("app assembles")
+    }
+
+    async fn send(app: Router, req: Request<Body>) -> Response {
+        app.oneshot(req).await.unwrap()
+    }
+
+    fn location(res: &Response) -> Option<&str> {
+        res.headers().get("location").and_then(|v| v.to_str().ok())
     }
 
     async fn get(app: Router, path: &str) -> Response {
@@ -391,16 +517,15 @@ mod tests {
     /// API-shaped as a JSON `404` rather than HTML with a `200`.
     #[tokio::test]
     async fn the_console_is_served_only_when_a_bundle_is_configured() {
-        let mut config = Config::for_test();
-        config.static_dir = Some(bundle("only-when-configured"));
-        let make = || app(lazy_db(), &config).expect("app assembles");
+        let bundle = bundle("only-when-configured");
+        let make = || console_app(&bundle);
 
         // `/apiary` is a legal org slug: a page, not an API path.
         for path in ["/o/acme/members", "/apiary"] {
             let res = get(make(), path).await;
             assert_eq!(res.status(), StatusCode::OK, "{path}");
             assert_eq!(robots(&res), Some("noindex, nofollow"), "{path}");
-            assert_eq!(body(res).await, "<html>shell</html>", "{path}");
+            assert_eq!(body(res).await, SHELL_HTML, "{path}");
         }
 
         let (status, body) = status_and_body(make(), "/_app/app.js").await;
@@ -432,9 +557,8 @@ mod tests {
     /// `noindex`.
     #[tokio::test]
     async fn prerendered_pages_are_served_without_the_shell() {
-        let mut config = Config::for_test();
-        config.static_dir = Some(bundle("prerendered"));
-        let make = || app(lazy_db(), &config).expect("app assembles");
+        let bundle = bundle("prerendered");
+        let make = || console_app(&bundle);
 
         for (path, expected) in [
             ("/", "<html>landing</html>"),
@@ -457,25 +581,30 @@ mod tests {
     /// asset: each has one right answer, and none of them is a page.
     #[tokio::test]
     async fn the_shell_and_index_names_are_not_pages() {
-        let mut config = Config::for_test();
-        config.static_dir = Some(bundle("names"));
-        let make = || app(lazy_db(), &config).expect("app assembles");
+        let bundle = bundle("names");
+        let make = || console_app(&bundle);
 
-        for path in ["/index.html", "/index"] {
+        for (path, to) in [
+            ("/index.html", "/"),
+            ("/index", "/"),
+            ("/index.html?a=1", "/?a=1"),
+        ] {
             let res = get(make(), path).await;
             assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT, "{path}");
-            assert_eq!(
-                res.headers().get("location").and_then(|v| v.to_str().ok()),
-                Some("/"),
-                "{path}"
-            );
+            assert_eq!(location(&res), Some(to), "{path}");
         }
+
+        // Not the landing page's name, and not a redirect anywhere: a path
+        // under a directory called `evil.com` that does not exist.
+        let res = get(make(), "//evil.com/index.html").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(location(&res), None);
 
         for path in ["/200", "/200.html", "/200/"] {
             let res = get(make(), path).await;
             assert_eq!(res.status(), StatusCode::OK, "{path}");
             assert_eq!(robots(&res), Some("noindex, nofollow"), "{path}");
-            assert_eq!(body(res).await, "<html>shell</html>", "{path}");
+            assert_eq!(body(res).await, SHELL_HTML, "{path}");
         }
 
         // A missing script answered with HTML is a syntax error in the
@@ -484,6 +613,152 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         assert_eq!(robots(&res), None);
         assert!(!body(res).await.contains("shell"));
+    }
+
+    /// Decisions are made on the decoded path, the one `ServeDir` looks up.
+    /// On the raw one, an encoded name reaches the shell without its header,
+    /// skips the landing redirect, or turns a missing asset into HTML.
+    #[tokio::test]
+    async fn percent_encoding_does_not_change_the_answer() {
+        let bundle = bundle("encoded");
+        let make = || console_app(&bundle);
+
+        for path in ["/%32%30%30", "/200%2Ehtml", "/200%2ehtml"] {
+            let res = get(make(), path).await;
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+            assert_eq!(robots(&res), Some("noindex, nofollow"), "{path}");
+            assert_eq!(body(res).await, SHELL_HTML, "{path}");
+        }
+
+        for path in ["/%69ndex.html", "/index%2Ehtml", "/%69ndex"] {
+            let res = get(make(), path).await;
+            assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT, "{path}");
+            assert_eq!(location(&res), Some("/"), "{path}");
+        }
+
+        for path in ["/x%2Ejs", "/_app/missing%2Ejs"] {
+            let res = get(make(), path).await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(robots(&res), None, "{path}");
+            assert!(!body(res).await.contains("shell"), "{path}");
+        }
+
+        // An encoded API prefix is still the API's, as at the edge.
+        let (status, body) = status_and_body(make(), "/%61pi/nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("\"not_found\""), "{body}");
+
+        // Not UTF-8 once decoded: no file, no route.
+        let (status, body) = status_and_body(make(), "/%FF").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("\"not_found\""), "{body}");
+    }
+
+    /// A trailing slash is redirected away, as Cloudflare and SvelteKit do,
+    /// and the redirect is built so it can never leave the site.
+    #[tokio::test]
+    async fn a_trailing_slash_is_redirected_on_site() {
+        let bundle = bundle("slash");
+        let make = || console_app(&bundle);
+
+        for (path, to) in [
+            ("/pricing/", "/pricing"),
+            ("/pricing/?a=1", "/pricing?a=1"),
+            ("/es/", "/es"),
+            ("/o/acme/", "/o/acme"),
+            ("//evil.com/", "/evil.com"),
+            ("///evil.com//", "/evil.com"),
+        ] {
+            let res = get(make(), path).await;
+            assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT, "{path}");
+            assert_eq!(location(&res), Some(to), "{path}");
+        }
+
+        // A directory is not a page and not a 307 to itself with a slash,
+        // which the rule above would send straight back. With no file of its
+        // own it is a client route like any other.
+        let res = get(make(), "/_app").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(robots(&res), Some("noindex, nofollow"));
+    }
+
+    /// Only a `404` falls through to the shell. Any other answer from a file
+    /// lookup is that file's, and the shell would hide it.
+    #[tokio::test]
+    async fn only_a_miss_falls_through_to_the_shell() {
+        let bundle = bundle("fallthrough");
+        let make = || console_app(&bundle);
+
+        let res = send(
+            make(),
+            Request::get("/pricing")
+                .header("if-unmodified-since", "Thu, 01 Jan 1970 00:00:00 GMT")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(robots(&res), None);
+
+        let res = send(
+            make(),
+            Request::get("/pricing")
+                .header("range", "bytes=9999-")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(robots(&res), None);
+
+        // A write to a page route is not a page view: no shell.
+        let res = send(
+            make(),
+            Request::post("/o/acme/members")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(!body(res).await.contains("shell"));
+    }
+
+    /// `HEAD` on a client route is the shell's headers and no body.
+    #[tokio::test]
+    async fn head_on_a_client_route_is_the_shell_without_a_body() {
+        let bundle = bundle("head");
+        let res = send(
+            console_app(&bundle),
+            Request::head("/o/acme/members")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(robots(&res), Some("noindex, nofollow"));
+        assert_eq!(
+            res.headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok()),
+            Some(SHELL_HTML.len().to_string().as_str())
+        );
+        assert_eq!(body(res).await, "");
+    }
+
+    /// A bundle without `200.html` would 404 every deep link. It is refused
+    /// when the app is built, by name, not discovered from a user.
+    #[tokio::test]
+    async fn a_bundle_without_the_shell_is_refused_at_startup() {
+        let bundle = bundle("no-shell");
+        std::fs::remove_file(bundle.0.join("200.html")).expect("rm");
+        let mut config = Config::for_test();
+        config.static_dir = Some(bundle.0.clone());
+        let err = app(lazy_db(), &config).expect_err("no shell, no app");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("OTTO_STATIC_DIR") && msg.contains("200.html"),
+            "{msg}"
+        );
     }
 
     fn robots(res: &Response) -> Option<&str> {

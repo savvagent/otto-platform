@@ -52,7 +52,8 @@ async fn health_and_discovery_share_one_router(pool: PgPool) {
 
 /// Served directly, with the console mounted and no edge in front: the CSRF
 /// guard still holds same-origin, API paths keep their JSON 404s rather than
-/// falling into the SPA shell, and only console routes get `index.html`.
+/// falling into the SPA shell, and only console routes get the shell
+/// (`200.html`, marked `X-Robots-Tag: noindex`).
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn the_console_served_directly_keeps_csrf_and_json_404s(pool: PgPool) {
     let dir = std::env::temp_dir().join(format!("otto-app-test-{}", std::process::id()));
@@ -118,4 +119,5 @@ async fn the_console_served_directly_keeps_csrf_and_json_404s(pool: PgPool) {
     );
     let (status, _) = call(Request::get("/readyz").body(Body::empty()).unwrap()).await;
     assert_eq!(status, StatusCode::OK);
+    let _ = std::fs::remove_dir_all(cfg.static_dir.as_ref().expect("set above"));
 }

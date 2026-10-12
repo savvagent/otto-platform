@@ -50,9 +50,10 @@ primary_region = "iad"
   # `cf-connecting-ip`; see docs/deploy/cloudflare.md.)
   OTTO_CLIENT_IP_HEADER = "fly-client-ip"
   # This process serves the console itself, the way otto-factory does: the image
-  # carries the built bundle at /srv/console, served with an index.html fallback
-  # for client-side routes. Unknown /api, /oauth, /sso, /.well-known and
-  # /internal paths still answer a JSON 404.
+  # carries the built bundle at /srv/console: prerendered pages as themselves,
+  # and the SPA shell (200.html, which the bundle must contain or the server
+  # refuses to start) with X-Robots-Tag: noindex for client-side routes. Unknown
+  # /api, /oauth, /sso, /.well-known and /internal paths still answer a JSON 404.
   OTTO_STATIC_DIR = "/srv/console"
 
 [http_service]
