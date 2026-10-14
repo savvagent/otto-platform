@@ -14,6 +14,7 @@
   import Alert from '$lib/components/Alert.svelte';
   import Loading from '$lib/components/Loading.svelte';
   import Logo from '$lib/components/Logo.svelte';
+  import ServiceLink from '$lib/components/ServiceLink.svelte';
 
   /**
    * Decide the language before anything renders.
@@ -177,20 +178,16 @@
 
       <div class="ml-auto flex items-center gap-3 text-sm">
         <!--
-          Other Otto consoles. A plain external link, not a client-side route:
-          each service is its own origin with its own session, so following one
-          is a full navigation.
+          The Otto services. One with a web console is a plain external link:
+          each is its own origin with its own session, so following one is a
+          full navigation. One without goes to its product page's connect card,
+          badged as a connector; `ServiceLink` says why.
         -->
         {#if SERVICES.length > 0}
           <nav class="hidden items-center gap-1 sm:flex" aria-label={m.nav_services()}>
             <span class="otto-label">{m.nav_services()}</span>
-            {#each SERVICES as service (service.url)}
-              <a
-                href={service.url}
-                class="rounded-md px-2.5 py-1 text-muted transition hover:bg-raised hover:text-ink"
-              >
-                {service.name}
-              </a>
+            {#each SERVICES as service (service.slug)}
+              <ServiceLink {service} variant="nav" />
             {/each}
           </nav>
         {/if}

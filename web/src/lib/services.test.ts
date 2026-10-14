@@ -2,10 +2,18 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { getLocale, locales, overwriteGetLocale } from '$lib/paraglide/runtime';
 
-import { SERVICES, serviceBySlug, servicesIn, type Service } from './services';
+import {
+  SERVICES,
+  claudeCodeCommand,
+  connectorName,
+  serviceBySlug,
+  serviceLink,
+  servicesIn,
+  type Service
+} from './services';
 
 /** A candidate with throwaway copy, so a test names only what it is about. */
-function candidate(fields: Pick<Service, 'slug' | 'name' | 'url'> & Partial<Service>): Service {
+function candidate(fields: Pick<Service, 'slug' | 'name'> & Partial<Service>): Service {
   return {
     copy: {
       title: () => 'T',
@@ -31,9 +39,21 @@ describe('the services list', () => {
       ['cxp', 'Otto CXP']
     ]);
     for (const service of SERVICES) {
-      expect(service.url.startsWith('https://')).toBe(true);
-      expect(service.mcpUrl).toBe(`${service.url}/mcp`);
+      expect(service.mcpUrl).toBe(`https://otto-${service.slug}.savvagent.com/mcp`);
     }
+  });
+
+  /**
+   * Only Otto Factory serves a web console. Flags and CXP answer a browser
+   * at their origin with a JSON 404, so a `consoleUrl` on either would put a
+   * dead end back in the header.
+   */
+  it('gives a web console to Otto Factory only', () => {
+    expect(SERVICES.map((s) => [s.slug, s.consoleUrl])).toEqual([
+      ['factory', 'https://otto-factory.savvagent.com'],
+      ['flags', undefined],
+      ['cxp', undefined]
+    ]);
   });
 
   it('has copy for every entry, read at call time', () => {
@@ -79,22 +99,28 @@ describe('the services list', () => {
     expect(serviceBySlug('')).toBeUndefined();
   });
 
-  it('drops anything that is not an https link', () => {
-    const good = candidate({ slug: 'good', name: 'Good', url: 'https://good.example' });
+  it('drops a console that is not an https link', () => {
+    const good = candidate({ slug: 'good', name: 'Good', consoleUrl: 'https://good.example' });
     const kept = servicesIn([
       good,
-      candidate({ slug: 'plain', name: 'Plain', url: 'http://plain.example' }),
-      candidate({ slug: 'script', name: 'Script', url: 'javascript:alert(1)' }),
-      candidate({ slug: 'garbage', name: 'Garbage', url: 'not a url' }),
-      candidate({ slug: 'nameless', name: '  ', url: 'https://nameless.example' })
+      candidate({ slug: 'plain', name: 'Plain', consoleUrl: 'http://plain.example' }),
+      candidate({ slug: 'script', name: 'Script', consoleUrl: 'javascript:alert(1)' }),
+      candidate({ slug: 'garbage', name: 'Garbage', consoleUrl: 'not a url' }),
+      candidate({ slug: 'nameless', name: '  ', consoleUrl: 'https://nameless.example' })
     ]);
     expect(kept).toEqual([good]);
+  });
+
+  it('keeps a connector-only service, and drops one with nowhere to send anyone', () => {
+    const connector = candidate({ slug: 'conn', name: 'Conn', mcpUrl: 'https://c.example/mcp' });
+    const kept = servicesIn([connector, candidate({ slug: 'bare', name: 'Bare' })]);
+    expect(kept).toEqual([connector]);
   });
 
   it('drops a slug that cannot be a single path segment', () => {
     const kept = servicesIn(
       ['ok-1', 'Upper', 'has space', '../up', 'a/b', ''].map((slug) =>
-        candidate({ slug, name: slug || 'x', url: 'https://x.example' })
+        candidate({ slug, name: slug || 'x', consoleUrl: 'https://x.example' })
       )
     );
     expect(kept.map((s) => s.slug)).toEqual(['ok-1']);
@@ -102,21 +128,62 @@ describe('the services list', () => {
 
   it('drops an MCP endpoint that is not https, and keeps an absent one', () => {
     const kept = servicesIn([
-      candidate({ slug: 'none', name: 'None', url: 'https://a.example' }),
+      candidate({ slug: 'none', name: 'None', consoleUrl: 'https://a.example' }),
       candidate({
         slug: 'tls',
         name: 'Tls',
-        url: 'https://a.example',
+        consoleUrl: 'https://a.example',
         mcpUrl: 'https://a.example/mcp'
       }),
       candidate({
         slug: 'plain',
         name: 'Plain',
-        url: 'https://a.example',
+        consoleUrl: 'https://a.example',
         mcpUrl: 'http://a.example/mcp'
       }),
-      candidate({ slug: 'junk', name: 'Junk', url: 'https://a.example', mcpUrl: 'nope' })
+      candidate({ slug: 'junk', name: 'Junk', consoleUrl: 'https://a.example', mcpUrl: 'nope' })
     ]);
     expect(kept.map((s) => s.slug)).toEqual(['none', 'tls']);
+  });
+});
+
+describe('where a link to a service goes', () => {
+  it('leaves for the web console when there is one', () => {
+    const factory = serviceBySlug('factory')!;
+    expect(serviceLink(factory, 'en')).toEqual({
+      kind: 'console',
+      href: 'https://otto-factory.savvagent.com'
+    });
+  });
+
+  it("goes to the product page's connect card, in the given language, when there is not", () => {
+    const cxp = serviceBySlug('cxp')!;
+    expect(serviceLink(cxp, 'en')).toEqual({ kind: 'connector', href: '/products/cxp#connect' });
+    expect(serviceLink(cxp, 'es')).toEqual({
+      kind: 'connector',
+      href: '/es/products/cxp#connect'
+    });
+  });
+
+  it('never links to the bare origin of a service with no console', () => {
+    for (const service of SERVICES.filter((s) => !s.consoleUrl)) {
+      expect(serviceLink(service, 'en').href.startsWith('https://')).toBe(false);
+    }
+  });
+});
+
+describe('the Claude Code command', () => {
+  it("names each server after its host, so it matches the service's own docs", () => {
+    expect(SERVICES.map(connectorName)).toEqual(['otto-factory', 'otto-flags', 'otto-cxp']);
+    for (const service of SERVICES) {
+      expect(new URL(service.mcpUrl!).hostname.split('.')[0]).toBe(connectorName(service));
+    }
+  });
+
+  it('adds the MCP endpoint over HTTP', () => {
+    expect(claudeCodeCommand(serviceBySlug('cxp')!)).toBe(
+      'claude mcp add --transport http otto-cxp https://otto-cxp.savvagent.com/mcp'
+    );
+    expect(claudeCodeCommand(candidate({ slug: 'x', name: 'X' }))).toBeUndefined();
   });
 });

@@ -12,14 +12,16 @@
   import Empty from '$lib/components/Empty.svelte';
   import Loading from '$lib/components/Loading.svelte';
   import Meter from '$lib/components/Meter.svelte';
+  import ServiceLink from '$lib/components/ServiceLink.svelte';
 
   /**
    * The organization overview: who is in it, what plan it is on, how much of
    * the period's bucket has gone, and where to go to use the services it has.
    *
    * It owns identity and billing only. What an org *does* with a service (queues,
-   * repositories, trackers) lives in that service's own console, which this page
-   * links to from `SERVICES`.
+   * repositories, trackers) lives in that service's own console, or, for a
+   * service with none, in the person's AI assistant; this page links to each
+   * from `SERVICES` through `ServiceLink`, which knows which is which.
    *
    * The three reads land as one value so a render never pairs one request's
    * member count with another's meter. They are plain `GET`s, not polled: nothing
@@ -115,15 +117,8 @@
           </Empty>
         {:else}
           <ul class="flex flex-wrap gap-2">
-            {#each SERVICES as service (service.url)}
-              <li>
-                <a
-                  class="block rounded-md border border-edge px-3 py-1.5 text-sm text-muted transition hover:bg-raised hover:text-ink"
-                  href={service.url}
-                >
-                  {service.name}
-                </a>
-              </li>
+            {#each SERVICES as service (service.slug)}
+              <li><ServiceLink {service} variant="chip" /></li>
             {/each}
           </ul>
         {/if}

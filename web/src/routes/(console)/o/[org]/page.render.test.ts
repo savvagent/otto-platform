@@ -8,7 +8,6 @@
 import { mount, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { SERVICES } from '$lib/services';
 import Harness from './OrgPageHarness.svelte';
 
 const members = [
@@ -75,9 +74,18 @@ describe('the organization overview', () => {
     expect(tiles.some((t) => t?.includes('2') && t.includes('Members'))).toBe(true);
     expect(tiles.some((t) => t?.includes('1') && t.includes('Teams'))).toBe(true);
 
-    for (const service of SERVICES) {
-      const link = container.querySelector(`a[href="${service.url}"]`);
-      expect(link?.textContent?.trim()).toBe(service.name);
+    // Otto Factory has a web console to leave for; Flags and CXP do not, so
+    // they go to their connect cards, badged as connectors.
+    const factory = container.querySelector('a[href="https://otto-factory.savvagent.com"]');
+    expect(factory?.textContent?.trim()).toBe('Otto Factory');
+    for (const [slug, name] of [
+      ['flags', 'Otto Flags'],
+      ['cxp', 'Otto CXP']
+    ]) {
+      const link = container.querySelector(`a[href="/products/${slug}#connect"]`);
+      expect(link?.getAttribute('aria-label')).toBe(`${name}, connector`);
+      expect(link?.textContent).toContain('Connector');
+      expect(container.querySelector(`a[href^="https://otto-${slug}."]`)).toBeNull();
     }
 
     unmount(instance);
