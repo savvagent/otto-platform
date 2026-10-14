@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
 
   import { m } from '$lib/paraglide/messages';
   import { SERVICES, claudeCodeCommand, serviceBySlug } from '$lib/services';
@@ -46,13 +46,21 @@
    * card is `tabindex="-1"` (focusable by script, not a Tab stop) and is
    * focused on the button's click, on a `hashchange` to `#connect`, and on
    * mount when the page was opened at `#connect` — which is how the console's
-   * Services links arrive. The brief accent outline that marks the landing
-   * is in the component styles at the end of this file.
+   * Services links arrive. On mount it only takes focus nobody else has: a
+   * visitor who started tabbing before a slow hydration keeps their place.
+   *
+   * **The landing mark is a class, not `:focus`.** The card is focusable, so
+   * a mouse click on its text focuses it too, and a ring flashing round the
+   * card whenever someone selects the address would be noise. `arrived` is
+   * set only by an arrival, and cleared when the fade ends or focus leaves;
+   * the styles are at the end of this file.
    */
   let { data }: { data: PageData } = $props();
 
   const service = $derived(serviceBySlug(data.slug));
   const others = $derived(SERVICES.filter((candidate) => candidate.slug !== data.slug));
+  /** No web console of its own, but an endpoint to add to an assistant: Flags, CXP. */
+  const agentOnly = $derived(service !== undefined && !service.consoleUrl && !!service.mcpUrl);
   const ottoConsole = $derived(consoleEntry(session));
   const command = $derived(service ? claudeCodeCommand(service) : undefined);
 
@@ -63,22 +71,44 @@
    * word order wants it (Hindi's comes before the verb); a sentinel stands in
    * for it and the two halves are rendered either side of the link. A
    * sentence built from "before" and "after" messages would fix the English
-   * order in every language.
+   * order in every language. `services.test.ts` checks every locale has the
+   * placeholder exactly once, so neither half is ever silently lost.
    */
   const LINK = '\u0000';
   const billing = $derived(m.product_agent_only_billing({ console: LINK }).split(LINK));
 
   let connect = $state<HTMLElement | undefined>(undefined);
+  let arrived = $state(false);
 
-  function focusConnect() {
-    connect?.focus();
+  /**
+   * Focus the card and mark the landing. The class is dropped and put back
+   * across a tick so a second arrival while the card still has focus replays
+   * the fade; `focus()` on the focused element would do nothing visible.
+   */
+  async function arrive() {
+    if (!connect) return;
+    arrived = false;
+    await tick();
+    connect.focus();
+    arrived = true;
+  }
+
+  /** The button's own click. A modified click opens a new tab and leaves this page alone. */
+  function onAddClick(event: MouseEvent) {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+      return;
+    }
+    void arrive();
   }
 
   function onHashChange() {
-    if (location.hash === '#connect') focusConnect();
+    if (location.hash === '#connect') void arrive();
   }
 
-  onMount(onHashChange);
+  onMount(() => {
+    const idle = document.activeElement === null || document.activeElement === document.body;
+    if (idle) onHashChange();
+  });
 </script>
 
 <svelte:window onhashchange={onHashChange} />
@@ -108,21 +138,22 @@
             {m.product_open_console({ name: service.name })}
             <span aria-hidden="true">↗</span>
           </LinkButton>
-        {:else if service.mcpUrl}
-          <LinkButton href="#connect" size="lg" onclick={focusConnect}>
+        {:else if agentOnly}
+          <LinkButton href="#connect" size="lg" onclick={onAddClick}>
             {m.product_add_to_assistant()}
           </LinkButton>
         {/if}
         <ConsoleLink tone="quiet" />
       </div>
-      {#if !service.consoleUrl && service.mcpUrl}
+      {#if agentOnly}
+        <!-- Underlined at rest: inside a sentence, colour alone would not mark it as a link. -->
         <p class="mt-4 text-sm text-pretty text-muted">
           {m.product_agent_only_note({ name: service.name })}
-          {billing[0]}<a
+          {billing[0] ?? ''}<a
             href={ottoConsole.href}
-            class="font-medium text-accent hover:underline"
+            class="font-medium text-accent underline underline-offset-2 hover:decoration-2"
             data-sveltekit-reload>{m.product_otto_console()}</a
-          >{billing[1]}
+          >{billing[1] ?? ''}
         </p>
       {/if}
     </section>
@@ -155,6 +186,9 @@
           bind:this={connect}
           aria-labelledby="connect-title"
           class="connect otto-card scroll-mt-6 self-start p-6"
+          class:arrived
+          onblur={() => (arrived = false)}
+          onanimationend={() => (arrived = false)}
         >
           <h2 id="connect-title" class="text-2xl font-semibold tracking-tight text-ink">
             {m.product_connect_heading()}
@@ -215,15 +249,20 @@
   /*
     The landing mark on the connect card: an accent outline that fades over a
     couple of seconds, so arriving says "here" without leaving a ring around
-    the card for as long as it holds focus. `:focus` rather than
-    `:focus-visible`, because the focus is always set by script and a browser
-    may decide a scripted focus after a mouse click is not "visible".
+    the card for as long as it holds focus. Keyed on `arrived`, which only an
+    arrival sets (see the script), rather than on `:focus`, which a click on
+    the card's text would also trigger. The browser's own focus outline is
+    suppressed for the same reason: the card is a landing point, not a
+    control, and the next Tab lands on its first control, which has a ring.
 
-    With reduced motion the outline does not fade: it stays while the card is
-    focused and goes when focus moves on, which is a change of state, not an
-    animation.
+    With reduced motion the outline does not fade: it stays until focus moves
+    on, which is a change of state, not an animation.
   */
   .connect:focus {
+    outline: none;
+  }
+
+  .connect.arrived {
     outline: 2px solid var(--color-accent);
     outline-offset: 4px;
     animation: connect-arrival 2.4s ease-out forwards;
@@ -240,7 +279,7 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .connect:focus {
+    .connect.arrived {
       animation: none;
     }
   }

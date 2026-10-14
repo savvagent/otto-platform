@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { m } from '$lib/paraglide/messages';
 import { getLocale, locales, overwriteGetLocale } from '$lib/paraglide/runtime';
 
 import {
@@ -185,5 +186,20 @@ describe('the Claude Code command', () => {
       'claude mcp add --transport http otto-cxp https://otto-cxp.savvagent.com/mcp'
     );
     expect(claudeCodeCommand(candidate({ slug: 'x', name: 'X' }))).toBeUndefined();
+  });
+});
+
+/**
+ * The product page renders "Usage and billing are in your {console}." by
+ * splitting the message around a sentinel and putting the link between the
+ * halves. A translation that dropped or repeated the placeholder would lose
+ * the link or half the sentence without an error, so it is counted here.
+ */
+describe('the agent-only billing sentence', () => {
+  it('has the console link exactly once, in every locale', () => {
+    for (const locale of locales) {
+      const parts = m.product_agent_only_billing({ console: '\u0000' }, { locale }).split('\u0000');
+      expect(parts, locale).toHaveLength(2);
+    }
   });
 });

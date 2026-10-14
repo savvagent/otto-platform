@@ -124,16 +124,16 @@ the SPA shell, `200.html`.
 
 ### Adding a product
 
-A new product is one entry in [`src/lib/services.ts`](src/lib/services.ts) (slug, name,
-its web console's URL if it has one, its MCP endpoint, and its copy as message functions) plus
-those copy keys in all six catalogs. Leave `consoleUrl` out for an agent-only service, one whose
-origin serves no page: every link to it then goes to its product page's connect card, which
-says how to add it to an AI assistant, instead of to a JSON 404. From that entry alone it gets a link in the console and marketing headers,
-a card on the landing page, a prerendered `/products/{slug}` in every language, and its
-sitemap entries. The build check is the one place that does not follow by itself:
-`scripts/check-build.mjs` runs in plain Node, without `$lib`, so it keeps its own copy of
-the slugs, and `scripts/check-build.test.mjs` fails until the new slug is added there too.
-`services.test.ts` pins the shipped list as well.
+A new product is one entry in [`src/lib/services.ts`](src/lib/services.ts) (slug, name, its
+web console's URL if it has one, its MCP endpoint, and its copy as message functions) plus
+those copy keys in all six catalogs. Leave `consoleUrl` out for an agent-only service, one
+whose origin serves no page: every link to it then goes to its product page's connect card,
+which says how to add it to an AI assistant, instead of to a JSON 404. From that entry alone
+it gets a link in the console and marketing headers, a card on the landing page, a prerendered
+`/products/{slug}` in every language, and its sitemap entries. The build check is the one
+place that does not follow by itself: `scripts/check-build.mjs` runs in plain Node, without
+`$lib`, so it keeps its own copy of the slugs, and `scripts/check-build.test.mjs` fails until
+the new slug is added there too. `services.test.ts` pins the shipped list as well.
 
 ## Messages, and what a new string costs
 

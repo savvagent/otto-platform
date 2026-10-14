@@ -190,9 +190,10 @@ export function serviceBySlug(slug: string): Service | undefined {
  * the console into the marketing half and needs `data-sveltekit-reload`, and
  * says so with a badge.
  */
-export type ServiceLink = { kind: 'console'; href: string } | { kind: 'connector'; href: string };
+export type ServiceDestination =
+  { kind: 'console'; href: string } | { kind: 'connector'; href: string };
 
-export function serviceLink(service: Service, lang: Locale): ServiceLink {
+export function serviceLink(service: Service, lang: Locale): ServiceDestination {
   if (service.consoleUrl) return { kind: 'console', href: service.consoleUrl };
   return { kind: 'connector', href: `${localizedPath(lang, `/products/${service.slug}`)}#connect` };
 }

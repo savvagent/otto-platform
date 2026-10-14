@@ -10,7 +10,7 @@
  */
 
 import { flushSync, mount, unmount } from 'svelte';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { session } from '$lib/session.svelte';
 import type { Me } from '$lib/types';
@@ -158,10 +158,7 @@ describe('the product page', () => {
 
       // Nothing on the page leads to the bare origin, which answers a browser
       // with a JSON 404.
-      const origin = `https://otto-${slug}.savvagent.com`;
-      for (const a of container.querySelectorAll('a')) {
-        expect(a.getAttribute('href')).not.toBe(origin);
-      }
+      expect(container.querySelector(`a[href^="https://otto-${slug}."]`)).toBeNull();
       expect(container.textContent).not.toContain(`Open the ${name} console`);
 
       const add = container.querySelector('a[href="#connect"]');
@@ -227,22 +224,76 @@ describe('the product page', () => {
     }
   });
 
-  it('moves focus to the connect card when the button is followed', () => {
+  it('moves focus to the connect card, marked as arrived, when the button is followed', async () => {
     const instance = mountProduct('cxp');
-    const connect = container.querySelector<HTMLElement>('#connect');
+    const connect = container.querySelector<HTMLElement>('#connect')!;
+    expect(connect.classList.contains('arrived')).toBe(false);
 
     container.querySelector<HTMLAnchorElement>('a[href="#connect"]')?.click();
-    expect(document.activeElement).toBe(connect);
+    await vi.waitFor(() => expect(document.activeElement).toBe(connect));
+    flushSync();
+    expect(connect.classList.contains('arrived')).toBe(true);
+
+    // Leaving the card clears the mark, so it never lingers.
+    connect.blur();
+    flushSync();
+    expect(connect.classList.contains('arrived')).toBe(false);
 
     unmount(instance);
   });
 
-  it('moves focus to the connect card on arriving at #connect from another page', () => {
+  it('does not mark a click on the card itself as an arrival', () => {
+    const instance = mountProduct('cxp');
+    const connect = container.querySelector<HTMLElement>('#connect')!;
+
+    connect.focus();
+    connect.click();
+    flushSync();
+    expect(connect.classList.contains('arrived')).toBe(false);
+
+    unmount(instance);
+  });
+
+  it('moves focus to the connect card when the hash changes to #connect, and only then', async () => {
+    const instance = mountProduct('cxp');
+    const connect = container.querySelector<HTMLElement>('#connect')!;
+
+    history.replaceState(null, '', '/products/cxp#elsewhere');
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    await Promise.resolve();
+    flushSync();
+    expect(document.activeElement).not.toBe(connect);
+
+    history.replaceState(null, '', '/products/cxp#connect');
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    await vi.waitFor(() => expect(document.activeElement).toBe(connect));
+
+    unmount(instance);
+  });
+
+  it('moves focus to the connect card on arriving at #connect from another page', async () => {
     history.replaceState(null, '', '/products/cxp#connect');
     const instance = mountProduct('cxp');
 
-    expect(document.activeElement).toBe(container.querySelector('#connect'));
+    await vi.waitFor(() =>
+      expect(document.activeElement).toBe(container.querySelector('#connect'))
+    );
 
     unmount(instance);
+  });
+
+  it('leaves focus alone on arrival if the visitor has already moved it', async () => {
+    const elsewhere = document.createElement('button');
+    document.body.appendChild(elsewhere);
+    elsewhere.focus();
+    history.replaceState(null, '', '/products/cxp#connect');
+    const instance = mountProduct('cxp');
+
+    await Promise.resolve();
+    flushSync();
+    expect(document.activeElement).toBe(elsewhere);
+
+    unmount(instance);
+    elsewhere.remove();
   });
 });

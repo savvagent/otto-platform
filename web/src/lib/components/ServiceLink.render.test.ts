@@ -9,7 +9,14 @@
  */
 
 import { flushSync, mount, unmount } from 'svelte';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+/** The console's language, which a test may change: `currentLocale` reads it. */
+const locale = vi.hoisted(() => ({ current: 'en' }));
+vi.mock('$lib/locale', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('$lib/locale')>()),
+  currentLocale: () => locale.current
+}));
 
 import { serviceBySlug } from '$lib/services';
 import ServiceLink from './ServiceLink.svelte';
@@ -23,6 +30,7 @@ beforeEach(() => {
 
 afterEach(() => {
   container.remove();
+  locale.current = 'en';
 });
 
 function render(slug: string) {
@@ -55,6 +63,15 @@ describe('a link to a service', () => {
     expect(link.hasAttribute('data-sveltekit-reload')).toBe(true);
     expect(link.getAttribute('aria-label')).toBe('Otto CXP, connector');
     expect(link.textContent?.replace(/\s+/g, ' ').trim()).toBe('Otto CXP Connector');
+
+    unmount(instance);
+  });
+
+  it("spells the connect card in the console's language", () => {
+    locale.current = 'es';
+    const { instance, link } = render('flags');
+
+    expect(link.getAttribute('href')).toBe('/es/products/flags#connect');
 
     unmount(instance);
   });
