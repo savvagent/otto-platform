@@ -24,10 +24,11 @@ const defaultGetLocale = getLocale;
 afterEach(() => overwriteGetLocale(defaultGetLocale));
 
 describe('the services list', () => {
-  it('ships Otto Factory and Otto Flags, over https', () => {
+  it('ships Otto Factory, Otto Flags and Otto CXP, over https', () => {
     expect(SERVICES.map((s) => [s.slug, s.name])).toEqual([
       ['factory', 'Otto Factory'],
-      ['flags', 'Otto Flags']
+      ['flags', 'Otto Flags'],
+      ['cxp', 'Otto CXP']
     ]);
     for (const service of SERVICES) {
       expect(service.url.startsWith('https://')).toBe(true);
