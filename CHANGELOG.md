@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/savvagent/otto-platform/compare/v0.6.1...v0.7.0) (2026-10-14)
+
+
+### Features
+
+* **web:** list otto-cxp among the otto services ([#39](https://github.com/savvagent/otto-platform/issues/39)) ([bae939f](https://github.com/savvagent/otto-platform/commit/bae939fb554c38a220904b1f9f9bd1ce5814800d))
+
 ## [0.6.1](https://github.com/savvagent/otto-platform/compare/v0.6.0...v0.6.1) (2026-10-12)
 
 
