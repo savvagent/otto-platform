@@ -131,7 +131,7 @@ describe('the landing page', () => {
     const pricing = links('Ver precios');
     expect(pricing).toHaveLength(2);
     for (const a of pricing) expect(a.getAttribute('href')).toBe('/es/pricing');
-    for (const slug of ['factory', 'flags']) {
+    for (const slug of ['factory', 'flags', 'cxp']) {
       expect(container.querySelector(`a[href="/es/products/${slug}"]`)).not.toBeNull();
     }
     expect(container.querySelector('a[href^="/products/"]')).toBeNull();

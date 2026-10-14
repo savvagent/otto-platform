@@ -106,6 +106,24 @@ const CONFIGURED: readonly Service[] = [
         m.product_flags_feature_auto_rollback()
       ]
     }
+  },
+  {
+    slug: 'cxp',
+    name: 'Otto CXP',
+    url: 'https://otto-cxp.savvagent.com',
+    mcpUrl: 'https://otto-cxp.savvagent.com/mcp',
+    copy: {
+      title: () => m.product_cxp_title(),
+      description: () => m.product_cxp_description(),
+      tagline: () => m.product_cxp_tagline(),
+      summary: () => m.product_cxp_summary(),
+      features: () => [
+        m.product_cxp_feature_profiles(),
+        m.product_cxp_feature_support(),
+        m.product_cxp_feature_feedback(),
+        m.product_cxp_feature_scope()
+      ]
+    }
   }
 ];
 
