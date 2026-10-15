@@ -424,9 +424,8 @@ impl Authorization {
     /// server's, unknown, or a near-miss with whitespace. The consent form can
     /// only ever take away.
     ///
-    /// An empty result is `Ok(vec![])`, and what it means is the caller's
-    /// decision. An empty result means nothing was granted, and
-    /// [`issue_authorization_code`] refuses it.
+    /// An empty result is `Ok(vec![])`: nothing was granted, and how to say so
+    /// is the caller's decision. [`issue_authorization_code`] refuses it.
     pub fn narrow(&self, chosen: &[String]) -> Result<Vec<String>> {
         if let Some(extra) = chosen.iter().find(|c| !self.scopes.contains(c)) {
             return Err(AuthError::InvalidScope(format!(

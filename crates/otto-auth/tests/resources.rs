@@ -78,6 +78,8 @@ fn authorize_req(client_id: &str, resource: &str, scopes: &[&str]) -> AuthorizeR
 }
 
 /// Runs the whole authorization-code flow and returns the issued tokens.
+/// Issues with the scopes `validate_authorize` resolved, as otto-web does, so
+/// an empty `scopes` gets the resource server's defaults from there.
 async fn code_flow(
     db: &Db,
     resource: &str,
