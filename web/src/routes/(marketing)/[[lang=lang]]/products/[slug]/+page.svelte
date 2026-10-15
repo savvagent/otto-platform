@@ -2,7 +2,7 @@
   import { onMount, tick } from 'svelte';
 
   import { m } from '$lib/paraglide/messages';
-  import { SERVICES, claudeCodeCommand, serviceBySlug } from '$lib/services';
+  import { SERVICES, claudeCodeCommand, serviceBySlug, serviceLink } from '$lib/services';
   import { consoleEntry, session } from '$lib/session.svelte';
   import { localizedPath } from '$lib/site';
   import CopyField from '$lib/components/CopyField.svelte';
@@ -59,8 +59,10 @@
 
   const service = $derived(serviceBySlug(data.slug));
   const others = $derived(SERVICES.filter((candidate) => candidate.slug !== data.slug));
+  /** Where `serviceLink` sends a link to this service: the one place that decides "has a console". */
+  const link = $derived(service ? serviceLink(service, data.lang) : undefined);
   /** No web console of its own, but an endpoint to add to an assistant: Flags, CXP. */
-  const agentOnly = $derived(service !== undefined && !service.consoleUrl && !!service.mcpUrl);
+  const agentOnly = $derived(link?.kind === 'connector');
   const ottoConsole = $derived(consoleEntry(session));
   const command = $derived(service ? claudeCodeCommand(service) : undefined);
 
@@ -89,7 +91,7 @@
     if (!connect) return;
     arrived = false;
     await tick();
-    connect.focus();
+    connect?.focus();
     arrived = true;
   }
 
@@ -133,8 +135,8 @@
       <p class="mt-4 text-xl text-pretty text-ink">{service.copy.tagline()}</p>
       <p class="mt-4 text-lg text-pretty text-muted">{service.copy.summary()}</p>
       <div class="mt-8 flex flex-wrap items-center gap-3">
-        {#if service.consoleUrl}
-          <LinkButton href={service.consoleUrl} size="lg">
+        {#if link?.kind === 'console'}
+          <LinkButton href={link.href} size="lg">
             {m.product_open_console({ name: service.name })}
             <span aria-hidden="true">↗</span>
           </LinkButton>
@@ -188,7 +190,9 @@
           class="connect otto-card scroll-mt-6 self-start p-6"
           class:arrived
           onblur={() => (arrived = false)}
-          onanimationend={() => (arrived = false)}
+          onanimationend={(event) => {
+            if (event.target === event.currentTarget) arrived = false;
+          }}
         >
           <h2 id="connect-title" class="text-2xl font-semibold tracking-tight text-ink">
             {m.product_connect_heading()}
