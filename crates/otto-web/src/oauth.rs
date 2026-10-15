@@ -46,15 +46,16 @@
 //!   parameters, which is what lets an agent show a useful message instead of
 //!   hanging on a callback that never arrives.
 
-use axum::extract::{Form, Query, State};
+use axum::extract::{Form, Query, RawForm, State};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
+use chrono::Utc;
 use http::request::Parts;
 use otto_auth::error::AuthError;
 use otto_auth::{oauth, resources, tokens};
 use otto_core::orgs::OrgsExt;
 use otto_tenant::audit::{action, Entry};
-use otto_tenant::ids::OrgId;
+use otto_tenant::ids::{OrgId, UserId};
 use serde::Deserialize;
 
 use crate::error::ApiError;
@@ -253,6 +254,111 @@ fn downscope(scopes: &[String], role: otto_core::orgs::Role) -> Vec<String> {
         .collect()
 }
 
+/// One authorization request, resolved and validated: what a consent page is
+/// rendered for, and what its seal binds.
+struct Resolved<'a> {
+    params: &'a AuthorizeParams,
+    request: &'a oauth::AuthorizeRequest,
+    authorization: &'a oauth::Authorization,
+}
+
+impl<'a> Resolved<'a> {
+    /// What the seal binds for `user` (see [`crate::consent_seal`]).
+    ///
+    /// The *resolved* values, never raw query or form strings: the client the
+    /// registry returned, the redirect URI `validate_authorize` accepted, the
+    /// resolved resource URI and scopes, and the PKCE challenge and `state`
+    /// the validated request carries. The page and the POST both build it
+    /// here, so what the seal vouches for and what it is checked against
+    /// cannot drift apart.
+    fn bound(&self, user: UserId) -> crate::consent_seal::Expected<'a> {
+        crate::consent_seal::Expected {
+            client_id: &self.authorization.client.client_id,
+            redirect_uri: &self.request.redirect_uri,
+            resource: &self.authorization.resource.resource_uri,
+            user_id: user,
+            scopes: &self.authorization.scopes,
+            code_challenge: &self.request.code_challenge,
+            code_challenge_method: &self.request.code_challenge_method,
+            state: self.request.state.as_deref(),
+        }
+    }
+}
+
+/// The caller's orgs, or the page that says they have none.
+///
+/// Every consent render goes through here first: a token opens exactly one
+/// org, so with none there is nothing to choose and no form to show.
+async fn consent_orgs(
+    state: &AppState,
+    caller: &CurrentUser,
+    client: &oauth::Client,
+    locale: Locale,
+) -> Result<Vec<otto_core::orgs::Membership>, Box<Response>> {
+    let orgs =
+        state.db.list_user_orgs(caller.user.id).await.map_err(|e| {
+            Box::new(ApiError::internal("list orgs for consent", e).into_response())
+        })?;
+    if orgs.is_empty() {
+        return Err(Box::new(error_page_html(
+            i18n::msg(locale, Key::ErrorNoOrgTitle),
+            // Escaped once, around the whole filled sentence. Escaping the name
+            // first as well double-encodes it, so a client called `<b>x</b>`
+            // renders as the literal text `&lt;b&gt;x&lt;/b&gt;` — which is safe
+            // but makes this page misreport the one fact it exists to show.
+            &escape(&i18n::fill(
+                i18n::msg(locale, Key::ErrorNoOrgBody),
+                client.client_name.as_deref().unwrap_or("A client"),
+            )),
+            locale,
+        )));
+    }
+    Ok(orgs)
+}
+
+/// Render the consent page for `resolved`, with `checked` ticked and a fresh
+/// seal. The one place a consent page is built, for the first render and for
+/// the "read only" re-render alike.
+///
+/// `preselect` is honoured only when it names one of `orgs`, the caller's
+/// own, so neither a hint nor a hand-edited form can make the page claim an
+/// org the caller is not in.
+fn render_consent(
+    state: &AppState,
+    caller: &CurrentUser,
+    resolved: &Resolved<'_>,
+    orgs: &[otto_core::orgs::Membership],
+    preselect: Option<OrgId>,
+    checked: &[String],
+    locale: Locale,
+) -> Response {
+    let preselected = preselect.filter(|id| orgs.iter().any(|m| m.org_id == *id));
+    let request_seal =
+        match crate::consent_seal::RequestSeal::new(&resolved.bound(caller.user.id), Utc::now())
+            .seal(&state.consent_cipher)
+        {
+            Ok(seal) => seal,
+            Err(e) => return ApiError::internal("seal the consent request", e).into_response(),
+        };
+    Html(consent_html(
+        &resolved.authorization.client,
+        resolved.params,
+        &resolved.authorization.resource,
+        &resolved.authorization.scopes,
+        checked,
+        orgs,
+        preselected,
+        caller
+            .user
+            .email
+            .as_deref()
+            .unwrap_or_else(|| i18n::msg(locale, Key::ConsentThisAccount)),
+        &request_seal,
+        locale,
+    ))
+    .into_response()
+}
+
 /// `GET /oauth/authorize` — render the consent screen.
 ///
 /// A signed-out visitor is sent to the console's login page with `next` set to
@@ -299,25 +405,10 @@ pub async fn authorize_page(
         );
     }
 
-    let orgs = match state.db.list_user_orgs(caller.user.id).await {
+    let orgs = match consent_orgs(&state, &caller, client, locale).await {
         Ok(orgs) => orgs,
-        Err(e) => return ApiError::internal("list orgs for consent", e).into_response(),
+        Err(page) => return *page,
     };
-
-    if orgs.is_empty() {
-        return error_page_html(
-            i18n::msg(locale, Key::ErrorNoOrgTitle),
-            // Escaped once, around the whole filled sentence. Escaping the name
-            // first as well double-encodes it, so a client called `<b>x</b>`
-            // renders as the literal text `&lt;b&gt;x&lt;/b&gt;` — which is safe
-            // but makes this page misreport the one fact it exists to show.
-            &escape(&i18n::fill(
-                i18n::msg(locale, Key::ErrorNoOrgBody),
-                client.client_name.as_deref().unwrap_or("A client"),
-            )),
-            locale,
-        );
-    }
 
     // The hint only ever selects among orgs the caller is already in.
     let hinted = resolve_org_hint(&orgs, params.org_hint.as_deref());
@@ -341,6 +432,7 @@ pub async fn authorize_page(
             _ => None,
         });
         if let Some(membership) = determined {
+            let requested = authorization.scopes.clone();
             let mut request = request;
             request.scopes = authorization.scopes;
             return grant(
@@ -349,6 +441,7 @@ pub async fn authorize_page(
                 &caller,
                 &params,
                 request,
+                &requested,
                 membership.org_id,
                 membership.role,
                 true,
@@ -359,22 +452,22 @@ pub async fn authorize_page(
     }
 
     // The registry resolved the scopes: the resource server's defaults when the
-    // client asked for none, otherwise exactly what it asked for.
-    Html(consent_html(
-        client,
-        &params,
-        &authorization.resource,
-        &authorization.scopes,
+    // client asked for none, otherwise exactly what it asked for. Every one
+    // starts checked; the person can only take away.
+    let resolved = Resolved {
+        params: &params,
+        request: &request,
+        authorization: &authorization,
+    };
+    render_consent(
+        &state,
+        &caller,
+        &resolved,
         &orgs,
         hinted.map(|m| m.org_id),
-        caller
-            .user
-            .email
-            .as_deref()
-            .unwrap_or_else(|| i18n::msg(locale, Key::ConsentThisAccount)),
+        &authorization.scopes,
         locale,
-    ))
-    .into_response()
+    )
 }
 
 /// The consent form's fields: the original request, plus the two decisions the
@@ -382,10 +475,13 @@ pub async fn authorize_page(
 ///
 /// The authorization parameters are written out rather than pulled in with
 /// `#[serde(flatten)]`, which would be the obvious way and does not work:
-/// `axum::Form` deserializes with `serde_urlencoded`, whose deserializer is not
-/// self-describing, and `flatten` needs one. The failure is a runtime rejection
-/// of every consent submission, not a compile error — so the duplication stays,
-/// with [`ConsentForm::params`] as the single place it is undone.
+/// `authorize_decision` deserializes it with `serde_urlencoded` from the raw
+/// body (repeated `grant` values are read separately, because
+/// `serde_urlencoded` cannot collect a repeated key into a `Vec`), and that
+/// deserializer is not self-describing, which `flatten` needs. The failure is
+/// a runtime rejection of every consent submission, not a compile error — so
+/// the duplication stays, with [`ConsentForm::params`] as the single place it
+/// is undone.
 #[derive(Debug, Deserialize)]
 pub struct ConsentForm {
     #[serde(default)]
@@ -406,9 +502,20 @@ pub struct ConsentForm {
     pub org_hint: Option<String>,
     /// Which org this token will act in. A token opens exactly one.
     pub org_id: OrgId,
-    /// "allow" or anything else, which is a denial.
+    /// "allow" grants, "read_only" re-renders with only read scopes checked, and
+    /// anything else is a denial.
     #[serde(default)]
     pub decision: String,
+    /// The seal `authorize_page` rendered (see [`crate::consent_seal`]).
+    /// Required: there is no unsealed fallback, which would let a forger
+    /// simply drop it.
+    #[serde(default)]
+    pub request_seal: Option<String>,
+    /// `"1"` on every rendered form: "this POST carries the person's
+    /// selection". Its absence is read as an empty selection, never as
+    /// "everything", so a form that lost it cannot grant more by omission.
+    #[serde(default)]
+    pub scope_choice: Option<String>,
 }
 
 impl ConsentForm {
@@ -437,18 +544,41 @@ fn blank_to_none(value: Option<String>) -> Option<String> {
 
 /// `POST /oauth/authorize` — the user's decision.
 ///
-/// Cross-site protection is the session cookie's `SameSite=Lax`, which
-/// withholds it on a cross-site `POST`: a form on an attacker's page submitting
-/// here arrives without a session and is bounced to login rather than silently
-/// consenting on the victim's behalf.
+/// Cross-site protection does not rest on the session cookie's `SameSite`
+/// attribute. The Origin / `Sec-Fetch-Site` guard in front of every `POST`
+/// refuses a cross-site submission before this handler runs, and the form's
+/// `request_seal` then binds the decision to the exact request, client, user
+/// and scopes the page was rendered for, so a form this server did not render
+/// for this person is a 400 page and never drives a redirect.
 pub async fn authorize_decision(
     State(state): State<AppState>,
     caller: CurrentUser,
     parts: Parts,
-    Form(form): Form<ConsentForm>,
+    RawForm(body): RawForm,
 ) -> Response {
-    let params = form.params();
     let locale = page_locale(&caller, &parts);
+    // Read by hand rather than with `Form`: the person's selection arrives as
+    // repeated `grant` values, which `serde_urlencoded` cannot collect into a
+    // field, so the body is needed twice. A body that does not deserialize is
+    // a 400 page, as `Form`'s rejection was a 4xx, never a 500.
+    let form: ConsentForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(form) => form,
+        Err(e) => {
+            // serde's wording names fields and is for the log, not the person.
+            tracing::warn!(
+                user_id = %caller.user.id,
+                error = %e,
+                "consent form refused: the body did not deserialize"
+            );
+            return error_page(
+                &AuthError::InvalidRequest(
+                    "the consent form could not be read; start again from the app".into(),
+                ),
+                locale,
+            );
+        }
+    };
+    let params = form.params();
     let mut req = match params.to_request(&state.db).await {
         Ok(req) => req,
         Err(e) => return error_page(&e, locale),
@@ -462,13 +592,61 @@ pub async fn authorize_decision(
         Err(e) => return error_page(&e, locale),
     };
 
-    // Normalize the same way `authorize_page` did before rendering the consent
-    // screen: a client that omits `scope` gets the resource server's defaults,
-    // which is what the human just looked at. Without this, the hidden form
-    // field resubmits the *original*, empty `scope`, and the code issued below
-    // would carry zero scopes while the page just displayed a list of grants —
-    // an agent whose every tool call then fails, with no visible reason why.
-    req.scopes = authorization.scopes;
+    // ...and re-validation proves only that the request is legal, not that it is
+    // the one the person was shown. The seal does that, compared field by field
+    // with the *resolved* values (the client the registry returned, the
+    // redirect URI `validate_authorize` accepted, the re-resolved resource, the
+    // resolved scopes, the PKCE challenge and `state`; see `Resolved::bound`),
+    // never with raw form strings. Checked before every
+    // branch, `deny` included: a form this server cannot vouch for must not
+    // drive any redirect.
+    let resolved = Resolved {
+        params: &params,
+        request: &req,
+        authorization: &authorization,
+    };
+    if let Err(e) = crate::consent_seal::check(
+        &state.consent_cipher,
+        form.request_seal.as_deref(),
+        &resolved.bound(caller.user.id),
+        Utc::now(),
+    ) {
+        // The reason, the field and who: enough to tell tampering from an
+        // expired page or a key rotation. Never the seal itself.
+        tracing::warn!(
+            reason = ?e,
+            client_id = %authorization.client.client_id,
+            user_id = %caller.user.id,
+            "consent form refused: the request seal did not verify"
+        );
+        return error_page(&AuthError::InvalidRequest(e.to_string()), locale);
+    }
+
+    // "Read only" is a no-JS submit button: it re-renders this page with only
+    // the `:read` scopes checked and issues nothing. The person still presses
+    // Allow, and that POST is checked from scratch. It is the same render as
+    // the first one, with a fresh seal because the page is new.
+    if form.decision == "read_only" {
+        let orgs = match consent_orgs(&state, &caller, &authorization.client, locale).await {
+            Ok(orgs) => orgs,
+            Err(page) => return *page,
+        };
+        let read_only: Vec<String> = authorization
+            .scopes
+            .iter()
+            .filter(|s| resources::is_read_scope(s))
+            .cloned()
+            .collect();
+        return render_consent(
+            &state,
+            &caller,
+            &resolved,
+            &orgs,
+            Some(form.org_id),
+            &read_only,
+            locale,
+        );
+    }
 
     if form.decision != "allow" {
         return redirect_error(
@@ -493,12 +671,49 @@ pub async fn authorize_decision(
         Err(e) => return ApiError::internal("check membership for consent", e).into_response(),
     };
 
+    // What the person left checked, narrowed against what the page offered.
+    // `authorization.scopes` is the resolved request (the resource server's
+    // defaults when the client asked for none, which is what the page showed),
+    // and the seal has already pinned it. `narrow` refuses (does not drop)
+    // anything else, so a forged `grant` is a 400 page and issues nothing.
+    let chosen: Vec<String> = if form.scope_choice.as_deref() == Some("1") {
+        url::form_urlencoded::parse(&body)
+            .filter(|(key, _)| key == "grant")
+            .map(|(_, value)| value.into_owned())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let narrowed = match authorization.narrow(&chosen) {
+        Ok(narrowed) => narrowed,
+        Err(e) => {
+            // The seal verified, so this is a hand-edited `grant` on a page
+            // this server rendered for this person.
+            tracing::warn!(
+                client_id = %authorization.client.client_id,
+                user_id = %caller.user.id,
+                error = %e,
+                "consent form refused: a chosen scope was not on the page"
+            );
+            return error_page(&e, locale);
+        }
+    };
+
+    // Load-bearing: `issue_authorization_code` reads an empty scope list as
+    // "the resource server's defaults", so an empty selection passed through
+    // would *widen* to them. Nothing checked means nothing granted.
+    if narrowed.is_empty() {
+        return redirect_error(&params, "access_denied", "no access was selected");
+    }
+    req.scopes = narrowed;
+
     grant(
         &state,
         &parts,
         &caller,
         &params,
         req,
+        &authorization.scopes,
         form.org_id,
         role,
         false,
@@ -511,8 +726,11 @@ pub async fn authorize_decision(
 /// client's callback. The single place a code is minted for the authorization
 /// endpoint, so the consent POST and a first-party skip cannot drift apart.
 ///
-/// `req` must already carry the resolved scopes. `role` is the caller's role in
-/// `org_id`, which the caller has established.
+/// `req` must already carry the scopes to grant: the resolved request, narrowed
+/// to what the person left checked. `role` is the caller's role in
+/// `org_id`, which the caller has established. `requested` is the resolved
+/// request before the person narrowed it; it is recorded beside what was
+/// granted.
 #[allow(clippy::too_many_arguments)]
 async fn grant(
     state: &AppState,
@@ -520,6 +738,7 @@ async fn grant(
     caller: &CurrentUser,
     params: &AuthorizeParams,
     mut req: oauth::AuthorizeRequest,
+    requested: &[String],
     org_id: OrgId,
     role: otto_core::orgs::Role,
     skipped_consent: bool,
@@ -531,8 +750,8 @@ async fn grant(
     // the most it could use, and a first-party client asks for the admin scope
     // of every user, most of whom are not admins. Only a request that loses
     // everything is an error.
-    let requested = std::mem::take(&mut req.scopes);
-    req.scopes = downscope(&requested, role);
+    let chosen = std::mem::take(&mut req.scopes);
+    req.scopes = downscope(&chosen, role);
     if req.scopes.is_empty() {
         return redirect_error(
             params,
@@ -547,7 +766,10 @@ async fn grant(
         Err(e) => return error_page(&e, locale),
     };
 
-    let _ = state
+    // The code is already issued, so a failed audit write does not undo the
+    // grant. It is logged, because for a narrowed grant this entry is the only
+    // record of what was asked for beside what was granted.
+    if let Err(e) = state
         .db
         .audit_for_org(
             org_id,
@@ -557,11 +779,20 @@ async fn grant(
                 .from_request(client_ip(parts, &state.config).as_deref(), None)
                 .detail(serde_json::json!({
                     "scopes": req.scopes,
+                    "requested": requested,
                     "resource": req.resource,
                     "consent_skipped": skipped_consent,
                 })),
         )
-        .await;
+        .await
+    {
+        tracing::error!(
+            error = %e,
+            org_id = %org_id,
+            client_id = %params.client_id,
+            "failed to write audit event for an authorization grant"
+        );
+    }
 
     let mut location = append_query(&params.redirect_uri, &[("code", &code)]);
     if let Some(s) = &params.state {
@@ -857,12 +1088,16 @@ body{font:16px/1.5 system-ui,sans-serif;margin:0;background:#f6f7f9;color:#111}\
 main{max-width:34rem;margin:3rem auto;padding:2rem;background:#fff;border-radius:12px;\
 box-shadow:0 1px 3px rgba(0,0,0,.1)}\
 h1{font-size:1.35rem;margin:0 0 1rem}\
-.host{font:600 1.05rem ui-monospace,monospace;background:#eef;padding:.3rem .5rem;border-radius:6px}\
+.host{font:600 1.05rem ui-monospace,monospace;background:#eef;padding:.3rem .5rem;\
+border-radius:6px}\
 .name{color:#555}\
-ul{padding-left:1.2rem}li{margin:.25rem 0}\
+fieldset{border:0;padding:0;margin:0}\
+legend{padding:0;margin:0 0 .5rem}\
+.grant{margin:.35rem 0}\
+.grant label{margin-left:.4rem}\
 code.scope{color:#666;font-size:.8rem;margin-left:.25rem}\
 .note{color:#666;font-size:.875rem}\
-label{display:block;margin:1rem 0 .35rem;font-weight:600}\
+label.field{display:block;margin:1rem 0 .35rem;font-weight:600}\
 select{font:inherit;padding:.5rem;width:100%;border:1px solid #ccc;border-radius:8px}\
 .row{display:flex;gap:.75rem;margin-top:1.75rem}\
 button{font:inherit;padding:.6rem 1.2rem;border-radius:8px;border:1px solid #ccc;cursor:pointer}\
@@ -875,9 +1110,11 @@ fn consent_html(
     params: &AuthorizeParams,
     resource: &resources::ResourceServer,
     scopes: &[String],
+    checked: &[String],
     orgs: &[otto_core::orgs::Membership],
     preselected: Option<OrgId>,
     signed_in_as: &str,
+    request_seal: &str,
     locale: Locale,
 ) -> String {
     // The fact the user can actually judge. `client_name` is self-asserted
@@ -899,24 +1136,44 @@ fn consent_html(
         })
         .unwrap_or_default();
 
+    // One native checkbox per resolved scope, each with its own <label for>,
+    // so it is keyboard-operable and announced with its text and no script.
+    // The id is the index rather than the scope, because a scope token may
+    // hold characters that are awkward in an id. The description is the main
+    // text and the raw name stays beside it as `<code>`; a scope with no
+    // description is just its name. Descriptions are single-language (see
+    // `ResourceServer::scope_descriptions`) and operator-supplied text, never
+    // markup.
     let scope_items = scopes
         .iter()
-        // A description is the main text and the raw scope name stays
-        // beside it as `<code>`: the name is what a client asked for and what
-        // an operator greps for, the description is what a user can actually
-        // consent to. A scope with no registered description is just its
-        // name. Descriptions are single-language (see
-        // `ResourceServer::scope_descriptions`); only the page chrome is
-        // localized. Both are operator-supplied text, never markup.
-        .map(|s| match resource.scope_description(s) {
-            Some(d) => format!(
-                "<li>{} <code class=scope>{}</code></li>",
-                escape(d),
-                escape(s)
-            ),
-            None => format!("<li><code>{}</code></li>", escape(s)),
+        .enumerate()
+        .map(|(i, s)| {
+            let text = match resource.scope_description(s) {
+                Some(d) => format!("{} <code class=scope>{}</code>", escape(d), escape(s)),
+                None => format!("<code>{}</code>", escape(s)),
+            };
+            format!(
+                "<div class=grant><input type=checkbox id=grant-{i} name=grant value=\"{}\"{}>\
+                 <label for=grant-{i}>{text}</label></div>",
+                escape(s),
+                if checked.contains(s) { " checked" } else { "" },
+            )
         })
         .collect::<String>();
+
+    // "Read only" only where it would change something without emptying the
+    // grant. It is the first submit button in tree order, so an implicit
+    // (Enter) submission re-renders instead of granting.
+    let mixed = scopes.iter().any(|s| resources::is_read_scope(s))
+        && scopes.iter().any(|s| !resources::is_read_scope(s));
+    let read_only = if mixed {
+        format!(
+            "<button type=submit name=decision value=read_only>{}</button>",
+            escape(i18n::msg(locale, Key::ConsentReadOnly))
+        )
+    } else {
+        String::new()
+    };
 
     let org_options = orgs
         .iter()
@@ -953,6 +1210,11 @@ fn consent_html(
         ("resource", resource.resource_uri.as_str()),
         ("state", params.state.as_deref().unwrap_or("")),
         ("org_hint", params.org_hint.as_deref().unwrap_or("")),
+        // Marks a form that rendered the scope checkboxes. A POST without it
+        // comes from an older or forged form that never offered a choice, so
+        // its missing `grant` fields must not be read as "grant everything".
+        ("scope_choice", "1"),
+        ("request_seal", request_seal),
     ]
     .iter()
     .map(|(k, v)| format!("<input type=hidden name={k} value=\"{}\">", escape(v)))
@@ -974,9 +1236,11 @@ fn consent_html(
          <p>{asking}</p>\
          {named}\
          <p class=note>{warn}</p>\
-         <p>{asking_to}</p><ul>{scope_items}</ul>\
          <form method=post action=\"/oauth/authorize\">{hidden}\
-         <label for=org_id>{organization}</label>\
+         <fieldset><legend>{asking_to}</legend>{scope_items}</fieldset>\
+         <p class=note>{narrow_hint}</p>\
+         {read_only}\
+         <label class=field for=org_id>{organization}</label>\
          <select id=org_id name=org_id>{org_options}</select>\
          <p class=note>{org_note}</p>\
          <div class=row>\
@@ -1000,6 +1264,7 @@ fn consent_html(
         org_note = escape(i18n::msg(locale, Key::ConsentOrgScopeNote)),
         allow = escape(i18n::msg(locale, Key::ConsentAllow)),
         cancel = escape(i18n::msg(locale, Key::ConsentCancel)),
+        narrow_hint = escape(i18n::msg(locale, Key::ConsentNarrowHint)),
         signed_in = escape(&i18n::fill(
             i18n::msg(locale, Key::ConsentSignedInAs),
             signed_in_as
@@ -1119,6 +1384,130 @@ mod tests {
         }
     }
 
+    fn fixture_client() -> oauth::Client {
+        oauth::Client {
+            client_id: "otto_client_x".into(),
+            client_name: Some("Agent".into()),
+            redirect_uris: vec!["http://127.0.0.1:1455/callback".into()],
+            disabled: false,
+            first_party: false,
+        }
+    }
+
+    fn fixture_params() -> AuthorizeParams {
+        AuthorizeParams {
+            response_type: "code".into(),
+            client_id: "otto_client_x".into(),
+            redirect_uri: "http://127.0.0.1:1455/callback".into(),
+            code_challenge: "x".repeat(43),
+            code_challenge_method: "S256".into(),
+            scope: Some("things:read things:write".into()),
+            resource: None,
+            state: Some("s".into()),
+            org_hint: None,
+        }
+    }
+
+    fn fixture_resource(scopes: &[&str], described: &[(&str, &str)]) -> resources::ResourceServer {
+        resources::ResourceServer {
+            resource_uri: "https://things.otto.test/mcp".into(),
+            name: "Things".into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            default_scopes: vec!["things:read".into()],
+            scope_descriptions: sqlx::types::Json(
+                described
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            disabled: false,
+            webhook_url: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn render(scopes: &[&str], checked: &[&str], described: &[(&str, &str)]) -> String {
+        let scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        let checked: Vec<String> = checked.iter().map(|s| s.to_string()).collect();
+        consent_html(
+            &fixture_client(),
+            &fixture_params(),
+            &fixture_resource(&["things:read", "things:write", "org:admin"], described),
+            &scopes,
+            &checked,
+            &[membership("acme", otto_core::orgs::Role::Owner)],
+            None,
+            "rob@acme.test",
+            "SEAL-VALUE",
+            Locale::En,
+        )
+    }
+
+    #[test]
+    fn each_requested_scope_is_a_labelled_checkbox() {
+        let html = render(
+            &["things:read", "things:write"],
+            &["things:read"],
+            &[("things:write", "<b>Change</b> everything")],
+        );
+        assert!(
+            html.contains(
+                "<input type=checkbox id=grant-0 name=grant value=\"things:read\" checked>\
+                 <label for=grant-0><code>things:read</code></label>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<input type=checkbox id=grant-1 name=grant value=\"things:write\">\
+                 <label for=grant-1>&lt;b&gt;Change&lt;/b&gt; everything \
+                 <code class=scope>things:write</code></label>"
+            ),
+            "an unchecked box has no `checked`, and a hostile description is escaped: {html}"
+        );
+        assert!(!html.contains("<b>Change</b>"));
+        assert!(html.contains("<fieldset><legend>It is asking to:</legend>"));
+        assert!(html.contains(
+            "Uncheck anything you don&#39;t want to allow. It can never be given more than this."
+        ));
+    }
+
+    #[test]
+    fn the_read_only_button_appears_only_for_a_mixed_set() {
+        let button = "<button type=submit name=decision value=read_only>Read only</button>";
+        assert!(render(&["things:read", "things:write"], &[], &[]).contains(button));
+        assert!(render(&["things:read", "org:admin"], &[], &[]).contains(button));
+        assert!(
+            !render(&["things:read"], &[], &[]).contains(button),
+            "a no-op"
+        );
+        assert!(
+            !render(&["things:write", "org:admin"], &[], &[]).contains(button),
+            "it would empty the grant"
+        );
+    }
+
+    /// Implicit submission (Enter) uses the first submit button in tree order.
+    /// When Read only is shown, it must come before Allow, so Enter re-renders
+    /// and never grants.
+    #[test]
+    fn read_only_precedes_allow_in_tree_order() {
+        let html = render(&["things:read", "things:write"], &[], &[]);
+        let read_only = html.find("value=read_only").unwrap();
+        let allow = html.find("value=allow").unwrap();
+        assert!(read_only < allow);
+    }
+
+    #[test]
+    fn the_form_carries_the_scope_choice_marker_and_the_seal() {
+        let html = render(&["things:read"], &["things:read"], &[]);
+        assert!(html.contains("<input type=hidden name=scope_choice value=\"1\">"));
+        assert!(html.contains("<input type=hidden name=request_seal value=\"SEAL-VALUE\">"));
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("tabindex"));
+    }
+
     #[test]
     fn an_org_hint_matches_slug_or_id_among_the_callers_orgs_only() {
         use otto_core::orgs::Role;
@@ -1204,9 +1593,11 @@ mod tests {
                 updated_at: chrono::Utc::now(),
             },
             &["things:read".to_string()],
+            &["things:read".to_string()],
             &orgs,
             None,
             "rob@acme.test",
+            "SEAL",
             Locale::En,
         );
 

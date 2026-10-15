@@ -580,3 +580,144 @@ pub async fn org_with_owner(h: &Harness, slug: &str, owner: &Account) -> OrgId {
 pub async fn add_member(h: &Harness, org: OrgId, user: UserId, role: Role) {
     h.db.add_member(org, user, role).await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// The consent form
+// ---------------------------------------------------------------------------
+
+/// A rendered consent form, read the way a browser would submit it: every
+/// hidden field and every `grant` checkbox, unescaped and in page order.
+#[derive(Debug, Clone)]
+pub struct ConsentPage {
+    pub hidden: Vec<(String, String)>,
+    /// `(scope, checked)`.
+    pub grants: Vec<(String, bool)>,
+}
+
+impl ConsentPage {
+    pub fn parse(html: &str) -> Self {
+        let mut hidden = Vec::new();
+        let mut grants = Vec::new();
+        for chunk in html.split("<input ").skip(1) {
+            let tag = &chunk[..chunk.find('>').expect("an unterminated <input> tag")];
+            if tag.starts_with("type=hidden") {
+                hidden.push((
+                    html_attr(tag, "name").expect("a hidden input with no name"),
+                    html_attr(tag, "value").unwrap_or_default(),
+                ));
+            } else if tag.starts_with("type=checkbox")
+                && html_attr(tag, "name").as_deref() == Some("grant")
+            {
+                grants.push((
+                    html_attr(tag, "value").expect("a grant checkbox with no value"),
+                    tag.split_whitespace().any(|word| word == "checked"),
+                ));
+            }
+        }
+        Self { hidden, grants }
+    }
+
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.hidden
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn checked(&self) -> Vec<&str> {
+        self.grants
+            .iter()
+            .filter(|(_, c)| *c)
+            .map(|(s, _)| s.as_str())
+            .collect()
+    }
+
+    /// Overwrite (or add) a hidden field, as a forger editing the form would.
+    pub fn set_field(&mut self, name: &str, value: &str) {
+        match self.hidden.iter_mut().find(|(k, _)| k == name) {
+            Some(field) => field.1 = value.to_string(),
+            None => self.hidden.push((name.to_string(), value.to_string())),
+        }
+    }
+
+    pub fn remove_field(&mut self, name: &str) {
+        self.hidden.retain(|(k, _)| k != name);
+    }
+
+    /// The body a browser submits for `decision` in `org_id`, with the boxes
+    /// left as they were rendered.
+    pub fn submission(&self, org_id: &str, decision: &str) -> Vec<(String, String)> {
+        let checked = self.checked();
+        self.submission_with(org_id, decision, &checked)
+    }
+
+    /// The same, with exactly `grants` checked: the person changed the boxes,
+    /// or a forger edited the form.
+    pub fn submission_with(
+        &self,
+        org_id: &str,
+        decision: &str,
+        grants: &[&str],
+    ) -> Vec<(String, String)> {
+        let mut fields = self.hidden.clone();
+        fields.extend(grants.iter().map(|g| ("grant".to_string(), g.to_string())));
+        fields.push(("org_id".into(), org_id.into()));
+        fields.push(("decision".into(), decision.into()));
+        fields
+    }
+}
+
+/// An attribute value from inside one tag: `name=foo` or `value="…"`.
+fn html_attr(tag: &str, name: &str) -> Option<String> {
+    let marker = format!(" {name}=");
+    let rest = &tag[tag.find(&marker)? + marker.len()..];
+    let raw = match rest.strip_prefix('"') {
+        Some(quoted) => &quoted[..quoted.find('"')?],
+        None => rest.split_whitespace().next()?,
+    };
+    Some(unescape_html(raw))
+}
+
+/// The inverse of `otto_web::oauth::escape`. `&amp;` goes last, so `&amp;lt;`
+/// stays literal text.
+fn unescape_html(raw: &str) -> String {
+    raw.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// The page with its request seal blanked. Every render seals with a fresh
+/// nonce, so byte-for-byte comparisons of two renders must ignore it.
+pub fn without_seal(html: &str) -> String {
+    let marker = "name=request_seal value=\"";
+    match html.find(marker) {
+        Some(at) => {
+            let start = at + marker.len();
+            let end = start + html[start..].find('"').expect("an unterminated seal value");
+            format!("{}{}", &html[..start], &html[end..])
+        }
+        None => html.to_string(),
+    }
+}
+
+/// GET a consent page as `session` and parse its form. Panics unless it rendered.
+pub async fn consent_page(h: &Harness, session: &str, url: &str) -> ConsentPage {
+    let page = Call::get(url).with_session(session).send(&h.router).await;
+    page.expect(StatusCode::OK);
+    ConsentPage::parse(&page.text)
+}
+
+/// POST a consent form as `session`, from the honest origin.
+pub async fn submit_consent(h: &Harness, session: &str, fields: &[(String, String)]) -> Reply {
+    let pairs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    Call::post("/oauth/authorize")
+        .with_session(session)
+        .form(&pairs)
+        .send(&h.router)
+        .await
+}

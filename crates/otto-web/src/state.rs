@@ -113,6 +113,10 @@ pub struct AppState {
     /// IdP client secrets. Held as an `Arc` because the key material is loaded
     /// once at startup and shared by every request.
     pub cipher: Arc<Cipher>,
+    /// Seals consent pages (see [`crate::consent_seal`]). A subkey derived
+    /// once at startup from `cipher`'s key, so the seal never shares a key
+    /// with secrets at rest.
+    pub(crate) consent_cipher: Arc<Cipher>,
     pub config: Arc<Config>,
     /// The assembled `GET /api/plans` answer, held briefly so an anonymous,
     /// unauthenticated endpoint does not reach the database on every call.
@@ -130,6 +134,7 @@ impl AppState {
         Self {
             db,
             webauthn,
+            consent_cipher: Arc::new(cipher.derive(crate::consent_seal::KEY_LABEL)),
             cipher: Arc::new(cipher),
             config: Arc::new(config),
             plans: Arc::default(),

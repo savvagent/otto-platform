@@ -281,11 +281,18 @@ pub fn catalog() -> Vec<Endpoint> {
             .status(303)
             .summary("Record the consent decision")
             .describe(
-                "On approval, issues an authorization code and redirects to the \
-                 client's callback. The selected org must be one the caller belongs \
-                 to — this is where a token's org is fixed, and it cannot be changed \
-                 afterwards. An `org:admin` scope requested by someone who is not an \
-                 owner or admin of that org is dropped from the grant rather than \
+                "The consent form's submission. Every field round-trips from the rendered page, \
+                 including `request_seal`, which binds the form to the request the page was \
+                 rendered for: a missing, mismatched or expired seal (it lasts 10 minutes) is \
+                 a 400 page, for every `decision`. `decision=allow` issues an authorization code and redirects to the \
+                 client's callback. It grants only the scopes submitted as repeated `grant` values \
+                 (with the `scope_choice=1` marker), each of which must be one the page offered: \
+                 any other is a 400 page, and an empty selection redirects with `access_denied`. \
+                 `decision=read_only` re-renders the page (200) with only the `:read` scopes \
+                 checked and issues nothing; any other `decision` is a denial. The selected org \
+                 must be one the caller belongs to — this is where a token's org is fixed, and \
+                 it cannot be changed afterwards. An `org:admin` scope chosen by someone who is \
+                 not an owner or admin of that org is dropped from the grant rather than \
                  refused; the token response's `scope` lists what was granted.",
             ),
         Endpoint::post("/oauth/token", oauth::token)

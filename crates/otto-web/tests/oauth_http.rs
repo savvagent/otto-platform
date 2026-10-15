@@ -13,6 +13,8 @@ mod common;
 use base64::Engine;
 use common::{harness, onboard, org_with_owner, Call, Harness, RESOURCE};
 use http::StatusCode;
+use otto_web::i18n::{msg, Key, Locale};
+use otto_web::oauth::escape;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
@@ -98,6 +100,49 @@ fn percent_decode(raw: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+async fn code_count(h: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM authorization_codes")
+        .fetch_one(h.db.pool())
+        .await
+        .unwrap()
+}
+
+/// A refusal that must not reach the client: a 400 page, no redirect, and no
+/// code anywhere in the database.
+async fn assert_refused_as_a_page(h: &Harness, reply: &common::Reply, why: &str) {
+    assert_eq!(
+        reply.status,
+        StatusCode::BAD_REQUEST,
+        "{why}: {}",
+        reply.text
+    );
+    assert!(
+        reply.headers.get(http::header::LOCATION).is_none(),
+        "{why}: an unauthenticated form drove a redirect"
+    );
+    assert_eq!(code_count(h).await, 0, "{why}: a code was issued");
+}
+
+/// Render the consent page for `scope`, submit it with exactly `grants`
+/// checked, and return the decision.
+async fn consent_with(
+    h: &Harness,
+    who: &common::Account,
+    client_id: &str,
+    challenge: &str,
+    scope: &str,
+    org: &str,
+    grants: &[&str],
+) -> common::Reply {
+    let page = common::consent_page(
+        h,
+        &who.session,
+        &authorize_url(client_id, challenge, scope, "s"),
+    )
+    .await;
+    common::submit_consent(h, &who.session, &page.submission_with(org, "allow", grants)).await
 }
 
 // ------------------------------------------------------------- discovery
@@ -211,22 +256,12 @@ async fn an_agent_gets_a_token_it_can_use_against_its_resource_server(pool: PgPo
     let org_id = h.db.get_org_by_slug("acme").await.unwrap().unwrap().id;
 
     // The decision.
-    let granted = Call::post("/oauth/authorize")
-        .with_session(&rob.session)
-        .form(&[
-            ("response_type", "code"),
-            ("client_id", &client_id),
-            ("redirect_uri", REDIRECT),
-            ("code_challenge", &challenge),
-            ("code_challenge_method", "S256"),
-            ("scope", "things:read things:write"),
-            ("resource", RESOURCE),
-            ("state", "opaque-state"),
-            ("org_id", &org_id.to_string()),
-            ("decision", "allow"),
-        ])
-        .send(&h.router)
-        .await;
+    let granted = common::submit_consent(
+        &h,
+        &rob.session,
+        &common::ConsentPage::parse(&page.text).submission(&org_id.to_string(), "allow"),
+    )
+    .await;
     granted.expect(StatusCode::SEE_OTHER);
 
     let callback = location(&granted);
@@ -333,17 +368,21 @@ async fn the_consent_page_shows_scope_descriptions_and_falls_back_to_names(pool:
     page.expect(StatusCode::OK);
 
     assert!(
-        page.text
-            .contains("<li>See your things <code class=scope>things:read</code></li>"),
+        page.text.contains(
+            "<label for=grant-0>See your things <code class=scope>things:read</code></label>"
+        ),
         "{}",
         page.text
     );
-    assert!(page.text.contains(
-        "<li>Change &lt;b&gt;everything&lt;/b&gt; &amp; more <code class=scope>things:write</code></li>"
-    ));
+    assert!(page.text.contains(concat!(
+        "<label for=grant-1>Change &lt;b&gt;everything&lt;/b&gt; &amp; more ",
+        "<code class=scope>things:write</code></label>"
+    )));
     assert!(!page.text.contains("<b>everything</b>"));
     // No description registered: just the name, as before.
-    assert!(page.text.contains("<li><code>org:admin</code></li>"));
+    assert!(page
+        .text
+        .contains("<label for=grant-2><code>org:admin</code></label>"));
 }
 
 /// A client that omits `scope` gets its resource server's default scopes. The consent page shows
@@ -377,23 +416,14 @@ async fn a_scopeless_request_is_granted_the_scopes_the_consent_page_showed(pool:
 
     let org_id = h.db.get_org_by_slug("acme").await.unwrap().unwrap().id;
 
-    // Mirrors what the rendered form actually submits: `scope` present but
-    // blank, exactly as `blank_to_none` expects from an unfilled hidden field.
-    let granted = Call::post("/oauth/authorize")
-        .with_session(&rob.session)
-        .form(&[
-            ("response_type", "code"),
-            ("client_id", &client_id),
-            ("redirect_uri", REDIRECT),
-            ("code_challenge", &challenge),
-            ("code_challenge_method", "S256"),
-            ("scope", ""),
-            ("state", "s"),
-            ("org_id", &org_id.to_string()),
-            ("decision", "allow"),
-        ])
-        .send(&h.router)
-        .await;
+    // Exactly what the rendered form submits: the hidden scope is blank, and
+    // the default scopes it showed come back as checked grants.
+    let granted = common::submit_consent(
+        &h,
+        &rob.session,
+        &common::ConsentPage::parse(&page.text).submission(&org_id.to_string(), "allow"),
+    )
+    .await;
     granted.expect(StatusCode::SEE_OTHER);
 
     let code = query_param(&location(&granted), "code").expect("no code in the callback");
@@ -492,21 +522,18 @@ async fn declining_sends_the_client_an_error_not_a_dead_end(pool: PgPool) {
     let client_id = register(&h, "Test Agent", REDIRECT).await;
     let (_, challenge) = pkce();
 
-    let declined = Call::post("/oauth/authorize")
-        .with_session(&rob.session)
-        .form(&[
-            ("response_type", "code"),
-            ("client_id", &client_id),
-            ("redirect_uri", REDIRECT),
-            ("code_challenge", &challenge),
-            ("code_challenge_method", "S256"),
-            ("scope", "things:read"),
-            ("state", "opaque-state"),
-            ("org_id", &org_id.to_string()),
-            ("decision", "deny"),
-        ])
-        .send(&h.router)
-        .await;
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "opaque-state"),
+    )
+    .await;
+    let declined = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&org_id.to_string(), "deny"),
+    )
+    .await;
     declined.expect(StatusCode::SEE_OTHER);
 
     let callback = location(&declined);
@@ -519,6 +546,36 @@ async fn declining_sends_the_client_an_error_not_a_dead_end(pool: PgPool) {
         Some("opaque-state")
     );
     assert!(query_param(&callback, "code").is_none());
+}
+
+/// `state` has no length limit at `/oauth/authorize`, and a client may send a
+/// JWT-sized one. Its consent page must still be submittable, and the redirect
+/// must echo all of it.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_very_long_state_still_gets_a_submittable_consent_page(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org_id = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let state = "x".repeat(8 * 1024);
+
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", &state),
+    )
+    .await;
+    let granted = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&org_id.to_string(), "allow"),
+    )
+    .await;
+    granted.expect(StatusCode::SEE_OTHER);
+    let callback = location(&granted);
+    assert_eq!(query_param(&callback, "state").as_deref(), Some(&*state));
+    assert!(query_param(&callback, "code").is_some());
 }
 
 /// The org on a token is decided here and cannot be changed afterwards, so a
@@ -534,20 +591,18 @@ async fn consent_cannot_name_an_org_the_caller_is_not_in(pool: PgPool) {
     let client_id = register(&h, "Mallory's Agent", REDIRECT).await;
     let (_, challenge) = pkce();
 
-    let attempted = Call::post("/oauth/authorize")
-        .with_session(&mallory.session)
-        .form(&[
-            ("response_type", "code"),
-            ("client_id", &client_id),
-            ("redirect_uri", REDIRECT),
-            ("code_challenge", &challenge),
-            ("code_challenge_method", "S256"),
-            ("scope", "things:read"),
-            ("org_id", &acme.to_string()),
-            ("decision", "allow"),
-        ])
-        .send(&h.router)
-        .await;
+    let page = common::consent_page(
+        &h,
+        &mallory.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+    let attempted = common::submit_consent(
+        &h,
+        &mallory.session,
+        &page.submission(&acme.to_string(), "allow"),
+    )
+    .await;
     attempted.expect(StatusCode::SEE_OTHER);
 
     let callback = location(&attempted);
@@ -571,20 +626,18 @@ async fn a_member_cannot_consent_to_org_admin(pool: PgPool) {
     let client_id = register(&h, "Test Agent", REDIRECT).await;
     let (_, challenge) = pkce();
 
-    let refused = Call::post("/oauth/authorize")
-        .with_session(&bob.session)
-        .form(&[
-            ("response_type", "code"),
-            ("client_id", &client_id),
-            ("redirect_uri", REDIRECT),
-            ("code_challenge", &challenge),
-            ("code_challenge_method", "S256"),
-            ("scope", "org:admin"),
-            ("org_id", &org.to_string()),
-            ("decision", "allow"),
-        ])
-        .send(&h.router)
-        .await;
+    let page = common::consent_page(
+        &h,
+        &bob.session,
+        &authorize_url(&client_id, &challenge, "org:admin", "s"),
+    )
+    .await;
+    let refused = common::submit_consent(
+        &h,
+        &bob.session,
+        &page.submission(&org.to_string(), "allow"),
+    )
+    .await;
     refused.expect(StatusCode::SEE_OTHER);
 
     let callback = location(&refused);
@@ -659,20 +712,18 @@ async fn a_stolen_code_is_useless_without_the_verifier(pool: PgPool) {
     let client_id = register(&h, "Test Agent", REDIRECT).await;
     let (_, challenge) = pkce();
 
-    let granted = Call::post("/oauth/authorize")
-        .with_session(&rob.session)
-        .form(&[
-            ("response_type", "code"),
-            ("client_id", &client_id),
-            ("redirect_uri", REDIRECT),
-            ("code_challenge", &challenge),
-            ("code_challenge_method", "S256"),
-            ("scope", "things:read"),
-            ("org_id", &org_id.to_string()),
-            ("decision", "allow"),
-        ])
-        .send(&h.router)
-        .await;
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+    let granted = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&org_id.to_string(), "allow"),
+    )
+    .await;
     let code = query_param(&location(&granted), "code").unwrap();
 
     let refused = Call::post("/oauth/token")
@@ -985,7 +1036,10 @@ async fn the_no_organization_page_is_translated(pool: PgPool) {
 
 // ------------------------------------------ one server, many resources
 
-/// Run the consent flow for `resource` and return the code it ends in.
+/// POST a hand-built consent form with no request seal. Only for requests that
+/// are refused before the seal is checked (no or ambiguous resource, another
+/// resource server's scope, a disabled or unknown resource): every other
+/// consent test submits the rendered page through `common::submit_consent`.
 async fn consent_for(
     h: &Harness,
     rob: &common::Account,
@@ -1021,7 +1075,7 @@ async fn consent_for(
 async fn a_client_can_be_authorized_for_any_registered_resource(pool: PgPool) {
     let h = common::harness_with_two_resources(pool).await;
     let rob = onboard(&h, "rob@acme.test").await;
-    org_with_owner(&h, "acme", &rob).await;
+    let org_id = org_with_owner(&h, "acme", &rob).await;
     let client_id = register(&h, "Test Agent", REDIRECT).await;
     let (verifier, challenge) = pkce();
 
@@ -1044,13 +1098,10 @@ async fn a_client_can_be_authorized_for_any_registered_resource(pool: PgPool) {
         "another resource server's scopes leaked onto this consent page"
     );
 
-    let granted = consent_for(
+    let granted = common::submit_consent(
         &h,
-        &rob,
-        &client_id,
-        &challenge,
-        "widgets:write",
-        common::OTHER_RESOURCE,
+        &rob.session,
+        &common::ConsentPage::parse(&page.text).submission(&org_id.to_string(), "allow"),
     )
     .await;
     granted.expect(StatusCode::SEE_OTHER);
@@ -1204,7 +1255,7 @@ async fn discovery_is_503_when_the_database_is_unreachable(pool: PgPool) {
 async fn the_consent_form_pins_the_resource_the_page_showed(pool: PgPool) {
     let h = harness(pool).await;
     let rob = onboard(&h, "rob@acme.test").await;
-    org_with_owner(&h, "acme", &rob).await;
+    let org_id = org_with_owner(&h, "acme", &rob).await;
     let client_id = register(&h, "Test Agent", REDIRECT).await;
     let (verifier, challenge) = pkce();
 
@@ -1224,7 +1275,12 @@ async fn the_consent_form_pins_the_resource_the_page_showed(pool: PgPool) {
     // A second resource server registers while the human reads the page.
     common::register_other_resource(&h.db).await;
 
-    let granted = consent_for(&h, &rob, &client_id, &challenge, "", pinned).await;
+    let granted = common::submit_consent(
+        &h,
+        &rob.session,
+        &common::ConsentPage::parse(&page.text).submission(&org_id.to_string(), "allow"),
+    )
+    .await;
     granted.expect(StatusCode::SEE_OTHER);
     let code = query_param(&location(&granted), "code").expect("no code");
     let tokens = Call::post("/oauth/token")
@@ -1320,6 +1376,297 @@ async fn agent_endpoints_without_a_cookie_are_not_guarded(pool: PgPool) {
         .send(&h.router)
         .await;
     registered.expect(StatusCode::CREATED);
+}
+
+// --------------------------------------------------------- the request seal
+
+/// The decision must carry the seal from its own page: a missing, garbled,
+/// tampered or borrowed seal is refused, and none of that burns the honest form.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_consent_decision_needs_the_seal_from_its_own_page(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let other_client = register(&h, "Other Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let honest = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+
+    // No seal, as a page rendered by the previous binary would send.
+    let mut form = honest.clone();
+    form.remove_field("request_seal");
+    let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "allow")).await;
+    assert_refused_as_a_page(&h, &reply, "missing seal").await;
+    assert!(reply.text.contains("request seal"), "{}", reply.text);
+
+    // Garbled.
+    let long = "A".repeat(300);
+    for garbage in ["", "AAAA", "not base64!", long.as_str()] {
+        let mut form = honest.clone();
+        form.set_field("request_seal", garbage);
+        let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "allow")).await;
+        assert_refused_as_a_page(&h, &reply, &format!("garbled seal {garbage:?}")).await;
+    }
+
+    // A real seal with one flipped byte.
+    let mut raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(honest.field("request_seal").unwrap())
+        .unwrap();
+    raw[20] ^= 0x01;
+    let mut form = honest.clone();
+    form.set_field(
+        "request_seal",
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw),
+    );
+    let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "allow")).await;
+    assert_refused_as_a_page(&h, &reply, "flipped byte").await;
+
+    // A genuine seal, from another client's page.
+    let theirs = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&other_client, &challenge, "things:read", "s"),
+    )
+    .await;
+    let mut form = honest.clone();
+    form.set_field("request_seal", theirs.field("request_seal").unwrap());
+    let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "allow")).await;
+    assert_refused_as_a_page(&h, &reply, "another client's seal").await;
+    assert_generic_mismatch(&reply);
+
+    // None of that burned anything: the honest form still works.
+    let reply = common::submit_consent(&h, &rob.session, &honest.submission(&org, "allow")).await;
+    reply.expect(StatusCode::SEE_OTHER);
+    assert!(query_param(&location(&reply), "code").is_some());
+}
+
+/// A repeated `request_seal` or `scope` is refused outright rather than read
+/// as "the first one" by one parse and "the last one" by another: the handler
+/// reads the body twice, and the two reads must agree.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_consent_post_with_a_repeated_field_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+
+    let mut doubled_seal = page.submission(&org.to_string(), "allow");
+    doubled_seal.push(("request_seal".into(), "AAAA".into()));
+    let reply = common::submit_consent(&h, &rob.session, &doubled_seal).await;
+    assert_refused_as_a_page(&h, &reply, "two seals, one honest").await;
+
+    let mut doubled_scope = page.submission(&org.to_string(), "allow");
+    doubled_scope.push(("scope".into(), "things:read things:write".into()));
+    let reply = common::submit_consent(&h, &rob.session, &doubled_scope).await;
+    assert_refused_as_a_page(&h, &reply, "two scopes").await;
+    // The page shows a fixed message, not serde's wording.
+    assert!(!reply.text.contains("duplicate"), "{}", reply.text);
+}
+
+/// Editing the hidden `scope` to ask for more than the page showed is caught
+/// by the seal, even though the edited request is itself legal.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn widening_the_hidden_scope_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let mut form = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+
+    form.set_field("scope", "things:read things:write");
+    let reply = common::submit_consent(
+        &h,
+        &rob.session,
+        &form.submission_with(&org, "allow", &["things:read", "things:write"]),
+    )
+    .await;
+    assert_refused_as_a_page(&h, &reply, "widened hidden scope").await;
+    assert_generic_mismatch(&reply);
+}
+
+/// A mismatch page says the form does not match, and never which field: the
+/// field is for the log.
+fn assert_generic_mismatch(reply: &common::Reply) {
+    assert!(
+        reply
+            .text
+            .contains("does not match the request it was shown for"),
+        "{}",
+        reply.text
+    );
+    for field in [
+        "(client_id)",
+        "(scopes)",
+        "(state)",
+        "(code_challenge)",
+        "(code_challenge_method)",
+    ] {
+        assert!(!reply.text.contains(field), "{field}: {}", reply.text);
+    }
+}
+
+/// Swapping the hidden PKCE challenge for one the attacker holds the verifier
+/// for is caught by the seal: the code would otherwise be redeemable by
+/// whoever edited the form, not by the client the page was shown for.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn editing_the_hidden_code_challenge_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let honest = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+    assert_eq!(honest.field("code_challenge"), Some(challenge.as_str()));
+
+    let attackers = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(b"the attacker's own verifier, long enough"));
+    let mut form = honest.clone();
+    form.set_field("code_challenge", &attackers);
+    let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "allow")).await;
+    assert_refused_as_a_page(&h, &reply, "edited code_challenge").await;
+    assert_generic_mismatch(&reply);
+
+    // The honest page still works.
+    let reply = common::submit_consent(&h, &rob.session, &honest.submission(&org, "allow")).await;
+    reply.expect(StatusCode::SEE_OTHER);
+}
+
+/// Swapping the hidden `state` would hand the client a callback it attributes
+/// to a different session of its own. The seal binds it, and dropping it is
+/// as much a change as editing it.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn editing_the_hidden_state_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let honest = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "victim-state"),
+    )
+    .await;
+    assert_eq!(honest.field("state"), Some("victim-state"));
+
+    for edited in ["attacker-state", ""] {
+        let mut form = honest.clone();
+        form.set_field("state", edited);
+        for decision in ["allow", "deny"] {
+            let reply =
+                common::submit_consent(&h, &rob.session, &form.submission(&org, decision)).await;
+            assert_refused_as_a_page(&h, &reply, &format!("state {edited:?}, {decision}")).await;
+            assert_generic_mismatch(&reply);
+        }
+    }
+
+    let reply = common::submit_consent(&h, &rob.session, &honest.submission(&org, "allow")).await;
+    reply.expect(StatusCode::SEE_OTHER);
+    assert_eq!(
+        query_param(&location(&reply), "state").as_deref(),
+        Some("victim-state")
+    );
+}
+
+/// A seal is bound to the person it was rendered for.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn another_users_consent_form_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let bob = onboard(&h, "bob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    common::add_member(&h, org, bob.user, otto_core::orgs::Role::Owner).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let robs = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+
+    let reply = common::submit_consent(
+        &h,
+        &bob.session,
+        &robs.submission(&org.to_string(), "allow"),
+    )
+    .await;
+    assert_refused_as_a_page(&h, &reply, "rob's form submitted by bob").await;
+}
+
+/// A form this server cannot vouch for must not drive a redirect, even one
+/// that says "denied": the redirect would carry the forger's `state` to the
+/// client as if the person had answered.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_deny_with_a_bad_seal_is_a_page_not_a_redirect(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let mut form = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "opaque-state"),
+    )
+    .await;
+
+    for seal in [None, Some("AAAA")] {
+        match seal {
+            None => form.remove_field("request_seal"),
+            Some(s) => form.set_field("request_seal", s),
+        }
+        let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "deny")).await;
+        assert_refused_as_a_page(&h, &reply, &format!("deny with seal {seal:?}")).await;
+        assert!(
+            !reply.text.contains("opaque-state"),
+            "state must not be echoed"
+        );
+    }
+}
+
+/// The body is parsed by hand rather than by axum's `Form`. A body that does
+/// not deserialize must still be a 400 page, not a 422 and never a 500.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_malformed_consent_body_is_a_400_page(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let form = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+
+    let reply =
+        common::submit_consent(&h, &rob.session, &form.submission("not-an-org-id", "allow")).await;
+    assert_refused_as_a_page(&h, &reply, "unparseable org_id").await;
 }
 
 // ------------------------------------------------ first-party clients
@@ -1460,6 +1807,21 @@ async fn a_first_party_client_with_one_org_skips_consent(pool: PgPool) {
     .unwrap();
     assert_eq!(principal.org_id, org);
     assert_eq!(principal.user_id, rob.user);
+
+    // No screen means nothing was narrowed: what was asked for is what the
+    // audit trail says was resolved, before the downscope.
+    let detail: serde_json::Value = sqlx::query_scalar(
+        "SELECT detail FROM audit_events WHERE action = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(otto_tenant::audit::action::AUTHORIZATION_GRANTED)
+    .fetch_one(h.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(detail["requested"], detail["scopes"]);
+    assert_eq!(
+        detail["requested"],
+        serde_json::json!(["things:read", "things:write"])
+    );
 }
 
 /// The skip is after full validation: a bad redirect URI or missing PKCE is
@@ -1566,8 +1928,12 @@ async fn an_org_hint_the_caller_cannot_use_is_ignored_without_leaking(pool: PgPo
     assert!(someone_elses.contains("name=org_id"), "no consent screen");
     assert!(!someone_elses.contains(" selected"));
     assert!(!someone_elses.contains("initech</option>"));
-    // Same page, byte for byte, apart from the caller's own echoed input.
-    assert_eq!(someone_elses.replace("initech", "nonexistent"), nonexistent);
+    // Same page, byte for byte, apart from the caller's own echoed input and
+    // the request seal, which is freshly encrypted on every render.
+    assert_eq!(
+        common::without_seal(&someone_elses).replace("initech", "nonexistent"),
+        common::without_seal(&nonexistent)
+    );
 }
 
 /// With exactly one org there is nothing to pick, so a hint that is useless is
@@ -1673,21 +2039,18 @@ async fn a_member_requesting_org_admin_gets_a_downscoped_token(pool: PgPool) {
 
     // Consent POST.
     let client_id = register(&h, "Test Agent", REDIRECT).await;
-    let granted = Call::post("/oauth/authorize")
-        .with_session(&bob.session)
-        .form(&[
-            ("response_type", "code"),
-            ("client_id", &client_id),
-            ("redirect_uri", REDIRECT),
-            ("code_challenge", &challenge),
-            ("code_challenge_method", "S256"),
-            ("scope", scope),
-            ("resource", RESOURCE),
-            ("org_id", &org.to_string()),
-            ("decision", "allow"),
-        ])
-        .send(&h.router)
-        .await;
+    let page = common::consent_page(
+        &h,
+        &bob.session,
+        &authorize_url(&client_id, &challenge, scope, "s"),
+    )
+    .await;
+    let granted = common::submit_consent(
+        &h,
+        &bob.session,
+        &page.submission(&org.to_string(), "allow"),
+    )
+    .await;
     granted.expect(StatusCode::SEE_OTHER);
     let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
     tokens.expect(StatusCode::OK);
@@ -1729,4 +2092,612 @@ async fn a_first_party_client_on_a_loopback_redirect_still_gets_consent(pool: Pg
     page.expect(StatusCode::OK);
     assert!(page.text.contains("name=org_id"));
     assert!(!page.headers.contains_key(http::header::LOCATION));
+}
+
+// ------------------------------------------------------ narrowing the grant
+
+/// Every checkbox has a label, the controls are native (keyboard-operable
+/// with no script or tabindex), and every requested scope starts checked.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn every_consent_checkbox_is_labelled_and_starts_checked(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+
+    let page = Call::get(authorize_url(
+        &client_id,
+        &challenge,
+        "things:read things:write org:admin",
+        "s",
+    ))
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    page.expect(StatusCode::OK);
+
+    let ids: Vec<&str> = page
+        .text
+        .split("<input type=checkbox id=")
+        .skip(1)
+        .map(|rest| rest.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(ids, ["grant-0", "grant-1", "grant-2"], "{}", page.text);
+    for id in ids {
+        assert!(
+            page.text.contains(&format!("<label for={id}>")),
+            "checkbox {id} has no label"
+        );
+    }
+    let form = common::ConsentPage::parse(&page.text);
+    assert_eq!(form.checked(), ["things:read", "things:write", "org:admin"]);
+    assert_eq!(form.field("scope_choice"), Some("1"));
+    assert!(
+        !page.text.contains("<script"),
+        "the consent page must need no script"
+    );
+    assert!(!page.text.contains("tabindex"), "native tab order only");
+}
+
+/// The new copy is in every locale.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_read_only_button_is_translated_in_every_locale(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+
+    let english_hint = msg(Locale::En, Key::ConsentNarrowHint);
+    for (header, locale, label) in [
+        ("en", Locale::En, "Read only"),
+        ("es", Locale::Es, "Solo lectura"),
+        ("de", Locale::De, "Nur lesen"),
+        ("fr", Locale::Fr, "Lecture seule"),
+        ("it", Locale::It, "Sola lettura"),
+        ("hi", Locale::Hi, "केवल पढ़ना"),
+    ] {
+        let page = Call::get(authorize_url(
+            &client_id,
+            &challenge,
+            "things:read things:write",
+            "s",
+        ))
+        .with_session(&rob.session)
+        .header("accept-language", header)
+        .send(&h.router)
+        .await;
+        page.expect(StatusCode::OK);
+        assert!(
+            page.text.contains(&format!(
+                "<button type=submit name=decision value=read_only>{label}</button>"
+            )),
+            "Accept-Language: {header}"
+        );
+        let hint = msg(locale, Key::ConsentNarrowHint);
+        assert!(
+            page.text
+                .contains(&format!("<p class=note>{}</p>", escape(hint))),
+            "the narrowing hint is missing for Accept-Language: {header}"
+        );
+        if header != "en" {
+            assert_ne!(hint, english_hint, "{header} hint is untranslated");
+        }
+    }
+}
+
+/// The page carries a fresh, non-empty request seal on every render.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_consent_page_carries_a_fresh_request_seal(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let url = authorize_url(&client_id, &challenge, "things:read", "s");
+
+    let first = common::consent_page(&h, &rob.session, &url).await;
+    let second = common::consent_page(&h, &rob.session, &url).await;
+    let a = first.field("request_seal").expect("no request_seal field");
+    let b = second.field("request_seal").expect("no request_seal field");
+    assert!(a.len() > 40, "{a}");
+    assert_ne!(a, b, "a seal must use a fresh nonce per render");
+}
+
+/// The test helper submits exactly what a browser would, and the result is
+/// what the page offered.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn submitting_the_rendered_form_unchanged_grants_what_it_showed(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read things:write", "s"),
+    )
+    .await;
+    let fields = page.submission(&org.to_string(), "allow");
+    assert!(fields.contains(&("grant".into(), "things:read".into())));
+    assert!(fields.contains(&("grant".into(), "things:write".into())));
+    assert!(fields
+        .iter()
+        .any(|(k, v)| k == "request_seal" && !v.is_empty()));
+
+    let granted = common::submit_consent(&h, &rob.session, &fields).await;
+    granted.expect(StatusCode::SEE_OTHER);
+    let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
+    tokens.expect(StatusCode::OK);
+    assert_eq!(tokens.body["scope"], "things:read things:write");
+}
+
+// ------------------------------------------------------------- narrowing
+
+/// Unchecking the write scope yields a token whose introspection shows only
+/// the read scope, and a write check against it fails. The audit trail records
+/// both what was asked for and what was granted.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn unchecking_the_write_scope_yields_a_read_only_token(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let granted = consent_with(
+        &h,
+        &rob,
+        &client_id,
+        &challenge,
+        "things:read things:write",
+        &org.to_string(),
+        &["things:read"],
+    )
+    .await;
+    granted.expect(StatusCode::SEE_OTHER);
+    let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
+    tokens.expect(StatusCode::OK);
+    assert_eq!(tokens.body["scope"], "things:read");
+
+    let principal = otto_auth::tokens::introspect(
+        &h.db,
+        tokens.body["access_token"].as_str().unwrap(),
+        RESOURCE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(principal.scopes, vec!["things:read".to_string()]);
+    assert!(
+        matches!(
+            principal.require_scope("things:write"),
+            Err(otto_auth::AuthError::InvalidScope(_))
+        ),
+        "a write tool must refuse this token with insufficient scope"
+    );
+
+    let detail: serde_json::Value = sqlx::query_scalar(
+        "SELECT detail FROM audit_events WHERE action = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(otto_tenant::audit::action::AUTHORIZATION_GRANTED)
+    .fetch_one(h.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(detail["scopes"], serde_json::json!(["things:read"]));
+    assert_eq!(
+        detail["requested"],
+        serde_json::json!(["things:read", "things:write"])
+    );
+}
+
+/// A refresh of a narrowed token stays narrow, whatever scope the refresh
+/// request names.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn refreshing_a_narrowed_token_never_widens_it(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let granted = consent_with(
+        &h,
+        &rob,
+        &client_id,
+        &challenge,
+        "things:read things:write",
+        &org.to_string(),
+        &["things:read"],
+    )
+    .await;
+    let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
+    tokens.expect(StatusCode::OK);
+
+    let refreshed = Call::post("/oauth/token")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            (
+                "refresh_token",
+                tokens.body["refresh_token"].as_str().unwrap(),
+            ),
+            ("client_id", &client_id),
+            ("resource", RESOURCE),
+            // Not a parameter this server reads on refresh; sent to prove it.
+            ("scope", "things:read things:write"),
+        ])
+        .send(&h.router)
+        .await;
+    refreshed.expect(StatusCode::OK);
+    assert_eq!(refreshed.body["scope"], "things:read");
+    let principal = otto_auth::tokens::introspect(
+        &h.db,
+        refreshed.body["access_token"].as_str().unwrap(),
+        RESOURCE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(principal.scopes, vec!["things:read".to_string()]);
+}
+
+/// The form can only take away. A `grant` naming anything the page did not
+/// offer is refused, not dropped, and nothing is issued.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_form_cannot_grant_a_scope_the_client_did_not_request(pool: PgPool) {
+    let h = common::harness_with_two_resources(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let url = format!(
+        "{}&resource={}",
+        authorize_url(&client_id, &challenge, "things:read", "s"),
+        percent_encode(RESOURCE)
+    );
+    let page = common::consent_page(&h, &rob.session, &url).await;
+
+    for forged in [
+        "things:write",
+        "widgets:read",
+        "bogus",
+        " things:read",
+        "things:read ",
+        "",
+    ] {
+        let reply = common::submit_consent(
+            &h,
+            &rob.session,
+            &page.submission_with(&org, "allow", &["things:read", forged]),
+        )
+        .await;
+        assert_refused_as_a_page(&h, &reply, &format!("grant={forged:?}")).await;
+        assert!(
+            reply.text.contains("was not requested"),
+            "{forged:?}: {}",
+            reply.text
+        );
+    }
+}
+
+/// Nothing checked is `access_denied`, never an empty token and never the
+/// defaults. That includes a scopeless request, whose checkboxes *are* the
+/// defaults, and a sealed form that lost its `scope_choice` marker.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn unchecking_everything_is_access_denied(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+
+    let assert_denied = |reply: &common::Reply, why: &str| {
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{why}: {}", reply.text);
+        let callback = location(reply);
+        assert!(callback.starts_with(REDIRECT), "{why}: {callback}");
+        assert_eq!(
+            query_param(&callback, "error").as_deref(),
+            Some("access_denied"),
+            "{why}"
+        );
+        assert_eq!(
+            query_param(&callback, "state").as_deref(),
+            Some("s"),
+            "{why}"
+        );
+        assert!(query_param(&callback, "code").is_none(), "{why}");
+    };
+
+    for scope in ["things:read things:write", ""] {
+        let reply = consent_with(&h, &rob, &client_id, &challenge, scope, &org, &[]).await;
+        assert_denied(&reply, &format!("nothing checked for scope {scope:?}"));
+    }
+
+    let mut page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read things:write", "s"),
+    )
+    .await;
+    page.remove_field("scope_choice");
+    let reply = common::submit_consent(&h, &rob.session, &page.submission(&org, "allow")).await;
+    assert_denied(&reply, "sealed form without scope_choice");
+
+    assert_eq!(
+        code_count(&h).await,
+        0,
+        "no code may exist after any of these"
+    );
+}
+
+/// A scope checked twice is granted once.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_repeated_grant_is_granted_once(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let granted = consent_with(
+        &h,
+        &rob,
+        &client_id,
+        &challenge,
+        "things:read things:write",
+        &org.to_string(),
+        &["things:read", "things:read"],
+    )
+    .await;
+    let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
+    tokens.expect(StatusCode::OK);
+    assert_eq!(tokens.body["scope"], "things:read");
+}
+
+/// Narrowing happens before the admin downscope, and the downscope still
+/// applies to what is left.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_member_narrowing_to_org_admin_is_still_downscoped(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let bob = onboard(&h, "bob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    common::add_member(&h, org, bob.user, otto_core::orgs::Role::Member).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+    let scope = "things:read things:write org:admin";
+
+    let granted = consent_with(
+        &h,
+        &bob,
+        &client_id,
+        &challenge,
+        scope,
+        &org.to_string(),
+        &["things:read", "org:admin"],
+    )
+    .await;
+    let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
+    tokens.expect(StatusCode::OK);
+    assert_eq!(tokens.body["scope"], "things:read");
+
+    let codes_before = code_count(&h).await;
+    let refused = consent_with(
+        &h,
+        &bob,
+        &client_id,
+        &challenge,
+        scope,
+        &org.to_string(),
+        &["org:admin"],
+    )
+    .await;
+    refused.expect(StatusCode::SEE_OTHER);
+    assert_eq!(
+        query_param(&location(&refused), "error").as_deref(),
+        Some("invalid_scope")
+    );
+    assert!(
+        query_param(&location(&refused), "code").is_none(),
+        "everything was downscoped away, so no code may be issued"
+    );
+    assert_eq!(code_count(&h).await, codes_before, "no code was stored");
+}
+
+/// "Read only" leaves exactly the read scopes checked, keeps the chosen
+/// org, issues nothing, and the re-rendered page then grants just those.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn read_only_leaves_exactly_the_read_scopes_checked(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let globex = org_with_owner(&h, "globex", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(
+            &client_id,
+            &challenge,
+            "things:read things:write org:admin",
+            "s",
+        ),
+    )
+    .await;
+    let reply = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&globex.to_string(), "read_only"),
+    )
+    .await;
+    reply.expect(StatusCode::OK);
+    assert!(reply.headers.get(http::header::LOCATION).is_none());
+    assert_eq!(code_count(&h).await, 0, "read only must issue nothing");
+
+    let again = common::ConsentPage::parse(&reply.text);
+    assert_eq!(
+        again.grants,
+        vec![
+            ("things:read".to_string(), true),
+            ("things:write".to_string(), false),
+            ("org:admin".to_string(), false),
+        ]
+    );
+    assert!(
+        reply.text.contains(&format!("value=\"{globex}\" selected")),
+        "the submitted org must stay selected: {}",
+        reply.text
+    );
+    assert_ne!(
+        again.field("request_seal"),
+        page.field("request_seal"),
+        "the re-render must carry a fresh seal"
+    );
+    for name in [
+        "client_id",
+        "redirect_uri",
+        "scope",
+        "resource",
+        "state",
+        "scope_choice",
+    ] {
+        assert_eq!(
+            again.field(name),
+            page.field(name),
+            "{name} must round-trip"
+        );
+    }
+
+    let granted = common::submit_consent(
+        &h,
+        &rob.session,
+        &again.submission(&globex.to_string(), "allow"),
+    )
+    .await;
+    let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
+    tokens.expect(StatusCode::OK);
+    assert_eq!(tokens.body["scope"], "things:read");
+}
+
+/// An org the caller is not in is not preselected, and nothing is issued.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn read_only_does_not_preselect_an_org_the_caller_is_not_in(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let eve = onboard(&h, "eve@initech.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let initech = org_with_owner(&h, "initech", &eve).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read things:write", "s"),
+    )
+    .await;
+    let reply = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&initech.to_string(), "read_only"),
+    )
+    .await;
+    reply.expect(StatusCode::OK);
+    assert!(!reply.text.contains(" selected"), "{}", reply.text);
+    assert!(!reply.text.contains("initech</option>"));
+    assert_eq!(code_count(&h).await, 0);
+}
+
+/// "Read only" renders through the same path as the first page: a caller who
+/// has left every org since the page was shown gets the same "no org" page
+/// the first render would have given, not a form with an empty org list.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn read_only_for_a_caller_with_no_orgs_is_the_no_org_page(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let url = authorize_url(&client_id, &challenge, "things:read things:write", "s");
+    let page = common::consent_page(&h, &rob.session, &url).await;
+
+    sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
+        .bind(org)
+        .bind(rob.user)
+        .execute(h.db.pool())
+        .await
+        .unwrap();
+
+    let first_render = Call::get(&url)
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    first_render.expect(StatusCode::BAD_REQUEST);
+    assert!(first_render
+        .text
+        .contains(msg(Locale::En, Key::ErrorNoOrgTitle)));
+
+    let reply = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&org.to_string(), "read_only"),
+    )
+    .await;
+    assert_eq!(reply.status, first_render.status, "{}", reply.text);
+    assert_eq!(reply.text, first_render.text);
+    assert!(!reply.text.contains("request_seal"));
+    assert_eq!(code_count(&h).await, 0);
+}
+
+/// Read only is seal-checked like any decision.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn read_only_without_a_valid_seal_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let mut page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read things:write", "s"),
+    )
+    .await;
+    page.set_field("request_seal", "AAAA");
+    let reply = common::submit_consent(&h, &rob.session, &page.submission(&org, "read_only")).await;
+    assert_refused_as_a_page(&h, &reply, "read_only with a garbled seal").await;
+}
+
+/// The cross-site guard stands in front of read_only too. (This passes
+/// before the branch exists, because the guard runs first. It pins the
+/// guard, not the branch.)
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_read_only_post_from_a_sibling_origin_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read things:write", "s"),
+    )
+    .await;
+    let fields = page.submission(&org, "read_only");
+    let pairs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let reply = Call::post("/oauth/authorize")
+        .with_session(&rob.session)
+        .header("origin", "https://blog.otto.test")
+        .form(&pairs)
+        .send(&h.router)
+        .await;
+    reply.expect(StatusCode::FORBIDDEN);
+    assert_eq!(reply.error_code(), Some("cross_site_request"));
 }
