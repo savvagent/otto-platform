@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/savvagent/otto-platform/compare/v0.8.0...v0.9.0) (2026-10-15)
+
+
+### Features
+
+* **otto-web:** let a person narrow a connector's scopes on the consent screen ([#45](https://github.com/savvagent/otto-platform/issues/45)) ([82b17dc](https://github.com/savvagent/otto-platform/commit/82b17dc0809c00c71273d8e43dd828742566e276)), closes [#43](https://github.com/savvagent/otto-platform/issues/43)
+
 ## [0.8.0](https://github.com/savvagent/otto-platform/compare/v0.7.0...v0.8.0) (2026-10-15)
 
 
