@@ -2,10 +2,15 @@
 /**
  * A product page renders its own product: the name as the page's only `<h1>`,
  * and the MCP endpoint an agent is pointed at, as text that can be copied.
+ *
+ * Its primary button depends on whether the product has a web console of its
+ * own. Otto Factory does, and the button leaves for it; Otto Flags and Otto
+ * CXP live inside the visitor's AI assistant, so theirs stays on the page and
+ * points at the connect card.
  */
 
 import { flushSync, mount, unmount } from 'svelte';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { session } from '$lib/session.svelte';
 import type { Me } from '$lib/types';
@@ -36,6 +41,7 @@ beforeEach(() => {
 afterEach(() => {
   container.remove();
   session.clear();
+  history.replaceState(null, '', '/');
 });
 
 function mountProduct(slug: string) {
@@ -105,7 +111,6 @@ describe('the product page', () => {
     expectNoSkips(headingLevels(container));
     expect(container.textContent).toContain('https://otto-flags.savvagent.com/mcp');
     expect(container.textContent).toContain('Automatic rollback on Team plans and above.');
-    expect(linkText('https://otto-flags.savvagent.com')).toContain('Open the Otto Flags console');
     expect(container.querySelector('a[href="/products/factory"]')).not.toBeNull();
     expect(container.querySelector('a[href="/products/flags"]')).toBeNull();
 
@@ -130,5 +135,165 @@ describe('the product page', () => {
     ).toBe(true);
 
     unmount(instance);
+  });
+
+  it("keeps the way into a product's own web console when it has one", () => {
+    const instance = mountProduct('factory');
+
+    expect(linkText('https://otto-factory.savvagent.com')).toContain(
+      'Open the Otto Factory console'
+    );
+    expect(container.querySelector('a[href="#connect"]')).toBeNull();
+    expect(container.textContent).not.toContain('has no web console of its own');
+
+    unmount(instance);
+  });
+
+  for (const [slug, name] of [
+    ['flags', 'Otto Flags'],
+    ['cxp', 'Otto CXP']
+  ] as const) {
+    it(`sends a visitor to the connect card for ${name}, which has no web console`, () => {
+      const instance = mountProduct(slug);
+
+      // Nothing on the page leads to the bare origin, which answers a browser
+      // with a JSON 404.
+      expect(container.querySelector(`a[href^="https://otto-${slug}."]`)).toBeNull();
+      expect(container.textContent).not.toContain(`Open the ${name} console`);
+
+      const add = container.querySelector('a[href="#connect"]');
+      expect(add?.textContent?.trim()).toBe('Add to your AI assistant');
+
+      const note = Array.from(container.querySelectorAll('p')).find((p) =>
+        p.textContent?.includes('has no web console of its own')
+      );
+      expect(note?.textContent?.replace(/\s+/g, ' ').trim()).toBe(
+        `${name} works inside your AI assistant; it has no web console of its own. Usage and billing are in your Otto console.`
+      );
+      // "Otto console" goes where every other way into the console goes.
+      const otto = note?.querySelector('a');
+      expect(otto?.textContent?.trim()).toBe('Otto console');
+      expect(otto?.getAttribute('href')).toBe('/signup');
+      expect(otto?.hasAttribute('data-sveltekit-reload')).toBe(true);
+
+      // The account console stays as the secondary button.
+      expect(linkText('/signup')).toBe('Create account');
+
+      unmount(instance);
+    });
+  }
+
+  it('sends the "Otto console" note to the signed-in visitor\'s org', () => {
+    session.me = {
+      orgs: [
+        { orgId: 'o1', userId: 'u1', role: 'owner', orgSlug: 'acme', orgName: 'Acme', plan: 'free' }
+      ]
+    } as unknown as Me;
+    const instance = mountProduct('cxp');
+
+    const otto = Array.from(container.querySelectorAll('a')).find(
+      (a) => a.textContent?.trim() === 'Otto console'
+    );
+    expect(otto?.getAttribute('href')).toBe('/o/acme');
+
+    unmount(instance);
+  });
+
+  it('gives the connect card a focusable target, setup steps, and the Claude Code command', () => {
+    for (const slug of ['factory', 'flags', 'cxp']) {
+      const instance = mountProduct(slug);
+
+      const connect = container.querySelector('#connect');
+      expect(connect?.tagName).toBe('SECTION');
+      expect(connect?.getAttribute('tabindex')).toBe('-1');
+      expect(connect?.getAttribute('aria-labelledby')).toBe('connect-title');
+
+      const text = connect?.textContent ?? '';
+      expect(text).toContain('Connector address');
+      expect(text).toContain(`https://otto-${slug}.savvagent.com/mcp`);
+      expect(text).toContain('Add custom connector');
+      expect(text).toContain('ChatGPT');
+      expect(text).toContain('developer mode');
+      expect(text).toContain(
+        `claude mcp add --transport http otto-${slug} https://otto-${slug}.savvagent.com/mcp`
+      );
+      expect(text).toContain('/mcp');
+      expectNoSkips(headingLevels(container));
+
+      unmount(instance);
+    }
+  });
+
+  it('moves focus to the connect card, marked as arrived, when the button is followed', async () => {
+    const instance = mountProduct('cxp');
+    const connect = container.querySelector<HTMLElement>('#connect')!;
+    expect(connect.classList.contains('arrived')).toBe(false);
+
+    container.querySelector<HTMLAnchorElement>('a[href="#connect"]')?.click();
+    await vi.waitFor(() => expect(document.activeElement).toBe(connect));
+    flushSync();
+    expect(connect.classList.contains('arrived')).toBe(true);
+
+    // Leaving the card clears the mark, so it never lingers.
+    connect.blur();
+    flushSync();
+    expect(connect.classList.contains('arrived')).toBe(false);
+
+    unmount(instance);
+  });
+
+  it('does not mark a click on the card itself as an arrival', () => {
+    const instance = mountProduct('cxp');
+    const connect = container.querySelector<HTMLElement>('#connect')!;
+
+    connect.focus();
+    connect.click();
+    flushSync();
+    expect(connect.classList.contains('arrived')).toBe(false);
+
+    unmount(instance);
+  });
+
+  it('moves focus to the connect card when the hash changes to #connect, and only then', async () => {
+    const instance = mountProduct('cxp');
+    const connect = container.querySelector<HTMLElement>('#connect')!;
+
+    history.replaceState(null, '', '/products/cxp#elsewhere');
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    await Promise.resolve();
+    flushSync();
+    expect(document.activeElement).not.toBe(connect);
+
+    history.replaceState(null, '', '/products/cxp#connect');
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    await vi.waitFor(() => expect(document.activeElement).toBe(connect));
+
+    unmount(instance);
+  });
+
+  it('moves focus to the connect card on arriving at #connect from another page', async () => {
+    history.replaceState(null, '', '/products/cxp#connect');
+    const instance = mountProduct('cxp');
+
+    await vi.waitFor(() =>
+      expect(document.activeElement).toBe(container.querySelector('#connect'))
+    );
+
+    unmount(instance);
+  });
+
+  it('leaves focus alone on arrival if the visitor has already moved it', async () => {
+    const elsewhere = document.createElement('button');
+    document.body.appendChild(elsewhere);
+    elsewhere.focus();
+    history.replaceState(null, '', '/products/cxp#connect');
+    const instance = mountProduct('cxp');
+
+    await Promise.resolve();
+    flushSync();
+    expect(document.activeElement).toBe(elsewhere);
+
+    unmount(instance);
+    elsewhere.remove();
   });
 });
