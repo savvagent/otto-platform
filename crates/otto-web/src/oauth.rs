@@ -699,9 +699,10 @@ pub async fn authorize_decision(
         }
     };
 
-    // Load-bearing: `issue_authorization_code` reads an empty scope list as
-    // "the resource server's defaults", so an empty selection passed through
-    // would *widen* to them. Nothing checked means nothing granted.
+    // Nothing checked means the person granted nothing: `access_denied`.
+    // Without this, `grant` would still refuse `[]`, but as `invalid_scope`
+    // with its org:admin message, and `issue_authorization_code` refuses it
+    // last. Those are backstops; this is the answer the client should get.
     if narrowed.is_empty() {
         return redirect_error(&params, "access_denied", "no access was selected");
     }

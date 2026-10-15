@@ -78,6 +78,8 @@ fn authorize_req(client_id: &str, resource: &str, scopes: &[&str]) -> AuthorizeR
 }
 
 /// Runs the whole authorization-code flow and returns the issued tokens.
+/// Issues with the scopes `validate_authorize` resolved, as otto-web does, so
+/// an empty `scopes` gets the resource server's defaults from there.
 async fn code_flow(
     db: &Db,
     resource: &str,
@@ -86,7 +88,11 @@ async fn code_flow(
     let (user, org) = member(db).await;
     let client_id = client(db).await;
     let req = authorize_req(&client_id, resource, scopes);
-    oauth::validate_authorize(db, &req).await.unwrap();
+    let auth = oauth::validate_authorize(db, &req).await.unwrap();
+    let req = AuthorizeRequest {
+        scopes: auth.scopes,
+        ..req
+    };
     let code = oauth::issue_authorization_code(db, &req, user, org)
         .await
         .unwrap();
@@ -305,6 +311,44 @@ async fn authorize_reports_the_resource_and_granted_scopes(pool: PgPool) {
 
 // ---- code redemption and audience ----
 
+/// Defaults are resolved once, by `validate_authorize`. Issuance must not
+/// re-resolve an empty list into them: whatever reaches it is what was
+/// consented to, and nothing was.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn issuing_a_code_for_no_scopes_is_refused(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register_both(&db).await;
+    let (user, org) = member(&db).await;
+    let client_id = client(&db).await;
+    let err =
+        oauth::issue_authorization_code(&db, &authorize_req(&client_id, FLAGS, &[]), user, org)
+            .await
+            .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidScope(_)), "{err:?}");
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM authorization_codes")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored, 0, "a refused issuance must store no code");
+}
+
+/// The empty check comes before the registry lookup, so it holds even where
+/// the lookup would fail for another reason: no path through issuance lets
+/// `[]` reach `grant_scopes`.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn no_scopes_is_refused_before_the_resource_is_looked_up(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register_both(&db).await;
+    resources::set_disabled(&db, FLAGS, true).await.unwrap();
+    let (user, org) = member(&db).await;
+    let client_id = client(&db).await;
+    let err =
+        oauth::issue_authorization_code(&db, &authorize_req(&client_id, FLAGS, &[]), user, org)
+            .await
+            .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidScope(_)), "{err:?}");
+}
+
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn an_empty_scope_request_yields_that_resources_defaults(pool: PgPool) {
     let db = Db::from_pool(pool);
@@ -335,7 +379,7 @@ async fn redemption_refuses_a_different_requested_resource(pool: PgPool) {
     register_both(&db).await;
     let (user, org) = member(&db).await;
     let client_id = client(&db).await;
-    let req = authorize_req(&client_id, FLAGS, &[]);
+    let req = authorize_req(&client_id, FLAGS, &["flags:read"]);
     let code = oauth::issue_authorization_code(&db, &req, user, org)
         .await
         .unwrap();
@@ -353,7 +397,7 @@ async fn disabling_a_resource_stops_redemption_and_refresh(pool: PgPool) {
     // A code issued before the resource was disabled cannot be redeemed after.
     let (user, org) = member(&db).await;
     let client_id = client(&db).await;
-    let req = authorize_req(&client_id, FLAGS, &[]);
+    let req = authorize_req(&client_id, FLAGS, &["flags:read"]);
     let code = oauth::issue_authorization_code(&db, &req, user, org)
         .await
         .unwrap();
@@ -365,7 +409,7 @@ async fn disabling_a_resource_stops_redemption_and_refresh(pool: PgPool) {
 
     // A refresh token issued while enabled cannot be redeemed after.
     resources::set_disabled(&db, FLAGS, false).await.unwrap();
-    let req = authorize_req(&client_id, FLAGS, &[]);
+    let req = authorize_req(&client_id, FLAGS, &["flags:read"]);
     let code = oauth::issue_authorization_code(&db, &req, user, org)
         .await
         .unwrap();

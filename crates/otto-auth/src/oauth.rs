@@ -424,9 +424,8 @@ impl Authorization {
     /// server's, unknown, or a near-miss with whitespace. The consent form can
     /// only ever take away.
     ///
-    /// An empty result is `Ok(vec![])`, and what it means is the caller's
-    /// decision. Do not pass it to [`issue_authorization_code`], which reads an
-    /// empty list as "the resource server's defaults" and would widen it.
+    /// An empty result is `Ok(vec![])`: nothing was granted, and how to say so
+    /// is the caller's decision. [`issue_authorization_code`] refuses it.
     pub fn narrow(&self, chosen: &[String]) -> Result<Vec<String>> {
         if let Some(extra) = chosen.iter().find(|c| !self.scopes.contains(c)) {
             return Err(AuthError::InvalidScope(format!(
@@ -496,16 +495,27 @@ pub async fn validate_authorize(db: &Db, req: &AuthorizeRequest) -> Result<Autho
 /// in transit is useless without the verifier that only the initiating client
 /// holds.
 ///
-/// The resource and scopes are resolved again here rather than trusted from
-/// the consent screen, so a resource disabled (or a scope removed) between
-/// consent and issuance is caught, and the code carries the scopes actually
-/// granted — the resource server's defaults when the client asked for none.
+/// `req.scopes` must be the scopes to grant: the resolved, consented set,
+/// never empty. Defaults are resolved once, by [`validate_authorize`], before
+/// consent. An empty list is refused with [`AuthError::InvalidScope`] and
+/// stores nothing, rather than widened to the defaults. Each scope is still
+/// re-checked against the registry here, so a resource disabled (or a scope
+/// removed) between consent and issuance is caught. The empty check runs
+/// first, so `[]` is `invalid_scope` even for a disabled resource.
 pub async fn issue_authorization_code(
     db: &Db,
     req: &AuthorizeRequest,
     user: UserId,
     org: OrgId,
 ) -> Result<String> {
+    // Defaults are `validate_authorize`'s to resolve, once, before consent.
+    // Here an empty list could only mean "nothing was granted", and
+    // `grant_scopes` would read it as "the defaults" and widen it.
+    if req.scopes.is_empty() {
+        return Err(AuthError::InvalidScope(
+            "an authorization code needs at least one granted scope".into(),
+        ));
+    }
     let resource = resources::get_active(db, &req.resource).await?;
     let scopes = resource.grant_scopes(&req.scopes)?;
     let code = crypto::generate(prefix::AUTH_CODE);
@@ -963,8 +973,8 @@ mod tests {
     }
 
     /// Empty is not an error here. The caller decides, and the authorization
-    /// endpoint refuses it, because `issue_authorization_code` would read `[]`
-    /// as "the defaults".
+    /// endpoint refuses it: issuance refuses `[]`, and the endpoint turns it
+    /// into `access_denied` first.
     #[test]
     fn narrow_to_nothing_is_an_empty_ok() {
         let a = authorization(&["things:read", "things:write"]);

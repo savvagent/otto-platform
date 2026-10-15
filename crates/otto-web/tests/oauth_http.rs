@@ -1824,6 +1824,30 @@ async fn a_first_party_client_with_one_org_skips_consent(pool: PgPool) {
     );
 }
 
+/// The skip path resolves defaults the same way the consent page does,
+/// through `validate_authorize`, so it never hands issuance an empty list.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_scopeless_first_party_request_skips_consent_with_the_defaults(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register_first_party(&h).await;
+    let (verifier, challenge) = pkce();
+
+    let reply = Call::get(fp_url(&client_id, &challenge, "", "s"))
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    reply.expect(StatusCode::SEE_OTHER);
+
+    let tokens = redeem(&h, &client_id, &location(&reply), &verifier).await;
+    tokens.expect(StatusCode::OK);
+    assert_eq!(
+        tokens.body["scope"],
+        common::RESOURCE_DEFAULT_SCOPES.join(" ")
+    );
+}
+
 /// The skip is after full validation: a bad redirect URI or missing PKCE is
 /// still an error page, never a code.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]

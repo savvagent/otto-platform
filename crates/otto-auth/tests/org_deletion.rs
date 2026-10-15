@@ -55,7 +55,7 @@ fn request(client_id: &str) -> AuthorizeRequest {
         redirect_uri: REDIRECT.into(),
         code_challenge: URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes())),
         code_challenge_method: "S256".into(),
-        scopes: vec![],
+        scopes: vec!["jobs:read".into()],
         resource: RS.into(),
         state: None,
     }
