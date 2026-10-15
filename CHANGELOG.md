@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1](https://github.com/savvagent/otto-platform/compare/v0.9.0...v0.9.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* **otto-auth:** refuse an authorization request that resolves to no scopes ([#51](https://github.com/savvagent/otto-platform/issues/51)) ([71f24f7](https://github.com/savvagent/otto-platform/commit/71f24f7c16e0e6c73312d4288a08c87e143a2f3d)), closes [#49](https://github.com/savvagent/otto-platform/issues/49)
+* **otto-auth:** refuse an empty scope list at code issuance ([#48](https://github.com/savvagent/otto-platform/issues/48)) ([a6d03ac](https://github.com/savvagent/otto-platform/commit/a6d03ac6eae03090ca631a378bc8bcb7113d5dee)), closes [#46](https://github.com/savvagent/otto-platform/issues/46)
+
 ## [0.9.0](https://github.com/savvagent/otto-platform/compare/v0.8.0...v0.9.0) (2026-10-15)
 
 
