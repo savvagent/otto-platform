@@ -323,7 +323,7 @@ async fn consent_orgs(
 /// `preselect` is honoured only when it names one of `orgs`, the caller's
 /// own, so neither a hint nor a hand-edited form can make the page claim an
 /// org the caller is not in.
-async fn render_consent(
+fn render_consent(
     state: &AppState,
     caller: &CurrentUser,
     resolved: &Resolved<'_>,
@@ -468,7 +468,6 @@ pub async fn authorize_page(
         &authorization.scopes,
         locale,
     )
-    .await
 }
 
 /// The consent form's fields: the original request, plus the two decisions the
@@ -646,8 +645,7 @@ pub async fn authorize_decision(
             Some(form.org_id),
             &read_only,
             locale,
-        )
-        .await;
+        );
     }
 
     if form.decision != "allow" {
