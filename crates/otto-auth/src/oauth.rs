@@ -411,6 +411,8 @@ pub struct Authorization {
     pub resource: ResourceServer,
     /// What the user consents to: the resource server's defaults when the
     /// client asked for nothing, otherwise exactly what it asked for.
+    /// Never empty: a request that would resolve to nothing is refused by
+    /// [`validate_authorize`].
     pub scopes: Vec<String>,
 }
 
@@ -447,6 +449,11 @@ impl Authorization {
 /// because every later error is reported by redirecting to it. Validating
 /// anything else first would mean bouncing an error — with `state` — to an
 /// unvalidated destination.
+///
+/// Scopes are resolved last: the request's, or the resource server's defaults
+/// when it names none. A request that resolves to no scope at all is refused
+/// with [`AuthError::InvalidScope`], so an [`Authorization`] never carries an
+/// empty list.
 pub async fn validate_authorize(db: &Db, req: &AuthorizeRequest) -> Result<Authorization> {
     let client = get_client(db, &req.client_id).await?;
     if client.disabled {
@@ -481,6 +488,17 @@ pub async fn validate_authorize(db: &Db, req: &AuthorizeRequest) -> Result<Autho
     // tokens audienced for somewhere else.
     let resource = resources::get_active(db, &req.resource).await?;
     let scopes = resource.grant_scopes(&req.scopes)?;
+    // A non-empty request either fails above or resolves to something, so
+    // empty here means nothing was asked for and there are no defaults to
+    // fall back on. Refused now, so no consent page renders with nothing on
+    // it and nothing downstream has to guess why the list is empty.
+    if scopes.is_empty() {
+        return Err(AuthError::InvalidScope(format!(
+            "no scope was requested and {} has no default scopes; request one of: {}",
+            resource.resource_uri,
+            resource.scopes.join(" ")
+        )));
+    }
     Ok(Authorization {
         client,
         resource,

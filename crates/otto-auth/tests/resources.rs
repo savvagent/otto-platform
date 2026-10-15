@@ -285,6 +285,42 @@ async fn authorize_refuses_another_resource_servers_scope(pool: PgPool) {
     assert!(matches!(err, AuthError::InvalidScope(_)), "{err:?}");
 }
 
+/// A resource server may be registered with no default scopes. A client that
+/// then asks for nothing has asked for nothing at all, so `validate_authorize`
+/// refuses it up front with an accurate `invalid_scope`. Otherwise an empty
+/// consent page renders and a downstream refusal gives a misleading reason
+/// (#49). An explicit scope still works.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn authorize_refuses_a_scopeless_request_to_a_resource_without_defaults(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    resources::register(
+        &db,
+        ResourceServerSpec {
+            resource_uri: FLAGS,
+            name: "otto-flags",
+            scopes: &["flags:read", "flags:write"],
+            default_scopes: &[],
+        },
+    )
+    .await
+    .unwrap();
+    let client_id = client(&db).await;
+
+    let err = oauth::validate_authorize(&db, &authorize_req(&client_id, FLAGS, &[]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AuthError::InvalidScope(m) if m.contains("no default scopes")),
+        "{err:?}"
+    );
+    assert_eq!(err.oauth_code(), Some("invalid_scope"));
+
+    let auth = oauth::validate_authorize(&db, &authorize_req(&client_id, FLAGS, &["flags:write"]))
+        .await
+        .unwrap();
+    assert_eq!(auth.scopes, vec!["flags:write".to_string()]);
+}
+
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn authorize_refuses_a_disabled_resource(pool: PgPool) {
     let db = Db::from_pool(pool);
