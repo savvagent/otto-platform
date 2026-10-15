@@ -102,6 +102,29 @@ fn percent_decode(raw: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+async fn code_count(h: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM authorization_codes")
+        .fetch_one(h.db.pool())
+        .await
+        .unwrap()
+}
+
+/// A refusal that must not reach the client: a 400 page, no redirect, and no
+/// code anywhere in the database.
+async fn assert_refused_as_a_page(h: &Harness, reply: &common::Reply, why: &str) {
+    assert_eq!(
+        reply.status,
+        StatusCode::BAD_REQUEST,
+        "{why}: {}",
+        reply.text
+    );
+    assert!(
+        reply.headers.get(http::header::LOCATION).is_none(),
+        "{why}: an unauthenticated form drove a redirect"
+    );
+    assert_eq!(code_count(h).await, 0, "{why}: a code was issued");
+}
+
 // ------------------------------------------------------------- discovery
 
 /// The document every OAuth client believes over anything written elsewhere. If
@@ -1303,6 +1326,178 @@ async fn agent_endpoints_without_a_cookie_are_not_guarded(pool: PgPool) {
         .send(&h.router)
         .await;
     registered.expect(StatusCode::CREATED);
+}
+
+// --------------------------------------------------------- the request seal
+
+/// The decision must carry the seal from its own page: a missing, garbled,
+/// tampered or borrowed seal is refused, and none of that burns the honest form.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_consent_decision_needs_the_seal_from_its_own_page(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let other_client = register(&h, "Other Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let honest = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+
+    // No seal, as a page rendered by the previous binary would send.
+    let mut form = honest.clone();
+    form.remove_field("request_seal");
+    let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "allow")).await;
+    assert_refused_as_a_page(&h, &reply, "missing seal").await;
+    assert!(reply.text.contains("request seal"), "{}", reply.text);
+
+    // Garbled.
+    let long = "A".repeat(300);
+    for garbage in ["", "AAAA", "not base64!", long.as_str()] {
+        let mut form = honest.clone();
+        form.set_field("request_seal", garbage);
+        let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "allow")).await;
+        assert_refused_as_a_page(&h, &reply, &format!("garbled seal {garbage:?}")).await;
+    }
+
+    // A real seal with one flipped byte.
+    let mut raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(honest.field("request_seal").unwrap())
+        .unwrap();
+    raw[20] ^= 0x01;
+    let mut form = honest.clone();
+    form.set_field(
+        "request_seal",
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw),
+    );
+    let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "allow")).await;
+    assert_refused_as_a_page(&h, &reply, "flipped byte").await;
+
+    // A genuine seal, from another client's page.
+    let theirs = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&other_client, &challenge, "things:read", "s"),
+    )
+    .await;
+    let mut form = honest.clone();
+    form.set_field("request_seal", theirs.field("request_seal").unwrap());
+    let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "allow")).await;
+    assert_refused_as_a_page(&h, &reply, "another client's seal").await;
+    assert!(reply.text.contains("client_id"), "{}", reply.text);
+
+    // None of that burned anything: the honest form still works.
+    let reply = common::submit_consent(&h, &rob.session, &honest.submission(&org, "allow")).await;
+    reply.expect(StatusCode::SEE_OTHER);
+    assert!(query_param(&location(&reply), "code").is_some());
+}
+
+/// Editing the hidden `scope` to ask for more than the page showed is caught
+/// by the seal, even though the edited request is itself legal.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn widening_the_hidden_scope_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let mut form = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+
+    form.set_field("scope", "things:read things:write");
+    let reply = common::submit_consent(
+        &h,
+        &rob.session,
+        &form.submission_with(&org, "allow", &["things:read", "things:write"]),
+    )
+    .await;
+    assert_refused_as_a_page(&h, &reply, "widened hidden scope").await;
+    assert!(reply.text.contains("scopes"), "{}", reply.text);
+}
+
+/// A seal is bound to the person it was rendered for.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn another_users_consent_form_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let bob = onboard(&h, "bob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    common::add_member(&h, org, bob.user, otto_core::orgs::Role::Owner).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let robs = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+
+    let reply = common::submit_consent(
+        &h,
+        &bob.session,
+        &robs.submission(&org.to_string(), "allow"),
+    )
+    .await;
+    assert_refused_as_a_page(&h, &reply, "rob's form submitted by bob").await;
+}
+
+/// A form this server cannot vouch for must not drive a redirect, even one
+/// that says "denied": the redirect would carry the forger's `state` to the
+/// client as if the person had answered.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_deny_with_a_bad_seal_is_a_page_not_a_redirect(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let mut form = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "opaque-state"),
+    )
+    .await;
+
+    for seal in [None, Some("AAAA")] {
+        match seal {
+            None => form.remove_field("request_seal"),
+            Some(s) => form.set_field("request_seal", s),
+        }
+        let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "deny")).await;
+        assert_refused_as_a_page(&h, &reply, &format!("deny with seal {seal:?}")).await;
+        assert!(
+            !reply.text.contains("opaque-state"),
+            "state must not be echoed"
+        );
+    }
+}
+
+/// The body is parsed by hand rather than by axum's `Form`. A body that does
+/// not deserialize must still be a 400 page, not a 422 and never a 500.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_malformed_consent_body_is_a_400_page(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let form = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+
+    let reply =
+        common::submit_consent(&h, &rob.session, &form.submission("not-an-org-id", "allow")).await;
+    assert_refused_as_a_page(&h, &reply, "unparseable org_id").await;
 }
 
 // ------------------------------------------------ first-party clients

@@ -20,8 +20,6 @@
 //! grants nothing that page did not already offer. No new key, crate or
 //! table.
 
-#![cfg_attr(not(test), allow(dead_code))] // Wired in by authorize_decision; removed once used.
-
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};

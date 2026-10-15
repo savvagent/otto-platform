@@ -46,7 +46,7 @@
 //!   parameters, which is what lets an agent show a useful message instead of
 //!   hanging on a callback that never arrives.
 
-use axum::extract::{Form, Query, State};
+use axum::extract::{Form, Query, RawForm, State};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use http::request::Parts;
@@ -414,10 +414,13 @@ pub async fn authorize_page(
 ///
 /// The authorization parameters are written out rather than pulled in with
 /// `#[serde(flatten)]`, which would be the obvious way and does not work:
-/// `axum::Form` deserializes with `serde_urlencoded`, whose deserializer is not
-/// self-describing, and `flatten` needs one. The failure is a runtime rejection
-/// of every consent submission, not a compile error — so the duplication stays,
-/// with [`ConsentForm::params`] as the single place it is undone.
+/// `authorize_decision` deserializes it with `serde_urlencoded` from the raw
+/// body (repeated `grant` values are read separately, because
+/// `serde_urlencoded` cannot collect a repeated key into a `Vec`), and that
+/// deserializer is not self-describing, which `flatten` needs. The failure is
+/// a runtime rejection of every consent submission, not a compile error — so
+/// the duplication stays, with [`ConsentForm::params`] as the single place it
+/// is undone.
 #[derive(Debug, Deserialize)]
 pub struct ConsentForm {
     #[serde(default)]
@@ -441,6 +444,11 @@ pub struct ConsentForm {
     /// "allow" or anything else, which is a denial.
     #[serde(default)]
     pub decision: String,
+    /// The seal `authorize_page` rendered (see [`crate::consent_seal`]).
+    /// Required: there is no unsealed fallback, which would let a forger
+    /// simply drop it.
+    #[serde(default)]
+    pub request_seal: Option<String>,
 }
 
 impl ConsentForm {
@@ -477,10 +485,23 @@ pub async fn authorize_decision(
     State(state): State<AppState>,
     caller: CurrentUser,
     parts: Parts,
-    Form(form): Form<ConsentForm>,
+    RawForm(body): RawForm,
 ) -> Response {
-    let params = form.params();
     let locale = page_locale(&caller, &parts);
+    // Read by hand rather than with `Form`: the person's selection arrives as
+    // repeated `grant` values, which `serde_urlencoded` cannot collect into a
+    // field, so the body is needed twice. A body that does not deserialize is
+    // a 400 page, as `Form`'s rejection was a 4xx, never a 500.
+    let form: ConsentForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(form) => form,
+        Err(e) => {
+            return error_page(
+                &AuthError::InvalidRequest(format!("the consent form could not be read: {e}")),
+                locale,
+            )
+        }
+    };
+    let params = form.params();
     let mut req = match params.to_request(&state.db).await {
         Ok(req) => req,
         Err(e) => return error_page(&e, locale),
@@ -493,6 +514,28 @@ pub async fn authorize_decision(
         Ok(authorization) => authorization,
         Err(e) => return error_page(&e, locale),
     };
+
+    // ...and re-validation proves only that the request is legal, not that it is
+    // the one the person was shown. The seal does that, compared field by field
+    // with the *resolved* values (the client the registry returned, the
+    // redirect URI `validate_authorize` accepted, the re-resolved resource, the
+    // resolved scopes), never with raw form strings. Checked before every
+    // branch, `deny` included: a form this server cannot vouch for must not
+    // drive any redirect.
+    if let Err(e) = crate::consent_seal::check(
+        &state.cipher,
+        form.request_seal.as_deref(),
+        &crate::consent_seal::Expected {
+            client_id: &authorization.client.client_id,
+            redirect_uri: &req.redirect_uri,
+            resource: &authorization.resource.resource_uri,
+            user_id: caller.user.id,
+            scopes: &authorization.scopes,
+        },
+        chrono::Utc::now(),
+    ) {
+        return error_page(&AuthError::InvalidRequest(e.to_string()), locale);
+    }
 
     // Normalize the same way `authorize_page` did before rendering the consent
     // screen: a client that omits `scope` gets the resource server's defaults,

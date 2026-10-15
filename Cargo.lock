@@ -1764,6 +1764,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha2",
  "sqlx",
  "tokio",
