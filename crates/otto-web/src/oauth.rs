@@ -485,10 +485,12 @@ fn blank_to_none(value: Option<String>) -> Option<String> {
 
 /// `POST /oauth/authorize` — the user's decision.
 ///
-/// Cross-site protection is the session cookie's `SameSite=Lax`, which
-/// withholds it on a cross-site `POST`: a form on an attacker's page submitting
-/// here arrives without a session and is bounced to login rather than silently
-/// consenting on the victim's behalf.
+/// Cross-site protection does not rest on the session cookie's `SameSite`
+/// attribute. The Origin / `Sec-Fetch-Site` guard in front of every `POST`
+/// refuses a cross-site submission before this handler runs, and the form's
+/// `request_seal` then binds the decision to the exact request, client, user
+/// and scopes the page was rendered for, so a form this server did not render
+/// for this person is a 400 page and never drives a redirect.
 pub async fn authorize_decision(
     State(state): State<AppState>,
     caller: CurrentUser,
@@ -503,10 +505,14 @@ pub async fn authorize_decision(
     let form: ConsentForm = match serde_urlencoded::from_bytes(&body) {
         Ok(form) => form,
         Err(e) => {
+            // serde's wording names fields and is for the log, not the person.
+            tracing::debug!(error = %e, "consent form body did not deserialize");
             return error_page(
-                &AuthError::InvalidRequest(format!("the consent form could not be read: {e}")),
+                &AuthError::InvalidRequest(
+                    "the consent form could not be read; start again from the app".into(),
+                ),
                 locale,
-            )
+            );
         }
     };
     let params = form.params();

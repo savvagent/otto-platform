@@ -1415,6 +1415,36 @@ async fn a_consent_decision_needs_the_seal_from_its_own_page(pool: PgPool) {
     assert!(query_param(&location(&reply), "code").is_some());
 }
 
+/// A repeated `request_seal` or `scope` is refused outright rather than read
+/// as "the first one" by one parse and "the last one" by another: the handler
+/// reads the body twice, and the two reads must agree.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_consent_post_with_a_repeated_field_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+
+    let mut doubled_seal = page.submission(&org.to_string(), "allow");
+    doubled_seal.push(("request_seal".into(), "AAAA".into()));
+    let reply = common::submit_consent(&h, &rob.session, &doubled_seal).await;
+    assert_refused_as_a_page(&h, &reply, "two seals, one honest").await;
+
+    let mut doubled_scope = page.submission(&org.to_string(), "allow");
+    doubled_scope.push(("scope".into(), "things:read things:write".into()));
+    let reply = common::submit_consent(&h, &rob.session, &doubled_scope).await;
+    assert_refused_as_a_page(&h, &reply, "two scopes").await;
+    // The page shows a fixed message, not serde's wording.
+    assert!(!reply.text.contains("duplicate"), "{}", reply.text);
+}
+
 /// Editing the hidden `scope` to ask for more than the page showed is caught
 /// by the seal, even though the edited request is itself legal.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
@@ -1658,6 +1688,21 @@ async fn a_first_party_client_with_one_org_skips_consent(pool: PgPool) {
     .unwrap();
     assert_eq!(principal.org_id, org);
     assert_eq!(principal.user_id, rob.user);
+
+    // No screen means nothing was narrowed: what was asked for is what the
+    // audit trail says was resolved, before the downscope.
+    let detail: serde_json::Value = sqlx::query_scalar(
+        "SELECT detail FROM audit_events WHERE action = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(otto_tenant::audit::action::AUTHORIZATION_GRANTED)
+    .fetch_one(h.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(detail["requested"], detail["scopes"]);
+    assert_eq!(
+        detail["requested"],
+        serde_json::json!(["things:read", "things:write"])
+    );
 }
 
 /// The skip is after full validation: a bad redirect URI or missing PKCE is
@@ -2108,7 +2153,10 @@ async fn unchecking_the_write_scope_yields_a_read_only_token(pool: PgPool) {
     .unwrap();
     assert_eq!(principal.scopes, vec!["things:read".to_string()]);
     assert!(
-        principal.require_scope("things:write").is_err(),
+        matches!(
+            principal.require_scope("things:write"),
+            Err(otto_auth::AuthError::InvalidScope(_))
+        ),
         "a write tool must refuse this token with insufficient scope"
     );
 
@@ -2315,6 +2363,7 @@ async fn a_member_narrowing_to_org_admin_is_still_downscoped(pool: PgPool) {
     tokens.expect(StatusCode::OK);
     assert_eq!(tokens.body["scope"], "things:read");
 
+    let codes_before = code_count(&h).await;
     let refused = consent_with(
         &h,
         &bob,
@@ -2330,6 +2379,11 @@ async fn a_member_narrowing_to_org_admin_is_still_downscoped(pool: PgPool) {
         query_param(&location(&refused), "error").as_deref(),
         Some("invalid_scope")
     );
+    assert!(
+        query_param(&location(&refused), "code").is_none(),
+        "everything was downscoped away, so no code may be issued"
+    );
+    assert_eq!(code_count(&h).await, codes_before, "no code was stored");
 }
 
 /// "Read only" leaves exactly the read scopes checked, keeps the chosen
