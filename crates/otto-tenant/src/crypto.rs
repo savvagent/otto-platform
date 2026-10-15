@@ -8,7 +8,9 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use rand::RngCore;
+use sha2::Sha256;
 
 use crate::error::{Error, Result};
 
@@ -21,6 +23,9 @@ use crate::error::{Error, Result};
 #[derive(Clone)]
 pub struct Cipher {
     inner: Aes256Gcm,
+    /// The raw key, kept only so [`Cipher::derive`] can key HMAC with it.
+    /// Private, and never printed: `Debug` is redacted below.
+    key: [u8; 32],
 }
 
 impl std::fmt::Debug for Cipher {
@@ -55,10 +60,44 @@ impl Cipher {
             )));
         }
 
-        let key = Key::<Aes256Gcm>::from_slice(&raw);
-        Ok(Self {
-            inner: Aes256Gcm::new(key),
-        })
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&raw);
+        Ok(Self::from_key(key))
+    }
+
+    fn from_key(key: [u8; 32]) -> Self {
+        Self {
+            inner: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key)),
+            key,
+        }
+    }
+
+    /// A cipher under a subkey dedicated to one purpose:
+    /// `HMAC-SHA256(key, label)`, which is 32 bytes and so a full AES-256 key.
+    ///
+    /// Use it when a component needs AEAD for something other than secrets at
+    /// rest. A separate key means a value sealed for one purpose can never be
+    /// opened as another, and the at-rest key's GCM nonce budget is not spent
+    /// on it. Deterministic: the same base key and label always give the same
+    /// subkey, so every replica derives the same one and no new secret or
+    /// configuration is needed. Labels must be distinct per purpose.
+    ///
+    /// ```
+    /// # use otto_tenant::crypto::Cipher;
+    /// let base = Cipher::from_base64_key(&"A".repeat(43)).unwrap();
+    /// let sealed = base.derive("example").seal(b"hello").unwrap();
+    /// assert!(base.open(&sealed.ciphertext, &sealed.nonce).is_err());
+    /// assert_eq!(
+    ///     base.derive("example").open(&sealed.ciphertext, &sealed.nonce).unwrap(),
+    ///     b"hello"
+    /// );
+    /// ```
+    pub fn derive(&self, label: &str) -> Cipher {
+        // HMAC takes a key of any length, so this cannot fail.
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key)
+            .expect("HMAC-SHA256 accepts a key of any length");
+        mac.update(label.as_bytes());
+        Self::from_key(mac.finalize().into_bytes().into())
     }
 
     /// Seal a secret. A fresh random 96-bit nonce every time — reusing a nonce
@@ -140,5 +179,60 @@ mod tests {
     fn key_must_be_32_bytes() {
         assert!(Cipher::from_base64_key(&B64.encode([0u8; 16])).is_err());
         assert!(Cipher::from_base64_key("not base64!!").is_err());
+    }
+
+    #[test]
+    fn a_derived_cipher_and_its_base_cannot_open_each_other() {
+        let base = Cipher::from_base64_key(&B64.encode([7u8; 32])).unwrap();
+        let derived = base.derive("consent-seal");
+
+        let from_base = base.seal(b"secret").unwrap();
+        assert!(derived
+            .open(&from_base.ciphertext, &from_base.nonce)
+            .is_err());
+
+        let from_derived = derived.seal(b"secret").unwrap();
+        assert!(base
+            .open(&from_derived.ciphertext, &from_derived.nonce)
+            .is_err());
+        assert_eq!(
+            derived
+                .open(&from_derived.ciphertext, &from_derived.nonce)
+                .unwrap(),
+            b"secret"
+        );
+    }
+
+    #[test]
+    fn derivation_is_deterministic_and_label_separated() {
+        let key = B64.encode([7u8; 32]);
+        let a = Cipher::from_base64_key(&key)
+            .unwrap()
+            .derive("consent-seal");
+        let b = Cipher::from_base64_key(&key)
+            .unwrap()
+            .derive("consent-seal");
+        let sealed = a.seal(b"secret").unwrap();
+        assert_eq!(
+            b.open(&sealed.ciphertext, &sealed.nonce).unwrap(),
+            b"secret"
+        );
+
+        let other = Cipher::from_base64_key(&key)
+            .unwrap()
+            .derive("something-else");
+        assert!(other.open(&sealed.ciphertext, &sealed.nonce).is_err());
+
+        let other_base = Cipher::from_base64_key(&B64.encode([8u8; 32]))
+            .unwrap()
+            .derive("consent-seal");
+        assert!(other_base.open(&sealed.ciphertext, &sealed.nonce).is_err());
+    }
+
+    #[test]
+    fn debug_never_prints_key_material() {
+        let c = Cipher::from_base64_key(&B64.encode([7u8; 32])).unwrap();
+        assert_eq!(format!("{c:?}"), "Cipher(<key redacted>)");
+        assert_eq!(format!("{:?}", c.derive("x")), "Cipher(<key redacted>)");
     }
 }
