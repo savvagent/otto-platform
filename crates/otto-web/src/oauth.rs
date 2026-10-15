@@ -443,7 +443,8 @@ pub struct ConsentForm {
     pub org_hint: Option<String>,
     /// Which org this token will act in. A token opens exactly one.
     pub org_id: OrgId,
-    /// "allow" or anything else, which is a denial.
+    /// "allow" grants, "read_only" re-renders with only read scopes checked, and
+    /// anything else is a denial.
     #[serde(default)]
     pub decision: String,
     /// The seal `authorize_page` rendered (see [`crate::consent_seal`]).
@@ -542,6 +543,49 @@ pub async fn authorize_decision(
         chrono::Utc::now(),
     ) {
         return error_page(&AuthError::InvalidRequest(e.to_string()), locale);
+    }
+
+    // "Read only" is a no-JS submit button: it re-renders this page with only
+    // the `:read` scopes checked and issues nothing. The person still presses
+    // Allow, and that POST is checked from scratch. A fresh seal is emitted,
+    // because the page is new; the org is preselected only if the caller
+    // belongs to it.
+    if form.decision == "read_only" {
+        let orgs = match state.db.list_user_orgs(caller.user.id).await {
+            Ok(orgs) => orgs,
+            Err(e) => return ApiError::internal("list orgs for consent", e).into_response(),
+        };
+        let preselected = orgs
+            .iter()
+            .find(|m| m.org_id == form.org_id)
+            .map(|m| m.org_id);
+        let read_only: Vec<String> = authorization
+            .scopes
+            .iter()
+            .filter(|s| resources::is_read_scope(s))
+            .cloned()
+            .collect();
+        let request_seal = match seal_request(&state, &caller, &req.redirect_uri, &authorization) {
+            Ok(seal) => seal,
+            Err(e) => return e.into_response(),
+        };
+        return Html(consent_html(
+            &authorization.client,
+            &params,
+            &authorization.resource,
+            &authorization.scopes,
+            &read_only,
+            &orgs,
+            preselected,
+            caller
+                .user
+                .email
+                .as_deref()
+                .unwrap_or_else(|| i18n::msg(locale, Key::ConsentThisAccount)),
+            &request_seal,
+            locale,
+        ))
+        .into_response();
     }
 
     if form.decision != "allow" {

@@ -2331,3 +2331,159 @@ async fn a_member_narrowing_to_org_admin_is_still_downscoped(pool: PgPool) {
         Some("invalid_scope")
     );
 }
+
+/// "Read only" leaves exactly the read scopes checked, keeps the chosen
+/// org, issues nothing, and the re-rendered page then grants just those.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn read_only_leaves_exactly_the_read_scopes_checked(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let globex = org_with_owner(&h, "globex", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(
+            &client_id,
+            &challenge,
+            "things:read things:write org:admin",
+            "s",
+        ),
+    )
+    .await;
+    let reply = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&globex.to_string(), "read_only"),
+    )
+    .await;
+    reply.expect(StatusCode::OK);
+    assert!(reply.headers.get(http::header::LOCATION).is_none());
+    assert_eq!(code_count(&h).await, 0, "read only must issue nothing");
+
+    let again = common::ConsentPage::parse(&reply.text);
+    assert_eq!(
+        again.grants,
+        vec![
+            ("things:read".to_string(), true),
+            ("things:write".to_string(), false),
+            ("org:admin".to_string(), false),
+        ]
+    );
+    assert!(
+        reply.text.contains(&format!("value=\"{globex}\" selected")),
+        "the submitted org must stay selected: {}",
+        reply.text
+    );
+    assert_ne!(
+        again.field("request_seal"),
+        page.field("request_seal"),
+        "the re-render must carry a fresh seal"
+    );
+    for name in [
+        "client_id",
+        "redirect_uri",
+        "scope",
+        "resource",
+        "state",
+        "scope_choice",
+    ] {
+        assert_eq!(
+            again.field(name),
+            page.field(name),
+            "{name} must round-trip"
+        );
+    }
+
+    let granted = common::submit_consent(
+        &h,
+        &rob.session,
+        &again.submission(&globex.to_string(), "allow"),
+    )
+    .await;
+    let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
+    tokens.expect(StatusCode::OK);
+    assert_eq!(tokens.body["scope"], "things:read");
+}
+
+/// An org the caller is not in is not preselected, and nothing is issued.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn read_only_does_not_preselect_an_org_the_caller_is_not_in(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let eve = onboard(&h, "eve@initech.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let initech = org_with_owner(&h, "initech", &eve).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read things:write", "s"),
+    )
+    .await;
+    let reply = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&initech.to_string(), "read_only"),
+    )
+    .await;
+    reply.expect(StatusCode::OK);
+    assert!(!reply.text.contains(" selected"), "{}", reply.text);
+    assert!(!reply.text.contains("initech</option>"));
+    assert_eq!(code_count(&h).await, 0);
+}
+
+/// Read only is seal-checked like any decision.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn read_only_without_a_valid_seal_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let mut page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read things:write", "s"),
+    )
+    .await;
+    page.set_field("request_seal", "AAAA");
+    let reply = common::submit_consent(&h, &rob.session, &page.submission(&org, "read_only")).await;
+    assert_refused_as_a_page(&h, &reply, "read_only with a garbled seal").await;
+}
+
+/// The cross-site guard stands in front of read_only too. (This passes
+/// before the branch exists, because the guard runs first. It pins the
+/// guard, not the branch.)
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_read_only_post_from_a_sibling_origin_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read things:write", "s"),
+    )
+    .await;
+    let fields = page.submission(&org, "read_only");
+    let pairs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let reply = Call::post("/oauth/authorize")
+        .with_session(&rob.session)
+        .header("origin", "https://blog.otto.test")
+        .form(&pairs)
+        .send(&h.router)
+        .await;
+    reply.expect(StatusCode::FORBIDDEN);
+    assert_eq!(reply.error_code(), Some("cross_site_request"));
+}
