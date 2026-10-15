@@ -405,6 +405,10 @@ pub async fn revoke_presented(db: &Db, presented: &str) -> Result<()> {
 /// audience enforcement, same scope model — so no code downstream needs to know
 /// which kind it received. That equivalence is the point: agent-agnosticism
 /// must not mean a weaker security model for the awkward clients.
+///
+/// An empty `scopes` means the resource server's default scopes. When it has
+/// none, the request is refused with [`AuthError::InvalidScope`], so a PAT
+/// never carries an empty scope list.
 pub async fn mint_pat(
     db: &Db,
     user: UserId,
@@ -422,6 +426,17 @@ pub async fn mint_pat(
     // an unregistered or disabled resource, or a scope its server never defined.
     let rs = crate::resources::get_active(db, resource).await?;
     let scopes = rs.grant_scopes(scopes)?;
+    // A non-empty request either fails above or resolves to something, so
+    // empty here means nothing was asked for and the resource has no defaults
+    // to fall back on. Refused rather than stored as a token that fails every
+    // call, with the same message `validate_authorize` gives.
+    if scopes.is_empty() {
+        return Err(AuthError::InvalidScope(format!(
+            "no scope was requested and {} has no default scopes; request one of: {}",
+            rs.resource_uri,
+            rs.scopes.join(" ")
+        )));
+    }
 
     // A deleted org must not gain new credentials.
     let live: bool = sqlx::query_scalar(
