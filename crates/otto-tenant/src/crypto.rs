@@ -82,6 +82,12 @@ impl Cipher {
     /// subkey, so every replica derives the same one and no new secret or
     /// configuration is needed. Labels must be distinct per purpose.
     ///
+    /// # Panics
+    ///
+    /// Cannot panic in practice. The one `expect` inside is on constructing
+    /// the HMAC, which accepts a key of any length, so that step has no
+    /// failing input.
+    ///
     /// ```
     /// # use otto_tenant::crypto::Cipher;
     /// let base = Cipher::from_base64_key(&"A".repeat(43)).unwrap();
