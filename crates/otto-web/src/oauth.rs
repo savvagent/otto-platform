@@ -366,6 +366,7 @@ pub async fn authorize_page(
             _ => None,
         });
         if let Some(membership) = determined {
+            let requested = authorization.scopes.clone();
             let mut request = request;
             request.scopes = authorization.scopes;
             return grant(
@@ -374,6 +375,7 @@ pub async fn authorize_page(
                 &caller,
                 &params,
                 request,
+                &requested,
                 membership.org_id,
                 membership.role,
                 true,
@@ -449,6 +451,11 @@ pub struct ConsentForm {
     /// simply drop it.
     #[serde(default)]
     pub request_seal: Option<String>,
+    /// `"1"` on every rendered form: "this POST carries the person's
+    /// selection". Its absence is read as an empty selection, never as
+    /// "everything", so a form that lost it cannot grant more by omission.
+    #[serde(default)]
+    pub scope_choice: Option<String>,
 }
 
 impl ConsentForm {
@@ -537,14 +544,6 @@ pub async fn authorize_decision(
         return error_page(&AuthError::InvalidRequest(e.to_string()), locale);
     }
 
-    // Normalize the same way `authorize_page` did before rendering the consent
-    // screen: a client that omits `scope` gets the resource server's defaults,
-    // which is what the human just looked at. Without this, the hidden form
-    // field resubmits the *original*, empty `scope`, and the code issued below
-    // would carry zero scopes while the page just displayed a list of grants —
-    // an agent whose every tool call then fails, with no visible reason why.
-    req.scopes = authorization.scopes;
-
     if form.decision != "allow" {
         return redirect_error(
             &params,
@@ -568,12 +567,39 @@ pub async fn authorize_decision(
         Err(e) => return ApiError::internal("check membership for consent", e).into_response(),
     };
 
+    // What the person left checked, narrowed against what the page offered.
+    // `authorization.scopes` is the resolved request (the resource server's
+    // defaults when the client asked for none, which is what the page showed),
+    // and the seal has already pinned it. `narrow` refuses (does not drop)
+    // anything else, so a forged `grant` is a 400 page and issues nothing.
+    let chosen: Vec<String> = if form.scope_choice.as_deref() == Some("1") {
+        url::form_urlencoded::parse(&body)
+            .filter(|(key, _)| key == "grant")
+            .map(|(_, value)| value.into_owned())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let narrowed = match authorization.narrow(&chosen) {
+        Ok(narrowed) => narrowed,
+        Err(e) => return error_page(&e, locale),
+    };
+
+    // Load-bearing: `issue_authorization_code` reads an empty scope list as
+    // "the resource server's defaults", so an empty selection passed through
+    // would *widen* to them. Nothing checked means nothing granted.
+    if narrowed.is_empty() {
+        return redirect_error(&params, "access_denied", "no access was selected");
+    }
+    req.scopes = narrowed;
+
     grant(
         &state,
         &parts,
         &caller,
         &params,
         req,
+        &authorization.scopes,
         form.org_id,
         role,
         false,
@@ -586,8 +612,11 @@ pub async fn authorize_decision(
 /// client's callback. The single place a code is minted for the authorization
 /// endpoint, so the consent POST and a first-party skip cannot drift apart.
 ///
-/// `req` must already carry the resolved scopes. `role` is the caller's role in
-/// `org_id`, which the caller has established.
+/// `req` must already carry the scopes to grant: the resolved request, narrowed
+/// to what the person left checked. `role` is the caller's role in
+/// `org_id`, which the caller has established. `requested` is the resolved
+/// request before the person narrowed it; it is recorded beside what was
+/// granted.
 #[allow(clippy::too_many_arguments)]
 async fn grant(
     state: &AppState,
@@ -595,6 +624,7 @@ async fn grant(
     caller: &CurrentUser,
     params: &AuthorizeParams,
     mut req: oauth::AuthorizeRequest,
+    requested: &[String],
     org_id: OrgId,
     role: otto_core::orgs::Role,
     skipped_consent: bool,
@@ -606,8 +636,8 @@ async fn grant(
     // the most it could use, and a first-party client asks for the admin scope
     // of every user, most of whom are not admins. Only a request that loses
     // everything is an error.
-    let requested = std::mem::take(&mut req.scopes);
-    req.scopes = downscope(&requested, role);
+    let chosen = std::mem::take(&mut req.scopes);
+    req.scopes = downscope(&chosen, role);
     if req.scopes.is_empty() {
         return redirect_error(
             params,
@@ -632,6 +662,7 @@ async fn grant(
                 .from_request(client_ip(parts, &state.config).as_deref(), None)
                 .detail(serde_json::json!({
                     "scopes": req.scopes,
+                    "requested": requested,
                     "resource": req.resource,
                     "consent_skipped": skipped_consent,
                 })),

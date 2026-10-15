@@ -125,6 +125,26 @@ async fn assert_refused_as_a_page(h: &Harness, reply: &common::Reply, why: &str)
     assert_eq!(code_count(h).await, 0, "{why}: a code was issued");
 }
 
+/// Render the consent page for `scope`, submit it with exactly `grants`
+/// checked, and return the decision.
+async fn consent_with(
+    h: &Harness,
+    who: &common::Account,
+    client_id: &str,
+    challenge: &str,
+    scope: &str,
+    org: &str,
+    grants: &[&str],
+) -> common::Reply {
+    let page = common::consent_page(
+        h,
+        &who.session,
+        &authorize_url(client_id, challenge, scope, "s"),
+    )
+    .await;
+    common::submit_consent(h, &who.session, &page.submission_with(org, "allow", grants)).await
+}
+
 // ------------------------------------------------------------- discovery
 
 /// The document every OAuth client believes over anything written elsewhere. If
@@ -2049,4 +2069,265 @@ async fn submitting_the_rendered_form_unchanged_grants_what_it_showed(pool: PgPo
     let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
     tokens.expect(StatusCode::OK);
     assert_eq!(tokens.body["scope"], "things:read things:write");
+}
+
+// ------------------------------------------------------------- narrowing
+
+/// Unchecking the write scope yields a token whose introspection shows only
+/// the read scope, and a write check against it fails. The audit trail records
+/// both what was asked for and what was granted.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn unchecking_the_write_scope_yields_a_read_only_token(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let granted = consent_with(
+        &h,
+        &rob,
+        &client_id,
+        &challenge,
+        "things:read things:write",
+        &org.to_string(),
+        &["things:read"],
+    )
+    .await;
+    granted.expect(StatusCode::SEE_OTHER);
+    let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
+    tokens.expect(StatusCode::OK);
+    assert_eq!(tokens.body["scope"], "things:read");
+
+    let principal = otto_auth::tokens::introspect(
+        &h.db,
+        tokens.body["access_token"].as_str().unwrap(),
+        RESOURCE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(principal.scopes, vec!["things:read".to_string()]);
+    assert!(
+        principal.require_scope("things:write").is_err(),
+        "a write tool must refuse this token with insufficient scope"
+    );
+
+    let detail: serde_json::Value = sqlx::query_scalar(
+        "SELECT detail FROM audit_events WHERE action = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(otto_tenant::audit::action::AUTHORIZATION_GRANTED)
+    .fetch_one(h.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(detail["scopes"], serde_json::json!(["things:read"]));
+    assert_eq!(
+        detail["requested"],
+        serde_json::json!(["things:read", "things:write"])
+    );
+}
+
+/// A refresh of a narrowed token stays narrow, whatever scope the refresh
+/// request names.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn refreshing_a_narrowed_token_never_widens_it(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let granted = consent_with(
+        &h,
+        &rob,
+        &client_id,
+        &challenge,
+        "things:read things:write",
+        &org.to_string(),
+        &["things:read"],
+    )
+    .await;
+    let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
+    tokens.expect(StatusCode::OK);
+
+    let refreshed = Call::post("/oauth/token")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            (
+                "refresh_token",
+                tokens.body["refresh_token"].as_str().unwrap(),
+            ),
+            ("client_id", &client_id),
+            ("resource", RESOURCE),
+            // Not a parameter this server reads on refresh; sent to prove it.
+            ("scope", "things:read things:write"),
+        ])
+        .send(&h.router)
+        .await;
+    refreshed.expect(StatusCode::OK);
+    assert_eq!(refreshed.body["scope"], "things:read");
+    let principal = otto_auth::tokens::introspect(
+        &h.db,
+        refreshed.body["access_token"].as_str().unwrap(),
+        RESOURCE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(principal.scopes, vec!["things:read".to_string()]);
+}
+
+/// The form can only take away. A `grant` naming anything the page did not
+/// offer is refused, not dropped, and nothing is issued.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_form_cannot_grant_a_scope_the_client_did_not_request(pool: PgPool) {
+    let h = common::harness_with_two_resources(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let url = format!(
+        "{}&resource={}",
+        authorize_url(&client_id, &challenge, "things:read", "s"),
+        percent_encode(RESOURCE)
+    );
+    let page = common::consent_page(&h, &rob.session, &url).await;
+
+    for forged in [
+        "things:write",
+        "widgets:read",
+        "bogus",
+        " things:read",
+        "things:read ",
+        "",
+    ] {
+        let reply = common::submit_consent(
+            &h,
+            &rob.session,
+            &page.submission_with(&org, "allow", &["things:read", forged]),
+        )
+        .await;
+        assert_refused_as_a_page(&h, &reply, &format!("grant={forged:?}")).await;
+        assert!(
+            reply.text.contains("was not requested"),
+            "{forged:?}: {}",
+            reply.text
+        );
+    }
+}
+
+/// Nothing checked is `access_denied`, never an empty token and never the
+/// defaults. That includes a scopeless request, whose checkboxes *are* the
+/// defaults, and a sealed form that lost its `scope_choice` marker.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn unchecking_everything_is_access_denied(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+
+    let assert_denied = |reply: &common::Reply, why: &str| {
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{why}: {}", reply.text);
+        let callback = location(reply);
+        assert!(callback.starts_with(REDIRECT), "{why}: {callback}");
+        assert_eq!(
+            query_param(&callback, "error").as_deref(),
+            Some("access_denied"),
+            "{why}"
+        );
+        assert_eq!(
+            query_param(&callback, "state").as_deref(),
+            Some("s"),
+            "{why}"
+        );
+        assert!(query_param(&callback, "code").is_none(), "{why}");
+    };
+
+    for scope in ["things:read things:write", ""] {
+        let reply = consent_with(&h, &rob, &client_id, &challenge, scope, &org, &[]).await;
+        assert_denied(&reply, &format!("nothing checked for scope {scope:?}"));
+    }
+
+    let mut page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read things:write", "s"),
+    )
+    .await;
+    page.remove_field("scope_choice");
+    let reply = common::submit_consent(&h, &rob.session, &page.submission(&org, "allow")).await;
+    assert_denied(&reply, "sealed form without scope_choice");
+
+    assert_eq!(
+        code_count(&h).await,
+        0,
+        "no code may exist after any of these"
+    );
+}
+
+/// A scope checked twice is granted once.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_repeated_grant_is_granted_once(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let granted = consent_with(
+        &h,
+        &rob,
+        &client_id,
+        &challenge,
+        "things:read things:write",
+        &org.to_string(),
+        &["things:read", "things:read"],
+    )
+    .await;
+    let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
+    tokens.expect(StatusCode::OK);
+    assert_eq!(tokens.body["scope"], "things:read");
+}
+
+/// Narrowing happens before the admin downscope, and the downscope still
+/// applies to what is left.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_member_narrowing_to_org_admin_is_still_downscoped(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let bob = onboard(&h, "bob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    common::add_member(&h, org, bob.user, otto_core::orgs::Role::Member).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+    let scope = "things:read things:write org:admin";
+
+    let granted = consent_with(
+        &h,
+        &bob,
+        &client_id,
+        &challenge,
+        scope,
+        &org.to_string(),
+        &["things:read", "org:admin"],
+    )
+    .await;
+    let tokens = redeem_at(&h, &client_id, &location(&granted), &verifier, REDIRECT).await;
+    tokens.expect(StatusCode::OK);
+    assert_eq!(tokens.body["scope"], "things:read");
+
+    let refused = consent_with(
+        &h,
+        &bob,
+        &client_id,
+        &challenge,
+        scope,
+        &org.to_string(),
+        &["org:admin"],
+    )
+    .await;
+    refused.expect(StatusCode::SEE_OTHER);
+    assert_eq!(
+        query_param(&location(&refused), "error").as_deref(),
+        Some("invalid_scope")
+    );
 }
