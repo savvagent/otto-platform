@@ -1848,6 +1848,89 @@ async fn a_scopeless_first_party_request_skips_consent_with_the_defaults(pool: P
     );
 }
 
+/// A resource server registered with no default scopes, for the requests
+/// that name no scope at all.
+const NO_DEFAULTS: &str = "https://bare.otto.test/mcp";
+
+async fn register_no_defaults_resource(h: &Harness) {
+    otto_auth::resources::register(
+        &h.db,
+        otto_auth::resources::ResourceServerSpec {
+            resource_uri: NO_DEFAULTS,
+            name: "Bare",
+            scopes: &["bare:read"],
+            default_scopes: &[],
+        },
+    )
+    .await
+    .expect("register the no-defaults resource server");
+}
+
+/// The page a scopeless request to [`NO_DEFAULTS`] must get: the protocol
+/// error, saying why, and never a consent form to refuse.
+fn assert_no_scope_page(reply: &common::Reply) {
+    reply.expect(StatusCode::BAD_REQUEST);
+    assert!(reply.text.contains("invalid_scope"), "{}", reply.text);
+    assert!(
+        reply.text.contains("has no default scopes"),
+        "{}",
+        reply.text
+    );
+    assert!(
+        !reply.text.contains("request_seal"),
+        "a consent form rendered for a request with nothing to grant"
+    );
+}
+
+/// With no `scope` and no defaults there is nothing to consent to. The person
+/// gets an accurate `invalid_scope` page, not a consent screen with nothing
+/// on it (#49).
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_scopeless_request_to_a_resource_without_defaults_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    register_no_defaults_resource(&h).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+
+    let reply = Call::get(format!(
+        "{}&resource={}",
+        authorize_url(&client_id, &challenge, "", "s"),
+        percent_encode(NO_DEFAULTS)
+    ))
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    assert_no_scope_page(&reply);
+}
+
+/// The first-party skip refuses the same way. It does not redirect with
+/// `grant`'s unrelated org:admin message (#49).
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_scopeless_first_party_request_to_a_resource_without_defaults_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    register_no_defaults_resource(&h).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register_first_party(&h).await;
+    let (_, challenge) = pkce();
+
+    let reply = Call::get(format!(
+        "{}&resource={}",
+        fp_url(&client_id, &challenge, "", "s"),
+        percent_encode(NO_DEFAULTS)
+    ))
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    assert_no_scope_page(&reply);
+    assert!(
+        !reply.text.contains("org:admin needs"),
+        "the org:admin reason was given for a request that never asked for it"
+    );
+}
+
 /// The skip is after full validation: a bad redirect URI or missing PKCE is
 /// still an error page, never a code.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]

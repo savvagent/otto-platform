@@ -254,6 +254,34 @@ fn downscope(scopes: &[String], role: otto_core::orgs::Role) -> Vec<String> {
         .collect()
 }
 
+/// `grant`'s refusal when it is handed nothing to grant. Neither caller does:
+/// `validate_authorize` refuses a request that resolves to no scope, and the
+/// consent POST answers an empty selection with `access_denied`.
+const NOTHING_TO_GRANT: &str = "there is no scope to grant";
+
+/// `grant`'s refusal when dropping the admin scope left nothing.
+const ADMIN_NEEDS_ADMIN: &str = "org:admin needs an owner or admin of the selected organization";
+
+/// What a member of `role` is granted out of `chosen`, or why nothing is.
+///
+/// `org:admin` is a real capability. A member consenting to it would hand a
+/// client authority the human granting it does not have, so it is dropped
+/// rather than granted. Dropped rather than refused: the client asked for the
+/// most it could use, and a first-party client asks for the admin scope of
+/// every user, most of whom are not admins. Only a request that loses
+/// everything is an error, and the error names org:admin only when dropping it
+/// is what emptied the list.
+fn grantable(chosen: &[String], role: otto_core::orgs::Role) -> Result<Vec<String>, &'static str> {
+    if chosen.is_empty() {
+        return Err(NOTHING_TO_GRANT);
+    }
+    let kept = downscope(chosen, role);
+    if kept.is_empty() {
+        return Err(ADMIN_NEEDS_ADMIN);
+    }
+    Ok(kept)
+}
+
 /// One authorization request, resolved and validated: what a consent page is
 /// rendered for, and what its seal binds.
 struct Resolved<'a> {
@@ -745,21 +773,10 @@ async fn grant(
     skipped_consent: bool,
     locale: Locale,
 ) -> Response {
-    // `org:admin` is a real capability. A member consenting to it would hand a
-    // client authority the human granting it does not have, so it is dropped
-    // rather than granted. Dropped rather than refused: the client asked for
-    // the most it could use, and a first-party client asks for the admin scope
-    // of every user, most of whom are not admins. Only a request that loses
-    // everything is an error.
-    let chosen = std::mem::take(&mut req.scopes);
-    req.scopes = downscope(&chosen, role);
-    if req.scopes.is_empty() {
-        return redirect_error(
-            params,
-            "invalid_scope",
-            "org:admin needs an owner or admin of the selected organization",
-        );
-    }
+    req.scopes = match grantable(&req.scopes, role) {
+        Ok(scopes) => scopes,
+        Err(reason) => return redirect_error(params, "invalid_scope", reason),
+    };
 
     let code = match oauth::issue_authorization_code(&state.db, &req, caller.user.id, org_id).await
     {
@@ -1538,6 +1555,29 @@ mod tests {
         assert_eq!(downscope(&asked, Role::Admin), asked);
         assert_eq!(downscope(&asked, Role::Member), vec!["things:read"]);
         assert!(downscope(&[ADMIN_SCOPE.to_string()], Role::Member).is_empty());
+    }
+
+    /// `grant` blames org:admin only when dropping it is what left nothing.
+    /// Nothing to begin with is a different refusal (#49).
+    #[test]
+    fn grantable_names_the_reason_nothing_is_left() {
+        use otto_core::orgs::Role;
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(grantable(&[], Role::Owner), Err(NOTHING_TO_GRANT));
+        assert_eq!(grantable(&[], Role::Member), Err(NOTHING_TO_GRANT));
+        assert_eq!(
+            grantable(&s(&[ADMIN_SCOPE]), Role::Member),
+            Err(ADMIN_NEEDS_ADMIN)
+        );
+        assert_eq!(
+            grantable(&s(&["things:read", ADMIN_SCOPE]), Role::Member),
+            Ok(s(&["things:read"]))
+        );
+        assert_eq!(
+            grantable(&s(&[ADMIN_SCOPE]), Role::Owner),
+            Ok(s(&[ADMIN_SCOPE]))
+        );
     }
 
     #[test]
