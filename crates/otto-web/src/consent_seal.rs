@@ -34,6 +34,9 @@ pub(crate) const SEAL_VERSION: u8 = 1;
 /// How long a rendered consent page stays submittable.
 pub(crate) const SEAL_TTL_SECONDS: i64 = 600;
 const NONCE_LEN: usize = 12;
+/// Longest encoded seal accepted. A real one is a few hundred characters; the
+/// cap keeps a forged multi-megabyte field from reaching the decoder at all.
+const MAX_ENCODED_LEN: usize = 4096;
 
 /// What the consent page was rendered for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,8 +126,11 @@ impl RequestSeal {
     /// Every failure to decode, authenticate or parse is `Malformed`. Which
     /// one it was is no business of whoever forged it.
     pub(crate) fn open(cipher: &Cipher, encoded: &str) -> Result<Self, SealError> {
+        if encoded.len() > MAX_ENCODED_LEN {
+            return Err(SealError::Malformed);
+        }
         let raw = URL_SAFE_NO_PAD
-            .decode(encoded.trim())
+            .decode(encoded)
             .map_err(|_| SealError::Malformed)?;
         if raw.len() <= NONCE_LEN {
             return Err(SealError::Malformed);
@@ -295,7 +301,8 @@ mod tests {
             Err(SealError::Missing)
         );
         let long = "A".repeat(400);
-        for garbage in ["AAAA", "not base64!", long.as_str()] {
+        let huge = "A".repeat(MAX_ENCODED_LEN + 1);
+        for garbage in ["AAAA", "not base64!", long.as_str(), huge.as_str()] {
             assert_eq!(
                 check(&cipher(7), Some(garbage), &f.expected(), now),
                 Err(SealError::Malformed),
@@ -320,6 +327,13 @@ mod tests {
         let now = Utc::now();
         let rendered = now - chrono::Duration::seconds(SEAL_TTL_SECONDS + 1);
         let sealed = f.seal_at(rendered).seal(&c).unwrap();
+        assert_eq!(
+            check(&c, Some(&sealed), &f.expected(), now),
+            Err(SealError::Expired)
+        );
+        // Expired at the deadline itself, not a second after it.
+        let at_deadline = now - chrono::Duration::seconds(SEAL_TTL_SECONDS);
+        let sealed = f.seal_at(at_deadline).seal(&c).unwrap();
         assert_eq!(
             check(&c, Some(&sealed), &f.expected(), now),
             Err(SealError::Expired)
