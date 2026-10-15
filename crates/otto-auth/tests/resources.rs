@@ -332,6 +332,23 @@ async fn issuing_a_code_for_no_scopes_is_refused(pool: PgPool) {
     assert_eq!(stored, 0, "a refused issuance must store no code");
 }
 
+/// The empty check comes before the registry lookup, so it holds even where
+/// the lookup would fail for another reason: no path through issuance lets
+/// `[]` reach `grant_scopes`.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn no_scopes_is_refused_before_the_resource_is_looked_up(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register_both(&db).await;
+    resources::set_disabled(&db, FLAGS, true).await.unwrap();
+    let (user, org) = member(&db).await;
+    let client_id = client(&db).await;
+    let err =
+        oauth::issue_authorization_code(&db, &authorize_req(&client_id, FLAGS, &[]), user, org)
+            .await
+            .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidScope(_)), "{err:?}");
+}
+
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn an_empty_scope_request_yields_that_resources_defaults(pool: PgPool) {
     let db = Db::from_pool(pool);

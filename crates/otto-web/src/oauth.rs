@@ -699,10 +699,10 @@ pub async fn authorize_decision(
         }
     };
 
-    // Nothing checked means nothing granted: the person declined, so this is
-    // `access_denied`. `issue_authorization_code` refuses `[]` too, but a
-    // failure there renders an error page. This check is the second guard; it
-    // gives the client a proper `access_denied` redirect instead.
+    // Nothing checked means the person granted nothing: `access_denied`.
+    // Without this, `grant` would still refuse `[]`, but as `invalid_scope`
+    // with its org:admin message, and `issue_authorization_code` refuses it
+    // last. Those are backstops; this is the answer the client should get.
     if narrowed.is_empty() {
         return redirect_error(&params, "access_denied", "no access was selected");
     }
