@@ -21,6 +21,7 @@ axum.workspace = true
 http.workspace = true
 url.workspace = true
 base64.workspace = true
+sha2.workspace = true
 anyhow.workspace = true
 schemars.workspace = true
 # `sync` for the plan catalog's in-process cache (`routes::plans::PlansCache`).
@@ -36,7 +37,6 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 # local server — never enabled by the production dependency above. See that
 # feature's doc comment in crates/otto-auth/Cargo.toml.
 otto-auth = { workspace = true, features = ["test-support"] }
-sha2.workspace = true
 jsonwebtoken.workspace = true
 # `ServiceExt::oneshot`, for driving the assembled router without binding a port.
 tower = { workspace = true, features = ["util"] }

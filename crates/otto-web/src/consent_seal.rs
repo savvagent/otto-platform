@@ -30,12 +30,13 @@ use chrono::{DateTime, Utc};
 use otto_tenant::crypto::Cipher;
 use otto_tenant::ids::UserId;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// The label the seal's subkey is derived under (see [`Cipher::derive`]).
 /// Changing it invalidates every page currently open.
 pub(crate) const KEY_LABEL: &str = "otto-web/consent-request-seal";
 /// The seal's format version. Bump it on any change to [`RequestSeal`].
-pub(crate) const SEAL_VERSION: u8 = 1;
+pub(crate) const SEAL_VERSION: u8 = 2;
 /// How long a rendered consent page stays submittable.
 pub(crate) const SEAL_TTL_SECONDS: i64 = 600;
 const NONCE_LEN: usize = 12;
@@ -44,6 +45,13 @@ const NONCE_LEN: usize = 12;
 const MAX_ENCODED_LEN: usize = 4096;
 
 /// What the consent page was rendered for.
+///
+/// `code_challenge` and `state` are client-supplied and have no upper length
+/// limit at `/oauth/authorize` (a `state` can be a JWT). Carrying them verbatim
+/// would let a long one push the seal past [`MAX_ENCODED_LEN`], and its consent
+/// page could never be submitted. They are only ever compared, never read
+/// back, so the seal holds a fixed-size SHA-256 digest of each instead (see
+/// [`digest`]), which keeps its size bounded whatever the client sent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RequestSeal {
     pub(crate) v: u8,
@@ -56,10 +64,10 @@ pub(crate) struct RequestSeal {
     /// `Authorization::scopes`: what the client requested, or the resource
     /// server's defaults when it requested nothing.
     pub(crate) scopes: Vec<String>,
-    /// The PKCE challenge the code will be bound to.
+    /// Digest of the PKCE challenge the code will be bound to.
     pub(crate) code_challenge: String,
     pub(crate) code_challenge_method: String,
-    /// The client's `state`, with a blank one read as absent (see
+    /// Digest of the client's `state`, with a blank one read as absent (see
     /// [`normalize_state`]).
     pub(crate) state: Option<String>,
     /// Unix seconds.
@@ -85,6 +93,12 @@ pub(crate) struct Expected<'a> {
 /// request that arrived with `state=` must seal the same way it comes back.
 fn normalize_state(state: Option<&str>) -> Option<&str> {
     state.filter(|s| !s.trim().is_empty())
+}
+
+/// `URL_SAFE_NO_PAD(sha256(value))`: what the seal stores in place of a
+/// client-supplied value of unbounded length.
+fn digest(value: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,9 +138,9 @@ impl RequestSeal {
             resource: request.resource.to_string(),
             user_id: request.user_id,
             scopes: request.scopes.to_vec(),
-            code_challenge: request.code_challenge.to_string(),
+            code_challenge: digest(request.code_challenge),
             code_challenge_method: request.code_challenge_method.to_string(),
-            state: normalize_state(request.state).map(str::to_string),
+            state: normalize_state(request.state).map(digest),
             exp: now.timestamp() + SEAL_TTL_SECONDS,
         }
     }
@@ -187,13 +201,13 @@ impl RequestSeal {
         if as_set(&self.scopes) != as_set(expected.scopes) {
             return Err(SealError::Mismatch("scopes"));
         }
-        if self.code_challenge != expected.code_challenge {
+        if self.code_challenge != digest(expected.code_challenge) {
             return Err(SealError::Mismatch("code_challenge"));
         }
         if self.code_challenge_method != expected.code_challenge_method {
             return Err(SealError::Mismatch("code_challenge_method"));
         }
-        if normalize_state(self.state.as_deref()) != normalize_state(expected.state) {
+        if self.state != normalize_state(expected.state).map(digest) {
             return Err(SealError::Mismatch("state"));
         }
         Ok(())
@@ -524,6 +538,56 @@ mod tests {
             now,
         )
         .unwrap();
+    }
+
+    /// `state` and `code_challenge` have no upper length limit at
+    /// `/oauth/authorize`, so the seal holds digests of them: a client with a
+    /// JWT-sized `state` must still get a page whose form can be submitted.
+    #[test]
+    fn a_long_state_and_challenge_still_fit_in_a_submittable_seal() {
+        let f = Fixture::new();
+        let c = cipher(7);
+        let now = Utc::now();
+        let state = "s".repeat(8 * 1024);
+        let challenge = "c".repeat(8 * 1024);
+        let expected = Expected {
+            state: Some(&state),
+            code_challenge: &challenge,
+            ..f.expected()
+        };
+        let sealed = RequestSeal::new(&expected, now).seal(&c).unwrap();
+        assert!(
+            sealed.len() <= MAX_ENCODED_LEN,
+            "{} > {MAX_ENCODED_LEN}",
+            sealed.len()
+        );
+        check(&c, Some(&sealed), &expected, now).unwrap();
+        let other = "s".repeat(8 * 1024 - 1) + "t";
+        assert_eq!(
+            check(
+                &c,
+                Some(&sealed),
+                &Expected {
+                    state: Some(&other),
+                    ..expected
+                },
+                now
+            ),
+            Err(SealError::Mismatch("state"))
+        );
+        let other = "c".repeat(8 * 1024 - 1) + "d";
+        assert_eq!(
+            check(
+                &c,
+                Some(&sealed),
+                &Expected {
+                    code_challenge: &other,
+                    ..expected
+                },
+                now
+            ),
+            Err(SealError::Mismatch("code_challenge"))
+        );
     }
 
     #[test]

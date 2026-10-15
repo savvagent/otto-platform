@@ -548,6 +548,36 @@ async fn declining_sends_the_client_an_error_not_a_dead_end(pool: PgPool) {
     assert!(query_param(&callback, "code").is_none());
 }
 
+/// `state` has no length limit at `/oauth/authorize`, and a client may send a
+/// JWT-sized one. Its consent page must still be submittable, and the redirect
+/// must echo all of it.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_very_long_state_still_gets_a_submittable_consent_page(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org_id = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let state = "x".repeat(8 * 1024);
+
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", &state),
+    )
+    .await;
+    let granted = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&org_id.to_string(), "allow"),
+    )
+    .await;
+    granted.expect(StatusCode::SEE_OTHER);
+    let callback = location(&granted);
+    assert_eq!(query_param(&callback, "state").as_deref(), Some(&*state));
+    assert!(query_param(&callback, "code").is_some());
+}
+
 /// The org on a token is decided here and cannot be changed afterwards, so a
 /// hand-edited form field is the whole attack surface for a cross-tenant token.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
