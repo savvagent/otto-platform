@@ -49,12 +49,13 @@
 use axum::extract::{Form, Query, RawForm, State};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
+use chrono::Utc;
 use http::request::Parts;
 use otto_auth::error::AuthError;
 use otto_auth::{oauth, resources, tokens};
 use otto_core::orgs::OrgsExt;
 use otto_tenant::audit::{action, Entry};
-use otto_tenant::ids::OrgId;
+use otto_tenant::ids::{OrgId, UserId};
 use serde::Deserialize;
 
 use crate::error::ApiError;
@@ -253,29 +254,109 @@ fn downscope(scopes: &[String], role: otto_core::orgs::Role) -> Vec<String> {
         .collect()
 }
 
-/// Seal the request a consent page is rendered for (see [`crate::consent_seal`]).
+/// One authorization request, resolved and validated: what a consent page is
+/// rendered for, and what its seal binds.
+struct Resolved<'a> {
+    params: &'a AuthorizeParams,
+    request: &'a oauth::AuthorizeRequest,
+    authorization: &'a oauth::Authorization,
+}
+
+impl<'a> Resolved<'a> {
+    /// What the seal binds for `user` (see [`crate::consent_seal`]).
+    ///
+    /// The *resolved* values, never raw query or form strings: the client the
+    /// registry returned, the redirect URI `validate_authorize` accepted, the
+    /// resolved resource URI and scopes, and the PKCE challenge and `state`
+    /// the validated request carries. The page and the POST both build it
+    /// here, so what the seal vouches for and what it is checked against
+    /// cannot drift apart.
+    fn bound(&self, user: UserId) -> crate::consent_seal::Expected<'a> {
+        crate::consent_seal::Expected {
+            client_id: &self.authorization.client.client_id,
+            redirect_uri: &self.request.redirect_uri,
+            resource: &self.authorization.resource.resource_uri,
+            user_id: user,
+            scopes: &self.authorization.scopes,
+            code_challenge: &self.request.code_challenge,
+            code_challenge_method: &self.request.code_challenge_method,
+            state: self.request.state.as_deref(),
+        }
+    }
+}
+
+/// The caller's orgs, or the page that says they have none.
 ///
-/// The seal binds the *resolved* values the page was rendered for: the client
-/// the registry returned, the redirect URI `validate_authorize` accepted, the
-/// resolved resource URI, the signed-in user, and the resolved scopes. It is
-/// built from those rather than from raw query strings so that what the seal
-/// vouches for is what the person actually saw, not what the URL claimed.
-fn seal_request(
+/// Every consent render goes through here first: a token opens exactly one
+/// org, so with none there is nothing to choose and no form to show.
+async fn consent_orgs(
     state: &AppState,
     caller: &CurrentUser,
-    redirect_uri: &str,
-    authorization: &oauth::Authorization,
-) -> Result<String, ApiError> {
-    crate::consent_seal::RequestSeal::new(
-        &authorization.client.client_id,
-        redirect_uri,
-        &authorization.resource.resource_uri,
-        caller.user.id,
-        &authorization.scopes,
-        chrono::Utc::now(),
-    )
-    .seal(&state.cipher)
-    .map_err(|e| ApiError::internal("seal the consent request", e))
+    client: &oauth::Client,
+    locale: Locale,
+) -> Result<Vec<otto_core::orgs::Membership>, Box<Response>> {
+    let orgs =
+        state.db.list_user_orgs(caller.user.id).await.map_err(|e| {
+            Box::new(ApiError::internal("list orgs for consent", e).into_response())
+        })?;
+    if orgs.is_empty() {
+        return Err(Box::new(error_page_html(
+            i18n::msg(locale, Key::ErrorNoOrgTitle),
+            // Escaped once, around the whole filled sentence. Escaping the name
+            // first as well double-encodes it, so a client called `<b>x</b>`
+            // renders as the literal text `&lt;b&gt;x&lt;/b&gt;` — which is safe
+            // but makes this page misreport the one fact it exists to show.
+            &escape(&i18n::fill(
+                i18n::msg(locale, Key::ErrorNoOrgBody),
+                client.client_name.as_deref().unwrap_or("A client"),
+            )),
+            locale,
+        )));
+    }
+    Ok(orgs)
+}
+
+/// Render the consent page for `resolved`, with `checked` ticked and a fresh
+/// seal. The one place a consent page is built, for the first render and for
+/// the "read only" re-render alike.
+///
+/// `preselect` is honoured only when it names one of `orgs`, the caller's
+/// own, so neither a hint nor a hand-edited form can make the page claim an
+/// org the caller is not in.
+async fn render_consent(
+    state: &AppState,
+    caller: &CurrentUser,
+    resolved: &Resolved<'_>,
+    orgs: &[otto_core::orgs::Membership],
+    preselect: Option<OrgId>,
+    checked: &[String],
+    locale: Locale,
+) -> Response {
+    let preselected = preselect.filter(|id| orgs.iter().any(|m| m.org_id == *id));
+    let request_seal =
+        match crate::consent_seal::RequestSeal::new(&resolved.bound(caller.user.id), Utc::now())
+            .seal(&state.consent_cipher)
+        {
+            Ok(seal) => seal,
+            Err(e) => return ApiError::internal("seal the consent request", e).into_response(),
+        };
+    Html(consent_html(
+        &resolved.authorization.client,
+        resolved.params,
+        &resolved.authorization.resource,
+        &resolved.authorization.scopes,
+        checked,
+        orgs,
+        preselected,
+        caller
+            .user
+            .email
+            .as_deref()
+            .unwrap_or_else(|| i18n::msg(locale, Key::ConsentThisAccount)),
+        &request_seal,
+        locale,
+    ))
+    .into_response()
 }
 
 /// `GET /oauth/authorize` — render the consent screen.
@@ -324,25 +405,10 @@ pub async fn authorize_page(
         );
     }
 
-    let orgs = match state.db.list_user_orgs(caller.user.id).await {
+    let orgs = match consent_orgs(&state, &caller, client, locale).await {
         Ok(orgs) => orgs,
-        Err(e) => return ApiError::internal("list orgs for consent", e).into_response(),
+        Err(page) => return *page,
     };
-
-    if orgs.is_empty() {
-        return error_page_html(
-            i18n::msg(locale, Key::ErrorNoOrgTitle),
-            // Escaped once, around the whole filled sentence. Escaping the name
-            // first as well double-encodes it, so a client called `<b>x</b>`
-            // renders as the literal text `&lt;b&gt;x&lt;/b&gt;` — which is safe
-            // but makes this page misreport the one fact it exists to show.
-            &escape(&i18n::fill(
-                i18n::msg(locale, Key::ErrorNoOrgBody),
-                client.client_name.as_deref().unwrap_or("A client"),
-            )),
-            locale,
-        );
-    }
 
     // The hint only ever selects among orgs the caller is already in.
     let hinted = resolve_org_hint(&orgs, params.org_hint.as_deref());
@@ -388,27 +454,21 @@ pub async fn authorize_page(
     // The registry resolved the scopes: the resource server's defaults when the
     // client asked for none, otherwise exactly what it asked for. Every one
     // starts checked; the person can only take away.
-    let request_seal = match seal_request(&state, &caller, &request.redirect_uri, &authorization) {
-        Ok(seal) => seal,
-        Err(e) => return e.into_response(),
+    let resolved = Resolved {
+        params: &params,
+        request: &request,
+        authorization: &authorization,
     };
-    Html(consent_html(
-        client,
-        &params,
-        &authorization.resource,
-        &authorization.scopes,
-        &authorization.scopes,
+    render_consent(
+        &state,
+        &caller,
+        &resolved,
         &orgs,
         hinted.map(|m| m.org_id),
-        caller
-            .user
-            .email
-            .as_deref()
-            .unwrap_or_else(|| i18n::msg(locale, Key::ConsentThisAccount)),
-        &request_seal,
+        &authorization.scopes,
         locale,
-    ))
-    .into_response()
+    )
+    .await
 }
 
 /// The consent form's fields: the original request, plus the two decisions the
@@ -506,7 +566,11 @@ pub async fn authorize_decision(
         Ok(form) => form,
         Err(e) => {
             // serde's wording names fields and is for the log, not the person.
-            tracing::debug!(error = %e, "consent form body did not deserialize");
+            tracing::warn!(
+                user_id = %caller.user.id,
+                error = %e,
+                "consent form refused: the body did not deserialize"
+            );
             return error_page(
                 &AuthError::InvalidRequest(
                     "the consent form could not be read; start again from the app".into(),
@@ -533,65 +597,57 @@ pub async fn authorize_decision(
     // the one the person was shown. The seal does that, compared field by field
     // with the *resolved* values (the client the registry returned, the
     // redirect URI `validate_authorize` accepted, the re-resolved resource, the
-    // resolved scopes), never with raw form strings. Checked before every
+    // resolved scopes, the PKCE challenge and `state`; see `Resolved::bound`),
+    // never with raw form strings. Checked before every
     // branch, `deny` included: a form this server cannot vouch for must not
     // drive any redirect.
+    let resolved = Resolved {
+        params: &params,
+        request: &req,
+        authorization: &authorization,
+    };
     if let Err(e) = crate::consent_seal::check(
-        &state.cipher,
+        &state.consent_cipher,
         form.request_seal.as_deref(),
-        &crate::consent_seal::Expected {
-            client_id: &authorization.client.client_id,
-            redirect_uri: &req.redirect_uri,
-            resource: &authorization.resource.resource_uri,
-            user_id: caller.user.id,
-            scopes: &authorization.scopes,
-        },
-        chrono::Utc::now(),
+        &resolved.bound(caller.user.id),
+        Utc::now(),
     ) {
+        // The reason, the field and who: enough to tell tampering from an
+        // expired page or a key rotation. Never the seal itself.
+        tracing::warn!(
+            reason = ?e,
+            client_id = %authorization.client.client_id,
+            user_id = %caller.user.id,
+            "consent form refused: the request seal did not verify"
+        );
         return error_page(&AuthError::InvalidRequest(e.to_string()), locale);
     }
 
     // "Read only" is a no-JS submit button: it re-renders this page with only
     // the `:read` scopes checked and issues nothing. The person still presses
-    // Allow, and that POST is checked from scratch. A fresh seal is emitted,
-    // because the page is new; the org is preselected only if the caller
-    // belongs to it.
+    // Allow, and that POST is checked from scratch. It is the same render as
+    // the first one, with a fresh seal because the page is new.
     if form.decision == "read_only" {
-        let orgs = match state.db.list_user_orgs(caller.user.id).await {
+        let orgs = match consent_orgs(&state, &caller, &authorization.client, locale).await {
             Ok(orgs) => orgs,
-            Err(e) => return ApiError::internal("list orgs for consent", e).into_response(),
+            Err(page) => return *page,
         };
-        let preselected = orgs
-            .iter()
-            .find(|m| m.org_id == form.org_id)
-            .map(|m| m.org_id);
         let read_only: Vec<String> = authorization
             .scopes
             .iter()
             .filter(|s| resources::is_read_scope(s))
             .cloned()
             .collect();
-        let request_seal = match seal_request(&state, &caller, &req.redirect_uri, &authorization) {
-            Ok(seal) => seal,
-            Err(e) => return e.into_response(),
-        };
-        return Html(consent_html(
-            &authorization.client,
-            &params,
-            &authorization.resource,
-            &authorization.scopes,
-            &read_only,
+        return render_consent(
+            &state,
+            &caller,
+            &resolved,
             &orgs,
-            preselected,
-            caller
-                .user
-                .email
-                .as_deref()
-                .unwrap_or_else(|| i18n::msg(locale, Key::ConsentThisAccount)),
-            &request_seal,
+            Some(form.org_id),
+            &read_only,
             locale,
-        ))
-        .into_response();
+        )
+        .await;
     }
 
     if form.decision != "allow" {
@@ -632,7 +688,17 @@ pub async fn authorize_decision(
     };
     let narrowed = match authorization.narrow(&chosen) {
         Ok(narrowed) => narrowed,
-        Err(e) => return error_page(&e, locale),
+        Err(e) => {
+            // The seal verified, so this is a hand-edited `grant` on a page
+            // this server rendered for this person.
+            tracing::warn!(
+                client_id = %authorization.client.client_id,
+                user_id = %caller.user.id,
+                error = %e,
+                "consent form refused: a chosen scope was not on the page"
+            );
+            return error_page(&e, locale);
+        }
     };
 
     // Load-bearing: `issue_authorization_code` reads an empty scope list as
@@ -702,7 +768,10 @@ async fn grant(
         Err(e) => return error_page(&e, locale),
     };
 
-    let _ = state
+    // The code is already issued, so a failed audit write does not undo the
+    // grant. It is logged, because for a narrowed grant this entry is the only
+    // record of what was asked for beside what was granted.
+    if let Err(e) = state
         .db
         .audit_for_org(
             org_id,
@@ -717,7 +786,15 @@ async fn grant(
                     "consent_skipped": skipped_consent,
                 })),
         )
-        .await;
+        .await
+    {
+        tracing::error!(
+            error = %e,
+            org_id = %org_id,
+            client_id = %params.client_id,
+            "failed to write audit event for an authorization grant"
+        );
+    }
 
     let mut location = append_query(&params.redirect_uri, &[("code", &code)]);
     if let Some(s) = &params.state {

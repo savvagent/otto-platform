@@ -7,18 +7,22 @@
 //! re-validates fine. The seal closes that gap. It carries what the server
 //! resolved at render time (client, the redirect URI `validate_authorize`
 //! accepted, the resolved resource URI, the signed-in user, the resolved
-//! scopes and an expiry). The POST must match it, field for field, before
-//! any branch, `deny` included.
+//! scopes, the PKCE `code_challenge` and its method, the client's `state`,
+//! and an expiry). The POST must match it, field for field, before any
+//! branch, `deny` included.
 //!
-//! **Why the at-rest key is reused.** [`Cipher`] is AES-256-GCM, keyed by
-//! `OTTO_ENCRYPTION_KEY`, and it exists to keep secrets at rest. Here the same
-//! AEAD is used for what it also provides, which is authentication: a value
-//! that opens under the key was produced by this server and has not been
-//! altered. The plaintext is nothing secret (it is the page's own request), a
-//! fresh random nonce is drawn for every seal, and the 10-minute expiry
-//! bounds replay to the same client, user, resource and redirect URI, which
-//! grants nothing that page did not already offer. No new key, crate or
-//! table.
+//! **The key.** The seal is AES-256-GCM under a subkey dedicated to it,
+//! derived from `OTTO_ENCRYPTION_KEY` with [`Cipher::derive`] and
+//! [`KEY_LABEL`]. The AEAD is used for authentication: a value that opens
+//! under the subkey was produced by this server for this purpose and has not
+//! been altered. A separate key means a seal can never be opened as a secret
+//! at rest or the other way round, and rendering consent pages does not
+//! spend the at-rest key's nonce budget. Deriving it needs no new secret or
+//! setting. The plaintext is nothing secret (it is the page's own request),
+//! a fresh random nonce is drawn for every seal, and the 10-minute expiry
+//! bounds replay to the same client, user, resource, redirect URI, PKCE
+//! challenge and `state`, which grants nothing that page did not already
+//! offer.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -27,6 +31,9 @@ use otto_tenant::crypto::Cipher;
 use otto_tenant::ids::UserId;
 use serde::{Deserialize, Serialize};
 
+/// The label the seal's subkey is derived under (see [`Cipher::derive`]).
+/// Changing it invalidates every page currently open.
+pub(crate) const KEY_LABEL: &str = "otto-web/consent-request-seal";
 /// The seal's format version. Bump it on any change to [`RequestSeal`].
 pub(crate) const SEAL_VERSION: u8 = 1;
 /// How long a rendered consent page stays submittable.
@@ -49,11 +56,18 @@ pub(crate) struct RequestSeal {
     /// `Authorization::scopes`: what the client requested, or the resource
     /// server's defaults when it requested nothing.
     pub(crate) scopes: Vec<String>,
+    /// The PKCE challenge the code will be bound to.
+    pub(crate) code_challenge: String,
+    pub(crate) code_challenge_method: String,
+    /// The client's `state`, with a blank one read as absent (see
+    /// [`normalize_state`]).
+    pub(crate) state: Option<String>,
     /// Unix seconds.
     pub(crate) exp: i64,
 }
 
-/// What a consent POST resolved to, which the seal must match.
+/// A resolved, validated request: what a page is sealed for, and what a
+/// consent POST must match.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Expected<'a> {
     pub(crate) client_id: &'a str,
@@ -61,6 +75,16 @@ pub(crate) struct Expected<'a> {
     pub(crate) resource: &'a str,
     pub(crate) user_id: UserId,
     pub(crate) scopes: &'a [String],
+    pub(crate) code_challenge: &'a str,
+    pub(crate) code_challenge_method: &'a str,
+    pub(crate) state: Option<&'a str>,
+}
+
+/// A blank `state` is the same as none. The page renders an absent `state` as
+/// an empty hidden field, and the POST reads an empty field as absent, so a
+/// request that arrived with `state=` must seal the same way it comes back.
+fn normalize_state(state: Option<&str>) -> Option<&str> {
+    state.filter(|s| !s.trim().is_empty())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +92,8 @@ pub(crate) enum SealError {
     Missing,
     Malformed,
     Expired,
-    /// Names the first field that differs.
+    /// Names the first field that differs. For the log only: the page says
+    /// nothing about which field it was.
     Mismatch(&'static str),
 }
 
@@ -82,31 +107,26 @@ impl std::fmt::Display for SealError {
                 "the consent form's request seal is not valid; start again from the app",
             ),
             SealError::Expired => f.write_str("this page has expired; start again from the app"),
-            SealError::Mismatch(field) => write!(
-                f,
-                "the consent form does not match the request it was shown for ({field}); \
-                 start again from the app"
+            SealError::Mismatch(_) => f.write_str(
+                "the consent form does not match the request it was shown for; \
+                 start again from the app",
             ),
         }
     }
 }
 
 impl RequestSeal {
-    pub(crate) fn new(
-        client_id: &str,
-        redirect_uri: &str,
-        resource: &str,
-        user_id: UserId,
-        scopes: &[String],
-        now: DateTime<Utc>,
-    ) -> Self {
+    pub(crate) fn new(request: &Expected<'_>, now: DateTime<Utc>) -> Self {
         Self {
             v: SEAL_VERSION,
-            client_id: client_id.to_string(),
-            redirect_uri: redirect_uri.to_string(),
-            resource: resource.to_string(),
-            user_id,
-            scopes: scopes.to_vec(),
+            client_id: request.client_id.to_string(),
+            redirect_uri: request.redirect_uri.to_string(),
+            resource: request.resource.to_string(),
+            user_id: request.user_id,
+            scopes: request.scopes.to_vec(),
+            code_challenge: request.code_challenge.to_string(),
+            code_challenge_method: request.code_challenge_method.to_string(),
+            state: normalize_state(request.state).map(str::to_string),
             exp: now.timestamp() + SEAL_TTL_SECONDS,
         }
     }
@@ -167,6 +187,15 @@ impl RequestSeal {
         if as_set(&self.scopes) != as_set(expected.scopes) {
             return Err(SealError::Mismatch("scopes"));
         }
+        if self.code_challenge != expected.code_challenge {
+            return Err(SealError::Mismatch("code_challenge"));
+        }
+        if self.code_challenge_method != expected.code_challenge_method {
+            return Err(SealError::Mismatch("code_challenge_method"));
+        }
+        if normalize_state(self.state.as_deref()) != normalize_state(expected.state) {
+            return Err(SealError::Mismatch("state"));
+        }
         Ok(())
     }
 }
@@ -204,6 +233,8 @@ mod tests {
         s.iter().map(|x| x.to_string()).collect()
     }
 
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
     struct Fixture {
         user: UserId,
         scopes: Vec<String>,
@@ -217,14 +248,7 @@ mod tests {
             }
         }
         fn seal_at(&self, now: DateTime<Utc>) -> RequestSeal {
-            RequestSeal::new(
-                "otto_client_a",
-                "http://127.0.0.1:1455/callback",
-                "https://things.otto.test/mcp",
-                self.user,
-                &self.scopes,
-                now,
-            )
+            RequestSeal::new(&self.expected(), now)
         }
         fn expected(&self) -> Expected<'_> {
             Expected {
@@ -233,6 +257,9 @@ mod tests {
                 resource: "https://things.otto.test/mcp",
                 user_id: self.user,
                 scopes: &self.scopes,
+                code_challenge: CHALLENGE,
+                code_challenge_method: "S256",
+                state: Some("opaque-state"),
             }
         }
     }
@@ -395,6 +422,34 @@ mod tests {
                     ..f.expected()
                 },
             ),
+            (
+                "code_challenge",
+                Expected {
+                    code_challenge: "attackers-own-challenge-attackers-own-challenge",
+                    ..f.expected()
+                },
+            ),
+            (
+                "code_challenge_method",
+                Expected {
+                    code_challenge_method: "plain",
+                    ..f.expected()
+                },
+            ),
+            (
+                "state",
+                Expected {
+                    state: Some("another-state"),
+                    ..f.expected()
+                },
+            ),
+            (
+                "state",
+                Expected {
+                    state: None,
+                    ..f.expected()
+                },
+            ),
         ];
         for (field, expected) in cases {
             assert_eq!(
@@ -402,6 +457,53 @@ mod tests {
                 Err(SealError::Mismatch(field)),
                 "{field}"
             );
+        }
+    }
+
+    /// A page rendered for `state=` comes back with the field empty, which
+    /// the POST reads as no state at all. Both are "no state".
+    #[test]
+    fn a_blank_state_is_the_same_as_none() {
+        let f = Fixture::new();
+        let c = cipher(7);
+        let now = Utc::now();
+        for rendered in [None, Some(""), Some("  ")] {
+            let sealed = RequestSeal::new(
+                &Expected {
+                    state: rendered,
+                    ..f.expected()
+                },
+                now,
+            )
+            .seal(&c)
+            .unwrap();
+            for submitted in [None, Some("")] {
+                check(
+                    &c,
+                    Some(&sealed),
+                    &Expected {
+                        state: submitted,
+                        ..f.expected()
+                    },
+                    now,
+                )
+                .unwrap_or_else(|e| panic!("{rendered:?} -> {submitted:?}: {e:?}"));
+            }
+        }
+    }
+
+    /// The page never names the field that differed; the log does.
+    #[test]
+    fn a_mismatch_reads_the_same_whichever_field_it_was() {
+        let shown: std::collections::BTreeSet<String> =
+            ["client_id", "scopes", "state", "code_challenge"]
+                .into_iter()
+                .map(|field| SealError::Mismatch(field).to_string())
+                .collect();
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        let text = shown.into_iter().next().unwrap();
+        for field in ["client_id", "scopes", "state", "code_challenge"] {
+            assert!(!text.contains(field), "{text}");
         }
     }
 

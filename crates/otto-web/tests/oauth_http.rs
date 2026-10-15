@@ -1407,7 +1407,7 @@ async fn a_consent_decision_needs_the_seal_from_its_own_page(pool: PgPool) {
     form.set_field("request_seal", theirs.field("request_seal").unwrap());
     let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "allow")).await;
     assert_refused_as_a_page(&h, &reply, "another client's seal").await;
-    assert!(reply.text.contains("client_id"), "{}", reply.text);
+    assert_generic_mismatch(&reply);
 
     // None of that burned anything: the honest form still works.
     let reply = common::submit_consent(&h, &rob.session, &honest.submission(&org, "allow")).await;
@@ -1469,7 +1469,96 @@ async fn widening_the_hidden_scope_is_refused(pool: PgPool) {
     )
     .await;
     assert_refused_as_a_page(&h, &reply, "widened hidden scope").await;
-    assert!(reply.text.contains("scopes"), "{}", reply.text);
+    assert_generic_mismatch(&reply);
+}
+
+/// A mismatch page says the form does not match, and never which field: the
+/// field is for the log.
+fn assert_generic_mismatch(reply: &common::Reply) {
+    assert!(
+        reply
+            .text
+            .contains("does not match the request it was shown for"),
+        "{}",
+        reply.text
+    );
+    for field in [
+        "(client_id)",
+        "(scopes)",
+        "(state)",
+        "(code_challenge)",
+        "(code_challenge_method)",
+    ] {
+        assert!(!reply.text.contains(field), "{field}: {}", reply.text);
+    }
+}
+
+/// Swapping the hidden PKCE challenge for one the attacker holds the verifier
+/// for is caught by the seal: the code would otherwise be redeemable by
+/// whoever edited the form, not by the client the page was shown for.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn editing_the_hidden_code_challenge_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let honest = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "s"),
+    )
+    .await;
+    assert_eq!(honest.field("code_challenge"), Some(challenge.as_str()));
+
+    let attackers = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(b"the attacker's own verifier, long enough"));
+    let mut form = honest.clone();
+    form.set_field("code_challenge", &attackers);
+    let reply = common::submit_consent(&h, &rob.session, &form.submission(&org, "allow")).await;
+    assert_refused_as_a_page(&h, &reply, "edited code_challenge").await;
+    assert_generic_mismatch(&reply);
+
+    // The honest page still works.
+    let reply = common::submit_consent(&h, &rob.session, &honest.submission(&org, "allow")).await;
+    reply.expect(StatusCode::SEE_OTHER);
+}
+
+/// Swapping the hidden `state` would hand the client a callback it attributes
+/// to a different session of its own. The seal binds it, and dropping it is
+/// as much a change as editing it.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn editing_the_hidden_state_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await.to_string();
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let honest = common::consent_page(
+        &h,
+        &rob.session,
+        &authorize_url(&client_id, &challenge, "things:read", "victim-state"),
+    )
+    .await;
+    assert_eq!(honest.field("state"), Some("victim-state"));
+
+    for edited in ["attacker-state", ""] {
+        let mut form = honest.clone();
+        form.set_field("state", edited);
+        for decision in ["allow", "deny"] {
+            let reply =
+                common::submit_consent(&h, &rob.session, &form.submission(&org, decision)).await;
+            assert_refused_as_a_page(&h, &reply, &format!("state {edited:?}, {decision}")).await;
+            assert_generic_mismatch(&reply);
+        }
+    }
+
+    let reply = common::submit_consent(&h, &rob.session, &honest.submission(&org, "allow")).await;
+    reply.expect(StatusCode::SEE_OTHER);
+    assert_eq!(
+        query_param(&location(&reply), "state").as_deref(),
+        Some("victim-state")
+    );
 }
 
 /// A seal is bound to the person it was rendered for.
@@ -2489,6 +2578,47 @@ async fn read_only_does_not_preselect_an_org_the_caller_is_not_in(pool: PgPool) 
     reply.expect(StatusCode::OK);
     assert!(!reply.text.contains(" selected"), "{}", reply.text);
     assert!(!reply.text.contains("initech</option>"));
+    assert_eq!(code_count(&h).await, 0);
+}
+
+/// "Read only" renders through the same path as the first page: a caller who
+/// has left every org since the page was shown gets the same "no org" page
+/// the first render would have given, not a form with an empty org list.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn read_only_for_a_caller_with_no_orgs_is_the_no_org_page(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let url = authorize_url(&client_id, &challenge, "things:read things:write", "s");
+    let page = common::consent_page(&h, &rob.session, &url).await;
+
+    sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
+        .bind(org)
+        .bind(rob.user)
+        .execute(h.db.pool())
+        .await
+        .unwrap();
+
+    let first_render = Call::get(&url)
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    first_render.expect(StatusCode::BAD_REQUEST);
+    assert!(first_render
+        .text
+        .contains(msg(Locale::En, Key::ErrorNoOrgTitle)));
+
+    let reply = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&org.to_string(), "read_only"),
+    )
+    .await;
+    assert_eq!(reply.status, first_render.status, "{}", reply.text);
+    assert_eq!(reply.text, first_render.text);
+    assert!(!reply.text.contains("request_seal"));
     assert_eq!(code_count(&h).await, 0);
 }
 
