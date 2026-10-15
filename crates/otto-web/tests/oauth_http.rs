@@ -333,17 +333,20 @@ async fn the_consent_page_shows_scope_descriptions_and_falls_back_to_names(pool:
     page.expect(StatusCode::OK);
 
     assert!(
-        page.text
-            .contains("<li>See your things <code class=scope>things:read</code></li>"),
+        page.text.contains(
+            "<label for=grant-0>See your things <code class=scope>things:read</code></label>"
+        ),
         "{}",
         page.text
     );
     assert!(page.text.contains(
-        "<li>Change &lt;b&gt;everything&lt;/b&gt; &amp; more <code class=scope>things:write</code></li>"
+        "<label for=grant-1>Change &lt;b&gt;everything&lt;/b&gt; &amp; more <code class=scope>things:write</code></label>"
     ));
     assert!(!page.text.contains("<b>everything</b>"));
     // No description registered: just the name, as before.
-    assert!(page.text.contains("<li><code>org:admin</code></li>"));
+    assert!(page
+        .text
+        .contains("<label for=grant-2><code>org:admin</code></label>"));
 }
 
 /// A client that omits `scope` gets its resource server's default scopes. The consent page shows
@@ -1566,8 +1569,12 @@ async fn an_org_hint_the_caller_cannot_use_is_ignored_without_leaking(pool: PgPo
     assert!(someone_elses.contains("name=org_id"), "no consent screen");
     assert!(!someone_elses.contains(" selected"));
     assert!(!someone_elses.contains("initech</option>"));
-    // Same page, byte for byte, apart from the caller's own echoed input.
-    assert_eq!(someone_elses.replace("initech", "nonexistent"), nonexistent);
+    // Same page, byte for byte, apart from the caller's own echoed input and
+    // the request seal, which is freshly encrypted on every render.
+    assert_eq!(
+        common::without_seal(&someone_elses).replace("initech", "nonexistent"),
+        common::without_seal(&nonexistent)
+    );
 }
 
 /// With exactly one org there is nothing to pick, so a hint that is useless is
@@ -1729,4 +1736,109 @@ async fn a_first_party_client_on_a_loopback_redirect_still_gets_consent(pool: Pg
     page.expect(StatusCode::OK);
     assert!(page.text.contains("name=org_id"));
     assert!(!page.headers.contains_key(http::header::LOCATION));
+}
+
+// ------------------------------------------------------ narrowing the grant
+
+/// every checkbox has a label, the controls are native (keyboard-operable
+/// with no script or tabindex), and every requested scope starts checked.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn every_consent_checkbox_is_labelled_and_starts_checked(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+
+    let page = Call::get(authorize_url(
+        &client_id,
+        &challenge,
+        "things:read things:write org:admin",
+        "s",
+    ))
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    page.expect(StatusCode::OK);
+
+    let ids: Vec<&str> = page
+        .text
+        .split("<input type=checkbox id=")
+        .skip(1)
+        .map(|rest| rest.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(ids, ["grant-0", "grant-1", "grant-2"], "{}", page.text);
+    for id in ids {
+        assert!(
+            page.text.contains(&format!("<label for={id}>")),
+            "checkbox {id} has no label"
+        );
+    }
+    let form = common::ConsentPage::parse(&page.text);
+    assert_eq!(form.checked(), ["things:read", "things:write", "org:admin"]);
+    assert_eq!(form.field("scope_choice"), Some("1"));
+    assert!(
+        !page.text.contains("<script"),
+        "the consent page must need no script"
+    );
+    assert!(!page.text.contains("tabindex"), "native tab order only");
+}
+
+/// the new copy is in every locale.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_read_only_button_is_translated_in_every_locale(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+
+    for (header, label) in [
+        ("en", "Read only"),
+        ("es", "Solo lectura"),
+        ("de", "Nur lesen"),
+        ("fr", "Lecture seule"),
+        ("it", "Sola lettura"),
+        ("hi", "केवल पढ़ना"),
+    ] {
+        let page = Call::get(authorize_url(
+            &client_id,
+            &challenge,
+            "things:read things:write",
+            "s",
+        ))
+        .with_session(&rob.session)
+        .header("accept-language", header)
+        .send(&h.router)
+        .await;
+        page.expect(StatusCode::OK);
+        assert!(
+            page.text.contains(&format!(
+                "<button type=submit name=decision value=read_only>{label}</button>"
+            )),
+            "Accept-Language: {header}"
+        );
+        assert!(
+            page.text.contains("<p class=note>"),
+            "the narrowing hint is missing"
+        );
+    }
+}
+
+/// The page carries a fresh, non-empty request seal on every render.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_consent_page_carries_a_fresh_request_seal(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+    let url = authorize_url(&client_id, &challenge, "things:read", "s");
+
+    let first = common::consent_page(&h, &rob.session, &url).await;
+    let second = common::consent_page(&h, &rob.session, &url).await;
+    let a = first.field("request_seal").expect("no request_seal field");
+    let b = second.field("request_seal").expect("no request_seal field");
+    assert!(a.len() > 40, "{a}");
+    assert_ne!(a, b, "a seal must use a fresh nonce per render");
 }

@@ -253,6 +253,33 @@ fn downscope(scopes: &[String], role: otto_core::orgs::Role) -> Vec<String> {
         .collect()
 }
 
+/// Seal the request a consent page is rendered for (see [`crate::consent_seal`]).
+///
+/// The bound values are the *resolved* ones: the client the registry
+/// returned, the redirect URI `validate_authorize` accepted, the resolved
+/// resource URI, and the resolved scopes. `authorize_decision` compares
+/// against the same sources, never against raw form strings.
+// The error is the finished response the handler returns as-is, like the other
+// handler helpers here.
+#[allow(clippy::result_large_err)]
+fn seal_request(
+    state: &AppState,
+    caller: &CurrentUser,
+    redirect_uri: &str,
+    authorization: &oauth::Authorization,
+) -> Result<String, Response> {
+    crate::consent_seal::RequestSeal::new(
+        &authorization.client.client_id,
+        redirect_uri,
+        &authorization.resource.resource_uri,
+        caller.user.id,
+        &authorization.scopes,
+        chrono::Utc::now(),
+    )
+    .seal(&state.cipher)
+    .map_err(|e| ApiError::internal("seal the consent request", e).into_response())
+}
+
 /// `GET /oauth/authorize` — render the consent screen.
 ///
 /// A signed-out visitor is sent to the console's login page with `next` set to
@@ -359,11 +386,17 @@ pub async fn authorize_page(
     }
 
     // The registry resolved the scopes: the resource server's defaults when the
-    // client asked for none, otherwise exactly what it asked for.
+    // client asked for none, otherwise exactly what it asked for. Every one starts checked; the person
+    // can only take away.
+    let request_seal = match seal_request(&state, &caller, &params.redirect_uri, &authorization) {
+        Ok(seal) => seal,
+        Err(response) => return response,
+    };
     Html(consent_html(
         client,
         &params,
         &authorization.resource,
+        &authorization.scopes,
         &authorization.scopes,
         &orgs,
         hinted.map(|m| m.org_id),
@@ -372,6 +405,7 @@ pub async fn authorize_page(
             .email
             .as_deref()
             .unwrap_or_else(|| i18n::msg(locale, Key::ConsentThisAccount)),
+        &request_seal,
         locale,
     ))
     .into_response()
@@ -859,10 +893,10 @@ box-shadow:0 1px 3px rgba(0,0,0,.1)}\
 h1{font-size:1.35rem;margin:0 0 1rem}\
 .host{font:600 1.05rem ui-monospace,monospace;background:#eef;padding:.3rem .5rem;border-radius:6px}\
 .name{color:#555}\
-ul{padding-left:1.2rem}li{margin:.25rem 0}\
+fieldset{border:0;padding:0;margin:0}legend{padding:0;margin:0 0 .5rem}.grant{margin:.35rem 0}.grant label{margin-left:.4rem}\
 code.scope{color:#666;font-size:.8rem;margin-left:.25rem}\
 .note{color:#666;font-size:.875rem}\
-label{display:block;margin:1rem 0 .35rem;font-weight:600}\
+label.field{display:block;margin:1rem 0 .35rem;font-weight:600}\
 select{font:inherit;padding:.5rem;width:100%;border:1px solid #ccc;border-radius:8px}\
 .row{display:flex;gap:.75rem;margin-top:1.75rem}\
 button{font:inherit;padding:.6rem 1.2rem;border-radius:8px;border:1px solid #ccc;cursor:pointer}\
@@ -875,9 +909,11 @@ fn consent_html(
     params: &AuthorizeParams,
     resource: &resources::ResourceServer,
     scopes: &[String],
+    checked: &[String],
     orgs: &[otto_core::orgs::Membership],
     preselected: Option<OrgId>,
     signed_in_as: &str,
+    request_seal: &str,
     locale: Locale,
 ) -> String {
     // The fact the user can actually judge. `client_name` is self-asserted
@@ -899,24 +935,44 @@ fn consent_html(
         })
         .unwrap_or_default();
 
+    // One native checkbox per resolved scope, each with its own <label for>,
+    // so it is keyboard-operable and announced with its text and no script.
+    // The id is the index rather than the scope, because a scope token may
+    // hold characters that are awkward in an id. The description is the main
+    // text and the raw name stays beside it as `<code>`; a scope with no
+    // description is just its name. Descriptions are single-language (see
+    // `ResourceServer::scope_descriptions`) and operator-supplied text, never
+    // markup.
     let scope_items = scopes
         .iter()
-        // A description is the main text and the raw scope name stays
-        // beside it as `<code>`: the name is what a client asked for and what
-        // an operator greps for, the description is what a user can actually
-        // consent to. A scope with no registered description is just its
-        // name. Descriptions are single-language (see
-        // `ResourceServer::scope_descriptions`); only the page chrome is
-        // localized. Both are operator-supplied text, never markup.
-        .map(|s| match resource.scope_description(s) {
-            Some(d) => format!(
-                "<li>{} <code class=scope>{}</code></li>",
-                escape(d),
-                escape(s)
-            ),
-            None => format!("<li><code>{}</code></li>", escape(s)),
+        .enumerate()
+        .map(|(i, s)| {
+            let text = match resource.scope_description(s) {
+                Some(d) => format!("{} <code class=scope>{}</code>", escape(d), escape(s)),
+                None => format!("<code>{}</code>", escape(s)),
+            };
+            format!(
+                "<div class=grant><input type=checkbox id=grant-{i} name=grant value=\"{}\"{}>\
+                 <label for=grant-{i}>{text}</label></div>",
+                escape(s),
+                if checked.contains(s) { " checked" } else { "" },
+            )
         })
         .collect::<String>();
+
+    // "Read only" only where it would change something without emptying the
+    // grant. It is the first submit button in tree order, so an implicit
+    // (Enter) submission re-renders instead of granting.
+    let mixed = scopes.iter().any(|s| resources::is_read_scope(s))
+        && scopes.iter().any(|s| !resources::is_read_scope(s));
+    let read_only = if mixed {
+        format!(
+            "<button type=submit name=decision value=read_only>{}</button>",
+            escape(i18n::msg(locale, Key::ConsentReadOnly))
+        )
+    } else {
+        String::new()
+    };
 
     let org_options = orgs
         .iter()
@@ -953,6 +1009,10 @@ fn consent_html(
         ("resource", resource.resource_uri.as_str()),
         ("state", params.state.as_deref().unwrap_or("")),
         ("org_hint", params.org_hint.as_deref().unwrap_or("")),
+        // "The form carries a selection", so a form without it is never
+        // read as "grant everything".
+        ("scope_choice", "1"),
+        ("request_seal", request_seal),
     ]
     .iter()
     .map(|(k, v)| format!("<input type=hidden name={k} value=\"{}\">", escape(v)))
@@ -974,9 +1034,11 @@ fn consent_html(
          <p>{asking}</p>\
          {named}\
          <p class=note>{warn}</p>\
-         <p>{asking_to}</p><ul>{scope_items}</ul>\
          <form method=post action=\"/oauth/authorize\">{hidden}\
-         <label for=org_id>{organization}</label>\
+         <fieldset><legend>{asking_to}</legend>{scope_items}</fieldset>\
+         <p class=note>{narrow_hint}</p>\
+         {read_only}\
+         <label class=field for=org_id>{organization}</label>\
          <select id=org_id name=org_id>{org_options}</select>\
          <p class=note>{org_note}</p>\
          <div class=row>\
@@ -1000,6 +1062,7 @@ fn consent_html(
         org_note = escape(i18n::msg(locale, Key::ConsentOrgScopeNote)),
         allow = escape(i18n::msg(locale, Key::ConsentAllow)),
         cancel = escape(i18n::msg(locale, Key::ConsentCancel)),
+        narrow_hint = escape(i18n::msg(locale, Key::ConsentNarrowHint)),
         signed_in = escape(&i18n::fill(
             i18n::msg(locale, Key::ConsentSignedInAs),
             signed_in_as
@@ -1119,6 +1182,130 @@ mod tests {
         }
     }
 
+    fn fixture_client() -> oauth::Client {
+        oauth::Client {
+            client_id: "otto_client_x".into(),
+            client_name: Some("Agent".into()),
+            redirect_uris: vec!["http://127.0.0.1:1455/callback".into()],
+            disabled: false,
+            first_party: false,
+        }
+    }
+
+    fn fixture_params() -> AuthorizeParams {
+        AuthorizeParams {
+            response_type: "code".into(),
+            client_id: "otto_client_x".into(),
+            redirect_uri: "http://127.0.0.1:1455/callback".into(),
+            code_challenge: "x".repeat(43),
+            code_challenge_method: "S256".into(),
+            scope: Some("things:read things:write".into()),
+            resource: None,
+            state: Some("s".into()),
+            org_hint: None,
+        }
+    }
+
+    fn fixture_resource(scopes: &[&str], described: &[(&str, &str)]) -> resources::ResourceServer {
+        resources::ResourceServer {
+            resource_uri: "https://things.otto.test/mcp".into(),
+            name: "Things".into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            default_scopes: vec!["things:read".into()],
+            scope_descriptions: sqlx::types::Json(
+                described
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            disabled: false,
+            webhook_url: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn render(scopes: &[&str], checked: &[&str], described: &[(&str, &str)]) -> String {
+        let scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        let checked: Vec<String> = checked.iter().map(|s| s.to_string()).collect();
+        consent_html(
+            &fixture_client(),
+            &fixture_params(),
+            &fixture_resource(&["things:read", "things:write", "org:admin"], described),
+            &scopes,
+            &checked,
+            &[membership("acme", otto_core::orgs::Role::Owner)],
+            None,
+            "rob@acme.test",
+            "SEAL-VALUE",
+            Locale::En,
+        )
+    }
+
+    #[test]
+    fn each_requested_scope_is_a_labelled_checkbox() {
+        let html = render(
+            &["things:read", "things:write"],
+            &["things:read"],
+            &[("things:write", "<b>Change</b> everything")],
+        );
+        assert!(
+            html.contains(
+                "<input type=checkbox id=grant-0 name=grant value=\"things:read\" checked>\
+                 <label for=grant-0><code>things:read</code></label>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<input type=checkbox id=grant-1 name=grant value=\"things:write\">\
+                 <label for=grant-1>&lt;b&gt;Change&lt;/b&gt; everything \
+                 <code class=scope>things:write</code></label>"
+            ),
+            "an unchecked box has no `checked`, and a hostile description is escaped: {html}"
+        );
+        assert!(!html.contains("<b>Change</b>"));
+        assert!(html.contains("<fieldset><legend>It is asking to:</legend>"));
+        assert!(html.contains(
+            "Uncheck anything you don&#39;t want to allow. It can never be given more than this."
+        ));
+    }
+
+    #[test]
+    fn the_read_only_button_appears_only_for_a_mixed_set() {
+        let button = "<button type=submit name=decision value=read_only>Read only</button>";
+        assert!(render(&["things:read", "things:write"], &[], &[]).contains(button));
+        assert!(render(&["things:read", "org:admin"], &[], &[]).contains(button));
+        assert!(
+            !render(&["things:read"], &[], &[]).contains(button),
+            "a no-op"
+        );
+        assert!(
+            !render(&["things:write", "org:admin"], &[], &[]).contains(button),
+            "it would empty the grant"
+        );
+    }
+
+    /// Implicit submission (Enter) uses the first submit button in tree order.
+    /// When Read only is shown, it must come before Allow, so Enter re-renders
+    /// and never grants.
+    #[test]
+    fn read_only_precedes_allow_in_tree_order() {
+        let html = render(&["things:read", "things:write"], &[], &[]);
+        let read_only = html.find("value=read_only").unwrap();
+        let allow = html.find("value=allow").unwrap();
+        assert!(read_only < allow);
+    }
+
+    #[test]
+    fn the_form_carries_the_scope_choice_marker_and_the_seal() {
+        let html = render(&["things:read"], &["things:read"], &[]);
+        assert!(html.contains("<input type=hidden name=scope_choice value=\"1\">"));
+        assert!(html.contains("<input type=hidden name=request_seal value=\"SEAL-VALUE\">"));
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("tabindex"));
+    }
+
     #[test]
     fn an_org_hint_matches_slug_or_id_among_the_callers_orgs_only() {
         use otto_core::orgs::Role;
@@ -1204,9 +1391,11 @@ mod tests {
                 updated_at: chrono::Utc::now(),
             },
             &["things:read".to_string()],
+            &["things:read".to_string()],
             &orgs,
             None,
             "rob@acme.test",
+            "SEAL",
             Locale::En,
         );
 
