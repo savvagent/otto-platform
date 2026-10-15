@@ -643,6 +643,28 @@ impl ConsentPage {
     pub fn remove_field(&mut self, name: &str) {
         self.hidden.retain(|(k, _)| k != name);
     }
+
+    /// The body a browser submits for `decision` in `org_id`, with the boxes
+    /// left as they were rendered.
+    pub fn submission(&self, org_id: &str, decision: &str) -> Vec<(String, String)> {
+        let checked = self.checked();
+        self.submission_with(org_id, decision, &checked)
+    }
+
+    /// The same, with exactly `grants` checked: the person changed the boxes,
+    /// or a forger edited the form.
+    pub fn submission_with(
+        &self,
+        org_id: &str,
+        decision: &str,
+        grants: &[&str],
+    ) -> Vec<(String, String)> {
+        let mut fields = self.hidden.clone();
+        fields.extend(grants.iter().map(|g| ("grant".to_string(), g.to_string())));
+        fields.push(("org_id".into(), org_id.into()));
+        fields.push(("decision".into(), decision.into()));
+        fields
+    }
 }
 
 /// An attribute value from inside one tag: `name=foo` or `value="…"`.
@@ -685,4 +707,17 @@ pub async fn consent_page(h: &Harness, session: &str, url: &str) -> ConsentPage 
     let page = Call::get(url).with_session(session).send(&h.router).await;
     page.expect(StatusCode::OK);
     ConsentPage::parse(&page.text)
+}
+
+/// POST a consent form as `session`, from the honest origin.
+pub async fn submit_consent(h: &Harness, session: &str, fields: &[(String, String)]) -> Reply {
+    let pairs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    Call::post("/oauth/authorize")
+        .with_session(session)
+        .form(&pairs)
+        .send(&h.router)
+        .await
 }
