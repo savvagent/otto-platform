@@ -255,19 +255,17 @@ fn downscope(scopes: &[String], role: otto_core::orgs::Role) -> Vec<String> {
 
 /// Seal the request a consent page is rendered for (see [`crate::consent_seal`]).
 ///
-/// The bound values are the *resolved* ones: the client the registry
-/// returned, the redirect URI `validate_authorize` accepted, the resolved
-/// resource URI, and the resolved scopes. `authorize_decision` compares
-/// against the same sources, never against raw form strings.
-// The error is the finished response the handler returns as-is, like the other
-// handler helpers here.
-#[allow(clippy::result_large_err)]
+/// The seal binds the *resolved* values the page was rendered for: the client
+/// the registry returned, the redirect URI `validate_authorize` accepted, the
+/// resolved resource URI, the signed-in user, and the resolved scopes. It is
+/// built from those rather than from raw query strings so that what the seal
+/// vouches for is what the person actually saw, not what the URL claimed.
 fn seal_request(
     state: &AppState,
     caller: &CurrentUser,
     redirect_uri: &str,
     authorization: &oauth::Authorization,
-) -> Result<String, Response> {
+) -> Result<String, ApiError> {
     crate::consent_seal::RequestSeal::new(
         &authorization.client.client_id,
         redirect_uri,
@@ -277,7 +275,7 @@ fn seal_request(
         chrono::Utc::now(),
     )
     .seal(&state.cipher)
-    .map_err(|e| ApiError::internal("seal the consent request", e).into_response())
+    .map_err(|e| ApiError::internal("seal the consent request", e))
 }
 
 /// `GET /oauth/authorize` — render the consent screen.
@@ -386,11 +384,11 @@ pub async fn authorize_page(
     }
 
     // The registry resolved the scopes: the resource server's defaults when the
-    // client asked for none, otherwise exactly what it asked for. Every one starts checked; the person
-    // can only take away.
-    let request_seal = match seal_request(&state, &caller, &params.redirect_uri, &authorization) {
+    // client asked for none, otherwise exactly what it asked for. Every one
+    // starts checked; the person can only take away.
+    let request_seal = match seal_request(&state, &caller, &request.redirect_uri, &authorization) {
         Ok(seal) => seal,
-        Err(response) => return response,
+        Err(e) => return e.into_response(),
     };
     Html(consent_html(
         client,
@@ -891,9 +889,13 @@ body{font:16px/1.5 system-ui,sans-serif;margin:0;background:#f6f7f9;color:#111}\
 main{max-width:34rem;margin:3rem auto;padding:2rem;background:#fff;border-radius:12px;\
 box-shadow:0 1px 3px rgba(0,0,0,.1)}\
 h1{font-size:1.35rem;margin:0 0 1rem}\
-.host{font:600 1.05rem ui-monospace,monospace;background:#eef;padding:.3rem .5rem;border-radius:6px}\
+.host{font:600 1.05rem ui-monospace,monospace;background:#eef;padding:.3rem .5rem;\
+border-radius:6px}\
 .name{color:#555}\
-fieldset{border:0;padding:0;margin:0}legend{padding:0;margin:0 0 .5rem}.grant{margin:.35rem 0}.grant label{margin-left:.4rem}\
+fieldset{border:0;padding:0;margin:0}\
+legend{padding:0;margin:0 0 .5rem}\
+.grant{margin:.35rem 0}\
+.grant label{margin-left:.4rem}\
 code.scope{color:#666;font-size:.8rem;margin-left:.25rem}\
 .note{color:#666;font-size:.875rem}\
 label.field{display:block;margin:1rem 0 .35rem;font-weight:600}\
@@ -1009,8 +1011,9 @@ fn consent_html(
         ("resource", resource.resource_uri.as_str()),
         ("state", params.state.as_deref().unwrap_or("")),
         ("org_hint", params.org_hint.as_deref().unwrap_or("")),
-        // "The form carries a selection", so a form without it is never
-        // read as "grant everything".
+        // Marks a form that rendered the scope checkboxes. A POST without it
+        // comes from an older or forged form that never offered a choice, so
+        // its missing `grant` fields must not be read as "grant everything".
         ("scope_choice", "1"),
         ("request_seal", request_seal),
     ]

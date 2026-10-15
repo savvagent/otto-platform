@@ -13,6 +13,8 @@ mod common;
 use base64::Engine;
 use common::{harness, onboard, org_with_owner, Call, Harness, RESOURCE};
 use http::StatusCode;
+use otto_web::i18n::{msg, Key, Locale};
+use otto_web::oauth::escape;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
@@ -339,9 +341,10 @@ async fn the_consent_page_shows_scope_descriptions_and_falls_back_to_names(pool:
         "{}",
         page.text
     );
-    assert!(page.text.contains(
-        "<label for=grant-1>Change &lt;b&gt;everything&lt;/b&gt; &amp; more <code class=scope>things:write</code></label>"
-    ));
+    assert!(page.text.contains(concat!(
+        "<label for=grant-1>Change &lt;b&gt;everything&lt;/b&gt; &amp; more ",
+        "<code class=scope>things:write</code></label>"
+    )));
     assert!(!page.text.contains("<b>everything</b>"));
     // No description registered: just the name, as before.
     assert!(page
@@ -1740,7 +1743,7 @@ async fn a_first_party_client_on_a_loopback_redirect_still_gets_consent(pool: Pg
 
 // ------------------------------------------------------ narrowing the grant
 
-/// every checkbox has a label, the controls are native (keyboard-operable
+/// Every checkbox has a label, the controls are native (keyboard-operable
 /// with no script or tabindex), and every requested scope starts checked.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn every_consent_checkbox_is_labelled_and_starts_checked(pool: PgPool) {
@@ -1784,7 +1787,7 @@ async fn every_consent_checkbox_is_labelled_and_starts_checked(pool: PgPool) {
     assert!(!page.text.contains("tabindex"), "native tab order only");
 }
 
-/// the new copy is in every locale.
+/// The new copy is in every locale.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn the_read_only_button_is_translated_in_every_locale(pool: PgPool) {
     let h = harness(pool).await;
@@ -1793,13 +1796,14 @@ async fn the_read_only_button_is_translated_in_every_locale(pool: PgPool) {
     let client_id = register(&h, "Test Agent", REDIRECT).await;
     let (_, challenge) = pkce();
 
-    for (header, label) in [
-        ("en", "Read only"),
-        ("es", "Solo lectura"),
-        ("de", "Nur lesen"),
-        ("fr", "Lecture seule"),
-        ("it", "Sola lettura"),
-        ("hi", "केवल पढ़ना"),
+    let english_hint = msg(Locale::En, Key::ConsentNarrowHint);
+    for (header, locale, label) in [
+        ("en", Locale::En, "Read only"),
+        ("es", Locale::Es, "Solo lectura"),
+        ("de", Locale::De, "Nur lesen"),
+        ("fr", Locale::Fr, "Lecture seule"),
+        ("it", Locale::It, "Sola lettura"),
+        ("hi", Locale::Hi, "केवल पढ़ना"),
     ] {
         let page = Call::get(authorize_url(
             &client_id,
@@ -1818,10 +1822,15 @@ async fn the_read_only_button_is_translated_in_every_locale(pool: PgPool) {
             )),
             "Accept-Language: {header}"
         );
+        let hint = msg(locale, Key::ConsentNarrowHint);
         assert!(
-            page.text.contains("<p class=note>"),
-            "the narrowing hint is missing"
+            page.text
+                .contains(&format!("<p class=note>{}</p>", escape(hint))),
+            "the narrowing hint is missing for Accept-Language: {header}"
         );
+        if header != "en" {
+            assert_ne!(hint, english_hint, "{header} hint is untranslated");
+        }
     }
 }
 
