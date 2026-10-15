@@ -527,8 +527,11 @@ async fn a_scopeless_pat_for_a_resource_without_defaults_is_refused(pool: PgPool
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, AuthError::InvalidScope(m) if m.contains("no default scopes")),
-        "{err:?}"
+        matches!(&err, AuthError::InvalidScope(m)
+            if m.contains("no default scopes")
+                && m.contains(FLAGS)
+                && m.contains("flags:read flags:write")),
+        "the refusal must name the resource and the scopes it does have: {err:?}"
     );
     assert_eq!(err.oauth_code(), Some("invalid_scope"));
     assert!(

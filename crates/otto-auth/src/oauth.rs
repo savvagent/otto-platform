@@ -493,11 +493,7 @@ pub async fn validate_authorize(db: &Db, req: &AuthorizeRequest) -> Result<Autho
     // fall back on. Refused now, so no consent page renders with nothing on
     // it and nothing downstream has to guess why the list is empty.
     if scopes.is_empty() {
-        return Err(AuthError::InvalidScope(format!(
-            "no scope was requested and {} has no default scopes; request one of: {}",
-            resource.resource_uri,
-            resource.scopes.join(" ")
-        )));
+        return Err(resource.no_scope_requested());
     }
     Ok(Authorization {
         client,

@@ -1331,7 +1331,8 @@ async fn a_pat_names_its_resource_when_several_are_registered(pool: PgPool) {
 
 /// A PAT that names no scopes, for a resource server registered with no
 /// default scopes, resolves to nothing. It is refused with `invalid_scope`
-/// and a message saying why, and nothing is minted (#52).
+/// and a message saying why, and nothing is minted (#52). A resource that
+/// has defaults still gives them to a scopeless PAT.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn a_scopeless_pat_for_a_resource_without_defaults_is_refused(pool: PgPool) {
     const BARE: &str = "https://bare.otto.test/mcp";
@@ -1358,8 +1359,8 @@ async fn a_scopeless_pat_for_a_resource_without_defaults_is_refused(pool: PgPool
     refused.expect(StatusCode::BAD_REQUEST);
     assert_eq!(refused.error_code(), Some("invalid_scope"));
     assert!(
-        refused.text.contains("has no default scopes"),
-        "the error must say why: {}",
+        refused.text.contains("has no default scopes") && refused.text.contains("bare:read"),
+        "the error must say why, and what to ask for instead: {}",
         refused.text
     );
 
@@ -1372,6 +1373,17 @@ async fn a_scopeless_pat_for_a_resource_without_defaults_is_refused(pool: PgPool
         listed.body.as_array().unwrap().is_empty(),
         "a refused PAT must not be minted: {}",
         listed.text
+    );
+
+    let defaulted = Call::post("/api/orgs/acme/tokens")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "name": "laptop", "resource": common::RESOURCE }))
+        .send(&h.router)
+        .await;
+    defaulted.expect(StatusCode::CREATED);
+    assert_eq!(
+        defaulted.body["scopes"],
+        serde_json::json!(common::RESOURCE_DEFAULT_SCOPES)
     );
 }
 

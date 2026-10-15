@@ -426,16 +426,11 @@ pub async fn mint_pat(
     // an unregistered or disabled resource, or a scope its server never defined.
     let rs = crate::resources::get_active(db, resource).await?;
     let scopes = rs.grant_scopes(scopes)?;
-    // A non-empty request either fails above or resolves to something, so
-    // empty here means nothing was asked for and the resource has no defaults
-    // to fall back on. Refused rather than stored as a token that fails every
-    // call, with the same message `validate_authorize` gives.
+    // `grant_scopes` returns an empty list only when nothing was asked for and
+    // the resource has no defaults. Refused rather than stored as a token that
+    // fails every call.
     if scopes.is_empty() {
-        return Err(AuthError::InvalidScope(format!(
-            "no scope was requested and {} has no default scopes; request one of: {}",
-            rs.resource_uri,
-            rs.scopes.join(" ")
-        )));
+        return Err(rs.no_scope_requested());
     }
 
     // A deleted org must not gain new credentials.

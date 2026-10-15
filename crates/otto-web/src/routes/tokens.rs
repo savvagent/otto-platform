@@ -50,7 +50,8 @@ pub struct MintTokenRequest {
     pub resource: Option<String>,
     /// Defaults to the resource server's default scopes, matching the
     /// authorization server's behaviour for a client that asks for nothing in
-    /// particular.
+    /// particular. A resource server with no default scopes refuses an empty
+    /// list with `invalid_scope`, as the authorization server does.
     #[serde(default)]
     pub scopes: Vec<String>,
     /// Days until expiry. Clamped to 1–365 by `otto-auth`; defaults to 90.
