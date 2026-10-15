@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.2](https://github.com/savvagent/otto-platform/compare/v0.9.1...v0.9.2) (2026-10-15)
+
+
+### Bug Fixes
+
+* **otto-auth:** refuse a PAT that resolves to no scopes ([#53](https://github.com/savvagent/otto-platform/issues/53)) ([4cd6042](https://github.com/savvagent/otto-platform/commit/4cd60420d77714d3e71dfc3da528df11bc46d258)), closes [#52](https://github.com/savvagent/otto-platform/issues/52)
+
 ## [0.9.1](https://github.com/savvagent/otto-platform/compare/v0.9.0...v0.9.1) (2026-10-15)
 
 
