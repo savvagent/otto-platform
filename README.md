@@ -178,6 +178,16 @@ Descriptions are plain text (at most 200 characters), single-language, and
 must name scopes the resource server defines. `describe` replaces the whole
 set; re-registering keeps descriptions of scopes it still lists.
 
+On the consent screen each requested scope (or each default scope, when the
+client asked for none) is a checkbox, checked by default. The person can
+uncheck any of them, or press **Read only** to keep only the scopes whose
+names end in `:read`. The code, the access token and every refresh carry only
+what was left checked, and a form naming a scope the client did not request is
+refused. Unchecking everything refuses the request with `access_denied`.
+"Read only" relies on that naming convention, so name a resource server's
+read scopes `<thing>:read`: any other name is treated as one that can change
+something.
+
 ### Running just the migrations
 
 Any tool that runs `sqlx::migrate!` against `crates/otto-tenant/migrations/`
