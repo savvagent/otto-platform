@@ -503,6 +503,52 @@ async fn pats_obey_the_registry(pool: PgPool) {
     assert_eq!(principal.scopes, ["flags:read"]);
 }
 
+/// A resource server may be registered with no default scopes. A PAT that asks
+/// for nothing then resolves to nothing, and is refused with an accurate
+/// `invalid_scope` rather than stored as a token that fails every call (#52).
+/// An explicit scope still mints.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_scopeless_pat_for_a_resource_without_defaults_is_refused(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    resources::register(
+        &db,
+        ResourceServerSpec {
+            resource_uri: FLAGS,
+            name: "otto-flags",
+            scopes: &["flags:read", "flags:write"],
+            default_scopes: &[],
+        },
+    )
+    .await
+    .unwrap();
+    let (user, org) = member(&db).await;
+
+    let err = tokens::mint_pat(&db, user, org, "ci", &[], FLAGS, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AuthError::InvalidScope(m)
+            if m.contains("no default scopes")
+                && m.contains(FLAGS)
+                && m.contains("flags:read flags:write")),
+        "the refusal must name the resource and the scopes it does have: {err:?}"
+    );
+    assert_eq!(err.oauth_code(), Some("invalid_scope"));
+    assert!(
+        tokens::list_tokens(&db, user, org)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused PAT must leave no token row"
+    );
+
+    let (pat, _) = tokens::mint_pat(&db, user, org, "ci", &["flags:write".into()], FLAGS, None)
+        .await
+        .unwrap();
+    let principal = tokens::introspect(&db, &pat, FLAGS).await.unwrap();
+    assert_eq!(principal.scopes, ["flags:write"]);
+}
+
 // ---- introspection credentials ----
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]

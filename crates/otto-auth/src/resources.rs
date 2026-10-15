@@ -104,6 +104,20 @@ impl ResourceServer {
         }
         Ok(granted)
     }
+
+    /// The refusal for a request that named no scope on a resource server
+    /// with no default scopes, i.e. one [`Self::grant_scopes`] resolved to
+    /// nothing. Both issuance paths that resolve an empty request
+    /// (`oauth::validate_authorize` and `tokens::mint_pat`) refuse with this,
+    /// so the two cannot drift apart. Kept out of `grant_scopes` because
+    /// "empty means the defaults" is that method's contract for every caller.
+    pub(crate) fn no_scope_requested(&self) -> AuthError {
+        AuthError::InvalidScope(format!(
+            "no scope was requested and {} has no default scopes; request one of: {}",
+            self.resource_uri,
+            self.scopes.join(" ")
+        ))
+    }
 }
 
 /// Register a resource server, or update the name and scopes of one already

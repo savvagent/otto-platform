@@ -50,7 +50,8 @@ pub struct MintTokenRequest {
     pub resource: Option<String>,
     /// Defaults to the resource server's default scopes, matching the
     /// authorization server's behaviour for a client that asks for nothing in
-    /// particular.
+    /// particular. A resource server with no default scopes refuses an empty
+    /// list with `invalid_scope`, as the authorization server does.
     #[serde(default)]
     pub scopes: Vec<String>,
     /// Days until expiry. Clamped to 1–365 by `otto-auth`; defaults to 90.
@@ -93,8 +94,9 @@ pub async fn mint_token(
 ) -> ApiResult<Response> {
     // Validated against the named resource server's registry row, so an unknown
     // scope is refused here exactly as it would be at `/oauth/authorize`
-    // — and an empty request gets the same default scopes. `mint_pat`
-    // checks the registry again; resolving it here is what gives the
+    // — and an empty request gets the same default scopes, or, when the
+    // resource has none, the same `invalid_scope` refusal from `mint_pat`.
+    // `mint_pat` checks the registry again; resolving it here is what gives the
     // `org:admin` check below, and the response, the effective scopes.
     let resource = resolve_resource(&state.db, req.resource.as_deref()).await?;
     let scopes = resource.grant_scopes(&req.scopes)?;
