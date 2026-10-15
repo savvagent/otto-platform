@@ -116,6 +116,10 @@ pub enum Key {
     /// a real state here, because a passkey creates the account and the profile
     /// comes afterwards.
     ConsentThisAccount,
+    /// Under the scope checkboxes: unchecking narrows, nothing can widen.
+    ConsentNarrowHint,
+    /// The no-JS button that re-renders with only the `:read` scopes checked.
+    ConsentReadOnly,
 
     // The error page.
     ErrorTitle,
@@ -260,6 +264,33 @@ pub fn msg(locale: Locale, key: Key) -> &'static str {
         (ConsentThisAccount, It) => "questo account",
         (ConsentThisAccount, Hi) => "यह खाता",
 
+        (ConsentNarrowHint, En) => {
+            "Uncheck anything you don't want to allow. It can never be given more than this."
+        }
+        (ConsentNarrowHint, Es) => {
+            "Desmarca lo que no quieras permitir. Nunca podrá recibir más que esto."
+        }
+        (ConsentNarrowHint, De) => {
+            "Entferne das Häkchen bei allem, was du nicht erlauben möchtest. \
+             Mehr als das kann sie nie erhalten."
+        }
+        (ConsentNarrowHint, Fr) => {
+            "Décochez ce que vous ne voulez pas autoriser. Elle ne pourra jamais obtenir plus."
+        }
+        (ConsentNarrowHint, It) => {
+            "Deseleziona ciò che non vuoi consentire. Non potrà mai ottenere più di questo."
+        }
+        (ConsentNarrowHint, Hi) => {
+            "जिसकी अनुमति आप नहीं देना चाहते, उसका निशान हटा दें। इसे इससे अधिक कभी नहीं दिया जा सकता।"
+        }
+
+        (ConsentReadOnly, En) => "Read only",
+        (ConsentReadOnly, Es) => "Solo lectura",
+        (ConsentReadOnly, De) => "Nur lesen",
+        (ConsentReadOnly, Fr) => "Lecture seule",
+        (ConsentReadOnly, It) => "Sola lettura",
+        (ConsentReadOnly, Hi) => "केवल पढ़ना",
+
         // --------------------------------------------------------- errors
         (ErrorTitle, En) => "This request could not be authorized",
         (ErrorTitle, Es) => "No se pudo autorizar esta solicitud",
@@ -403,6 +434,8 @@ mod tests {
             ConsentCancel,
             ConsentSignedInAs,
             ConsentThisAccount,
+            ConsentNarrowHint,
+            ConsentReadOnly,
             ErrorTitle,
             ErrorNothingAuthorized,
             ErrorNoOrgTitle,
