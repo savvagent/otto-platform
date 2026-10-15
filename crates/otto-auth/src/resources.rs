@@ -400,6 +400,19 @@ pub fn all_scopes(servers: &[ResourceServer]) -> Vec<String> {
     scopes
 }
 
+/// Whether `scope` only reads.
+///
+/// A naming convention, not a registry flag: a scope is read-only exactly when
+/// it ends in `:read`. Every other scope counts as non-read: `*:write`,
+/// `*:admin`, `org:admin`, and names that follow neither pattern, such as
+/// otto-factory's `messages` and `trackers`. The consent screen's "Read only"
+/// button unchecks everything this returns `false` for, so a scope that breaks
+/// the convention errs toward *not* being granted, and the person can still
+/// check it again by hand.
+pub fn is_read_scope(scope: &str) -> bool {
+    scope.ends_with(":read")
+}
+
 /// A resource indicator must be an absolute URI without a fragment
 /// (RFC 8707 §2). It must also be `https`, except on loopback for local
 /// development, because it is the audience every token for it carries.
@@ -591,5 +604,30 @@ mod tests {
         b.disabled = true;
         a.scopes.push("d".into());
         assert_eq!(all_scopes(&[a, b]), vec!["a", "b", "d"]);
+    }
+
+    /// Read-only exactly when the name ends in `:read`. Everything else,
+    /// including names that follow neither pattern, is non-read, so "Read
+    /// only" errs toward not granting it.
+    #[test]
+    fn is_read_scope_only_for_colon_read() {
+        for read in ["cxp:read", "jobs:read", "flags:read", "things:read"] {
+            assert!(is_read_scope(read), "{read} should be read-only");
+        }
+        for not_read in [
+            "cxp:write",
+            "apps:admin",
+            "org:admin",
+            "messages",
+            "trackers",
+            "read",
+            "cxp:reader",
+            "",
+        ] {
+            assert!(
+                !is_read_scope(not_read),
+                "{not_read:?} must not count as read-only"
+            );
+        }
     }
 }

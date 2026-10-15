@@ -414,6 +414,34 @@ pub struct Authorization {
     pub scopes: Vec<String>,
 }
 
+impl Authorization {
+    /// Narrow the resolved scopes to the ones the person left checked.
+    ///
+    /// Returns `self.scopes` filtered to `chosen`, in `self.scopes` order and
+    /// without duplicates (`self.scopes` is already deduplicated by
+    /// [`ResourceServer::grant_scopes`]). Any chosen scope outside
+    /// `self.scopes` is refused, never dropped: unrequested, another resource
+    /// server's, unknown, or a near-miss with whitespace. The consent form can
+    /// only ever take away.
+    ///
+    /// An empty result is `Ok(vec![])`, and what it means is the caller's
+    /// decision. Do not pass it to [`issue_authorization_code`], which reads an
+    /// empty list as "the resource server's defaults" and would widen it.
+    pub fn narrow(&self, chosen: &[String]) -> Result<Vec<String>> {
+        if let Some(extra) = chosen.iter().find(|c| !self.scopes.contains(c)) {
+            return Err(AuthError::InvalidScope(format!(
+                "{extra:?} was not requested"
+            )));
+        }
+        Ok(self
+            .scopes
+            .iter()
+            .filter(|s| chosen.contains(s))
+            .cloned()
+            .collect())
+    }
+}
+
 /// Validate an authorization request before showing a consent screen.
 ///
 /// Order is a security property: the redirect URI is validated **first**,
@@ -858,5 +886,88 @@ mod tests {
             verify_pkce(&challenge, "S256", &bad).is_err(),
             "'!' is outside the alphabet"
         );
+    }
+
+    // ---- narrowing the consented scopes ----
+
+    fn authorization(scopes: &[&str]) -> Authorization {
+        let owned: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        Authorization {
+            client: Client {
+                client_id: "otto_client_x".into(),
+                client_name: None,
+                redirect_uris: vec!["http://127.0.0.1:1455/callback".into()],
+                disabled: false,
+                first_party: false,
+            },
+            resource: ResourceServer {
+                resource_uri: "https://svc.example/mcp".into(),
+                name: "svc".into(),
+                scopes: owned.clone(),
+                default_scopes: vec![],
+                scope_descriptions: Default::default(),
+                disabled: false,
+                webhook_url: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            scopes: owned,
+        }
+    }
+
+    fn owned(scopes: &[&str]) -> Vec<String> {
+        scopes.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn narrow_keeps_the_chosen_subset_in_resolved_order() {
+        let a = authorization(&["things:read", "things:write", "org:admin"]);
+        assert_eq!(
+            a.narrow(&owned(&["org:admin", "things:read"])).unwrap(),
+            vec!["things:read", "org:admin"],
+            "order follows the resolved request, not the form"
+        );
+        assert_eq!(a.narrow(&a.scopes).unwrap(), a.scopes);
+    }
+
+    #[test]
+    fn narrow_collapses_duplicates() {
+        let a = authorization(&["things:read", "things:write"]);
+        assert_eq!(
+            a.narrow(&owned(&["things:read", "things:read"])).unwrap(),
+            vec!["things:read"]
+        );
+    }
+
+    /// The consent form can only take away. Anything it adds is refused, not
+    /// silently dropped: a forged form is an attack, not a typo.
+    #[test]
+    fn narrow_refuses_a_scope_that_was_not_requested() {
+        let a = authorization(&["things:read"]);
+        for forged in [
+            "things:write",
+            "widgets:read",
+            "bogus",
+            " things:read",
+            "things:read ",
+            "",
+        ] {
+            let err = a
+                .narrow(&owned(&["things:read", forged]))
+                .expect_err(&format!("{forged:?} must be refused"));
+            assert!(
+                matches!(&err, AuthError::InvalidScope(m) if m.contains("was not requested")),
+                "{forged:?}: {err}"
+            );
+        }
+    }
+
+    /// Empty is not an error here. The caller decides, and the authorization
+    /// endpoint refuses it, because `issue_authorization_code` would read `[]`
+    /// as "the defaults".
+    #[test]
+    fn narrow_to_nothing_is_an_empty_ok() {
+        let a = authorization(&["things:read", "things:write"]);
+        assert_eq!(a.narrow(&[]).unwrap(), Vec::<String>::new());
     }
 }
