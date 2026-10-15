@@ -39,6 +39,7 @@
 //! server's own domain routes live in its own service.
 
 pub mod catalog;
+mod consent_seal;
 pub mod csrf;
 pub mod error;
 pub mod i18n;
