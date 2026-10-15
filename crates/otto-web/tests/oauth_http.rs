@@ -2174,6 +2174,11 @@ async fn a_member_requesting_org_admin_gets_a_downscoped_token(pool: PgPool) {
         query_param(&callback, "error").as_deref(),
         Some("invalid_scope")
     );
+    // This, and only this, is when the refusal blames org:admin (#49).
+    assert!(
+        query_param(&callback, "error_description").is_some_and(|d| d.contains("org:admin")),
+        "{callback}"
+    );
     assert!(query_param(&callback, "code").is_none());
 }
 

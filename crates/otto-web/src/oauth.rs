@@ -254,9 +254,10 @@ fn downscope(scopes: &[String], role: otto_core::orgs::Role) -> Vec<String> {
         .collect()
 }
 
-/// `grant`'s refusal when it is handed nothing to grant. Neither caller does:
-/// `validate_authorize` refuses a request that resolves to no scope, and the
-/// consent POST answers an empty selection with `access_denied`.
+/// `grant`'s refusal when it is handed nothing to grant. A backstop: callers
+/// are expected never to pass `[]`, since `validate_authorize` refuses a
+/// request that resolves to no scope and the consent POST answers an empty
+/// selection with `access_denied`.
 const NOTHING_TO_GRANT: &str = "there is no scope to grant";
 
 /// `grant`'s refusal when dropping the admin scope left nothing.
@@ -728,8 +729,8 @@ pub async fn authorize_decision(
     };
 
     // Nothing checked means the person granted nothing: `access_denied`.
-    // Without this, `grant` would still refuse `[]`, but as `invalid_scope`
-    // with its org:admin message, and `issue_authorization_code` refuses it
+    // Without this, `grant` would still refuse `[]`, as `invalid_scope` with
+    // "there is no scope to grant", and `issue_authorization_code` refuses it
     // last. Those are backstops; this is the answer the client should get.
     if narrowed.is_empty() {
         return redirect_error(&params, "access_denied", "no access was selected");
