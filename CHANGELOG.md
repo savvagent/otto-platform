@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/savvagent/otto-platform/compare/v0.7.0...v0.8.0) (2026-10-15)
+
+
+### Features
+
+* **web:** send agent-only services to their connect card, not their origin ([#42](https://github.com/savvagent/otto-platform/issues/42)) ([bd2212f](https://github.com/savvagent/otto-platform/commit/bd2212fdc50754fd8d68264f85d07fd25353dba9))
+
 ## [0.7.0](https://github.com/savvagent/otto-platform/compare/v0.6.1...v0.7.0) (2026-10-14)
 
 
