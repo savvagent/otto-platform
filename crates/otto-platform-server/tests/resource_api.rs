@@ -1900,10 +1900,16 @@ async fn the_operator_cli_assigns_service_slugs(pool: PgPool) {
     let out = run(&format!("describe {FACTORY} --clear")).await.unwrap();
     assert!(out.contains("service=otto-factory"), "{out}");
 
-    // Slugs are validated, unique, and the URI must be registered.
+    // Malformed slugs are refused while parsing, before anything is written.
+    for bad in ["Otto", "otto_factory"] {
+        let args: Vec<String> = format!("set-service {FACTORY} {bad}")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        assert!(parse(&args).is_err(), "{bad}");
+    }
+    // Slugs are unique, and the URI must be registered.
     for bad in [
-        format!("set-service {FACTORY} Otto"),
-        format!("set-service {FACTORY} otto_factory"),
         format!("set-service {FACTORY} otto-flags"),
         "set-service https://nope.example/mcp otto-nope".to_owned(),
     ] {

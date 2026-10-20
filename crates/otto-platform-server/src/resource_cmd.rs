@@ -137,6 +137,15 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             })
             .collect()
     };
+    let slug = |s: &str| -> Result<String, String> {
+        if resources::is_service_slug(s) {
+            Ok(s.to_owned())
+        } else {
+            Err(format!(
+                "`{s}` is not a service slug: lower-case letters, digits and `-`, starting with a letter, at most 63 characters"
+            ))
+        }
+    };
     let one_uri = |positional: &[&str]| match positional {
         [uri] => Ok((*uri).to_owned()),
         _ => Err("expected exactly one <resource-uri>".to_owned()),
@@ -155,12 +164,14 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 .map(list)
                 .unwrap_or_default(),
             scope_descriptions: descriptions()?,
-            service: flag("--service").flatten().map(str::to_owned),
+            // Checked here so a bad slug is refused before `register` writes
+            // anything, rather than after the registration has committed.
+            service: flag("--service").flatten().map(slug).transpose()?,
         }),
         "set-service" => match positional.as_slice() {
             [uri, service] => Ok(Command::SetService {
                 resource_uri: (*uri).to_owned(),
-                service: (*service).to_owned(),
+                service: slug(service)?,
             }),
             _ => Err("expected <resource-uri> <slug>".into()),
         },
@@ -397,6 +408,10 @@ mod tests {
             "register https://x.example/mcp --name X --scopes a --service"
         ))
         .is_err());
+        assert!(parse(&args(
+            "register https://x.example/mcp --name X --scopes a --service Bad_Slug"
+        ))
+        .is_err());
     }
 
     #[test]
@@ -409,6 +424,7 @@ mod tests {
             }
         );
         assert!(parse(&args("set-service https://x.example/mcp")).is_err());
+        assert!(parse(&args("set-service https://x.example/mcp Otto-X")).is_err());
         assert!(parse(&args("set-service https://x.example/mcp a b")).is_err());
     }
 

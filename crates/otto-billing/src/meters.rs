@@ -110,13 +110,29 @@ pub fn check_declaration(
     })
 }
 
+/// Bidi overrides and isolates, zero-width characters and the BOM. These names
+/// end up on usage pages and invoices, where an invisible character can make
+/// one meter read like another or reorder the text around it.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+    )
+}
+
 fn check_text(field: &str, text: &str, max: usize) -> std::result::Result<String, String> {
     let text = text.trim();
     if text.is_empty() || text.chars().count() > max {
         return Err(format!("`{field}` must be 1 to {max} characters"));
     }
-    if text.chars().any(char::is_control) {
-        return Err(format!("`{field}` must not contain control characters"));
+    if text
+        .chars()
+        .any(|c| c.is_control() || is_invisible_format(c))
+    {
+        return Err(format!(
+            "`{field}` must not contain control or invisible formatting characters"
+        ));
     }
     Ok(text.to_owned())
 }
@@ -204,6 +220,19 @@ mod tests {
                 check_declaration("otto-flags", &spec(key, "X", "x")).is_err(),
                 "{key:?}"
             );
+        }
+    }
+
+    #[test]
+    fn invisible_formatting_characters_are_refused() {
+        for name in [
+            "Jobs\u{202E}detelpmoc",
+            "Jobs\u{200B}completed",
+            "\u{FEFF}Jobs",
+        ] {
+            let refused =
+                check_declaration("otto-flags", &spec("otto-flags/evaluations", name, "eval"));
+            assert!(refused.is_err(), "{name:?} should be refused");
         }
     }
 
