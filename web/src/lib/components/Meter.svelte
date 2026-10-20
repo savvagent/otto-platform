@@ -19,11 +19,17 @@
    *   `aria-valuemax` is invalid ARIA), but not for the words, because an
    *   owner over budget needs to see by how much.
    *
+   * A service whose paid usage is paused for want of a card
+   * (`paymentRequired`) says so in words beside its spend, so the state sits
+   * next to the meter it explains; the page's `PaymentRequiredNotices` says
+   * what to do about it.
+   *
    * `compact` is the overview's form: the service named on the left, and
    * nothing a glance does not need.
    */
   interface Props {
-    usage: Pick<ServiceUsage, 'service' | 'spendCents' | 'budget'>;
+    usage: Pick<ServiceUsage, 'service' | 'spendCents' | 'budget'> &
+      Partial<Pick<ServiceUsage, 'paymentRequired'>>;
     compact?: boolean;
   }
 
@@ -64,6 +70,11 @@
     </span>
     {#if usage.budget?.blocked}
       <span class="rounded-full bg-bad/10 px-2 py-0.5 text-xs text-bad">{m.meter_blocked()}</span>
+    {/if}
+    {#if usage.paymentRequired}
+      <span class="shrink-0 rounded-full bg-bad/10 px-2 py-0.5 text-xs text-bad">
+        {m.meter_payment_required()}
+      </span>
     {/if}
   </div>
 

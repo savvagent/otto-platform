@@ -9,8 +9,17 @@
 import { mount, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { Role } from '$lib/types';
+import OverviewPage from './+page.svelte';
 import Harness from './OrgPageHarness.svelte';
-import { BUDGETS, USAGE } from './test-fixtures';
+import RoleHarness from './RoleHarness.svelte';
+import {
+  BUDGETS,
+  USAGE,
+  USAGE_PAYMENT_REQUIRED,
+  json,
+  serve as serveRoutes
+} from './test-fixtures';
 
 const members = [
   { id: 'u1', email: 'ada@example.test', name: null, label: 'a-b-1', role: 'owner' },
@@ -132,4 +141,83 @@ describe('the organization overview', () => {
 
     unmount(instance);
   });
+});
+
+describe('the overview when a service needs a card', () => {
+  const routes = (usage: unknown) =>
+    serveRoutes({
+      'GET /api/orgs/acme/members': () => json(members),
+      'GET /api/orgs/acme/teams': () => json(teams),
+      'GET /api/orgs/acme/usage': () => json(usage),
+      'GET /api/orgs/acme/budgets': () => json(BUDGETS)
+    });
+
+  const render = (role: Role) =>
+    mount(RoleHarness, { target: container, props: { slug: 'acme', role, page: OverviewPage } });
+
+  const notices = () => container.querySelector('section[aria-label="Payment needed"]');
+
+  it('tells an owner paid usage is paused and links to billing', async () => {
+    vi.stubGlobal('fetch', routes(USAGE_PAYMENT_REQUIRED));
+    const instance = render('owner');
+
+    await vi.waitFor(() => expect(notices()).not.toBeNull());
+    const status = notices()!.querySelector('[role="status"]')!;
+    expect(status.textContent).toContain(
+      'Otto Flags is past its free allowance this month, so its paid usage is paused until a card is on file. Its free calls keep working.'
+    );
+    expect(status.textContent).not.toContain('Otto CXP');
+    const link = status.querySelector('a')!;
+    expect(link.getAttribute('href')).toBe('/o/acme/billing');
+    expect(link.textContent?.trim()).toBe('Add a card');
+    expect(notices()!.querySelectorAll('[role="alert"]')).toHaveLength(0);
+
+    // Beside the service's own meter too, in words.
+    const rows = Array.from(container.querySelectorAll('[role="meter"]'))
+      .map((meter) => meter.closest('li')!)
+      .map((li) => li.textContent);
+    expect(rows[0]).toContain('Otto Flags');
+    expect(rows[0]).toContain('Paid usage paused');
+    const cxp = Array.from(container.querySelectorAll('li')).find((li) =>
+      li.textContent?.includes('Spend unavailable')
+    );
+    expect(cxp?.textContent).not.toContain('Paid usage paused');
+    expect(container.textContent).not.toMatch(/operation|bucket|billable/i);
+
+    unmount(instance);
+  });
+
+  it.each<Role>(['admin', 'member'])(
+    'tells an %s an owner must add a card, with no link',
+    async (role) => {
+      vi.stubGlobal('fetch', routes(USAGE_PAYMENT_REQUIRED));
+      const instance = render(role);
+
+      await vi.waitFor(() => expect(notices()).not.toBeNull());
+      const status = notices()!.querySelector('[role="status"]')!;
+      expect(status.textContent).toContain(
+        'Otto Flags is past its free allowance this month, so its paid usage is paused until an owner of this organization adds a card. Its free calls keep working.'
+      );
+      expect(status.querySelector('a')).toBeNull();
+      expect(container.querySelector('a[href="/o/acme/billing"]')).toBeNull();
+      expect(container.textContent).toContain('Paid usage paused');
+
+      unmount(instance);
+    }
+  );
+
+  it.each<Role>(['owner', 'admin', 'member'])(
+    'says nothing about payment to a %s when no service needs a card',
+    async (role) => {
+      vi.stubGlobal('fetch', routes(USAGE));
+      const instance = render(role);
+
+      await vi.waitFor(() => expect(container.querySelector('[role="meter"]')).not.toBeNull());
+      expect(notices()).toBeNull();
+      expect(container.textContent).not.toContain('Paid usage paused');
+      expect(container.textContent).not.toContain('free allowance');
+
+      unmount(instance);
+    }
+  );
 });
