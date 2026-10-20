@@ -23,8 +23,10 @@
 //! router. Lifecycle webhooks are delivered by [`webhooks::run`], and
 //! notification email by [`email::run`] when SMTP is configured, background
 //! tasks the binary starts; `otto-platform-server resource ...` provisions
-//! resource servers ([`resource_cmd`]) and `otto-platform-server client ...`
-//! registers first-party OAuth clients ([`client_cmd`]). The console bundle is
+//! resource servers ([`resource_cmd`]), `otto-platform-server client ...`
+//! registers first-party OAuth clients ([`client_cmd`]), and
+//! `otto-platform-server pricebook ...` sets what each value meter costs
+//! ([`pricebook_cmd`]). The console bundle is
 //! a separate piece in `web/`, served from here when `OTTO_STATIC_DIR` is set,
 //! which is how the hosted Fly deployment runs.
 //!
@@ -40,6 +42,7 @@ pub mod email;
 pub mod health;
 pub mod internal;
 pub mod introspect;
+pub mod pricebook_cmd;
 pub mod resource_cmd;
 pub mod webhooks;
 

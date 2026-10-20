@@ -29,7 +29,9 @@
 //! capabilities it unlocks; usage is priced per value meter, the same on every
 //! plan, by the price book in effect this month (`otto_billing::pricebook`),
 //! listed once alongside the plans as `meters`. Only meters with a price in
-//! effect are listed: an unpriced meter is not on offer yet.
+//! effect are listed: an unpriced meter is not on offer yet. Because of the two
+//! caches, a new month's prices can take up to about six minutes after 00:00
+//! UTC on the first to appear.
 
 use std::future::Future;
 use std::time::Duration;
@@ -37,9 +39,8 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::IntoResponse;
-use chrono::Utc;
 use otto_billing::plans::{list_plans, PlanOffer};
-use otto_billing::pricebook::{self, book_in_effect, Month, PricedMeter};
+use otto_billing::pricebook::{self, book_in_effect, current_month, PricedMeter};
 use serde::Serialize;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
@@ -374,7 +375,9 @@ fn pricebook_error(e: pricebook::Error) -> ApiError {
 async fn load(state: &AppState) -> ApiResult<Bytes> {
     let mut tx = state.db.begin_unpinned().await.map_err(tenant_error)?;
     let rows = list_plans(&mut tx).await.map_err(core_error)?;
-    let book = book_in_effect(tx.conn(), Month::of(Utc::now()))
+    // The database's month, the clock `pricebook set` judges the future by.
+    let month = current_month(tx.conn()).await.map_err(pricebook_error)?;
+    let book = book_in_effect(tx.conn(), month)
         .await
         .map_err(pricebook_error)?;
     tx.commit().await.map_err(tenant_error)?;
@@ -420,7 +423,7 @@ mod tests {
         use otto_billing::meters::Meter;
         use otto_billing::pricebook::{PriceVersion, Tier, Tiers};
 
-        let now = Utc::now();
+        let now = chrono::Utc::now();
         let priced = PricedMeter {
             meter: Meter {
                 key: "otto-flags/evaluations".into(),

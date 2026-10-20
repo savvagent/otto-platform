@@ -17,8 +17,6 @@ use otto_platform_server::{app, Config, LogFormat};
 use otto_tenant::Db;
 use tokio::net::TcpListener;
 
-mod pricebook_cmd;
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Loads `.env` if there is one. `dotenvy` never overwrites a variable that
@@ -187,13 +185,15 @@ async fn run_client_command(args: &[String]) -> Result<()> {
 }
 
 async fn run_pricebook_command(args: &[String]) -> Result<()> {
+    use otto_platform_server::pricebook_cmd;
+
     let cmd = pricebook_cmd::parse(args)
         .map_err(|e| anyhow::anyhow!("{e}\n\n{}", pricebook_cmd::USAGE))?;
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
     let db = Db::connect(&database_url)
         .await
         .context("could not connect to DATABASE_URL")?;
-    pricebook_cmd::execute(&db, cmd, chrono::Utc::now(), &mut std::io::stdout()).await
+    pricebook_cmd::execute(&db, cmd, &mut std::io::stdout()).await
 }
 
 /// Resolves on SIGINT or SIGTERM.

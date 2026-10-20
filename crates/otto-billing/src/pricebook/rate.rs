@@ -1,61 +1,9 @@
-//! The price book: what each value meter costs, as data (savvagent/otto-platform#60).
-//!
-//! A meter's price is a **version**: graduated tiers that take effect at
-//! 00:00 UTC on the first day of a month ([`Month`]) and stay in effect until
-//! the meter's next version. The tiers in effect for a billing period are
-//! those of the latest version whose month is not after the period's month
-//! ([`tiers_in_effect`]). A meter with no such version is **unpriced**: it
-//! rates to 0 and says so ([`LineAmount::Unpriced`]), rather than looking free.
-//!
-//! **Graduated tiers.** Units `1..=up_to` of the first tier are charged at its
-//! unit amount, the units above that up to the second tier's `up_to` at the
-//! second's, and so on; the last tier is unbounded. A free allowance is a first
-//! tier priced at 0. [`Tiers`] is the only way to hold a tier list, and it
-//! cannot be built with bounds that are not strictly increasing or a last tier
-//! that is bounded, so [`rate`] never meets one.
-//!
-//! **Money is exact.** Unit amounts are `i64` millionths of a US cent
-//! (`ucents`), so sub-cent prices need no floats. See [`rate`] for the
-//! arithmetic and the one rounding step.
-//!
-//! **Past prices never change.** [`set_version`] writes a version for the
-//! current month or a later one, never an earlier one, and replaces an existing
-//! version only while its month is still in the future, so a period that has
-//! been (or is being) billed keeps the price it was billed at. A replacement is
-//! a new version with a new id, never an edit: the id is what a Stripe Price is
-//! recorded against, and Stripe prices are immutable.
-//!
-//! **Read by anyone, written by the operator.** `otto_app` may read the price
-//! book but not write it (migration 0020), so the read functions take any
-//! connection, pinned or not, and [`set_version`] takes an [`Unpinned`]
-//! transaction, which runs as the connecting role.
-//!
-//! ```
-//! use otto_billing::pricebook::{rate, LineAmount, Tier, Tiers};
-//!
-//! // The first 1,000 units free, then 0.15 cents (150,000 ucents) each.
-//! let tiers = Tiers::new(vec![
-//!     Tier { up_to: Some(1_000), unit_amount_ucents: 0 },
-//!     Tier { up_to: None, unit_amount_ucents: 150_000 },
-//! ])
-//! .unwrap();
-//!
-//! assert_eq!(rate(1_000, Some(&tiers)).unwrap(), LineAmount::Priced { cents: 0 });
-//! // 10 billable units: 1.5 cents, rounded half up to 2.
-//! assert_eq!(rate(1_010, Some(&tiers)).unwrap(), LineAmount::Priced { cents: 2 });
-//! // No price in effect: 0, and reported as unpriced.
-//! assert_eq!(rate(1_010, None).unwrap(), LineAmount::Unpriced);
-//! ```
+//! The pure half of the price book: months, tiers, and rating. No database.
 
 use std::fmt;
 use std::str::FromStr;
 
-use chrono::{DateTime, Datelike, Days, NaiveDate, Utc};
-use otto_tenant::Unpinned;
-use sqlx::PgConnection;
-use uuid::Uuid;
-
-use crate::meters::Meter;
+use chrono::{DateTime, Datelike, Days, Months, NaiveDate, Utc};
 
 /// Millionths of a cent in one cent.
 pub const UCENTS_PER_CENT: i64 = 1_000_000;
@@ -102,6 +50,18 @@ impl Month {
     /// The first day of the month.
     pub fn first_day(self) -> NaiveDate {
         self.0
+    }
+
+    /// The month `months` after this one (before it, if negative), if chrono
+    /// can represent it.
+    pub fn offset(self, months: i32) -> Option<Self> {
+        let n = Months::new(months.unsigned_abs());
+        if months >= 0 {
+            self.0.checked_add_months(n)
+        } else {
+            self.0.checked_sub_months(n)
+        }
+        .map(Self)
     }
 }
 
@@ -321,284 +281,26 @@ fn line_ucents(quantity: i64, tiers: &Tiers) -> i128 {
     total
 }
 
-// -------------------------------------------------------------- storage
+// ------------------------------------------------------------- selection
 
-/// A price-book failure.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(
-        "no meter {0:?}: a service declares its meters (PUT /internal/meters) before they can \
-         be priced"
-    )]
-    UnknownMeter(String),
-    #[error(
-        "{month} is before the current month ({current}); a past month's price is never \
-         changed, so past invoices never change"
-    )]
-    PastMonth { month: Month, current: Month },
-    #[error(
-        "{meter} already has a price for {month}, which is in effect; set one for a later \
-         month instead"
-    )]
-    InEffect { meter: String, month: Month },
-    #[error(transparent)]
-    Tiers(#[from] TierError),
-    /// A stored version the rater cannot price: its rows were edited by hand
-    /// into a shape [`Tiers`] refuses.
-    #[error("price version {version} is malformed: {reason}")]
-    Corrupt { version: Uuid, reason: String },
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
-}
-
-/// A price-book result.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-/// One version of one meter's price.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PriceVersion {
-    /// Stable for the life of the version; a replacement gets a new one.
-    pub id: Uuid,
-    /// The meter's key, `<service>/<meter>`.
-    pub meter: String,
-    pub effective_month: Month,
-    pub created_at: DateTime<Utc>,
-    pub tiers: Tiers,
-}
-
-/// A meter with the price version in effect for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PricedMeter {
-    pub meter: Meter,
-    pub version: PriceVersion,
-}
-
-/// What [`set_version`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SetOutcome {
-    pub version: PriceVersion,
-    /// The id of the future version this one replaced, if any.
-    pub replaced: Option<Uuid>,
-}
-
-#[derive(sqlx::FromRow)]
-struct VersionRow {
-    id: Uuid,
-    meter: String,
-    effective_month: NaiveDate,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(sqlx::FromRow)]
-struct TierRow {
-    version_id: Uuid,
-    position: i16,
-    up_to: Option<i64>,
-    unit_amount_ucents: i64,
-}
-
-/// Attach each version's tiers, checking them as [`Tiers`] does.
-async fn with_tiers(conn: &mut PgConnection, rows: Vec<VersionRow>) -> Result<Vec<PriceVersion>> {
-    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
-    let tier_rows: Vec<TierRow> = sqlx::query_as(
-        "SELECT version_id, position, up_to, unit_amount_ucents FROM price_tiers \
-         WHERE version_id = ANY($1) ORDER BY version_id, position",
-    )
-    .bind(&ids)
-    .fetch_all(conn)
-    .await?;
-
-    rows.into_iter()
-        .map(|row| {
-            let corrupt = |reason: String| Error::Corrupt {
-                version: row.id,
-                reason,
-            };
-            let mine = tier_rows.iter().filter(|t| t.version_id == row.id);
-            let mut tiers = Vec::new();
-            for (expected, t) in mine.enumerate() {
-                if usize::try_from(t.position).ok() != Some(expected) {
-                    return Err(corrupt(format!(
-                        "tier positions are not 0..n (at {expected})"
-                    )));
-                }
-                tiers.push(Tier {
-                    up_to: t.up_to,
-                    unit_amount_ucents: t.unit_amount_ucents,
-                });
-            }
-            let tiers = Tiers::new(tiers).map_err(|e| corrupt(e.to_string()))?;
-            let effective_month = Month::containing(row.effective_month);
-            if effective_month.first_day() != row.effective_month {
-                return Err(corrupt("effective month is not a first of month".into()));
-            }
-            Ok(PriceVersion {
-                id: row.id,
-                meter: row.meter,
-                effective_month,
-                created_at: row.created_at,
-                tiers,
-            })
-        })
-        .collect()
-}
-
-/// The version of `meter`'s price in effect during `month`: the latest one
-/// whose effective month is not after it. `None` means the meter is unpriced
-/// for that month (which [`rate`] reports as [`LineAmount::Unpriced`]).
+/// The rule that decides which version is in effect: of the effective
+/// `months` of one meter's versions, the latest that is not after `period`.
+/// `None` means the meter is unpriced for `period`.
 ///
-/// Takes any connection: `otto_app` may read the price book, so a pinned
-/// transaction's `conn()` works as well as an unpinned one's.
-pub async fn tiers_in_effect(
-    conn: &mut PgConnection,
-    meter: &str,
-    month: Month,
-) -> Result<Option<PriceVersion>> {
-    let rows: Vec<VersionRow> = sqlx::query_as(
-        "SELECT id, meter, effective_month, created_at FROM price_versions \
-         WHERE meter = $1 AND effective_month <= $2 \
-         ORDER BY effective_month DESC LIMIT 1",
-    )
-    .bind(meter)
-    .bind(month.first_day())
-    .fetch_all(&mut *conn)
-    .await?;
-    Ok(with_tiers(conn, rows).await?.pop())
-}
-
-/// Every meter that has a price in effect during `month`, with that price, by
-/// meter key. Meters with no price in effect are left out.
-pub async fn book_in_effect(conn: &mut PgConnection, month: Month) -> Result<Vec<PricedMeter>> {
-    let meters: Vec<Meter> = sqlx::query_as(
-        "SELECT m.key, m.service, m.meter, m.display_name, m.unit, m.created_at, m.updated_at \
-         FROM meters m \
-         WHERE EXISTS (SELECT 1 FROM price_versions v \
-                       WHERE v.meter = m.key AND v.effective_month <= $1) \
-         ORDER BY m.key",
-    )
-    .bind(month.first_day())
-    .fetch_all(&mut *conn)
-    .await?;
-    let rows: Vec<VersionRow> = sqlx::query_as(
-        "SELECT DISTINCT ON (meter) id, meter, effective_month, created_at \
-         FROM price_versions WHERE effective_month <= $1 \
-         ORDER BY meter, effective_month DESC",
-    )
-    .bind(month.first_day())
-    .fetch_all(&mut *conn)
-    .await?;
-    let mut versions = with_tiers(conn, rows).await?;
-
-    let mut book = Vec::with_capacity(meters.len());
-    for meter in meters {
-        // Every version names an existing meter (a foreign key), and every
-        // meter listed has a version in effect, so this always finds one.
-        let Some(at) = versions.iter().position(|v| v.meter == meter.key) else {
-            continue;
-        };
-        let version = versions.swap_remove(at);
-        book.push(PricedMeter { meter, version });
-    }
-    Ok(book)
-}
-
-/// Every version of every meter's price, by meter key, oldest month first.
-pub async fn list_versions(conn: &mut PgConnection) -> Result<Vec<PriceVersion>> {
-    let rows: Vec<VersionRow> = sqlx::query_as(
-        "SELECT id, meter, effective_month, created_at FROM price_versions \
-         ORDER BY meter, effective_month",
-    )
-    .fetch_all(&mut *conn)
-    .await?;
-    with_tiers(conn, rows).await
-}
-
-/// Write `meter`'s price from `month` on.
+/// [`super::tiers_in_effect`] and [`super::book_in_effect`] apply the same
+/// rule in SQL (`effective_month <= $period ORDER BY effective_month DESC`);
+/// this is the form for callers already holding the versions.
 ///
-/// `now` decides which months are past. A month before the current one is
-/// refused ([`Error::PastMonth`]); so is replacing the current month's
-/// existing version ([`Error::InEffect`]): either would change what an
-/// already-billed (or being-billed) period costs. A version for a future month
-/// is replaced if one exists: the old version and its tiers are deleted and a
-/// new version, with a new id, is written. A version for the current month may
-/// be created when the meter has none for it yet. The meter must exist
-/// ([`Error::UnknownMeter`]).
+/// ```
+/// use otto_billing::pricebook::{month_in_effect, Month};
 ///
-/// Unpinned because `otto_app` cannot write the price book (migration 0020).
-pub async fn set_version(
-    tx: &mut Unpinned,
-    meter: &str,
-    month: Month,
-    tiers: &Tiers,
-    now: DateTime<Utc>,
-) -> Result<SetOutcome> {
-    let current = Month::of(now);
-    if month < current {
-        return Err(Error::PastMonth { month, current });
-    }
-    // FOR SHARE: the meter cannot be deleted while its price is written.
-    let known: Option<String> =
-        sqlx::query_scalar("SELECT key FROM meters WHERE key = $1 FOR SHARE")
-            .bind(meter)
-            .fetch_optional(tx.conn())
-            .await?;
-    if known.is_none() {
-        return Err(Error::UnknownMeter(meter.to_owned()));
-    }
-
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM price_versions WHERE meter = $1 AND effective_month = $2 FOR UPDATE",
-    )
-    .bind(meter)
-    .bind(month.first_day())
-    .fetch_optional(tx.conn())
-    .await?;
-    if let Some(old) = existing {
-        if month <= current {
-            return Err(Error::InEffect {
-                meter: meter.to_owned(),
-                month,
-            });
-        }
-        sqlx::query("DELETE FROM price_versions WHERE id = $1")
-            .bind(old)
-            .execute(tx.conn())
-            .await?;
-    }
-
-    let (id, created_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
-        "INSERT INTO price_versions (meter, effective_month) VALUES ($1, $2) \
-         RETURNING id, created_at",
-    )
-    .bind(meter)
-    .bind(month.first_day())
-    .fetch_one(tx.conn())
-    .await?;
-    for (position, tier) in tiers.as_slice().iter().enumerate() {
-        // MAX_TIERS keeps every position inside smallint.
-        let position = i16::try_from(position).map_err(|_| TierError::TooMany)?;
-        sqlx::query(
-            "INSERT INTO price_tiers (version_id, position, up_to, unit_amount_ucents) \
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(id)
-        .bind(position)
-        .bind(tier.up_to)
-        .bind(tier.unit_amount_ucents)
-        .execute(tx.conn())
-        .await?;
-    }
-
-    Ok(SetOutcome {
-        version: PriceVersion {
-            id,
-            meter: meter.to_owned(),
-            effective_month: month,
-            created_at,
-            tiers: tiers.clone(),
-        },
-        replaced: existing,
-    })
+/// let m = |s: &str| s.parse::<Month>().unwrap();
+/// let versions = [m("2026-01"), m("2026-04"), m("2026-07")];
+/// assert_eq!(month_in_effect(versions, m("2026-05")), Some(m("2026-04")));
+/// assert_eq!(month_in_effect(versions, m("2025-12")), None);
+/// ```
+pub fn month_in_effect(months: impl IntoIterator<Item = Month>, period: Month) -> Option<Month> {
+    months.into_iter().filter(|&m| m <= period).max()
 }
 
 #[cfg(test)]
@@ -802,6 +504,26 @@ mod tests {
         ] {
             assert!(bad.parse::<Month>().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_latest_month_not_after_the_period_is_in_effect() {
+        let m = |s: &str| s.parse::<Month>().unwrap();
+        let versions = [m("2026-07"), m("2026-01"), m("2026-04")];
+        assert_eq!(month_in_effect(versions, m("2025-12")), None);
+        assert_eq!(month_in_effect(versions, m("2026-01")), Some(m("2026-01")));
+        assert_eq!(month_in_effect(versions, m("2026-03")), Some(m("2026-01")));
+        assert_eq!(month_in_effect(versions, m("2026-04")), Some(m("2026-04")));
+        assert_eq!(month_in_effect(versions, m("2031-01")), Some(m("2026-07")));
+        assert_eq!(month_in_effect([], m("2026-01")), None);
+    }
+
+    #[test]
+    fn months_offset_across_years() {
+        let m = |s: &str| s.parse::<Month>().unwrap();
+        assert_eq!(m("2026-11").offset(2), Some(m("2027-01")));
+        assert_eq!(m("2026-01").offset(-1), Some(m("2025-12")));
+        assert_eq!(m("2026-05").offset(0), Some(m("2026-05")));
     }
 
     #[test]

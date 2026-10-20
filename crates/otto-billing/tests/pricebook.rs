@@ -1,14 +1,18 @@
 //! `pricebook`: versions by effective month, written unpinned, read anywhere.
 //!
-//! Prices here are fixtures, not rates anyone is charged.
+//! Prices here are fixtures, not rates anyone is charged. `set_version` only
+//! writes future months, so versions already in effect are inserted directly,
+//! as the test pool's superuser.
 
-use chrono::{DateTime, Utc};
+use std::time::Duration;
+
 use otto_billing::pricebook::{
-    book_in_effect, list_versions, rate, set_version, tiers_in_effect, Error, LineAmount, Month,
-    Tier, Tiers,
+    book_in_effect, current_month, list_versions, rate, set_version, tiers_in_effect, Error,
+    LineAmount, Month, Tier, Tiers,
 };
 use otto_tenant::{Db, OrgId};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 /// Registers a resource server for `svc` and declares `svc/calls` and
 /// `svc/bytes`, as the test pool's superuser.
@@ -34,10 +38,6 @@ fn month(s: &str) -> Month {
     s.parse().unwrap()
 }
 
-fn at(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
-}
-
 /// A flat price of `ucents` per unit.
 fn flat(ucents: i64) -> Tiers {
     Tiers::new(vec![Tier {
@@ -47,9 +47,31 @@ fn flat(ucents: i64) -> Tiers {
     .unwrap()
 }
 
-async fn set(db: &Db, meter: &str, m: &str, tiers: &Tiers, now: &str) -> Result<(), Error> {
+/// Insert a version directly, bypassing `set_version`'s future-only rule.
+async fn insert_flat(pool: &PgPool, meter: &str, m: Month, ucents: i64) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO price_versions (meter, effective_month) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(meter)
+    .bind(m.first_day())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO price_tiers (version_id, position, up_to, unit_amount_ucents) \
+         VALUES ($1, 0, NULL, $2)",
+    )
+    .bind(id)
+    .bind(ucents)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+async fn set(db: &Db, meter: &str, m: Month, tiers: &Tiers) -> Result<(), Error> {
     let mut tx = db.begin_unpinned().await.unwrap();
-    set_version(&mut tx, meter, month(m), tiers, at(now)).await?;
+    set_version(&mut tx, meter, m, tiers).await?;
     tx.commit().await.unwrap();
     Ok(())
 }
@@ -60,20 +82,18 @@ async fn in_effect(db: &Db, meter: &str, m: &str) -> Option<i64> {
     v.map(|v| v.tiers.as_slice()[0].unit_amount_ucents)
 }
 
+async fn now_month(db: &Db) -> Month {
+    let mut tx = db.begin_unpinned().await.unwrap();
+    current_month(tx.conn()).await.unwrap()
+}
+
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn the_latest_version_not_after_the_month_is_in_effect(pool: PgPool) {
     seed_meters(&pool).await;
-    let db = Db::from_pool(pool);
-    let now = "2026-01-15T12:00:00Z";
-    set(&db, "svc/calls", "2026-01", &flat(100), now)
-        .await
-        .unwrap();
-    set(&db, "svc/calls", "2026-04", &flat(200), now)
-        .await
-        .unwrap();
-    set(&db, "svc/calls", "2026-07", &flat(300), now)
-        .await
-        .unwrap();
+    let db = Db::from_pool(pool.clone());
+    insert_flat(&pool, "svc/calls", month("2026-01"), 100).await;
+    insert_flat(&pool, "svc/calls", month("2026-04"), 200).await;
+    insert_flat(&pool, "svc/calls", month("2026-07"), 300).await;
 
     assert_eq!(
         in_effect(&db, "svc/calls", "2025-12").await,
@@ -114,8 +134,12 @@ async fn the_latest_version_not_after_the_month_is_in_effect(pool: PgPool) {
     let book = book_in_effect(tx.conn(), month("2026-05")).await.unwrap();
     assert_eq!(book.len(), 1, "svc/bytes is unpriced and left out");
     assert_eq!(book[0].meter.key, "svc/calls");
+    assert_eq!(book[0].meter.service, "svc");
+    assert_eq!(book[0].meter.meter, "calls");
     assert_eq!(book[0].meter.display_name, "Calls");
+    assert_eq!(book[0].meter.unit, "call");
     assert_eq!(book[0].version.effective_month, month("2026-04"));
+    assert_eq!(book[0].version.tiers, flat(200));
     assert!(book_in_effect(tx.conn(), month("2025-12"))
         .await
         .unwrap()
@@ -130,6 +154,7 @@ async fn the_latest_version_not_after_the_month_is_in_effect(pool: PgPool) {
 async fn tiers_round_trip_in_order(pool: PgPool) {
     seed_meters(&pool).await;
     let db = Db::from_pool(pool);
+    let next = now_month(&db).await.offset(1).unwrap();
     let tiers = Tiers::new(vec![
         Tier {
             up_to: Some(1_000),
@@ -145,12 +170,10 @@ async fn tiers_round_trip_in_order(pool: PgPool) {
         },
     ])
     .unwrap();
-    set(&db, "svc/calls", "2026-11", &tiers, "2026-10-20T00:00:00Z")
-        .await
-        .unwrap();
+    set(&db, "svc/calls", next, &tiers).await.unwrap();
 
     let mut tx = db.begin_unpinned().await.unwrap();
-    let v = tiers_in_effect(tx.conn(), "svc/calls", month("2026-11"))
+    let v = tiers_in_effect(tx.conn(), "svc/calls", next)
         .await
         .unwrap()
         .unwrap();
@@ -158,117 +181,159 @@ async fn tiers_round_trip_in_order(pool: PgPool) {
     assert_eq!(v.meter, "svc/calls");
 }
 
+/// Only a future month may be priced: the current month is being billed at
+/// the price it started with, even when a version from an earlier month is in
+/// effect for it, and an unpriced meter gets its first price from next month.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
-async fn past_and_in_effect_prices_never_change(pool: PgPool) {
+async fn only_a_future_month_can_be_priced(pool: PgPool) {
     seed_meters(&pool).await;
-    let db = Db::from_pool(pool);
-    let now = "2026-10-20T00:00:00Z";
+    let db = Db::from_pool(pool.clone());
+    let current = now_month(&db).await;
+    let last = current.offset(-1).unwrap();
+    let next = current.offset(1).unwrap();
+    insert_flat(&pool, "svc/calls", last, 1).await;
 
-    // A past month, whether or not it had a price, is refused.
-    let err = set(&db, "svc/calls", "2026-09", &flat(1), now)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::PastMonth { .. }), "{err}");
+    for m in [last, current] {
+        let err = set(&db, "svc/calls", m, &flat(2)).await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotFuture { month, current: c } if month == m && c == current),
+            "{m}: {err}"
+        );
+    }
+    assert_eq!(
+        in_effect(&db, "svc/calls", &current.to_string()).await,
+        Some(1),
+        "this month keeps the price in effect when it started"
+    );
+    let err = set(&db, "svc/bytes", current, &flat(2)).await.unwrap_err();
+    assert!(
+        matches!(err, Error::NotFuture { .. }),
+        "unpriced, still not now: {err}"
+    );
 
-    // The current month may be priced once ...
-    set(&db, "svc/calls", "2026-10", &flat(1), now)
-        .await
-        .unwrap();
-    // ... but not repriced: this month is being billed at that price.
-    let err = set(&db, "svc/calls", "2026-10", &flat(2), now)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::InEffect { .. }), "{err}");
-    assert_eq!(in_effect(&db, "svc/calls", "2026-10").await, Some(1));
-
-    // A future month is replaced, under a new id.
+    // A future month is set, and replaced under a new id.
     let mut tx = db.begin_unpinned().await.unwrap();
-    let first = set_version(&mut tx, "svc/calls", month("2026-12"), &flat(5), at(now))
+    let first = set_version(&mut tx, "svc/calls", next, &flat(5))
         .await
         .unwrap();
     tx.commit().await.unwrap();
     assert_eq!(first.replaced, None);
     let mut tx = db.begin_unpinned().await.unwrap();
-    let second = set_version(&mut tx, "svc/calls", month("2026-12"), &flat(6), at(now))
+    let second = set_version(&mut tx, "svc/calls", next, &flat(6))
         .await
         .unwrap();
     tx.commit().await.unwrap();
     assert_eq!(second.replaced, Some(first.version.id));
     assert_ne!(second.version.id, first.version.id);
-    assert_eq!(in_effect(&db, "svc/calls", "2026-12").await, Some(6));
-
-    // Once that month arrives, it is in effect and fixed.
-    let err = set(
-        &db,
-        "svc/calls",
-        "2026-12",
-        &flat(7),
-        "2026-12-01T00:00:00Z",
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(err, Error::InEffect { .. }), "{err}");
+    assert_eq!(
+        in_effect(&db, "svc/calls", &next.to_string()).await,
+        Some(6)
+    );
+    assert_eq!(
+        in_effect(&db, "svc/calls", &current.to_string()).await,
+        Some(1),
+        "a scheduled price does not reach back"
+    );
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn an_unknown_meter_cannot_be_priced(pool: PgPool) {
     seed_meters(&pool).await;
     let db = Db::from_pool(pool);
-    let err = set(&db, "svc/nope", "2026-11", &flat(1), "2026-10-20T00:00:00Z")
-        .await
-        .unwrap_err();
+    let next = now_month(&db).await.offset(1).unwrap();
+    let err = set(&db, "svc/nope", next, &flat(1)).await.unwrap_err();
     assert!(
         matches!(err, Error::UnknownMeter(ref m) if m == "svc/nope"),
         "{err}"
     );
 }
 
+/// Two runs pricing the same new (meter, month) at once: the second to commit
+/// gets a clear error, not Postgres's unique-violation text.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_concurrent_set_is_reported_as_such(pool: PgPool) {
+    seed_meters(&pool).await;
+    let db = Db::from_pool(pool);
+    let next = now_month(&db).await.offset(1).unwrap();
+
+    let mut first = db.begin_unpinned().await.unwrap();
+    set_version(&mut first, "svc/calls", next, &flat(1))
+        .await
+        .unwrap();
+
+    let other = db.clone();
+    let second = tokio::spawn(async move {
+        let mut tx = other.begin_unpinned().await.unwrap();
+        // Blocks on the unique index until `first` commits.
+        set_version(&mut tx, "svc/calls", next, &flat(2))
+            .await
+            .map(|_| ())
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    first.commit().await.unwrap();
+
+    let err = second.await.unwrap().unwrap_err();
+    assert!(
+        matches!(err, Error::Concurrent { ref meter, month } if meter == "svc/calls" && month == next),
+        "{err}"
+    );
+    assert!(err.to_string().contains("pricebook list"), "{err}");
+    assert_eq!(
+        in_effect(&db, "svc/calls", &next.to_string()).await,
+        Some(1)
+    );
+}
+
 /// The rater trusts [`Tiers`], so a stored version edited by hand into a shape
-/// it refuses must fail loudly on read rather than misprice.
+/// it refuses must fail loudly when priced, while a listing still shows it.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn a_malformed_stored_version_is_an_error_not_a_price(pool: PgPool) {
     seed_meters(&pool).await;
     let db = Db::from_pool(pool.clone());
-    set(
-        &db,
-        "svc/calls",
-        "2026-11",
-        &flat(1),
-        "2026-10-20T00:00:00Z",
-    )
-    .await
-    .unwrap();
+    let bad = insert_flat(&pool, "svc/calls", month("2026-01"), 1).await;
+    insert_flat(&pool, "svc/bytes", month("2026-01"), 1).await;
     // Bound the only tier: no unbounded last tier any more.
-    sqlx::query("UPDATE price_tiers SET up_to = 10")
+    sqlx::query("UPDATE price_tiers SET up_to = 10 WHERE version_id = $1")
+        .bind(bad)
         .execute(&pool)
         .await
         .unwrap();
 
     let mut tx = db.begin_unpinned().await.unwrap();
-    let err = tiers_in_effect(tx.conn(), "svc/calls", month("2026-11"))
+    let err = tiers_in_effect(tx.conn(), "svc/calls", month("2026-02"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Corrupt { version, .. } if version == bad),
+        "{err}"
+    );
+    let err = book_in_effect(tx.conn(), month("2026-02"))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Corrupt { .. }), "{err}");
+
+    let listed = list_versions(tx.conn()).await.unwrap();
+    assert_eq!(listed.len(), 2, "one bad version does not hide the rest");
+    let calls = listed.iter().find(|v| v.meter == "svc/calls").unwrap();
+    assert!(calls.tiers.as_ref().unwrap_err().contains("unbounded"));
+    let bytes = listed.iter().find(|v| v.meter == "svc/bytes").unwrap();
+    assert_eq!(bytes.tiers, Ok(flat(1)));
 }
 
 /// Billing reads prices inside an org's transaction, as `otto_app`.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn a_tenant_transaction_reads_the_price_book(pool: PgPool) {
     seed_meters(&pool).await;
-    let db = Db::from_pool(pool);
-    set(
-        &db,
-        "svc/calls",
-        "2026-11",
-        &flat(42),
-        "2026-10-20T00:00:00Z",
-    )
-    .await
-    .unwrap();
+    let db = Db::from_pool(pool.clone());
+    insert_flat(&pool, "svc/calls", month("2026-01"), 42).await;
     let mut tx = db.begin(OrgId::new()).await.unwrap();
     let v = tiers_in_effect(tx.conn(), "svc/calls", month("2026-11"))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(v.tiers, flat(42));
+    assert_eq!(
+        current_month(tx.conn()).await.unwrap(),
+        now_month(&db).await
+    );
 }

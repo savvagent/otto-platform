@@ -244,13 +244,18 @@ otto-platform-server pricebook list
 ```
 
 Each `--tier` is `<up_to>:<ucents>`, with strictly increasing bounds and the
-last one `inf`. The meter must already be declared by its service. A month
-before the current one is refused, and the current month's price cannot be
-replaced once set, so a billed period never changes price; running `set` again
-for a future month replaces that version with a new one (a new id). `list`
-marks each version `in-effect`, `scheduled` or `superseded`, and lists declared
-meters with no price as `unpriced`. Like `resource ...`, it needs only
+last one `inf`. The meter must already be declared by its service. Only a
+future month can be priced, judged by the database's clock: the current month
+and earlier ones are refused, so a period being billed, or already billed,
+never changes price, and a meter with no price gets its first one from next
+month. Running `set` again for a future month replaces that version with a new
+one (a new id). `list` marks each version `in-effect`, `scheduled` or
+`superseded`, lists declared meters with no price in effect as `unpriced` (or
+`unpriced (scheduled YYYY-MM)`), and shows a stored version that cannot be
+priced as `corrupt: <reason>`. Like `resource ...`, it needs only
 `DATABASE_URL`, pointed at a database a server has already migrated.
+`GET /api/plans` can show the previous month's prices for up to about six
+minutes after a month begins, because of its caches.
 
 ### Running just the migrations
 
