@@ -526,3 +526,11 @@ still serving.
   `_sqlx_migrations`. Rolling back from a later release to this one, or to any release
   after it, needs nothing special: they ignore unknown migrations (see
   [Migrations and rolling back](#migrations-and-rolling-back)).
+
+  Once billing is live, a rollback to v0.9.2 also costs revenue: that release
+  queues no meter events and holds no invoices, and rolling forward does not
+  backfill orgs that were already subscribed. Usage counted while it serves is
+  not invoiced, and drafts created meanwhile finalize on Stripe's own schedule.
+  Do not roll back across a month boundary; if you must, run `stripe sync` and
+  check `stripe outbox` after rolling forward, and expect that window's usage
+  to be missing from invoices.
