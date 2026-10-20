@@ -6,4 +6,5 @@
 //! catalog of tiers, which belongs to no org.
 
 pub mod plans;
+pub mod stripe;
 pub mod usage;
