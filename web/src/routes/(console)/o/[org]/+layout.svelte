@@ -67,6 +67,8 @@
     { href: `/o/${slug}/teams`, label: m.orgnav_teams() },
     ...(context.isAdmin ? [{ href: `/o/${slug}/sso`, label: m.orgnav_sso() }] : []),
     { href: `/o/${slug}/usage`, label: m.orgnav_usage() },
+    { href: `/o/${slug}/budgets`, label: m.budget_nav() },
+    ...(context.isOwner ? [{ href: `/o/${slug}/billing`, label: m.billing_nav() }] : []),
     ...(context.isAdmin ? [{ href: `/o/${slug}/audit`, label: m.orgnav_audit() }] : [])
   ]);
 
