@@ -1,5 +1,6 @@
 /**
- * How a plan from `GET /api/plans` is put into words on the pricing page.
+ * How the catalog from `GET /api/plans` — plans, and the metered usage prices
+ * in effect this month — is put into words on the pricing page.
  *
  * Pure, and free of English: each helper returns either a formatted number or
  * a structured value the component renders with messages, so the same plan
@@ -18,7 +19,8 @@
 
 import { m } from '$lib/paraglide/messages';
 import type { Locale } from '$lib/locale';
-import type { Plan, PlanTier } from '$lib/types';
+import { SERVICES, connectorName } from '$lib/services';
+import type { Plan, PlanTier, PlansResponse, PriceTier, PricedMeter } from '$lib/types';
 
 const TIERS: readonly PlanTier[] = ['free', 'team', 'business', 'enterprise'];
 
@@ -29,43 +31,88 @@ const isCount = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
 /**
- * The plans in a `GET /api/plans` body, or a thrown `Error` naming the first
- * field that is not what `Plan` promises.
+ * The catalog in a `GET /api/plans` body, or a thrown `Error` naming the first
+ * field that is not what `PlansResponse` promises.
  *
  * The page renders straight from these fields, so a contract drift that
  * reached it unchecked would not fail; it would mislead. A missing
- * `monthlyCents` prints `$NaN`, a missing `hardStop` reads as "keeps working
- * past the limit", and an unknown tier would be priced as if it were
- * self-serve. Refusing the whole answer turns any of those into the page's
+ * `monthlyCents` prints `$NaN`, an unknown tier would be priced as if it were
+ * self-serve, and a tier table that goes backwards would print a price nobody
+ * charges. Refusing the whole answer turns any of those into the page's
  * existing "could not be loaded" state, and the error says which field.
  *
- * `features` is the exception: it only ever adds a line, so a value that is
- * not an object is read as no features (see `featureLabels`) rather than
- * failing the page.
+ * A missing `meters` array is refused too, rather than read as "no prices
+ * yet": the page says something specific about an empty list, and saying it
+ * about a broken answer would be a claim the server never made.
+ *
+ * Fields the contract no longer has (the retired `includedOps` and
+ * `hardStop`) are dropped, not copied: an older cached answer cannot put an
+ * allowance back on the page.
+ *
+ * `features` is the exception to strictness: it only ever adds a line, so a
+ * value that is not an object is read as no features (see `featureLabels`)
+ * rather than failing the page.
  */
-export function parsePlans(body: unknown): Plan[] {
+export function parseCatalog(body: unknown): PlansResponse {
   if (!isRecord(body) || !Array.isArray(body.plans)) {
     throw new Error('GET /api/plans answered without a plans array');
   }
-  return body.plans.map((raw: unknown, i): Plan => {
-    const bad = (field: string) =>
-      new Error(`GET /api/plans: plans[${i}].${field} is missing or the wrong type`);
-    if (!isRecord(raw)) throw bad('(plan)');
-    const { plan, displayName, includedOps, hardStop, monthlyCents, features } = raw;
-    if (typeof plan !== 'string' || !TIERS.includes(plan as PlanTier)) throw bad('plan');
-    if (typeof displayName !== 'string' || displayName.trim() === '') throw bad('displayName');
-    if (!isCount(includedOps)) throw bad('includedOps');
-    if (typeof hardStop !== 'boolean') throw bad('hardStop');
-    if (!isCount(monthlyCents)) throw bad('monthlyCents');
-    return {
-      plan: plan as PlanTier,
-      displayName,
-      includedOps,
-      hardStop,
-      monthlyCents,
-      features: (isRecord(features) ? features : {}) as Plan['features']
-    };
+  if (!Array.isArray(body.meters)) {
+    throw new Error('GET /api/plans answered without a meters array');
+  }
+  return {
+    plans: body.plans.map(parsePlan),
+    meters: body.meters.map(parseMeter)
+  };
+}
+
+function parsePlan(raw: unknown, i: number): Plan {
+  const bad = (field: string) =>
+    new Error(`GET /api/plans: plans[${i}].${field} is missing or the wrong type`);
+  if (!isRecord(raw)) throw bad('(plan)');
+  const { plan, displayName, monthlyCents, features } = raw;
+  if (typeof plan !== 'string' || !TIERS.includes(plan as PlanTier)) throw bad('plan');
+  if (!isText(displayName)) throw bad('displayName');
+  if (!isCount(monthlyCents)) throw bad('monthlyCents');
+  return {
+    plan: plan as PlanTier,
+    displayName,
+    monthlyCents,
+    features: (isRecord(features) ? features : {}) as Plan['features']
+  };
+}
+
+const isText = (value: unknown): value is string =>
+  typeof value === 'string' && value.trim() !== '';
+
+/**
+ * One meter, with its tiers checked to form a graduated table: every bound a
+ * positive whole number above the one before, only the last unbounded, and
+ * every price a whole, non-negative number of millionths of a cent.
+ */
+function parseMeter(raw: unknown, i: number): PricedMeter {
+  const bad = (field: string) =>
+    new Error(`GET /api/plans: meters[${i}].${field} is missing or the wrong type`);
+  if (!isRecord(raw)) throw bad('(meter)');
+  const { service, meter, displayName, unit, tiers } = raw;
+  if (!isText(service)) throw bad('service');
+  if (!isText(meter)) throw bad('meter');
+  if (!isText(displayName)) throw bad('displayName');
+  if (!isText(unit)) throw bad('unit');
+  if (!Array.isArray(tiers) || tiers.length === 0) throw bad('tiers');
+
+  let floor = 0;
+  const parsed = tiers.map((tier: unknown, t): PriceTier => {
+    const where = `tiers[${t}]`;
+    if (!isRecord(tier)) throw bad(where);
+    const { upTo, unitAmountUcents } = tier;
+    if (!isCount(unitAmountUcents)) throw bad(`${where}.unitAmountUcents`);
+    const last = t === tiers.length - 1;
+    if (last ? upTo !== null : !isCount(upTo) || upTo <= floor) throw bad(`${where}.upTo`);
+    if (!last) floor = upTo as number;
+    return { upTo: upTo as number | null, unitAmountUcents };
   });
+  return { service, meter, displayName, unit, tiers: parsed };
 }
 
 /**
@@ -104,9 +151,144 @@ export function priceLabel(plan: Pick<Plan, 'plan' | 'monthlyCents'>, locale: Lo
   return { kind: 'monthly', amount: dollars(plan.monthlyCents, locale) };
 }
 
-/** An operation count with the page language's digit grouping (`10,000`, `10.000`, `10,00,000`). */
-export function formatOps(ops: number, locale: Locale): string {
-  return new Intl.NumberFormat(locale).format(ops);
+/** A unit count with the page language's digit grouping (`10,000`, `10.000`, `10,00,000`). */
+function formatCount(count: number, locale: Locale): string {
+  return new Intl.NumberFormat(locale).format(count);
+}
+
+/** A per-unit price: the word "free", or an exact dollar amount. */
+export type UnitPrice = { kind: 'free' } | { kind: 'unit'; amount: string };
+
+/** Millionths of a cent in one US dollar. */
+const UCENTS_PER_DOLLAR = 100_000_000n;
+const UCENT_DIGITS = 8;
+
+/**
+ * A price in millionths of a US cent, as the page language writes dollars.
+ *
+ * **Exact, never a float.** The book stores prices as whole millionths of a
+ * cent, so `7` is $0.00000007; dividing by 1e8 as a float would print
+ * rounding noise for some values and lose digits for large ones. The integer
+ * is split into whole dollars and an eight-digit fraction with `BigInt`, and
+ * the resulting decimal *string* is what `Intl.NumberFormat` formats — it
+ * formats a numeric string at full precision. At least two decimals, as money
+ * reads; trailing zeros past that are dropped, so 150 000 is `$0.0015`.
+ *
+ * `0` is the word "free" rather than `$0.00`.
+ */
+export function unitPrice(ucents: number, locale: Locale): UnitPrice {
+  if (ucents === 0) return { kind: 'free' };
+  const value = BigInt(ucents);
+  const whole = value / UCENTS_PER_DOLLAR;
+  const fraction = (value % UCENTS_PER_DOLLAR)
+    .toString()
+    .padStart(UCENT_DIGITS, '0')
+    .replace(/0+$/, '');
+  const decimal = fraction === '' ? `${whole}` : `${whole}.${fraction}`;
+  const amount = new Intl.NumberFormat(locale, {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: UCENT_DIGITS
+  }).format(decimal as `${number}`);
+  return { kind: 'unit', amount };
+}
+
+/**
+ * Which units of the month one tier row covers.
+ *
+ * `upTo` is the first tier ("up to 1,000"), `between` a middle one, `above`
+ * the unbounded last tier when there are others ("1,001 and above"), and
+ * `all` a meter with a single unbounded tier. Counts are already formatted.
+ */
+export type TierRange =
+  | { kind: 'upTo'; to: string }
+  | { kind: 'between'; from: string; to: string }
+  | { kind: 'above'; from: string }
+  | { kind: 'all' };
+
+export interface TierRow {
+  range: TierRange;
+  price: UnitPrice;
+}
+
+export interface MeterTiers {
+  /**
+   * The formatted size of the free allowance — "first N free" — when the
+   * first tier is priced at 0 and bounded, else `null`. A single free,
+   * unbounded tier has no N to name, so it is just a "free" row.
+   */
+  freeAllowance: string | null;
+  rows: TierRow[];
+}
+
+/**
+ * A meter's graduated tiers as table rows.
+ *
+ * Each tier after the first starts at the unit after the previous tier's
+ * `upTo`, which is how graduated pricing reads to a person ("1,001 to
+ * 10,000") even though the wire only carries upper bounds.
+ */
+export function meterTiers(meter: PricedMeter, locale: Locale): MeterTiers {
+  const { tiers } = meter;
+  const first = tiers[0];
+  const freeAllowance =
+    first && first.unitAmountUcents === 0 && first.upTo !== null
+      ? formatCount(first.upTo, locale)
+      : null;
+
+  const rows = tiers.map((tier, i): TierRow => {
+    const previous = i === 0 ? null : (tiers[i - 1]?.upTo ?? null);
+    const from = previous === null ? null : formatCount(previous + 1, locale);
+    let range: TierRange;
+    if (tier.upTo === null) {
+      range = from === null ? { kind: 'all' } : { kind: 'above', from };
+    } else {
+      const to = formatCount(tier.upTo, locale);
+      range = from === null ? { kind: 'upTo', to } : { kind: 'between', from, to };
+    }
+    return { range, price: unitPrice(tier.unitAmountUcents, locale) };
+  });
+
+  return { freeAllowance, rows };
+}
+
+export interface ServiceUsage {
+  /** The slug meters carry, e.g. `otto-flags`. */
+  service: string;
+  /**
+   * The name the header and product pages use ("Otto Flags"), or the slug
+   * for a service this site does not describe yet: its price is real either
+   * way, so it is shown rather than hidden.
+   */
+  name: string;
+  /** Empty for a service with no usage price published yet. */
+  meters: PricedMeter[];
+}
+
+/**
+ * The meters, grouped by service: every service this site describes, in the
+ * site's order, with its priced meters (possibly none), then any other
+ * service the server prices, in the order it listed them.
+ *
+ * Every described service is listed even with nothing priced, so the page can
+ * say so per service rather than letting a service silently vanish.
+ */
+export function usageByService(meters: readonly PricedMeter[]): ServiceUsage[] {
+  const groups = new Map<string, ServiceUsage>();
+  for (const s of SERVICES) {
+    const service = connectorName(s);
+    groups.set(service, { service, name: s.name, meters: [] });
+  }
+  for (const meter of meters) {
+    let group = groups.get(meter.service);
+    if (!group) {
+      group = { service: meter.service, name: meter.service, meters: [] };
+      groups.set(meter.service, group);
+    }
+    group.meters.push(meter);
+  }
+  return [...groups.values()];
 }
 
 /**

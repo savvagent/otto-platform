@@ -4,9 +4,13 @@
  * after mount.
  *
  * `api.plans` is mocked so each state — waiting, loaded, failed, empty — can
- * be held still and looked at. The seeded catalog below is the one the server
+ * be held still and looked at. The seeded plans below are the ones the server
  * ships, so "Team shows $29" is a check against what a visitor would really
  * read, not against numbers made up for the test.
+ *
+ * No usage price is set in production yet, so `meters` is empty in the
+ * seeded answer; the priced meters below are the server's own serialization
+ * test's, plus a second tier table, to exercise the graduated rendering.
  */
 
 import { flushSync, mount, unmount } from 'svelte';
@@ -21,43 +25,62 @@ import { ApiError, api } from '$lib/api';
 import { getLocale, overwriteGetLocale } from '$lib/paraglide/runtime';
 import { session } from '$lib/session.svelte';
 import { CONTACT_EMAIL } from '$lib/site';
-import type { Me, Plan } from '$lib/types';
+import type { Me, Plan, PlansResponse, PricedMeter } from '$lib/types';
 import Page from './+page.svelte';
 
 const SEEDED: Plan[] = [
   {
     plan: 'free',
     displayName: 'Free',
-    includedOps: 500,
-    hardStop: true,
     monthlyCents: 0,
     features: {}
   },
   {
     plan: 'team',
     displayName: 'Team',
-    includedOps: 10_000,
-    hardStop: false,
     monthlyCents: 2900,
     features: { auto_rollback: true }
   },
   {
     plan: 'business',
     displayName: 'Business',
-    includedOps: 100_000,
-    hardStop: false,
     monthlyCents: 19_900,
     features: { auto_rollback: true }
   },
   {
     plan: 'enterprise',
     displayName: 'Enterprise',
-    includedOps: 1_000_000,
-    hardStop: false,
     monthlyCents: 0,
     features: { auto_rollback: true }
   }
 ];
+
+const SEEDED_CATALOG: PlansResponse = { plans: SEEDED, meters: [] };
+
+const FLAG_EVALUATIONS: PricedMeter = {
+  service: 'otto-flags',
+  meter: 'evaluations',
+  displayName: 'Flag evaluations',
+  unit: 'evaluation',
+  tiers: [
+    { upTo: 1000, unitAmountUcents: 0 },
+    { upTo: null, unitAmountUcents: 7 }
+  ]
+};
+
+const FACTORY_JOBS: PricedMeter = {
+  service: 'otto-factory',
+  meter: 'jobs',
+  displayName: 'Jobs completed',
+  unit: 'job',
+  tiers: [
+    { upTo: 10_000, unitAmountUcents: 200_000 },
+    { upTo: 1_000_000, unitAmountUcents: 150_000 },
+    { upTo: null, unitAmountUcents: 100_000 }
+  ]
+};
+
+const PRICED: PlansResponse = { plans: SEEDED, meters: [FACTORY_JOBS, FLAG_EVALUATIONS] };
 
 const plans = vi.mocked(api.plans);
 
@@ -108,6 +131,22 @@ function region(): HTMLElement {
   return container.querySelector('#plans') as HTMLElement;
 }
 
+/** The region the live usage prices render into. */
+function usageRegion(): HTMLElement {
+  return container.querySelector('#usage') as HTMLElement;
+}
+
+/** The meter table captioned `name`, as rows of [units, price] text. */
+function meterRows(name: string): string[][] {
+  const table = Array.from(container.querySelectorAll('table')).find((t) =>
+    t.caption?.textContent?.includes(name)
+  );
+  expect(table, `a table captioned "${name}"`).toBeDefined();
+  return Array.from(table!.tBodies[0]!.rows).map((row) =>
+    Array.from(row.cells).map((cell) => cell.textContent?.trim() ?? '')
+  );
+}
+
 /** The page's one live region. */
 function status(): HTMLElement {
   const found = container.querySelectorAll('[role="status"]');
@@ -151,8 +190,8 @@ describe('the pricing page', () => {
     unmount(instance);
   });
 
-  it('renders every seeded plan, with its price, allowance, overage and features', async () => {
-    plans.mockResolvedValue({ plans: SEEDED });
+  it('renders every seeded plan, with its price and features, and no allowance', async () => {
+    plans.mockResolvedValue(SEEDED_CATALOG);
     const instance = mountPage();
     await settle();
 
@@ -165,35 +204,102 @@ describe('the pricing page', () => {
     // The price slot says the word; there is no "$0 per month".
     expect(free.querySelector('p')?.textContent?.trim()).toBe('Free');
     expect(free.textContent).not.toContain('$0');
-    expect(free.textContent).toContain('500 operations included per month');
-    expect(free.textContent).toContain('Billable calls stop at the limit');
+    expect(free.textContent).toContain('Usage is billed separately, per service');
     expect(free.textContent).not.toContain('Automatic rollback in Otto Flags');
     expect(free.querySelector('a[href="/signup"]')?.textContent?.trim()).toBe('Create account');
 
     const team = card('Team');
     expect(team.textContent).toContain('$29');
-    expect(team.textContent).toContain('10,000 operations included per month');
-    expect(team.textContent).toContain('Keeps working past the limit; overage is metered');
+    expect(team.textContent).toContain('Usage is billed separately, per service');
     expect(team.textContent).toContain('Automatic rollback in Otto Flags');
     expect(team.querySelector('a[href="/signup"]')).not.toBeNull();
 
     const business = card('Business');
     expect(business.textContent).toContain('$199');
-    expect(business.textContent).toContain('100,000 operations included per month');
 
     const enterprise = card('Enterprise');
     expect(enterprise.textContent).toContain('Contact us');
     expect(enterprise.textContent).not.toContain('$0');
-    // A floor, since a contract can include more.
-    expect(enterprise.textContent).toContain('From 1,000,000 operations per month');
     expect(enterprise.querySelector(MAILTO)).not.toBeNull();
     expect(enterprise.querySelector('a[href="/signup"]')).toBeNull();
+
+    // Plans buy features: no card speaks of operations, allowances or limits.
+    expect(region().textContent).not.toMatch(/operation|allowance|limit/i);
+
+    unmount(instance);
+  });
+
+  /**
+   * Production today: no meter has a price. The usage section must say that
+   * plainly, once, rather than list every service as "free" or show nothing.
+   */
+  it('says usage prices are still to come when no meter is priced', async () => {
+    plans.mockResolvedValue(SEEDED_CATALOG);
+    const instance = mountPage();
+    await settle();
+
+    expect(usageRegion().getAttribute('aria-busy')).toBe('false');
+    expect(usageRegion().textContent?.trim()).toBe(
+      'Usage prices have not been published yet. They will appear here, service by service, as soon as they are set.'
+    );
+    expect(usageRegion().querySelectorAll('table')).toHaveLength(0);
+    expect(usageRegion().textContent).not.toContain('$');
+
+    unmount(instance);
+  });
+
+  it('renders a graduated tier table per priced meter, grouped by service', async () => {
+    plans.mockResolvedValue(PRICED);
+    const instance = mountPage();
+    await settle();
+
+    expectNoSkips(headingLevels(container));
+    const services = Array.from(usageRegion().querySelectorAll('h3')).map((h) =>
+      h.textContent?.trim()
+    );
+    expect(services).toEqual(['Otto Factory', 'Otto Flags', 'Otto CXP']);
+
+    // Exact prices from millionths of a cent; the first unit of each tier is
+    // the one after the tier before.
+    expect(meterRows('Jobs completed')).toEqual([
+      ['Up to 10,000', '$0.002'],
+      ['10,001 to 1,000,000', '$0.0015'],
+      ['1,000,001 and above', '$0.001']
+    ]);
+    expect(meterRows('Flag evaluations')).toEqual([
+      ['Up to 1,000', 'Free'],
+      ['1,001 and above', '$0.00000007']
+    ]);
+
+    const flags = card('Otto Flags');
+    expect(flags.textContent).toContain('Billed per evaluation');
+    expect(flags.textContent).toContain('First 1,000 free every month');
+    // No free first tier, so no "free" claim.
+    expect(card('Otto Factory').textContent).not.toContain('free every month');
+    // A service with nothing priced says so, rather than vanishing or reading as free.
+    expect(card('Otto CXP').textContent).toContain('No usage price published yet.');
+    expect(card('Otto CXP').querySelector('table')).toBeNull();
+
+    const headers = Array.from(usageRegion().querySelectorAll('th[scope="col"]')).map((th) =>
+      th.textContent?.trim()
+    );
+    expect(headers.slice(0, 2)).toEqual(['Units each month', 'Price per unit']);
+
+    unmount(instance);
+  });
+
+  it('shows placeholders for the usage prices while they load', () => {
+    plans.mockReturnValue(new Promise(() => {}));
+    const instance = mountPage();
+
+    expect(usageRegion().getAttribute('aria-busy')).toBe('true');
+    expect(usageRegion().querySelector('[aria-hidden="true"]')).not.toBeNull();
 
     unmount(instance);
   });
 
   it('sends a signed-in visitor to the console from the self-serve plans', async () => {
-    plans.mockResolvedValue({ plans: SEEDED });
+    plans.mockResolvedValue(SEEDED_CATALOG);
     const instance = mountPage();
     await settle();
 
@@ -215,9 +321,13 @@ describe('the pricing page', () => {
 
   it('offers a retry when the plans cannot be loaded, and renders them once it works', async () => {
     plans.mockRejectedValueOnce(new ApiError(0, 'network', 'offline'));
-    plans.mockResolvedValueOnce({ plans: SEEDED });
+    plans.mockResolvedValueOnce(PRICED);
     const instance = mountPage();
     await settle();
+
+    // Reported once, beside its Retry; the usage region does not repeat it.
+    expect(container.querySelectorAll('[role="alert"]')).toHaveLength(1);
+    expect(usageRegion().textContent?.trim()).toBe('');
 
     const alert = container.querySelector('[role="alert"]');
     expect(alert?.textContent).toContain('Pricing could not be loaded.');
@@ -233,6 +343,7 @@ describe('the pricing page', () => {
     expect(plans).toHaveBeenCalledTimes(2);
     expect(container.querySelector('[role="alert"]')).toBeNull();
     expect(card('Team').textContent).toContain('$29');
+    expect(meterRows('Flag evaluations')).toHaveLength(2);
     // The button is gone; focus went to what replaced it, not to <body>.
     await vi.waitFor(() => expect(document.activeElement).toBe(region()));
     expect(consoleError).toHaveBeenCalledTimes(1);
@@ -280,7 +391,7 @@ describe('the pricing page', () => {
 
   it('treats a plan with a missing field as a failure, never $NaN', async () => {
     const { monthlyCents: _dropped, ...withoutPrice } = SEEDED[1]!;
-    plans.mockResolvedValue({ plans: [SEEDED[0]!, withoutPrice as Plan] });
+    plans.mockResolvedValue({ plans: [SEEDED[0]!, withoutPrice as Plan], meters: [] });
     const instance = mountPage();
     await settle();
 
@@ -295,8 +406,39 @@ describe('the pricing page', () => {
     unmount(instance);
   });
 
+  it('treats an answer without a meters array as a failure, not as "no prices yet"', async () => {
+    plans.mockResolvedValue({ plans: SEEDED } as never);
+    const instance = mountPage();
+    await settle();
+
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      'Pricing could not be loaded.'
+    );
+    expect(container.textContent).not.toContain('Usage prices have not been published yet.');
+    expect((consoleError.mock.calls[0]?.[1] as Error).message).toContain('meters array');
+
+    unmount(instance);
+  });
+
+  it('treats a meter with a broken tier table as a failure, never a wrong price', async () => {
+    plans.mockResolvedValue({
+      plans: SEEDED,
+      meters: [{ ...FLAG_EVALUATIONS, tiers: [{ upTo: null, unitAmountUcents: 1.5 }] }]
+    });
+    const instance = mountPage();
+    await settle();
+
+    expect(container.querySelector('[role="alert"]')).not.toBeNull();
+    expect(container.querySelectorAll('table')).toHaveLength(0);
+    expect((consoleError.mock.calls[0]?.[1] as Error).message).toContain(
+      'meters[0].tiers[0].unitAmountUcents'
+    );
+
+    unmount(instance);
+  });
+
   it('renders a plan whose features are null, with no feature lines', async () => {
-    plans.mockResolvedValue({ plans: [{ ...SEEDED[1]!, features: null as never }] });
+    plans.mockResolvedValue({ plans: [{ ...SEEDED[1]!, features: null as never }], meters: [] });
     const instance = mountPage();
     await settle();
 
@@ -315,12 +457,12 @@ describe('the pricing page', () => {
    * the path that is reachable.)
    */
   it('ignores an answer that arrives after the page is gone', async () => {
-    let answer!: (value: { plans: Plan[] }) => void;
+    let answer!: (value: PlansResponse) => void;
     plans.mockReturnValueOnce(new Promise((resolve) => (answer = resolve)));
     const instance = mountPage();
     unmount(instance);
 
-    answer({ plans: SEEDED });
+    answer(SEEDED_CATALOG);
     await vi.waitFor(() => expect(plans).toHaveBeenCalledTimes(1));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(container.innerHTML).toBe('');
@@ -329,7 +471,7 @@ describe('the pricing page', () => {
 
   it('points to sales when no plan is listed, and warns', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    plans.mockResolvedValue({ plans: [] });
+    plans.mockResolvedValue({ plans: [], meters: [] });
     const instance = mountPage();
     await settle();
 
@@ -354,7 +496,7 @@ describe('the pricing page', () => {
    */
   it('speaks Spanish, with US dollar prices in Spanish notation', async () => {
     overwriteGetLocale(() => 'es');
-    plans.mockResolvedValue({ plans: SEEDED });
+    plans.mockResolvedValue(PRICED);
     const instance = mountPage('es');
     await settle();
 
@@ -362,10 +504,18 @@ describe('the pricing page', () => {
     const team = card('Team');
     expect(team.textContent).toMatch(/29\sUS\$/);
     expect(team.textContent).not.toContain('€');
-    expect(team.textContent).toContain('10.000 operaciones incluidas al mes');
+    expect(team.textContent).toContain('El uso se factura aparte, por servicio');
     expect(team.textContent).toContain('Reversión automática en Otto Flags');
     expect(card('Enterprise').textContent).toContain('Contáctanos');
-    expect(card('Enterprise').textContent).toContain('Desde 1.000.000 de operaciones al mes');
+
+    expect(meterRows('Jobs completed')).toEqual([
+      ['Hasta 10.000', expect.stringMatching(/^0,002\sUS\$$/)],
+      ['De 10.001 a 1.000.000', expect.stringMatching(/^0,0015\sUS\$$/)],
+      ['1.000.001 en adelante', expect.stringMatching(/^0,001\sUS\$$/)]
+    ]);
+    expect(meterRows('Flag evaluations')[0]).toEqual(['Hasta 1000', 'Gratis']);
+    expect(card('Otto Flags').textContent).toContain('Las primeras 1000 unidades gratis cada mes');
+    expect(usageRegion().textContent).not.toContain('€');
     expect(card('Free').querySelector('p')?.textContent?.trim()).toBe('Gratis');
 
     unmount(instance);

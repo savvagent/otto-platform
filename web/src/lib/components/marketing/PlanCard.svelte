@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Locale } from '$lib/locale';
   import { m } from '$lib/paraglide/messages';
-  import { featureLabels, formatOps, priceLabel } from '$lib/pricing';
+  import { featureLabels, priceLabel } from '$lib/pricing';
   import { CONTACT_EMAIL } from '$lib/site';
   import type { Plan } from '$lib/types';
   import LinkButton from '$lib/components/LinkButton.svelte';
@@ -9,8 +9,12 @@
 
   /**
    * One plan from `GET /api/plans`, as the pricing page shows it: name,
-   * price, monthly allowance, what happens past it, the advertised features,
-   * and the way in.
+   * price, the advertised features, and the way in.
+   *
+   * **A plan buys features, not usage.** There is no allowance to print: usage
+   * is billed per service by its value meters, at the same rates on every
+   * plan, so each card says so in one line and the usage prices sit in their
+   * own section of the page.
    *
    * `displayName` comes from the server and is a name, so it is shown as
    * given in every language. Everything around it is a message, and every
@@ -19,10 +23,6 @@
    * **The way in depends on the tier, not on the price.** The self-serve
    * tiers get `ConsoleLink`, which follows the session like every other way
    * into the console; Enterprise is agreed with sales, so it is a `mailto:`.
-   *
-   * **Enterprise's allowance reads "from".** Its list figure is the floor a
-   * contract starts at, and a negotiated allowance can be larger; printing it
-   * bare would understate what a customer is actually offered.
    *
    * `level` is the name's heading level, as on `ProductCard`: one under the
    * plans section's `<h2>` is an `h3`.
@@ -37,7 +37,6 @@
 
   const price = $derived(priceLabel(plan, lang));
   const features = $derived(featureLabels(plan.features));
-  const ops = $derived({ count: plan.includedOps, ops: formatOps(plan.includedOps, lang) });
 </script>
 
 <article class="otto-card flex flex-col gap-5 p-5">
@@ -56,14 +55,7 @@
     {/if}
   </p>
 
-  <div class="flex flex-col gap-1.5 text-sm">
-    <p class="font-medium text-ink">
-      {plan.plan === 'enterprise' ? m.pricing_included_ops_from(ops) : m.pricing_included_ops(ops)}
-    </p>
-    <p class="text-muted">
-      {plan.hardStop ? m.pricing_overage_hard_stop() : m.pricing_overage_metered()}
-    </p>
-  </div>
+  <p class="text-sm text-muted">{m.pricing_plan_usage_note()}</p>
 
   {#if features.length > 0}
     <ul role="list" aria-label={m.pricing_features_label()} class="flex flex-col gap-2 text-sm">
