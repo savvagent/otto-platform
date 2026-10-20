@@ -3,16 +3,25 @@
 //!
 //! Like the client's own wire tests (`stripe::tests`), it records every request
 //! so a test can assert exactly what was sent. Unlike them it keeps state, so a
-//! whole flow (customer, checkout, subscription, items) can run against it:
-//! customers, meters, prices, subscriptions and their items are created and
-//! returned in Stripe's shapes, and setup intents are seeded by the test
-//! ([`MockStripe::add_setup_intent`]), standing in for the card a person types
-//! into Checkout.
+//! whole flow (customer, checkout, subscription, schedule) can run against it:
+//! customers, meters, prices, subscriptions, their items and their schedules
+//! are created and returned in Stripe's shapes, and setup intents are seeded
+//! by the test ([`MockStripe::add_setup_intent`]), standing in for the card a
+//! person types into Checkout.
 //!
-//! It honours `Idempotency-Key` the way Stripe does: a POST repeating a key
-//! gets the first response again and changes nothing. It enforces the two
-//! subscription rules sync depends on: at most [`super::MAX_SUBSCRIPTION_ITEMS`]
-//! items, and no price twice on one subscription.
+//! What it holds to, as Stripe does:
+//!
+//! - **Idempotency keys.** A POST repeating a key with the same method, path
+//!   and body gets the first response again, failures included (Stripe
+//!   replays a cached `500` too), and changes nothing. Repeating a key with
+//!   different parameters is `400 idempotency_error`.
+//! - At most [`super::MAX_SUBSCRIPTION_ITEMS`] items per subscription, no
+//!   price twice on one, one active meter per event name, one open schedule
+//!   per subscription, and a schedule update must keep the current phase's
+//!   start.
+//!
+//! Schedules do not run on their own: [`MockStripe::advance_to`] plays them to
+//! a given time, switching each subscription's items as its phases begin.
 //!
 //! Compiled for this crate's tests and, through the `test-support` feature, for
 //! other crates' tests. Never in a production build.
@@ -38,10 +47,12 @@ pub const MOCK_SECRET_KEY: &str = "sk_test_mock_stripe_key";
 pub struct Seen {
     pub method: String,
     pub path: String,
+    pub query: Vec<(String, String)>,
     pub idempotency_key: Option<String>,
     pub authorization: Option<String>,
     /// The decoded form body, in order.
     pub form: Vec<(String, String)>,
+    body: String,
 }
 
 impl Seen {
@@ -61,13 +72,28 @@ impl Seen {
             .map(|(_, v)| v.as_str())
             .collect()
     }
+
+    /// The first value of a query parameter.
+    pub fn query_field(&self, name: &str) -> Option<&str> {
+        self.query
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+struct Cached {
+    method: String,
+    path: String,
+    body: String,
+    status: StatusCode,
+    value: Value,
 }
 
 #[derive(Default)]
 struct Inner {
     seen: Vec<Seen>,
-    /// Idempotency key -> the response first given for it.
-    replies: HashMap<String, (StatusCode, Value)>,
+    replies: HashMap<String, Cached>,
     next_id: u64,
     customers: BTreeMap<String, Value>,
     setup_intents: BTreeMap<String, Value>,
@@ -75,10 +101,16 @@ struct Inner {
     prices: BTreeMap<String, Value>,
     /// Subscription id -> the subscription, without its items.
     subscriptions: BTreeMap<String, Value>,
-    /// Item id -> (subscription id, price id).
-    items: BTreeMap<String, (String, String)>,
+    /// Item id -> (subscription id, price id), in creation order by id.
+    items: BTreeMap<u64, (String, String, String)>,
+    schedules: BTreeMap<String, Value>,
+    detached: Vec<String>,
     /// Path prefix -> the status every matching request fails with.
     failures: Vec<(String, u16)>,
+}
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 impl Inner {
@@ -87,39 +119,70 @@ impl Inner {
         format!("{prefix}_mock{}", self.next_id)
     }
 
-    fn item_json(&self, item: &str) -> Value {
-        let (sub, price) = &self.items[item];
+    fn add_item(&mut self, sub: &str, price: &str) -> String {
+        self.next_id += 1;
+        let id = format!("si_mock{}", self.next_id);
+        self.items
+            .insert(self.next_id, (id.clone(), sub.to_owned(), price.to_owned()));
+        id
+    }
+
+    fn item_by_id(&mut self, id: &str) -> Option<&mut (String, String, String)> {
+        self.items.values_mut().find(|(i, _, _)| i == id)
+    }
+
+    fn item_json(&self, item: &(String, String, String)) -> Value {
+        let (id, sub, price) = item;
         json!({
-            "id": item,
+            "id": id,
             "object": "subscription_item",
             "subscription": sub,
             "price": self.prices.get(price).cloned().unwrap_or(Value::Null),
         })
     }
 
+    fn items_json(&self, sub: &str) -> Vec<Value> {
+        self.items
+            .values()
+            .filter(|(_, owner, _)| owner == sub)
+            .map(|i| self.item_json(i))
+            .collect()
+    }
+
     fn subscription_json(&self, sub: &str) -> Value {
         let mut s = self.subscriptions[sub].clone();
-        let data: Vec<Value> = self
-            .items
-            .iter()
-            .filter(|(_, (owner, _))| owner == sub)
-            .map(|(id, _)| self.item_json(id))
-            .collect();
-        s["items"] = json!({ "object": "list", "data": data, "has_more": false });
+        s["items"] = json!({ "object": "list", "data": self.items_json(sub), "has_more": false });
         s
     }
 
-    fn items_of(&self, sub: &str) -> Vec<String> {
+    fn prices_of(&self, sub: &str) -> Vec<String> {
         self.items
-            .iter()
-            .filter(|(_, (owner, _))| owner == sub)
-            .map(|(_, (_, price))| price.clone())
+            .values()
+            .filter(|(_, owner, _)| owner == sub)
+            .map(|(_, _, price)| price.clone())
             .collect()
+    }
+
+    /// Make a subscription hold exactly `prices` (as a schedule phase does).
+    fn set_items(&mut self, sub: &str, prices: &[String]) {
+        self.items
+            .retain(|_, (_, owner, price)| owner != sub || prices.contains(price));
+        let have = self.prices_of(sub);
+        for p in prices {
+            if !have.contains(p) {
+                self.add_item(sub, p);
+            }
+        }
+    }
+
+    fn schedule_open(&self, id: &str) -> bool {
+        self.schedules
+            .get(id)
+            .is_some_and(|s| matches!(s["status"].as_str(), Some("active" | "not_started")))
     }
 }
 
-/// A running mock. Dropping it leaves the listener running until the test's
-/// runtime shuts down, which is when the test ends.
+/// A running mock. The listener runs until the test's runtime shuts down.
 #[derive(Clone)]
 pub struct MockStripe {
     base_url: String,
@@ -134,11 +197,19 @@ impl std::fmt::Debug for MockStripe {
     }
 }
 
-fn error(status: StatusCode, message: &str) -> (StatusCode, Value) {
+fn error(status: StatusCode, kind: &str, message: &str) -> (StatusCode, Value) {
     (
         status,
-        json!({ "error": { "type": "invalid_request_error", "message": message } }),
+        json!({ "error": { "type": kind, "message": message } }),
     )
+}
+
+fn invalid(message: &str) -> (StatusCode, Value) {
+    error(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+}
+
+fn missing(message: &str) -> (StatusCode, Value) {
+    error(StatusCode::NOT_FOUND, "invalid_request_error", message)
 }
 
 fn metadata(form: &[(String, String)]) -> Value {
@@ -150,6 +221,10 @@ fn metadata(form: &[(String, String)]) -> Value {
         })
         .collect();
     Value::Object(map)
+}
+
+fn list(data: Vec<Value>) -> Value {
+    json!({ "object": "list", "data": data, "has_more": false })
 }
 
 impl MockStripe {
@@ -200,11 +275,19 @@ impl MockStripe {
             .collect()
     }
 
-    /// The POSTs whose path starts with `prefix`.
-    pub fn posts_under(&self, prefix: &str) -> Vec<Seen> {
+    /// Every POST so far.
+    pub fn posts(&self) -> Vec<Seen> {
         self.seen()
             .into_iter()
-            .filter(|s| s.method == "POST" && s.path.starts_with(prefix))
+            .filter(|s| s.method == "POST")
+            .collect()
+    }
+
+    /// The POSTs whose path starts with `prefix`.
+    pub fn posts_under(&self, prefix: &str) -> Vec<Seen> {
+        self.posts()
+            .into_iter()
+            .filter(|s| s.path.starts_with(prefix))
             .collect()
     }
 
@@ -220,7 +303,8 @@ impl MockStripe {
     }
 
     /// Every request whose path starts with `prefix` fails with `status`
-    /// until [`Self::clear_failures`].
+    /// until [`Self::clear_failures`]. A keyed POST's failure is cached under
+    /// its key, as Stripe caches it.
     pub fn fail(&self, prefix: &str, status: u16) {
         self.lock().failures.push((prefix.to_owned(), status));
     }
@@ -255,9 +339,28 @@ impl MockStripe {
         ids.into_iter().map(|(_, k)| k).collect()
     }
 
-    /// The price ids on a subscription.
+    /// Set a subscription's status, as Stripe does when it is canceled.
+    pub fn set_subscription_status(&self, id: &str, status: &str) {
+        if let Some(s) = self.lock().subscriptions.get_mut(id) {
+            s["status"] = json!(status);
+        }
+    }
+
+    /// The price ids on a subscription, sorted.
     pub fn subscription_prices(&self, id: &str) -> Vec<String> {
-        self.lock().items_of(id)
+        let mut p = self.lock().prices_of(id);
+        p.sort();
+        p
+    }
+
+    /// A subscription schedule as Stripe holds it.
+    pub fn schedule(&self, id: &str) -> Option<Value> {
+        self.lock().schedules.get(id).cloned()
+    }
+
+    /// Payment methods detached so far, in order.
+    pub fn detached(&self) -> Vec<String> {
+        self.lock().detached.clone()
     }
 
     /// A customer as Stripe holds it.
@@ -275,6 +378,57 @@ impl MockStripe {
         let inner = self.lock();
         (inner.meters.len(), inner.prices.len())
     }
+
+    /// Play every open schedule forward to `at` (Unix seconds): each
+    /// subscription takes the items of the phase in effect at `at`, and a
+    /// schedule whose last phase has ended releases its subscription.
+    pub fn advance_to(&self, at: i64) {
+        let mut inner = self.lock();
+        let open: Vec<String> = inner
+            .schedules
+            .keys()
+            .filter(|id| inner.schedule_open(id))
+            .cloned()
+            .collect();
+        for id in open {
+            let s = inner.schedules[&id].clone();
+            let sub = s["subscription"].as_str().unwrap_or_default().to_owned();
+            let phases = s["phases"].as_array().cloned().unwrap_or_default();
+            let prices = |p: &Value| -> Vec<String> {
+                p["items"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|i| i["price"].as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let current = phases.iter().find(|p| {
+                p["start_date"].as_i64().unwrap_or(i64::MAX) <= at
+                    && at < p["end_date"].as_i64().unwrap_or(i64::MAX)
+            });
+            if let Some(p) = current {
+                let p = p.clone();
+                inner.set_items(&sub, &prices(&p));
+                let schedule = inner.schedules.get_mut(&id).expect("schedule");
+                schedule["current_phase"] =
+                    json!({ "start_date": p["start_date"], "end_date": p["end_date"] });
+            } else if let Some(last) = phases.last() {
+                if last["end_date"].as_i64().is_some_and(|end| at >= end) {
+                    let last = last.clone();
+                    inner.set_items(&sub, &prices(&last));
+                    let schedule = inner.schedules.get_mut(&id).expect("schedule");
+                    schedule["status"] = json!("released");
+                    schedule["current_phase"] = Value::Null;
+                    if let Some(s) = inner.subscriptions.get_mut(&sub) {
+                        s["schedule"] = Value::Null;
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn handle(
@@ -285,6 +439,10 @@ async fn handle(
     body: Bytes,
 ) -> impl IntoResponse {
     let form: Vec<(String, String)> = serde_urlencoded::from_bytes(&body).unwrap_or_default();
+    let query: Vec<(String, String)> = uri
+        .query()
+        .and_then(|q| serde_urlencoded::from_str(q).ok())
+        .unwrap_or_default();
     let header = |name: &str| {
         headers
             .get(name)
@@ -294,34 +452,115 @@ async fn handle(
     let seen = Seen {
         method: method.as_str().to_owned(),
         path: uri.path().to_owned(),
+        query,
         idempotency_key: header("idempotency-key"),
         authorization: header("authorization"),
         form,
+        body: String::from_utf8_lossy(&body).into_owned(),
     };
 
     let mut inner = inner.lock().unwrap_or_else(PoisonError::into_inner);
     inner.seen.push(seen.clone());
 
-    if let Some((_, status)) = inner
+    if let Some(key) = seen.idempotency_key.as_ref() {
+        if let Some(c) = inner.replies.get(key) {
+            if c.method != seen.method || c.path != seen.path || c.body != seen.body {
+                let (s, v) = error(
+                    StatusCode::BAD_REQUEST,
+                    "idempotency_error",
+                    "Keys for idempotent requests can only be used with the same parameters \
+                     they were first used with.",
+                );
+                return (s, axum::Json(v));
+            }
+            return (c.status, axum::Json(c.value.clone()));
+        }
+    }
+
+    let failure = inner
         .failures
         .iter()
         .find(|(prefix, _)| seen.path.starts_with(prefix.as_str()))
-    {
-        let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let (s, v) = error(status, "the mock was told to fail this path");
-        return (s, axum::Json(v));
-    }
-
-    if let Some(key) = seen.idempotency_key.as_ref() {
-        if let Some((s, v)) = inner.replies.get(key) {
-            return (*s, axum::Json(v.clone()));
-        }
-    }
-    let (status, value) = route(&mut inner, &seen);
+        .map(|(_, status)| *status);
+    let (status, value) = match failure {
+        Some(status) => error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            "api_error",
+            "the mock was told to fail this path",
+        ),
+        None => route(&mut inner, &seen),
+    };
     if let Some(key) = seen.idempotency_key {
-        inner.replies.insert(key, (status, value.clone()));
+        inner.replies.insert(
+            key,
+            Cached {
+                method: seen.method,
+                path: seen.path,
+                body: seen.body,
+                status,
+                value: value.clone(),
+            },
+        );
     }
     (status, axum::Json(value))
+}
+
+/// `phases[i][...]` of a schedule update, as JSON phases.
+fn parse_phases(
+    inner: &Inner,
+    req: &Seen,
+    current_start: i64,
+) -> Result<Vec<Value>, (StatusCode, Value)> {
+    let mut phases = Vec::new();
+    let mut start = None;
+    for i in 0.. {
+        let Some(end) = req.field(&format!("phases[{i}][end_date]")) else {
+            break;
+        };
+        let end: i64 = end.parse().map_err(|_| invalid("bad end_date"))?;
+        let this_start = match (i, req.field(&format!("phases[{i}][start_date]"))) {
+            (0, Some(s)) => {
+                let s: i64 = s.parse().map_err(|_| invalid("bad start_date"))?;
+                if s != current_start {
+                    return Err(invalid(
+                        "phases[0][start_date] must be the current phase's start_date",
+                    ));
+                }
+                s
+            }
+            (0, None) => return Err(invalid("phases[0][start_date] is required")),
+            (_, Some(_)) => return Err(invalid("only the first phase may set start_date")),
+            (_, None) => start.ok_or_else(|| invalid("phase has no start"))?,
+        };
+        if end <= this_start {
+            return Err(invalid("a phase must end after it starts"));
+        }
+        let items: Vec<Value> = (0..)
+            .map_while(|j| req.field(&format!("phases[{i}][items][{j}][price]")))
+            .map(|p| json!({ "price": p }))
+            .collect();
+        if items.is_empty() || items.len() > MAX_SUBSCRIPTION_ITEMS {
+            return Err(invalid("a phase needs 1 to 20 items"));
+        }
+        if items.iter().any(|i| {
+            !inner
+                .prices
+                .contains_key(i["price"].as_str().unwrap_or_default())
+        }) {
+            return Err(invalid("No such price"));
+        }
+        phases.push(json!({
+            "start_date": this_start,
+            "end_date": end,
+            "items": items,
+            "proration_behavior": req.field(&format!("phases[{i}][proration_behavior]")),
+        }));
+        start = Some(end);
+    }
+    if phases.is_empty() {
+        return Err(invalid("phases are required"));
+    }
+    Ok(phases)
 }
 
 fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
@@ -338,6 +577,23 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
             inner.customers.insert(id, c.clone());
             (StatusCode::OK, c)
         }
+        ("GET", ["v1", "customers", "search"]) => {
+            let query = req.query_field("query").unwrap_or_default();
+            let parsed = query
+                .strip_prefix("metadata['")
+                .and_then(|r| r.split_once("']:'"))
+                .and_then(|(k, v)| Some((k.to_owned(), v.strip_suffix('\'')?.to_owned())));
+            let Some((key, value)) = parsed else {
+                return invalid("unsupported search query");
+            };
+            let data = inner
+                .customers
+                .values()
+                .filter(|c| c["metadata"][&key] == json!(value))
+                .cloned()
+                .collect();
+            (StatusCode::OK, list(data))
+        }
         ("POST", ["v1", "customers", id]) => match inner.customers.get_mut(*id) {
             Some(c) => {
                 if let Some(pm) = f("invoice_settings[default_payment_method]") {
@@ -345,11 +601,18 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
                 }
                 (StatusCode::OK, c.clone())
             }
-            None => error(StatusCode::NOT_FOUND, "No such customer"),
+            None => missing("No such customer"),
         },
+        ("POST", ["v1", "payment_methods", id, "detach"]) => {
+            inner.detached.push((*id).to_owned());
+            (
+                StatusCode::OK,
+                json!({ "id": id, "object": "payment_method", "customer": null }),
+            )
+        }
         ("POST", ["v1", "checkout", "sessions"]) => {
             if !f("customer").is_some_and(|c| inner.customers.contains_key(&c)) {
-                return error(StatusCode::BAD_REQUEST, "No such customer");
+                return invalid("No such customer");
             }
             let id = inner.id("cs");
             (
@@ -364,8 +627,12 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
         }
         ("GET", ["v1", "setup_intents", id]) => match inner.setup_intents.get(*id) {
             Some(si) => (StatusCode::OK, si.clone()),
-            None => error(StatusCode::NOT_FOUND, "No such setupintent"),
+            None => missing("No such setupintent"),
         },
+        ("GET", ["v1", "billing", "meters"]) => {
+            let data = inner.meters.values().cloned().collect();
+            (StatusCode::OK, list(data))
+        }
         ("POST", ["v1", "billing", "meters"]) => {
             let event_name = f("event_name").unwrap_or_default();
             if inner
@@ -373,10 +640,7 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
                 .values()
                 .any(|m| m["event_name"] == json!(event_name))
             {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "An active meter with this event_name already exists",
-                );
+                return invalid("An active meter with this event_name already exists");
             }
             let id = inner.id("mtr");
             let m = json!({
@@ -388,7 +652,7 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
         }
         ("POST", ["v1", "prices"]) => {
             let Some(meter) = f("recurring[meter]").filter(|m| inner.meters.contains_key(m)) else {
-                return error(StatusCode::BAD_REQUEST, "No such meter");
+                return invalid("No such meter");
             };
             let product = match f("product") {
                 Some(p) => p,
@@ -416,70 +680,242 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
             inner.prices.insert(id, p.clone());
             (StatusCode::OK, p)
         }
+        ("GET", ["v1", "subscriptions"]) => {
+            let customer = req.query_field("customer").unwrap_or_default().to_owned();
+            let ids: Vec<String> = inner
+                .subscriptions
+                .iter()
+                .filter(|(_, s)| s["customer"] == json!(customer))
+                .map(|(id, _)| id.clone())
+                .collect();
+            let data = ids.iter().map(|id| inner.subscription_json(id)).collect();
+            (StatusCode::OK, list(data))
+        }
+        ("GET", ["v1", "subscriptions", id]) => {
+            if inner.subscriptions.contains_key(*id) {
+                (StatusCode::OK, inner.subscription_json(id))
+            } else {
+                missing("No such subscription")
+            }
+        }
         ("POST", ["v1", "subscriptions"]) => {
             let prices: Vec<String> = req
                 .fields_starting("items[")
                 .into_iter()
                 .map(str::to_owned)
                 .collect();
-            if prices.len() > MAX_SUBSCRIPTION_ITEMS {
-                return error(StatusCode::BAD_REQUEST, "too many subscription items");
+            if prices.is_empty() || prices.len() > MAX_SUBSCRIPTION_ITEMS {
+                return invalid("a subscription needs 1 to 20 items");
             }
             let customer = f("customer").unwrap_or_default();
             if !inner.customers.contains_key(&customer) {
-                return error(StatusCode::BAD_REQUEST, "No such customer");
+                return invalid("No such customer");
             }
             if prices.iter().any(|p| !inner.prices.contains_key(p)) {
-                return error(StatusCode::BAD_REQUEST, "No such price");
+                return invalid("No such price");
             }
             let id = inner.id("sub");
+            let created = now();
+            let anchor: Option<i64> = f("billing_cycle_anchor").and_then(|a| a.parse().ok());
             inner.subscriptions.insert(
                 id.clone(),
                 json!({
                     "id": id, "object": "subscription", "customer": customer,
                     "status": "active", "metadata": metadata(&req.form),
-                    "billing_cycle_anchor": f("billing_cycle_anchor"),
+                    "created": created, "billing_cycle_anchor": anchor,
+                    "schedule": null,
                 }),
             );
             for price in prices {
-                let item = inner.id("si");
-                inner.items.insert(item, (id.clone(), price));
+                inner.add_item(&id, &price);
             }
             (StatusCode::OK, inner.subscription_json(&id))
         }
+        ("GET", ["v1", "subscription_items"]) => {
+            let sub = req.query_field("subscription").unwrap_or_default();
+            (StatusCode::OK, list(inner.items_json(sub)))
+        }
         ("POST", ["v1", "subscription_items"]) => {
             let (Some(sub), Some(price)) = (f("subscription"), f("price")) else {
-                return error(StatusCode::BAD_REQUEST, "missing subscription or price");
+                return invalid("missing subscription or price");
             };
             if !inner.subscriptions.contains_key(&sub) || !inner.prices.contains_key(&price) {
-                return error(StatusCode::BAD_REQUEST, "No such subscription or price");
+                return invalid("No such subscription or price");
             }
-            let existing = inner.items_of(&sub);
+            let existing = inner.prices_of(&sub);
             if existing.contains(&price) {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "Cannot add multiple subscription items with the same price",
-                );
+                return invalid("Cannot add multiple subscription items with the same price");
             }
             if existing.len() >= MAX_SUBSCRIPTION_ITEMS {
-                return error(StatusCode::BAD_REQUEST, "too many subscription items");
+                return invalid("too many subscription items");
             }
-            let item = inner.id("si");
-            inner.items.insert(item.clone(), (sub, price));
-            (StatusCode::OK, inner.item_json(&item))
+            let item = inner.add_item(&sub, &price);
+            let json = inner
+                .items
+                .values()
+                .find(|(i, _, _)| *i == item)
+                .map(|i| inner.item_json(i))
+                .unwrap_or(Value::Null);
+            (StatusCode::OK, json)
         }
         ("POST", ["v1", "subscription_items", id]) => {
             let Some(price) = f("price").filter(|p| inner.prices.contains_key(p)) else {
-                return error(StatusCode::BAD_REQUEST, "No such price");
+                return invalid("No such price");
             };
-            match inner.items.get_mut(*id) {
+            match inner.item_by_id(id) {
                 Some(entry) => {
-                    entry.1 = price;
-                    (StatusCode::OK, inner.item_json(id))
+                    entry.2 = price;
+                    let entry = entry.clone();
+                    (StatusCode::OK, inner.item_json(&entry))
                 }
-                None => error(StatusCode::NOT_FOUND, "No such subscription item"),
+                None => missing("No such subscription item"),
             }
         }
-        _ => error(StatusCode::NOT_FOUND, "the mock does not serve this route"),
+        ("POST", ["v1", "subscription_schedules"]) => {
+            let Some(sub) = f("from_subscription") else {
+                return invalid("from_subscription is required");
+            };
+            let Some(s) = inner.subscriptions.get(&sub).cloned() else {
+                return invalid("No such subscription");
+            };
+            if s["schedule"]
+                .as_str()
+                .is_some_and(|id| inner.schedule_open(id))
+            {
+                return invalid("The subscription is already attached to a schedule");
+            }
+            let start = s["created"].as_i64().unwrap_or_else(now);
+            let end = s["billing_cycle_anchor"]
+                .as_i64()
+                .unwrap_or(start + 30 * 86_400);
+            let items: Vec<Value> = inner
+                .prices_of(&sub)
+                .into_iter()
+                .map(|p| json!({ "price": p }))
+                .collect();
+            let id = inner.id("sub_sched");
+            let schedule = json!({
+                "id": id, "object": "subscription_schedule", "status": "active",
+                "subscription": sub, "end_behavior": "release",
+                "current_phase": { "start_date": start, "end_date": end },
+                "phases": [{
+                    "start_date": start, "end_date": end, "items": items,
+                    "proration_behavior": "create_prorations",
+                }],
+            });
+            inner.schedules.insert(id.clone(), schedule.clone());
+            if let Some(s) = inner.subscriptions.get_mut(&sub) {
+                s["schedule"] = json!(id);
+            }
+            (StatusCode::OK, schedule)
+        }
+        ("GET", ["v1", "subscription_schedules", id]) => match inner.schedules.get(*id) {
+            Some(s) => (StatusCode::OK, s.clone()),
+            None => missing("No such subscription schedule"),
+        },
+        ("POST", ["v1", "subscription_schedules", id]) => {
+            if !inner.schedule_open(id) {
+                return invalid("You cannot update a schedule that is not active");
+            }
+            let s = inner.schedules[*id].clone();
+            let current_start = s["current_phase"]["start_date"].as_i64().unwrap_or(0);
+            let phases = match parse_phases(inner, req, current_start) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            // The current phase's items apply now, as in Stripe.
+            let sub = s["subscription"].as_str().unwrap_or_default().to_owned();
+            let now_prices: Vec<String> = phases[0]["items"]
+                .as_array()
+                .map(|i| {
+                    i.iter()
+                        .filter_map(|x| x["price"].as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            inner.set_items(&sub, &now_prices);
+            let schedule = inner.schedules.get_mut(*id).expect("schedule");
+            schedule["current_phase"] = json!({
+                "start_date": phases[0]["start_date"], "end_date": phases[0]["end_date"],
+            });
+            schedule["phases"] = json!(phases);
+            schedule["end_behavior"] = json!(f("end_behavior"));
+            schedule["proration_behavior"] = json!(f("proration_behavior"));
+            (StatusCode::OK, schedule.clone())
+        }
+        ("POST", ["v1", "subscription_schedules", id, "release"]) => {
+            if !inner.schedule_open(id) {
+                return invalid("You cannot release a schedule that is not active");
+            }
+            let schedule = inner.schedules.get_mut(*id).expect("schedule");
+            schedule["status"] = json!("released");
+            let sub = schedule["subscription"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let schedule = schedule.clone();
+            if let Some(s) = inner.subscriptions.get_mut(&sub) {
+                s["schedule"] = Value::Null;
+            }
+            (StatusCode::OK, schedule)
+        }
+        _ => missing("the mock does not serve this route"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stripe::{CreateCustomer, IdempotencyKey};
+
+    #[tokio::test]
+    async fn a_key_reused_with_other_parameters_is_an_idempotency_error() {
+        let m = MockStripe::start().await;
+        let c = m.client();
+        let key = IdempotencyKey::new("k1").unwrap();
+        let a = CreateCustomer {
+            name: Some("A".into()),
+            ..Default::default()
+        };
+        let first = c.create_customer(&a, &key).await.unwrap();
+        assert_eq!(c.create_customer(&a, &key).await.unwrap().id, first.id);
+        let b = CreateCustomer {
+            name: Some("B".into()),
+            ..Default::default()
+        };
+        let err = c.create_customer(&b, &key).await.unwrap_err();
+        assert_eq!(err.api().unwrap().kind, "idempotency_error");
+        assert_eq!(m.lock().customers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_cached_under_its_key() {
+        let m = MockStripe::start().await;
+        let c = m.client();
+        let key = IdempotencyKey::new("k2").unwrap();
+        m.fail("/v1/customers", 500);
+        let params = CreateCustomer::default();
+        assert_eq!(
+            c.create_customer(&params, &key)
+                .await
+                .unwrap_err()
+                .api()
+                .unwrap()
+                .status,
+            500
+        );
+        m.clear_failures();
+        // Replayed, as Stripe replays it, until the key changes.
+        assert_eq!(
+            c.create_customer(&params, &key)
+                .await
+                .unwrap_err()
+                .api()
+                .unwrap()
+                .status,
+            500
+        );
+        let other = IdempotencyKey::new("k3").unwrap();
+        assert!(c.create_customer(&params, &other).await.is_ok());
     }
 }

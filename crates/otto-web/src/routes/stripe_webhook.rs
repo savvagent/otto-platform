@@ -20,7 +20,8 @@
 //! not act on and events about customers that are not ours, so Stripe stops
 //! sending them. `400` for a missing or bad signature, `413` for an oversized
 //! body, `503 billing_disabled` when billing is off, and `500` when handling
-//! failed, which makes Stripe retry.
+//! failed (including waiting too long for another change to the same org),
+//! which makes Stripe retry.
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;

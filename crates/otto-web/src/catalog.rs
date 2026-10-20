@@ -761,17 +761,19 @@ pub fn catalog() -> Vec<Endpoint> {
         Endpoint::post("/api/orgs/{org}/billing/setup", billing::start_setup)
             .auth(Auth::OrgOwner)
             .returns("BillingSetupSession")
-            .also_fails(&[502, 503])
+            .also_fails(&[409, 502, 503])
             .summary("Start putting a card on file")
             .describe(
                 "Owner-only and audited (`billing.setup.started`). Creates the org's \
                  Stripe customer on first use and returns a Stripe Checkout URL in setup \
-                 mode; send the owner there. Checkout returns them to the console's \
+                 mode, for cards only; send the owner there. Checkout returns them to the console's \
                  billing page with `?setup=success` or `?setup=cancelled`, but the card is \
                  on file only once Stripe confirms it on the webhook, after which the org \
                  is subscribed with one metered item per priced meter. `503 \
                  billing_disabled` when this deployment has no Stripe configuration; `502 \
-                 stripe_unavailable` when Stripe could not be reached.",
+                 stripe_unavailable` when Stripe could not be reached; `409 billing_busy` \
+                 while another billing change for the org is in progress. Putting a card \
+                 on file again after the subscription was canceled resumes billing.",
             ),
         Endpoint::post("/api/stripe/webhook", stripe_webhook::receive)
             .auth(Auth::Public)
@@ -785,7 +787,8 @@ pub fn catalog() -> Vec<Endpoint> {
                  verify); the body is capped at 64 KiB (`413`). Idempotent by event id. \
                  Acts on `checkout.session.completed` (setup mode), \
                  `customer.subscription.updated`, `customer.subscription.deleted`, \
-                 `invoice.payment_failed` and `payment_method.detached`, and acknowledges \
+                 `invoice.paid`, `invoice.payment_failed` and `payment_method.detached`, \
+                 and acknowledges \
                  every other verified event with no action. `500` asks Stripe to retry; \
                  `503 billing_disabled` when this deployment has no Stripe configuration.",
             ),

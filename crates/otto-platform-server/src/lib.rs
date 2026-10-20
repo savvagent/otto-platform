@@ -21,8 +21,9 @@
 //! server's own credential ([`api::CallingResourceServer`]), not a session
 //! cookie, and are outside `otto-web`'s CSRF guard, which only wraps its own
 //! router. Lifecycle webhooks are delivered by [`webhooks::run`], and
-//! notification email by [`email::run`] when SMTP is configured, background
-//! tasks the binary starts; `otto-platform-server resource ...` provisions
+//! notification email by [`email::run`] when SMTP is configured, and Stripe
+//! sync by [`stripe_cmd::run_loop`] when billing is enabled, background tasks
+//! the binary starts; `otto-platform-server resource ...` provisions
 //! resource servers ([`resource_cmd`]), `otto-platform-server client ...`
 //! registers first-party OAuth clients ([`client_cmd`]),
 //! `otto-platform-server pricebook ...` sets what each value meter costs

@@ -36,6 +36,9 @@ pub struct BillingStatusView {
     pub subscription_status: Option<String>,
     /// Whether the subscription is one usage is invoiced through.
     pub subscription_live: bool,
+    /// Stripe canceled the subscription; billing resumes only when an owner
+    /// puts a card on file again.
+    pub billing_stopped: bool,
 }
 
 /// The wire shape of `POST /api/orgs/{org}/billing/setup`.
@@ -60,6 +63,10 @@ pub fn billing_disabled() -> ApiError {
 pub(crate) fn from_billing(context: &str, e: billing::Error) -> ApiError {
     match e {
         billing::Error::Tenant(inner) => ApiError::from(inner),
+        billing::Error::Busy(_) => ApiError::conflict(
+            "billing_busy",
+            "another billing change for this org is in progress; try again shortly",
+        ),
         billing::Error::Stripe(_) | billing::Error::Unexpected(_) => {
             tracing::error!(error = %e, context, "Stripe request failed");
             ApiError::new(
@@ -91,14 +98,15 @@ pub async fn get_billing(
             .as_ref()
             .is_some_and(billing::SubscriptionState::is_live),
         subscription_status: status.subscription.map(|s| s.status),
+        billing_stopped: status.stopped,
     }))
 }
 
 /// `POST /api/orgs/{org}/billing/setup` — start putting a card on file.
 ///
-/// Creates the org's Stripe customer on first use (named for the org, with
-/// the requesting owner's email) and returns a Stripe Checkout URL in setup
-/// mode. Returning from Checkout lands on the console's billing page with
+/// Finds or creates the org's Stripe customer (named for the org, with the
+/// requesting owner's email) and returns a Stripe Checkout URL in setup mode,
+/// for cards only. Returning from Checkout lands on the console's billing page with
 /// `?setup=success` or `?setup=cancelled`; whether a card is actually on file
 /// is what Stripe later reports on the webhook, not the redirect.
 pub async fn start_setup(

@@ -880,3 +880,249 @@ async fn raw_meter_keys_are_refused_as_event_names() {
     }
     assert!(m.seen().is_empty());
 }
+
+// ------------------------------------------------------------- reads and schedules
+
+fn subscription_json(id: &str) -> Value {
+    json!({
+        "id": id, "object": "subscription", "customer": "cus_1", "status": "active",
+        "metadata": {"org_id": "o1"}, "schedule": null,
+        "items": {"object": "list", "has_more": false, "data": [
+            {"id": "si_1", "object": "subscription_item", "subscription": id, "price": price_json("price_1")}
+        ]},
+    })
+}
+
+#[tokio::test]
+async fn list_subscriptions_asks_for_every_status_of_one_customer() {
+    let m = Mock::start().await;
+    m.reply(
+        200,
+        json!({"object": "list", "has_more": false, "data": [subscription_json("sub_1")]}),
+    );
+    let list = m.client().list_subscriptions("cus_1").await.unwrap();
+    assert_eq!(list.data.len(), 1);
+    assert_eq!(list.data[0].metadata["org_id"], "o1");
+    assert_eq!(list.data[0].schedule, None);
+    let s = m.only();
+    assert_eq!(s.method, Method::GET);
+    assert_eq!(s.path, "/v1/subscriptions");
+    assert_eq!(
+        s.query.as_deref(),
+        Some("customer=cus_1&status=all&limit=100")
+    );
+    assert_eq!(s.header("idempotency-key"), None);
+    assert_common_headers(&s);
+    // The customer is checked before it reaches the query string.
+    assert!(m
+        .client()
+        .list_subscriptions("cus_1&status=x")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn retrieve_subscription_and_list_items() {
+    let m = Mock::start().await;
+    let mut sub = subscription_json("sub_1");
+    sub["schedule"] = json!("sub_sched_1");
+    m.reply(200, sub).reply(
+        200,
+        json!({"object": "list", "has_more": false, "data": [
+            {"id": "si_1", "object": "subscription_item", "subscription": "sub_1", "price": price_json("price_1")}
+        ]}),
+    );
+    let c = m.client();
+    assert_eq!(
+        c.retrieve_subscription("sub_1")
+            .await
+            .unwrap()
+            .schedule
+            .as_deref(),
+        Some("sub_sched_1")
+    );
+    let items = c.list_subscription_items("sub_1").await.unwrap();
+    assert_eq!(items.data[0].price.id, "price_1");
+    let seen = m.seen();
+    assert_eq!(seen[0].path, "/v1/subscriptions/sub_1");
+    assert_eq!(seen[1].path, "/v1/subscription_items");
+    assert_eq!(
+        seen[1].query.as_deref(),
+        Some("subscription=sub_1&limit=100")
+    );
+}
+
+#[tokio::test]
+async fn customer_search_is_by_one_plain_metadata_term() {
+    let m = Mock::start().await;
+    m.reply(
+        200,
+        json!({"object": "search_result", "has_more": false, "data": [
+            {"id": "cus_1", "object": "customer", "email": null, "name": "Acme",
+             "metadata": {"org_id": "o-1"}, "invoice_settings": null}
+        ]}),
+    );
+    let c = m.client();
+    let found = c
+        .search_customers_by_metadata("org_id", "o-1")
+        .await
+        .unwrap();
+    assert_eq!(found.data[0].id, "cus_1");
+    let s = m.only();
+    assert_eq!(s.path, "/v1/customers/search");
+    let q: Vec<(String, String)> = serde_urlencoded::from_str(s.query.as_deref().unwrap()).unwrap();
+    assert_eq!(q[0], ("query".into(), "metadata['org_id']:'o-1'".into()));
+    for bad in ["o'1", "o 1", "", "o:1"] {
+        assert!(
+            c.search_customers_by_metadata("org_id", bad).await.is_err(),
+            "{bad}"
+        );
+    }
+    assert_eq!(m.seen().len(), 1);
+}
+
+#[tokio::test]
+async fn list_meters_pages_and_detach_posts() {
+    let m = Mock::start().await;
+    m.reply(
+        200,
+        json!({"object": "list", "has_more": false, "data": [
+            {"id": "mtr_2", "event_name": "a__b", "display_name": "B", "status": "active"}
+        ]}),
+    )
+    .reply(
+        200,
+        json!({"id": "pm_1", "object": "payment_method", "customer": null}),
+    );
+    let c = m.client();
+    let page = c.list_meters(Some("mtr_1")).await.unwrap();
+    assert_eq!(page.data[0].event_name, "a__b");
+    let pm = c
+        .detach_payment_method("pm_1", &idem("detach-k"))
+        .await
+        .unwrap();
+    assert_eq!(pm.customer, None);
+    let seen = m.seen();
+    assert_eq!(seen[0].path, "/v1/billing/meters");
+    assert_eq!(
+        seen[0].query.as_deref(),
+        Some("status=active&limit=100&starting_after=mtr_1")
+    );
+    assert_post(&seen[1], "/v1/payment_methods/pm_1/detach", "detach-k");
+    assert_eq!(seen[1].body, "");
+}
+
+#[tokio::test]
+async fn schedules_are_encoded_with_exact_phase_boundaries_and_no_proration() {
+    let m = Mock::start().await;
+    let sched = json!({
+        "id": "sub_sched_1", "object": "subscription_schedule", "status": "active",
+        "subscription": "sub_1", "end_behavior": "release",
+        "current_phase": {"start_date": 1_760_000_000, "end_date": 1_761_955_200},
+        "phases": [{"start_date": 1_760_000_000, "end_date": 1_761_955_200,
+                    "items": [{"price": "price_1"}], "proration_behavior": "none"}],
+    });
+    m.reply(200, sched.clone())
+        .reply(200, sched.clone())
+        .reply(200, sched);
+    let c = m.client();
+    let created = c
+        .create_schedule_from_subscription("sub_1", &idem("s-create"))
+        .await
+        .unwrap();
+    assert!(created.is_open());
+    assert_eq!(created.current_phase.unwrap().start_date, 1_760_000_000);
+
+    let start = Utc.timestamp_opt(1_760_000_000, 0).unwrap();
+    let nov = Utc.with_ymd_and_hms(2025, 11, 1, 0, 0, 0).unwrap();
+    let dec = Utc.with_ymd_and_hms(2025, 12, 1, 0, 0, 0).unwrap();
+    c.update_schedule(
+        "sub_sched_1",
+        &UpdateSchedule {
+            phases: vec![
+                SchedulePhaseParams {
+                    start_date: Some(start),
+                    end_date: nov,
+                    prices: vec!["price_1".into()],
+                },
+                SchedulePhaseParams {
+                    start_date: None,
+                    end_date: dec,
+                    prices: vec!["price_2".into(), "price_3".into()],
+                },
+            ],
+        },
+        &idem("s-update"),
+    )
+    .await
+    .unwrap();
+    c.release_schedule("sub_sched_1", &idem("s-release"))
+        .await
+        .unwrap();
+
+    let seen = m.seen();
+    assert_post(&seen[0], "/v1/subscription_schedules", "s-create");
+    assert_eq!(seen[0].form(), pairs(&[("from_subscription", "sub_1")]));
+    assert_post(
+        &seen[1],
+        "/v1/subscription_schedules/sub_sched_1",
+        "s-update",
+    );
+    let (nov_s, dec_s, start_s) = (
+        nov.timestamp().to_string(),
+        dec.timestamp().to_string(),
+        start.timestamp().to_string(),
+    );
+    assert_eq!(
+        seen[1].form(),
+        pairs(&[
+            ("end_behavior", "release"),
+            ("proration_behavior", "none"),
+            ("phases[0][start_date]", &start_s),
+            ("phases[0][end_date]", &nov_s),
+            ("phases[0][proration_behavior]", "none"),
+            ("phases[0][items][0][price]", "price_1"),
+            ("phases[1][end_date]", &dec_s),
+            ("phases[1][proration_behavior]", "none"),
+            ("phases[1][items][0][price]", "price_2"),
+            ("phases[1][items][1][price]", "price_3"),
+        ])
+    );
+    assert_post(
+        &seen[2],
+        "/v1/subscription_schedules/sub_sched_1/release",
+        "s-release",
+    );
+}
+
+#[tokio::test]
+async fn malformed_schedules_are_refused_locally() {
+    let m = Mock::start().await;
+    let c = m.client();
+    let t = |d: u32| Utc.with_ymd_and_hms(2025, 11, d, 0, 0, 0).unwrap();
+    let phase = |start: Option<u32>, end: u32, prices: &[&str]| SchedulePhaseParams {
+        start_date: start.map(t),
+        end_date: t(end),
+        prices: prices.iter().map(|p| (*p).to_owned()).collect(),
+    };
+    for phases in [
+        vec![],
+        vec![phase(Some(1), 2, &[])],
+        vec![phase(Some(2), 1, &["price_1"])],
+        vec![
+            phase(Some(1), 2, &["price_1"]),
+            phase(Some(2), 3, &["price_1"]),
+        ],
+        vec![
+            phase(Some(1), 3, &["price_1"]),
+            phase(None, 2, &["price_1"]),
+        ],
+        vec![phase(Some(1), 2, &["price/1"])],
+    ] {
+        assert!(c
+            .update_schedule("sub_sched_1", &UpdateSchedule { phases }, &idem("k"))
+            .await
+            .is_err());
+    }
+    assert!(m.seen().is_empty());
+}

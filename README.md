@@ -265,12 +265,16 @@ minutes after a month begins, because of its caches.
 
 An org's owner puts a card on file through `POST
 /api/orgs/{org}/billing/setup`, which returns a Stripe Checkout URL in setup
-mode.
-When Stripe reports the card on the webhook (`POST /api/stripe/webhook`,
-signature-verified and idempotent by event id), the org gets a Stripe
-subscription with one metered item per priced meter, anchored to 00:00 UTC
-on the first of next month with no proration, so usage is invoiced monthly
-in arrears. `stripe sync` makes Stripe match the price book:
+mode, for cards only. When Stripe reports the card on the webhook (`POST
+/api/stripe/webhook`, signature-verified and idempotent by event id), the org
+gets a Stripe subscription with one metered item per priced meter, anchored to
+00:00 UTC on the first of next month with no proration, so usage is invoiced
+monthly in arrears. A canceled subscription stops billing until the owner puts
+a card on file again.
+
+`stripe sync` makes Stripe match the price book. With billing enabled the
+server runs it itself, at boot, every 15 minutes and just after each month
+starts (one machine at a time); the command runs it now and prints what it did:
 
 ```sh
 otto-platform-server stripe sync
@@ -278,14 +282,15 @@ otto-platform-server stripe sync
 
 It creates a Stripe billing meter for every declared meter and a Stripe Price
 for every price-book version (Stripe prices are immutable), subscribes orgs
-that have a card on file and no subscription, and moves every live
-subscription's items to the version in effect this month, adding an item for
-each newly priced meter. Run it after `pricebook set` and again early on the
-first of a month in which a new version takes effect. It is idempotent
-(`nothing to do` when Stripe already matches), warns as a subscription nears
-Stripe's 20 items, and exits non-zero after listing what it could not do. It
-needs `DATABASE_URL` and `STRIPE_SECRET_KEY`. The Stripe account, the
-restricted key and the webhook endpoint are set up by hand: see
+that have a card on file and no subscription, and puts each subscription on a
+Stripe subscription schedule that switches it to a new version's prices at
+exactly 00:00 UTC on the first of that version's month. It adopts a Stripe
+meter, customer or subscription left by an interrupted earlier attempt rather
+than making a second. It is idempotent (`nothing to do` when Stripe already
+matches), warns as a subscription nears Stripe's 20 items, and exits non-zero
+after listing what it could not do. It needs `DATABASE_URL` and
+`STRIPE_SECRET_KEY`. The Stripe account, the restricted key and the webhook
+endpoint are set up by hand: see
 [`docs/deploy/fly.md`](docs/deploy/fly.md#stripe-setup).
 
 ### Running just the migrations

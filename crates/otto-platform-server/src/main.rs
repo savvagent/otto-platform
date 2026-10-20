@@ -114,7 +114,9 @@ async fn main() -> Result<()> {
             let mailer = otto_platform_server::email::SmtpMailer::new(email)?;
             tracing::info!("notification email enabled");
             Some(tokio::spawn(otto_platform_server::email::run(
-                db, mailer, stop_rx,
+                db.clone(),
+                mailer,
+                stop_rx.clone(),
             )))
         }
         None => {
@@ -128,10 +130,20 @@ async fn main() -> Result<()> {
 
     // Billing, only when both Stripe secrets are set (`Config` refuses one
     // without the other). Off is a supported state, not a fault: production
-    // boots and serves without it.
-    if config.stripe.is_some() {
-        tracing::info!("billing enabled: Stripe is configured");
-    } else {
+    // boots and serves without it. On, every machine runs the sync loop; a
+    // lease in the database lets one of them sync at a time.
+    let stripe_task = match otto_platform_server::stripe(&config)? {
+        Some(stripe) => {
+            tracing::info!("billing enabled: Stripe is configured");
+            Some(tokio::spawn(otto_platform_server::stripe_cmd::run_loop(
+                db.clone(),
+                stripe.client,
+                stop_rx.clone(),
+            )))
+        }
+        None => None,
+    };
+    if config.stripe.is_none() {
         tracing::warn!(
             "billing disabled: STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET are not set; no card \
              can be put on file and the Stripe webhook answers 503 billing_disabled"
@@ -164,6 +176,9 @@ async fn main() -> Result<()> {
     let _ = stop_tasks.send(true);
     let _ = webhook_task.await;
     if let Some(task) = email_task {
+        let _ = task.await;
+    }
+    if let Some(task) = stripe_task {
         let _ = task.await;
     }
     tracing::info!("shut down cleanly");

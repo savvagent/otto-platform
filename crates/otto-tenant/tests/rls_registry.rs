@@ -75,6 +75,7 @@ async fn tenant_pinned_code_cannot_read_the_cross_tenant_tables(pool: PgPool) {
         "usage_event_ids",
         "stripe_customers",
         "stripe_events",
+        "stripe_sync_lease",
     ] {
         let mut tx = db.begin(OrgId::new()).await.unwrap();
         let read = sqlx::query(&format!("SELECT * FROM {table}"))
@@ -430,6 +431,8 @@ async fn tenant_pinned_code_cannot_write_the_stripe_ledgers(pool: PgPool) {
         "INSERT INTO stripe_events (event_id, event_type, stripe_created_at) \
          VALUES ('evt_2', 'x', now())",
         "DELETE FROM stripe_events",
+        "INSERT INTO stripe_sync_lease (name, token, until) \
+         VALUES ('sync', gen_random_uuid(), now())",
     ] {
         let mut tx = db.begin(OrgId::from(org)).await.unwrap();
         let err = sqlx::query(stmt).execute(tx.conn()).await.expect_err(stmt);

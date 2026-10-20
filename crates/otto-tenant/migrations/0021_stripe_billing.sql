@@ -4,8 +4,8 @@
 -- invoices its metered usage monthly in arrears. The Stripe API calls and every
 -- statement against these tables live in `otto_billing::billing`.
 --
--- Additive only: new columns on `subscriptions` (0003), one new tenant table,
--- and four new global tables.
+-- Additive only: new columns on `subscriptions` (0003) and five new global
+-- tables.
 
 -- ------------------------------------------------------------ subscriptions
 --
@@ -34,7 +34,24 @@ ALTER TABLE subscriptions
   -- `pm_...`: the card `payment_method_status` describes.
   ADD COLUMN stripe_payment_method_id text,
   ADD COLUMN payment_method_event_at  timestamptz,
-  ADD COLUMN subscription_event_at    timestamptz;
+  ADD COLUMN subscription_event_at    timestamptz,
+  -- Set when Stripe reports the subscription deleted (canceled in the
+  -- dashboard, or by dunning). A stopped org is never re-subscribed by sync;
+  -- only the owner putting a card on file again clears it.
+  ADD COLUMN billing_stopped_at       timestamptz,
+  -- `sub_sched_...`: the schedule that switches the subscription's prices at
+  -- the start of each month a new price-book version takes effect, while one
+  -- is needed.
+  ADD COLUMN stripe_schedule_id       text,
+  -- What sync last made Stripe hold for this org: the price ids of each phase,
+  -- by month. Sync calls Stripe for an org only when the price book's answer
+  -- differs from this.
+  ADD COLUMN stripe_plan              text,
+  -- A short per-org lease, so two workers (an owner's setup, a webhook, sync)
+  -- never act on one org's Stripe state at once, without a database lock or
+  -- connection held across a Stripe call.
+  ADD COLUMN lease_until              timestamptz,
+  ADD COLUMN lease_token              uuid;
 
 ALTER TABLE subscriptions
   ADD CONSTRAINT subscriptions_payment_method_status
@@ -47,32 +64,6 @@ CREATE UNIQUE INDEX subscriptions_stripe_customer_id
   ON subscriptions (stripe_customer_id) WHERE stripe_customer_id IS NOT NULL;
 CREATE UNIQUE INDEX subscriptions_stripe_subscription_id
   ON subscriptions (stripe_subscription_id) WHERE stripe_subscription_id IS NOT NULL;
-
--- ------------------------------------------------- stripe_subscription_items
---
--- One row per item of an org's live Stripe subscription: which meter it bills
--- and at which price-book version. Written when the subscription is created
--- and by `otto-platform-server stripe sync`, which compares it with the price
--- book to add an item for a newly priced meter and to move an item to the
--- version in effect this month. TENANT data, under the standard policy: sync
--- pins to each org in turn.
-CREATE TABLE stripe_subscription_items (
-  org_id                 uuid        NOT NULL REFERENCES orgs (id) ON DELETE CASCADE,
-  -- A `meters.key`. No foreign key: billing history must not depend on the
-  -- registry row, as with `usage_events.meter` (0019).
-  meter                  text        NOT NULL,
-  stripe_subscription_id text        NOT NULL,
-  stripe_item_id         text        NOT NULL UNIQUE,
-  -- The `price_versions.id` the item is priced at.
-  price_version_id       uuid        NOT NULL,
-  updated_at             timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (org_id, meter)
-);
-
-ALTER TABLE stripe_subscription_items ENABLE ROW LEVEL SECURITY;
-ALTER TABLE stripe_subscription_items FORCE ROW LEVEL SECURITY;
-CREATE POLICY stripe_subscription_items_tenant_isolation ON stripe_subscription_items
-  USING (org_id = current_org()) WITH CHECK (org_id = current_org());
 
 -- ------------------------------------------------------------ global tables
 --
@@ -134,16 +125,26 @@ CREATE TABLE stripe_prices (
   created_at       timestamptz NOT NULL DEFAULT now()
 );
 
+-- Who is running `stripe sync` (the server's background loop on any
+-- machine, or an operator's CLI), so only one runs at a time. A lease, not a
+-- held lock: it expires on its own if its holder dies.
+CREATE TABLE stripe_sync_lease (
+  name  text        PRIMARY KEY,
+  token uuid        NOT NULL,
+  until timestamptz NOT NULL
+);
+
 -- `otto_app` may read the meter and price ids (what a price is in Stripe is
 -- not a secret, and a tenant transaction shipping meter events needs the event
--- names) but not change them. The customer map and the event ledger are
--- cross-tenant and get nothing. Conditional because a managed deployment has
--- no such role (0004).
+-- names) but not change them. The customer map, the event ledger and the sync
+-- lease are cross-tenant and get nothing. Conditional because a managed
+-- deployment has no such role (0004).
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'otto_app') THEN
     -- 0004's default privileges granted the new tables to otto_app.
-    EXECUTE 'REVOKE ALL ON stripe_customers, stripe_events, stripe_meters, stripe_prices FROM otto_app';
+    EXECUTE 'REVOKE ALL ON stripe_customers, stripe_events, stripe_meters, stripe_prices, '
+         || 'stripe_sync_lease FROM otto_app';
     EXECUTE 'GRANT SELECT ON stripe_meters, stripe_prices TO otto_app';
   END IF;
 END $$;

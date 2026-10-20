@@ -93,16 +93,18 @@ fly secrets set -a otto-platform \
 
 Billing invoices each org's metered usage monthly in arrears through a Stripe
 subscription, once the org's owner has put a card on file (`POST
-/api/orgs/{org}/billing/setup`, which sends them to Stripe Checkout). It needs
+/api/orgs/{org}/billing/setup`, which sends them to Stripe Checkout, cards only). It needs
 these steps, in this order, all done by a person with access to the Stripe dashboard. None
 of them is done by CI or by the server.
 
 1. **Restricted key.** Dashboard → Developers → API keys → Create restricted key, named
    `otto-platform`. Grant **Write** on exactly:
-   - Customers (create customers, set the default payment method)
+   - Customers (create and search customers, set the default payment method)
+   - Payment Methods (detach the card a new one replaces)
    - Checkout Sessions (setup-mode sessions)
    - Setup Intents (read the card a session collected; Write includes the Read needed)
-   - Subscriptions (create subscriptions; add items and change an item's price)
+   - Subscriptions, including subscription schedules (create and list subscriptions,
+     list and change their items, and schedule each month's price switch)
    - Prices and Products (one price per price-book version, one product per meter)
    - Billing Meters, and Billing Meter Events (meters now; meter events for usage
      shipping, #64)
@@ -112,36 +114,59 @@ of them is done by CI or by the server.
 2. **Webhook endpoint.** Dashboard → Developers → Webhooks → Add endpoint:
    - URL: `https://otto.savvagent.com/api/stripe/webhook`
    - API version: `2025-03-31.basil` (the version the client is pinned to)
-   - Events, exactly these five: `checkout.session.completed`,
-     `customer.subscription.updated`, `customer.subscription.deleted`,
+   - Events, exactly these six: `checkout.session.completed`,
+     `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid`,
      `invoice.payment_failed`, `payment_method.detached`
 
    Copy the endpoint's signing secret (`whsec_...`).
 3. **Secrets.** Set `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` together (above). The
-   next release logs `billing enabled: Stripe is configured`.
+   next release logs `billing enabled: Stripe is configured`, and from then on every
+   machine runs `stripe sync` on its own: at boot, every 15 minutes, and 30 seconds after
+   00:00 UTC on the first of each month. A lease in the database lets only one machine
+   sync at a time.
 4. **Prices.** Set the price book (`otto-platform-server pricebook set ...`, see the
-   README), then run it on the app's machine, which has `DATABASE_URL` and
-   `STRIPE_SECRET_KEY` as secrets:
+   README). The next automatic sync creates a Stripe meter per declared meter and a Stripe
+   Price per price-book version, subscribes every org that already has a card on file, and
+   schedules every subscription's switch to the new prices. To see it happen, run it by
+   hand on the app's machine, which has `DATABASE_URL` and `STRIPE_SECRET_KEY` as secrets:
 
    ```bash
    fly ssh console -a otto-platform -C "otto-platform-server stripe sync"
    ```
 
-   It creates a Stripe meter per declared meter and a Stripe Price per price-book version,
-   subscribes every org that already has a card on file, and prints what it did; a second
-   run prints `nothing to do`. It exits non-zero after listing anything it could not do
-   (for example a meter key too long to be a Stripe event name), having done the rest.
-5. **Every month a new price takes effect**, run `stripe sync` again soon after 00:00 UTC
-   on the first: it moves each subscription's items to the version now in effect, and adds
-   an item for each newly priced meter. Until it runs, usage keeps being billed at the
-   previous version. It warns when a subscription nears Stripe's limit of 20 items.
+   It prints what it did (a second run prints `nothing to do`), or `another stripe sync is
+   running` if a machine is mid-run. It exits non-zero after listing anything it could not
+   do (for example a meter key too long to be a Stripe event name), having done the rest;
+   the logs show the same for the automatic runs.
+5. **Verify once in test mode** with a Stripe test clock: subscribe a test org, set a
+   price for next month, let sync run, advance the clock past 00:00 UTC on the first, and
+   check that the closing invoice is rated at the old price and the new month's usage at
+   the new one. The tests here run against a local stand-in for Stripe, not Stripe.
+
+**When a new price takes effect.** A price-book version can only be set for a future
+month, and sync puts each live subscription under a Stripe subscription schedule as soon
+as the version has its Stripe Price: the schedule switches the subscription's items to
+the new prices at exactly 00:00 UTC on the first of that month, without proration, then
+releases the subscription. The billing period is anchored to the first, so the closing
+month is invoiced at the old prices and the new month is rated at the new ones. The one
+window: a version set in the last ~15 minutes before its month may not be scheduled before
+the month starts; then the usage from 00:00 UTC until the sync 30 seconds later (or the
+next regular one, if that run fails) is billed at the previous price. Set prices earlier
+than that.
 
 Notes:
 
 - A Stripe price is immutable, and each price-book version gets its own. A future version
-  replaced with `pricebook set` before its month leaves its Stripe price unused; nothing
-  is billed at it.
-- Stripe is never called with a card number: the owner types it into Stripe Checkout.
+  replaced with `pricebook set` before its month leaves its Stripe price unused; the
+  schedule is updated to the replacement.
+- Stripe is never sent a card number: the owner types it into Stripe Checkout. Checkout
+  offers cards only, because a bank debit confirms days later and its setup could finish
+  in Checkout without ever reaching the platform as a card on file.
+- A card that fails to pay is marked `failed`; a later paid invoice marks it `active`
+  again. A new card on file replaces and detaches the old one.
+- When Stripe cancels a subscription (from the dashboard, or after failed retries),
+  billing for that org stops: nothing re-subscribes it until its owner puts a card on file
+  again.
 - With billing disabled, `GET /api/orgs/{org}/billing` says so and nothing is invoiced;
   usage is still metered and kept.
 - Deleting an org does not yet cancel its Stripe subscription. Cancel it in the dashboard.

@@ -9,7 +9,9 @@ use common::{add_member, onboard, org_with_owner, register_resource, Call, Harne
 use http::StatusCode;
 use otto_billing::billing::mock::MockStripe;
 use otto_billing::billing::{self, Stripe};
-use otto_billing::stripe::{sign_webhook, WebhookSecret};
+use otto_billing::stripe::{
+    sign_webhook, CreateCustomer, CreateSubscription, IdempotencyKey, WebhookSecret,
+};
 use otto_core::orgs::Role;
 use otto_tenant::ids::OrgId;
 use otto_tenant::Db;
@@ -77,6 +79,23 @@ async fn price_a_meter(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
+}
+
+/// The console with billing on against `mock`, over an existing pool.
+fn harness_on(pool: PgPool, mock: &MockStripe) -> Harness {
+    let db = Db::from_pool(pool);
+    let config = Config::new(PUBLIC_URL);
+    let webauthn = otto_web::relying_party(&config).unwrap();
+    let state =
+        AppState::new(db.clone(), common::cipher(), webauthn, config).with_stripe(Some(Stripe {
+            client: mock.client(),
+            webhook_secret: secret(),
+        }));
+    Harness {
+        db,
+        router: otto_web::router(state),
+        cipher: common::cipher(),
+    }
 }
 
 /// A Stripe event, signed now with the endpoint secret.
@@ -219,16 +238,47 @@ fn completed_session(customer: &str, org: OrgId, seti: &str) -> Value {
 /// Complete Checkout: Stripe has a succeeded setup intent with a card, and
 /// tells us.
 async fn complete(s: &Setup, event_id: &str, created: i64) -> common::Reply {
-    s.mock
-        .add_setup_intent("seti_1", &s.customer, "pm_card_1", "succeeded");
+    complete_with(s, event_id, created, "seti_1", "pm_card_1").await
+}
+
+async fn complete_with(
+    s: &Setup,
+    event_id: &str,
+    created: i64,
+    seti: &str,
+    pm: &str,
+) -> common::Reply {
+    s.mock.add_setup_intent(seti, &s.customer, pm, "succeeded");
     let (body, sig) = signed(
         event_id,
         "checkout.session.completed",
         created,
-        completed_session(&s.customer, s.org, "seti_1"),
+        completed_session(&s.customer, s.org, seti),
         None,
     );
     deliver(&s.h, body, &sig).await
+}
+
+/// An invoice of `subscription`, in API version 2025-03-31.basil's shape.
+fn invoice(id: &str, customer: &str, subscription: &str) -> Value {
+    json!({
+        "id": id, "object": "invoice", "customer": customer,
+        "parent": { "type": "subscription_details",
+                    "subscription_details": { "subscription": subscription } },
+    })
+}
+
+async fn deliver_event(s: &Setup, id: &str, kind: &str, at: i64, object: Value) -> common::Reply {
+    let (b, h) = signed(id, kind, at, object, None);
+    deliver(&s.h, b, &h).await
+}
+
+async fn current_subscription(s: &Setup) -> String {
+    sqlx::query_scalar("SELECT stripe_subscription_id FROM subscriptions WHERE org_id = $1")
+        .bind(s.org)
+        .fetch_one(&s.pool)
+        .await
+        .unwrap()
 }
 
 async fn billing_view(s: &Setup) -> Value {
@@ -259,6 +309,7 @@ async fn an_owner_starts_setup_and_gets_a_checkout_url(pool: PgPool) {
         json!({
             "billingEnabled": true, "cardStatus": "none",
             "subscriptionStatus": null, "subscriptionLive": false,
+            "billingStopped": false,
         })
     );
 
@@ -277,17 +328,27 @@ async fn an_owner_starts_setup_and_gets_a_checkout_url(pool: PgPool) {
     assert_eq!(c.field("email"), Some("owner@acme.test"));
     assert_eq!(c.field("name"), Some("acme"));
     assert_eq!(c.field("metadata[org_id]"), Some(org.to_string().as_str()));
+    assert!(c
+        .idempotency_key
+        .as_deref()
+        .is_some_and(|k| k.starts_with("otto-customer-")));
+    // Looked for first, by the org id, so a customer left by an earlier
+    // attempt is adopted rather than duplicated.
+    let searches = mock.requests("GET", "/v1/customers/search");
+    assert_eq!(searches.len(), 1);
     assert_eq!(
-        c.idempotency_key.as_deref(),
-        Some(format!("otto-customer-{org}").as_str())
+        searches[0].query_field("query"),
+        Some(format!("metadata['org_id']:'{org}'").as_str())
     );
 
-    // Checkout in setup mode, in dollars, back to the console's billing page.
+    // Checkout in setup mode, cards only, back to the console's billing page.
     let sessions = mock.requests("POST", "/v1/checkout/sessions");
     assert_eq!(sessions.len(), 1);
     let s = &sessions[0];
     assert_eq!(s.field("mode"), Some("setup"));
-    assert_eq!(s.field("currency"), Some("usd"));
+    assert_eq!(s.field("payment_method_types[0]"), Some("card"));
+    assert_eq!(s.fields_starting("payment_method_types["), ["card"]);
+    assert_eq!(s.field("currency"), None);
     assert_eq!(s.field("customer"), Some("cus_mock1"));
     assert_eq!(
         s.field("success_url"),
@@ -448,10 +509,10 @@ async fn checkout_completion_puts_the_card_on_file_and_subscribes(pool: PgPool) 
         defaults[0].field("invoice_settings[default_payment_method]"),
         Some("pm_card_1")
     );
-    assert_eq!(
-        defaults[0].idempotency_key.as_deref(),
-        Some("otto-default-pm-seti_1")
-    );
+    assert!(defaults[0]
+        .idempotency_key
+        .as_deref()
+        .is_some_and(|k| k.starts_with("otto-default-pm-")));
 
     // One subscription: an item per priced meter, anchored to 00:00 UTC on the
     // first of next month, no proration.
@@ -479,6 +540,7 @@ async fn checkout_completion_puts_the_card_on_file_and_subscribes(pool: PgPool) 
         json!({
             "billingEnabled": true, "cardStatus": "active",
             "subscriptionStatus": "active", "subscriptionLive": true,
+            "billingStopped": false,
         })
     );
     assert_eq!(
@@ -698,25 +760,77 @@ async fn subscription_status_moves_forward_in_event_time_only(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
-async fn a_failed_payment_and_a_detached_card_are_recorded(pool: PgPool) {
+async fn payments_failing_and_recovering_and_a_detached_card_are_recorded(pool: PgPool) {
     let s = started(pool).await;
     let t0 = Utc::now().timestamp() - 100;
     complete(&s, "evt_done", t0).await.expect(StatusCode::OK);
+    let sub = current_subscription(&s).await;
 
-    // An invoice failure older than the card going on file: ignored.
-    let invoice = json!({ "id": "in_1", "object": "invoice", "customer": s.customer });
-    let (b, h) = signed(
+    // A failure older than the card going on file: ignored.
+    deliver_event(
+        &s,
         "evt_old_fail",
         "invoice.payment_failed",
         t0 - 10,
-        invoice.clone(),
-        None,
-    );
-    deliver(&s.h, b, &h).await.expect(StatusCode::OK);
+        invoice("in_0", &s.customer, &sub),
+    )
+    .await
+    .expect(StatusCode::OK);
+    assert_eq!(billing_view(&s).await["cardStatus"], "active");
+    // A failure of some other (an old, canceled) subscription's invoice:
+    // ignored.
+    deliver_event(
+        &s,
+        "evt_other_fail",
+        "invoice.payment_failed",
+        t0 + 5,
+        invoice("in_x", &s.customer, "sub_old"),
+    )
+    .await
+    .expect(StatusCode::OK);
     assert_eq!(billing_view(&s).await["cardStatus"], "active");
 
-    let (b, h) = signed("evt_fail", "invoice.payment_failed", t0 + 10, invoice, None);
-    deliver(&s.h, b, &h).await.expect(StatusCode::OK);
+    deliver_event(
+        &s,
+        "evt_fail",
+        "invoice.payment_failed",
+        t0 + 10,
+        invoice("in_1", &s.customer, &sub),
+    )
+    .await
+    .expect(StatusCode::OK);
+    assert_eq!(billing_view(&s).await["cardStatus"], "failed");
+    // The retry is paid: the card is good again.
+    deliver_event(
+        &s,
+        "evt_paid",
+        "invoice.paid",
+        t0 + 15,
+        invoice("in_1", &s.customer, &sub),
+    )
+    .await
+    .expect(StatusCode::OK);
+    assert_eq!(billing_view(&s).await["cardStatus"], "active");
+    // A paid invoice of another subscription, or with the card fine, does
+    // nothing.
+    deliver_event(
+        &s,
+        "evt_paid_other",
+        "invoice.paid",
+        t0 + 16,
+        invoice("in_y", &s.customer, "sub_old"),
+    )
+    .await
+    .expect(StatusCode::OK);
+    deliver_event(
+        &s,
+        "evt_fail2",
+        "invoice.payment_failed",
+        t0 + 17,
+        invoice("in_2", &s.customer, &sub),
+    )
+    .await
+    .expect(StatusCode::OK);
     assert_eq!(billing_view(&s).await["cardStatus"], "failed");
 
     // Some other card detached: not ours to care about.
@@ -740,16 +854,28 @@ async fn a_failed_payment_and_a_detached_card_are_recorded(pool: PgPool) {
     );
     deliver(&s.h, b, &h).await.expect(StatusCode::OK);
     assert_eq!(billing_view(&s).await["cardStatus"], "detached");
+    // A paid invoice does not bring a detached card back.
+    deliver_event(
+        &s,
+        "evt_paid_late",
+        "invoice.paid",
+        t0 + 40,
+        invoice("in_3", &s.customer, &sub),
+    )
+    .await
+    .expect(StatusCode::OK);
+    assert_eq!(billing_view(&s).await["cardStatus"], "detached");
 
     // An event for a customer that is not ours is acknowledged, not acted on.
-    let (b, h) = signed(
+    deliver_event(
+        &s,
         "evt_stranger",
         "invoice.payment_failed",
-        t0 + 40,
-        json!({ "id": "in_2", "customer": "cus_not_ours" }),
-        None,
-    );
-    deliver(&s.h, b, &h).await.expect(StatusCode::OK);
+        t0 + 50,
+        invoice("in_4", "cus_not_ours", &sub),
+    )
+    .await
+    .expect(StatusCode::OK);
 
     assert_eq!(
         audit_actions(&s.pool, s.org).await,
@@ -758,9 +884,214 @@ async fn a_failed_payment_and_a_detached_card_are_recorded(pool: PgPool) {
             "billing.card.added",
             "billing.subscription.created",
             "billing.payment.failed",
+            "billing.payment.recovered",
+            "billing.payment.failed",
             "billing.card.detached",
         ]
     );
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_new_card_replaces_and_detaches_the_old_one(pool: PgPool) {
+    let s = started(pool).await;
+    let t0 = Utc::now().timestamp() - 100;
+    complete(&s, "evt_one", t0).await.expect(StatusCode::OK);
+    assert!(s.mock.detached().is_empty());
+    complete_with(&s, "evt_two", t0 + 10, "seti_2", "pm_card_2")
+        .await
+        .expect(StatusCode::OK);
+    assert_eq!(s.mock.detached(), ["pm_card_1"]);
+    let defaults = s
+        .mock
+        .requests("POST", &format!("/v1/customers/{}", s.customer));
+    assert_eq!(
+        defaults
+            .last()
+            .unwrap()
+            .field("invoice_settings[default_payment_method]"),
+        Some("pm_card_2")
+    );
+    // Stripe then reports the old card detached: it is not the card on file.
+    let (b, h) = signed(
+        "evt_det_old",
+        "payment_method.detached",
+        t0 + 20,
+        json!({ "id": "pm_card_1", "object": "payment_method", "customer": null }),
+        Some(json!({ "customer": s.customer })),
+    );
+    deliver(&s.h, b, &h).await.expect(StatusCode::OK);
+    assert_eq!(billing_view(&s).await["cardStatus"], "active");
+    // Still one subscription.
+    assert_eq!(s.mock.subscription_ids().len(), 1);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_canceled_subscription_stops_billing_until_a_new_card(pool: PgPool) {
+    let s = started(pool).await;
+    let t0 = Utc::now().timestamp() - 100;
+    complete(&s, "evt_done", t0).await.expect(StatusCode::OK);
+    let first = current_subscription(&s).await;
+    // Canceled in Stripe (the dashboard, or dunning), then reported.
+    s.mock.set_subscription_status(&first, "canceled");
+    let (b, h) = signed(
+        "evt_del",
+        "customer.subscription.deleted",
+        t0 + 10,
+        json!({ "id": first, "object": "subscription", "customer": s.customer, "status": "canceled" }),
+        None,
+    );
+    deliver(&s.h, b, &h).await.expect(StatusCode::OK);
+    let view = billing_view(&s).await;
+    assert_eq!(view["subscriptionStatus"], "canceled");
+    assert_eq!(view["billingStopped"], true);
+    assert_eq!(
+        view["cardStatus"], "active",
+        "the card itself is still fine"
+    );
+
+    // Sync does not quietly subscribe the org again.
+    let report = billing::sync(&s.h.db, &s.mock.client()).await.unwrap();
+    assert!(report.subscriptions_created.is_empty(), "{report:?}");
+    assert_eq!(s.mock.subscription_ids(), std::slice::from_ref(&first));
+
+    // The owner puts a card on file again: billing resumes, on a new
+    // subscription.
+    Call::post("/api/orgs/acme/billing/setup")
+        .with_session(&s.owner_session)
+        .send(&s.h.router)
+        .await
+        .expect(StatusCode::OK);
+    complete_with(&s, "evt_again", t0 + 20, "seti_2", "pm_card_2")
+        .await
+        .expect(StatusCode::OK);
+    let view = billing_view(&s).await;
+    assert_eq!(view["billingStopped"], false);
+    assert_eq!(view["subscriptionStatus"], "active");
+    let second = current_subscription(&s).await;
+    assert_ne!(second, first);
+    assert_eq!(s.mock.subscription_ids().len(), 2);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn stripe_objects_left_by_an_interrupted_attempt_are_adopted(pool: PgPool) {
+    let mock = MockStripe::start().await;
+    let h = harness(pool.clone(), Some(&mock)).await;
+    price_a_meter(&pool).await;
+    billing::sync(&h.db, &mock.client()).await.unwrap();
+    let owner = onboard(&h, "owner@acme.test").await;
+    let org = org_with_owner(&h, "acme", &owner).await;
+    let c = mock.client();
+    // A customer created for the org whose id was never recorded.
+    let orphan = c
+        .create_customer(
+            &CreateCustomer {
+                name: Some("acme".into()),
+                metadata: [("org_id".to_owned(), org.to_string())].into(),
+                ..Default::default()
+            },
+            &IdempotencyKey::random(),
+        )
+        .await
+        .unwrap();
+    Call::post("/api/orgs/acme/billing/setup")
+        .with_session(&owner.session)
+        .send(&h.router)
+        .await
+        .expect(StatusCode::OK);
+    assert_eq!(
+        mock.requests("POST", "/v1/customers").len(),
+        1,
+        "no second customer"
+    );
+    assert_eq!(
+        mock.requests("POST", "/v1/checkout/sessions")[0].field("customer"),
+        Some(orphan.id.as_str())
+    );
+
+    // And a subscription for it, likewise never recorded.
+    let price: String = sqlx::query_scalar("SELECT stripe_price_id FROM stripe_prices")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let orphan_sub = c
+        .create_subscription(
+            &CreateSubscription {
+                customer: orphan.id.clone(),
+                prices: vec![price],
+                billing_cycle_anchor: None,
+                metadata: [("org_id".to_owned(), org.to_string())].into(),
+            },
+            &IdempotencyKey::random(),
+        )
+        .await
+        .unwrap();
+    let s = Setup {
+        h,
+        mock,
+        pool,
+        org,
+        owner_session: owner.session,
+        customer: orphan.id,
+    };
+    complete(&s, "evt_done", Utc::now().timestamp())
+        .await
+        .expect(StatusCode::OK);
+    assert_eq!(current_subscription(&s).await, orphan_sub.id);
+    assert_eq!(s.mock.requests("POST", "/v1/subscriptions").len(), 1);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn concurrent_setups_finish_on_a_two_connection_pool(pool: PgPool) {
+    // More requests than connections, several for one org: each holds at
+    // most one connection at a time and none across a Stripe call, so all
+    // finish, and each org gets exactly one customer.
+    let mock = MockStripe::start().await;
+    let h = harness(pool.clone(), Some(&mock)).await;
+    let mut owners = Vec::new();
+    for slug in ["acme", "beta", "gamma"] {
+        let owner = onboard(&h, &format!("owner@{slug}.test")).await;
+        org_with_owner(&h, slug, &owner).await;
+        owners.push((slug, owner.session));
+    }
+    let small = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let small = harness_on(small, &mock);
+    // Settle the tenant-role probe first, as a server does at boot
+    // (`verify_tenant_isolation`): `Db::begin` asks it once, lazily.
+    small
+        .db
+        .begin(OrgId::new())
+        .await
+        .unwrap()
+        .rollback()
+        .await
+        .unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    for round in 0..3 {
+        for (slug, session) in &owners {
+            let router = small.router.clone();
+            let (slug, session) = (slug.to_string(), session.clone());
+            tasks.spawn(async move {
+                let r = Call::post(format!("/api/orgs/{slug}/billing/setup"))
+                    .with_session(&session)
+                    .send(&router)
+                    .await;
+                (round, r.status, r.text)
+            });
+        }
+    }
+    let results = tokio::time::timeout(std::time::Duration::from_secs(60), tasks.join_all())
+        .await
+        .expect("concurrent setups deadlocked");
+    assert_eq!(results.len(), 9);
+    for (round, status, text) in results {
+        assert_eq!(status, StatusCode::OK, "round {round}: {text}");
+    }
+    assert_eq!(mock.requests("POST", "/v1/customers").len(), 3);
+    assert_eq!(mock.requests("POST", "/v1/checkout/sessions").len(), 9);
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]

@@ -697,6 +697,12 @@ fn billing_schemas() -> Value {
                          `canceled`, ...), or null when the org has none yet: a card is \
                          needed, and at least one priced meter synced to Stripe.",
                 },
+                "billingStopped": {
+                    "type": "boolean",
+                    "description":
+                        "Stripe canceled the subscription. Nothing is invoiced and nothing \
+                         re-subscribes the org until an owner puts a card on file again.",
+                },
                 "subscriptionLive": {
                     "type": "boolean",
                     "description":
@@ -704,7 +710,13 @@ fn billing_schemas() -> Value {
                          `active`, `trialing`, `past_due` or `unpaid`).",
                 },
             },
-            "required": ["billingEnabled", "cardStatus", "subscriptionStatus", "subscriptionLive"],
+            "required": [
+                "billingEnabled",
+                "cardStatus",
+                "subscriptionStatus",
+                "subscriptionLive",
+                "billingStopped",
+            ],
         },
         "BillingSetupSession": {
             "type": "object",
