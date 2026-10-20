@@ -1,7 +1,7 @@
 //! The storage half of the price book: reading and writing `price_versions`
 //! and `price_tiers` (migration 0020).
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use otto_tenant::Unpinned;
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -22,6 +22,13 @@ pub enum Error {
          future month only, so a period being billed, or already billed, never changes price"
     )]
     NotFuture { month: Month, current: Month },
+    #[error(
+        "{month} starts in less than {} hours; a price must be set at least that long before \
+         its month starts, so Stripe has its price switch scheduled in time. The earliest \
+         month that can be priced now is {earliest}",
+        MIN_LEAD.num_hours()
+    )]
+    TooSoon { month: Month, earliest: Month },
     #[error(
         "the price of {meter} for {month} was set concurrently by another run; re-run \
          `pricebook list` to see which one was kept"
@@ -97,6 +104,45 @@ pub struct SetOutcome {
     pub version: PriceVersion,
     /// The id of the future version this one replaced, if any.
     pub replaced: Option<Uuid>,
+    /// The version that was in effect for the month before this one was
+    /// written (the replaced one, or an earlier month's), if any: what the
+    /// month would have cost.
+    pub before: Option<VersionRecord>,
+}
+
+/// How long before its month starts a price version must be set: long enough
+/// for many runs of Stripe sync to schedule the switch before 00:00 UTC on
+/// the first.
+pub const MIN_LEAD: Duration = Duration::hours(24);
+
+/// The earliest month whose price can be set at `now`: next month, unless it
+/// starts within [`MIN_LEAD`], then the month after.
+///
+/// ```
+/// use chrono::{TimeZone, Utc};
+/// use otto_billing::pricebook::{store::earliest_month_at, Month};
+///
+/// let mid = Utc.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap();
+/// assert_eq!(earliest_month_at(mid), Some(Month::new(2026, 11).unwrap()));
+/// let last_day = Utc.with_ymd_and_hms(2026, 10, 31, 0, 0, 1).unwrap();
+/// assert_eq!(earliest_month_at(last_day), Some(Month::new(2026, 12).unwrap()));
+/// ```
+pub fn earliest_month_at(now: DateTime<Utc>) -> Option<Month> {
+    let next = Month::of(now).offset(1)?;
+    if crate::period::starts_at(next) - now >= MIN_LEAD {
+        Some(next)
+    } else {
+        next.offset(1)
+    }
+}
+
+/// [`earliest_month_at`] by the database's clock.
+pub async fn earliest_month(conn: &mut PgConnection) -> Result<Month> {
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()").fetch_one(conn).await?;
+    earliest_month_at(now).ok_or(Error::NotFuture {
+        month: Month::of(now),
+        current: Month::of(now),
+    })
 }
 
 #[derive(sqlx::FromRow)]
@@ -278,8 +324,10 @@ pub async fn list_versions(conn: &mut PgConnection) -> Result<Vec<VersionRecord>
 /// `month` must be after the current month by the database's clock
 /// ([`current_month`]), or this is [`Error::NotFuture`]: a version for the
 /// current or an earlier month would change what a period being billed, or
-/// already billed, costs. A meter with no price therefore gets its first one
-/// from next month. If `meter` already has a version for `month`, that
+/// already billed, costs. It must also start at least [`MIN_LEAD`] from now
+/// ([`earliest_month`]), or this is [`Error::TooSoon`], so Stripe sync has
+/// the switch scheduled well before the month begins. A meter with no price
+/// therefore gets its first one from next month at the earliest. If `meter` already has a version for `month`, that
 /// version and its tiers are deleted and a new version, with a new id, is
 /// written. The meter must exist ([`Error::UnknownMeter`]). Two runs for the
 /// same meter and month at once: one wins, the other is
@@ -296,6 +344,10 @@ pub async fn set_version(
     if month <= current {
         return Err(Error::NotFuture { month, current });
     }
+    let earliest = earliest_month(tx.conn()).await?;
+    if month < earliest {
+        return Err(Error::TooSoon { month, earliest });
+    }
     // FOR SHARE: the meter cannot be deleted while its price is written.
     let known: Option<String> =
         sqlx::query_scalar("SELECT key FROM meters WHERE key = $1 FOR SHARE")
@@ -305,6 +357,17 @@ pub async fn set_version(
     if known.is_none() {
         return Err(Error::UnknownMeter(meter.to_owned()));
     }
+
+    let before: Vec<VersionRow> = sqlx::query_as(
+        "SELECT id, meter, effective_month, created_at FROM price_versions \
+         WHERE meter = $1 AND effective_month <= $2 \
+         ORDER BY effective_month DESC LIMIT 1",
+    )
+    .bind(meter)
+    .bind(month.first_day())
+    .fetch_all(tx.conn())
+    .await?;
+    let before = records(tx.conn(), before).await?.pop();
 
     let existing: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM price_versions WHERE meter = $1 AND effective_month = $2 FOR UPDATE",
@@ -367,5 +430,31 @@ pub async fn set_version(
             tiers: tiers.clone(),
         },
         replaced: existing,
+        before,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn a_month_must_start_a_full_day_after_now() {
+        let nov = Month::new(2026, 11).unwrap();
+        let dec = Month::new(2026, 12).unwrap();
+        let start = crate::period::starts_at(nov);
+        assert_eq!(earliest_month_at(start - MIN_LEAD), Some(nov));
+        assert_eq!(
+            earliest_month_at(start - MIN_LEAD + Duration::seconds(1)),
+            Some(dec)
+        );
+        assert_eq!(
+            earliest_month_at(Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap()),
+            Some(nov)
+        );
+        // December 31st: next year's February.
+        let new_year = Utc.with_ymd_and_hms(2026, 12, 31, 12, 0, 0).unwrap();
+        assert_eq!(earliest_month_at(new_year), Month::new(2027, 2));
+    }
 }

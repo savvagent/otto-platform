@@ -537,12 +537,14 @@ async fn subscription_create_add_and_change_price() {
     );
     let c = m.client();
     let anchor = Utc.with_ymd_and_hms(2026, 11, 1, 0, 0, 0).unwrap();
+    let start = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
     let sub = c
         .create_subscription(
             &CreateSubscription {
                 customer: "cus_1".into(),
                 prices: vec!["price_a".into(), "price_b".into()],
                 billing_cycle_anchor: Some(anchor),
+                backdate_start_date: Some(start),
                 metadata: [("org_id".to_owned(), "o1".to_owned())].into(),
             },
             &idem("sub-o1"),
@@ -571,6 +573,7 @@ async fn subscription_create_add_and_change_price() {
             ("items[0][price]", "price_a"),
             ("items[1][price]", "price_b"),
             ("billing_cycle_anchor", "1793491200"),
+            ("backdate_start_date", "1790812800"),
             ("proration_behavior", "none"),
             ("metadata[org_id]", "o1"),
         ])
@@ -589,6 +592,81 @@ async fn subscription_create_add_and_change_price() {
         seen[2].form(),
         pairs(&[("price", "price_d"), ("proration_behavior", "none")])
     );
+}
+
+#[tokio::test]
+async fn a_backdate_after_the_anchor_is_refused_locally() {
+    let m = Mock::start().await;
+    let anchor = Utc.with_ymd_and_hms(2026, 11, 1, 0, 0, 0).unwrap();
+    for start in [anchor, anchor + chrono::Duration::seconds(1)] {
+        let err = m
+            .client()
+            .create_subscription(
+                &CreateSubscription {
+                    customer: "cus_1".into(),
+                    prices: vec!["price_a".into()],
+                    billing_cycle_anchor: Some(anchor),
+                    backdate_start_date: Some(start),
+                    metadata: Default::default(),
+                },
+                &idem("sub"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StripeError::InvalidRequest(_)), "{err}");
+    }
+    assert!(m.seen().is_empty());
+}
+
+fn invoice_json(status: &str, auto_advance: bool) -> Value {
+    json!({"id": "in_1", "object": "invoice", "customer": "cus_1", "status": status,
+           "auto_advance": auto_advance, "billing_reason": "subscription_cycle",
+           "period_start": 1790812800, "period_end": 1793491200})
+}
+
+#[tokio::test]
+async fn invoices_are_held_finalized_and_read() {
+    let m = Mock::start().await;
+    m.reply(200, invoice_json("draft", false))
+        .reply(200, invoice_json("open", true))
+        .reply(200, invoice_json("open", true));
+    let c = m.client();
+    let held = c
+        .set_invoice_auto_advance("in_1", false, &idem("hold-in_1"))
+        .await
+        .unwrap();
+    assert_eq!(held.auto_advance, Some(false));
+    assert_eq!(held.status.as_deref(), Some("draft"));
+    assert_eq!(held.period_end, Some(1793491200));
+    let done = c
+        .finalize_invoice("in_1", true, &idem("fin-in_1"))
+        .await
+        .unwrap();
+    assert_eq!(done.status.as_deref(), Some("open"));
+    let read = c.retrieve_invoice("in_1").await.unwrap();
+    assert_eq!(read.billing_reason.as_deref(), Some("subscription_cycle"));
+
+    let seen = m.seen();
+    assert_eq!(seen.len(), 3);
+    assert_post(&seen[0], "/v1/invoices/in_1", "hold-in_1");
+    assert_eq!(seen[0].form(), pairs(&[("auto_advance", "false")]));
+    assert_post(&seen[1], "/v1/invoices/in_1/finalize", "fin-in_1");
+    assert_eq!(seen[1].form(), pairs(&[("auto_advance", "true")]));
+    assert_eq!(seen[2].method, Method::GET);
+    assert_eq!(seen[2].path, "/v1/invoices/in_1");
+    assert_eq!(seen[2].header("idempotency-key"), None);
+    assert_common_headers(&seen[2]);
+
+    // An id that would change the path is refused before anything is sent.
+    for bad in ["in_1/finalize", "in_1?x=1", ""] {
+        assert!(c.retrieve_invoice(bad).await.is_err());
+        assert!(c
+            .set_invoice_auto_advance(bad, false, &idem("k"))
+            .await
+            .is_err());
+        assert!(c.finalize_invoice(bad, true, &idem("k")).await.is_err());
+    }
+    assert_eq!(m.seen().len(), 3);
 }
 
 #[tokio::test]

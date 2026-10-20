@@ -31,6 +31,12 @@
 //! Schedules do not run on their own: [`MockStripe::advance_to`] plays them to
 //! a given time, switching each subscription's items as its phases begin.
 //!
+//! **Invoices** are seeded by the test ([`MockStripe::add_invoice`]), standing
+//! in for the draft Stripe makes when a period ends. They can be read, have
+//! `auto_advance` set, and be finalized (a draft only); and
+//! [`MockStripe::advance_to`] finalizes a draft whose `auto_advance` is still
+//! on an hour after it was made, as Stripe does.
+//!
 //! Compiled for this crate's tests and, through the `test-support` feature, for
 //! other crates' tests. Never in a production build.
 
@@ -112,6 +118,7 @@ struct Inner {
     /// Item id -> (subscription id, price id), in creation order by id.
     items: BTreeMap<u64, (String, String, String)>,
     schedules: BTreeMap<String, Value>,
+    invoices: BTreeMap<String, Value>,
     detached: Vec<String>,
     /// Meter events Stripe counted, in arrival order, one per identifier.
     meter_events: Vec<Value>,
@@ -431,11 +438,57 @@ impl MockStripe {
         (inner.meters.len(), inner.prices.len())
     }
 
+    /// Seed a draft subscription-cycle invoice of `subscription`, made at
+    /// `period_end` (Unix seconds) for the period that ends then, with
+    /// `auto_advance` on, as Stripe makes one. Returns it, in the shape an
+    /// `invoice.created` event carries.
+    pub fn add_invoice(
+        &self,
+        id: &str,
+        customer: &str,
+        subscription: &str,
+        period_end: i64,
+    ) -> Value {
+        let invoice = json!({
+            "id": id, "object": "invoice", "customer": customer, "status": "draft",
+            "auto_advance": true, "billing_reason": "subscription_cycle",
+            "created": period_end, "period_start": period_end - 30 * 86_400,
+            "period_end": period_end,
+            "parent": { "type": "subscription_details",
+                        "subscription_details": { "subscription": subscription } },
+        });
+        self.lock().invoices.insert(id.to_owned(), invoice.clone());
+        invoice
+    }
+
+    /// An invoice as Stripe holds it.
+    pub fn invoice(&self, id: &str) -> Option<Value> {
+        self.lock().invoices.get(id).cloned()
+    }
+
+    /// Set an invoice's status, as finalizing or voiding it in the dashboard
+    /// does.
+    pub fn set_invoice_status(&self, id: &str, status: &str) {
+        if let Some(i) = self.lock().invoices.get_mut(id) {
+            i["status"] = json!(status);
+        }
+    }
+
     /// Play every open schedule forward to `at` (Unix seconds): each
     /// subscription takes the items of the phase in effect at `at`, and a
-    /// schedule whose last phase has ended releases its subscription.
+    /// schedule whose last phase has ended releases its subscription. A draft
+    /// invoice whose `auto_advance` is on and that was made at least an hour
+    /// before `at` is finalized.
     pub fn advance_to(&self, at: i64) {
         let mut inner = self.lock();
+        for invoice in inner.invoices.values_mut() {
+            if invoice["status"] == json!("draft")
+                && invoice["auto_advance"] == json!(true)
+                && invoice["created"].as_i64().is_some_and(|c| c + 3600 <= at)
+            {
+                invoice["status"] = json!("open");
+            }
+        }
         let open: Vec<String> = inner
             .schedules
             .keys()
@@ -816,12 +869,22 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
             let id = inner.id("sub");
             let created = now();
             let anchor: Option<i64> = f("billing_cycle_anchor").and_then(|a| a.parse().ok());
+            let start: Option<i64> = f("backdate_start_date").and_then(|a| a.parse().ok());
+            if start.is_some_and(|s| s > created) {
+                return invalid("backdate_start_date must be in the past");
+            }
+            if let (Some(s), Some(a)) = (start, anchor) {
+                if a <= s {
+                    return invalid("billing_cycle_anchor must be after backdate_start_date");
+                }
+            }
             inner.subscriptions.insert(
                 id.clone(),
                 json!({
                     "id": id, "object": "subscription", "customer": customer,
                     "status": "active", "metadata": metadata(&req.form),
                     "created": created, "billing_cycle_anchor": anchor,
+                    "start_date": start.unwrap_or(created),
                     "schedule": null,
                 }),
             );
@@ -883,7 +946,11 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
             {
                 return invalid("The subscription is already attached to a schedule");
             }
-            let start = s["created"].as_i64().unwrap_or_else(now);
+            // The current period's start: the backdated start, if any.
+            let start = s["start_date"]
+                .as_i64()
+                .or_else(|| s["created"].as_i64())
+                .unwrap_or_else(now);
             let end = s["billing_cycle_anchor"]
                 .as_i64()
                 .unwrap_or(start + 30 * 86_400);
@@ -958,6 +1025,28 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
             }
             (StatusCode::OK, schedule)
         }
+        ("GET", ["v1", "invoices", id]) => match inner.invoices.get(*id) {
+            Some(i) => (StatusCode::OK, i.clone()),
+            None => missing("No such invoice"),
+        },
+        ("POST", ["v1", "invoices", id]) => match inner.invoices.get_mut(*id) {
+            Some(i) => {
+                if let Some(a) = f("auto_advance") {
+                    i["auto_advance"] = json!(a == "true");
+                }
+                (StatusCode::OK, i.clone())
+            }
+            None => missing("No such invoice"),
+        },
+        ("POST", ["v1", "invoices", id, "finalize"]) => match inner.invoices.get_mut(*id) {
+            Some(i) if i["status"] == json!("draft") => {
+                i["status"] = json!("open");
+                i["auto_advance"] = json!(f("auto_advance").as_deref() != Some("false"));
+                (StatusCode::OK, i.clone())
+            }
+            Some(_) => invalid("This invoice is already finalized."),
+            None => missing("No such invoice"),
+        },
         ("POST", ["v1", "billing", "meter_events"]) => {
             let (Some(event_name), Some(identifier)) = (f("event_name"), f("identifier")) else {
                 return invalid("event_name and identifier are required");

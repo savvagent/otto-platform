@@ -67,13 +67,14 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 pub use config::{Config, EmailConfig, LogFormat, StripeConfig};
+pub use internal::Billing;
 
-/// The routes that need nothing but a database handle: health and the
-/// resource-server API.
-pub fn router(db: Db) -> Router {
+/// The routes that need only a database handle and whether billing is
+/// enabled: health and the resource-server API.
+pub fn router(db: Db, billing: Billing) -> Router {
     health::router(db.clone())
         .merge(introspect::router(db.clone()))
-        .merge(internal::router(db))
+        .merge(internal::router(db, billing))
 }
 
 /// Build the whole application: health, the resource-server API, and the
@@ -86,7 +87,7 @@ pub fn router(db: Db) -> Router {
 pub fn app(db: Db, config: &Config) -> Result<Router> {
     let web = otto_web::router(web_state(db.clone(), config)?);
 
-    let app = router(db).merge(web);
+    let app = router(db, Billing::of(config)).merge(web);
     // Either way an unmatched API-shaped or undecodable path answers JSON: a
     // client that guessed a route needs something it can parse. The exception
     // is a miss under the bundle that is not a page route, such as a missing
@@ -486,6 +487,21 @@ pub fn stripe(config: &Config) -> Result<Option<otto_billing::billing::Stripe>> 
         .transpose()
 }
 
+/// Refuse a Stripe key whose mode (live or test) differs from the one this
+/// database's Stripe objects were made in, recording the mode the first time
+/// ([`otto_billing::billing::check_key_mode`]). Nothing to check with billing
+/// disabled. Called at boot, before anything talks to Stripe.
+pub async fn verify_stripe_mode(db: &Db, config: &Config) -> Result<()> {
+    let Some(stripe) = &config.stripe else {
+        return Ok(());
+    };
+    let mode = otto_billing::billing::check_key_mode(db, &stripe.secret_key)
+        .await
+        .context("refusing to start: the Stripe key does not fit this database")?;
+    tracing::info!(stripe_mode = %mode, "Stripe key mode matches this database");
+    Ok(())
+}
+
 /// Every setting `otto-web` takes from this deployment, in one place so it can
 /// be tested without a database.
 ///
@@ -514,6 +530,36 @@ mod tests {
         config.stripe =
             config::parse_stripe(Some("sk_test_x".into()), Some("whsec_x".into())).unwrap();
         assert!(stripe(&config).unwrap().is_some());
+    }
+
+    #[test]
+    fn billing_mode_follows_the_stripe_secrets() {
+        let mut config = Config::for_test();
+        assert_eq!(Billing::of(&config), Billing::Disabled);
+        config.stripe =
+            config::parse_stripe(Some("sk_test_x".into()), Some("whsec_x".into())).unwrap();
+        assert_eq!(Billing::of(&config), Billing::Enabled);
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn a_stripe_key_of_the_other_mode_is_refused_at_boot(pool: sqlx::PgPool) {
+        let db = Db::from_pool(pool);
+        let mut config = Config::for_test();
+        // Billing off: nothing to check, nothing recorded.
+        verify_stripe_mode(&db, &config).await.unwrap();
+        config.stripe =
+            config::parse_stripe(Some("sk_test_supersecret".into()), Some("whsec_x".into()))
+                .unwrap();
+        verify_stripe_mode(&db, &config).await.unwrap();
+        verify_stripe_mode(&db, &config).await.unwrap();
+        config.stripe =
+            config::parse_stripe(Some("rk_live_supersecret".into()), Some("whsec_x".into()))
+                .unwrap();
+        let err = format!("{:#}", verify_stripe_mode(&db, &config).await.unwrap_err());
+        assert!(err.contains("refusing to start"), "{err}");
+        assert!(err.contains("live-mode key"), "{err}");
+        assert!(err.contains("test mode"), "{err}");
+        assert!(!err.contains("supersecret"), "{err}");
     }
 
     #[test]

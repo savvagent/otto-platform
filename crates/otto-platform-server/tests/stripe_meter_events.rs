@@ -82,7 +82,7 @@ fn basic(uri: &str, secret: &str) -> String {
 }
 
 async fn send(db: &Db, req: Request<Body>) -> (StatusCode, Value) {
-    let res = otto_platform_server::router(db.clone())
+    let res = otto_platform_server::router(db.clone(), otto_platform_server::Billing::Enabled)
         .oneshot(req)
         .await
         .unwrap();

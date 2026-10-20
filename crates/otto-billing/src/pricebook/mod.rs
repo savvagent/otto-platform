@@ -20,9 +20,11 @@
 //! arithmetic and the one rounding step.
 //!
 //! **Only the future is priced.** [`set_version`] writes a version only for a
-//! month after the current one (by the database's clock), so a period that has
-//! been, or is being, billed keeps the price it started with; a meter with no
-//! price gets its first one from next month. A future version is replaced by a
+//! month after the current one that starts at least [`store::MIN_LEAD`] (24
+//! hours) from now (by the database's clock), so a period that has been, or
+//! is being, billed keeps the price it started with, and Stripe has the
+//! switch scheduled well before it happens; a meter with no price gets its
+//! first one from next month at the earliest. A future version is replaced by a
 //! new version with a new id, never edited: the id is what a Stripe Price is
 //! recorded against, and Stripe prices are immutable.
 //!

@@ -142,7 +142,7 @@ Stripe secrets):
 | `OTTO_LOG_FORMAT` | `text` | `json` for structured logs. |
 | `OTTO_SMTP_URL` | unset | Secret. SMTP server for notification email, credentials in the URL: `smtps://user:pass@host:465` or `smtp://user:pass@host:587?tls=required` (plain `smtp://` only to a loopback host). Set together with `OTTO_EMAIL_FROM`; exactly one of the two refuses to start. With neither, email is disabled (logged at boot) and messages stay queued in `notification_outbox`. |
 | `OTTO_EMAIL_FROM` | unset | Secret. The `From:` mailbox for notification email, e.g. `otto <alerts@savvagent.com>`. Set together with `OTTO_SMTP_URL`. |
-| `STRIPE_SECRET_KEY` | unset | Secret. Billing's Stripe API key (`sk_...`, or a restricted `rk_...`). Set together with `STRIPE_WEBHOOK_SECRET`; exactly one of the two refuses to start. With neither, billing is disabled (logged at boot): `GET /api/orgs/{org}/billing` reports `billingEnabled: false`, and `POST /api/orgs/{org}/billing/setup` and `POST /api/stripe/webhook` answer `503 billing_disabled`. |
+| `STRIPE_SECRET_KEY` | unset | Secret. Billing's Stripe API key (`sk_...`, or a restricted `rk_...`), live or test mode (`..._live_...` / `..._test_...`); the first boot records its mode in the database and a key of the other mode refuses to start. Set together with `STRIPE_WEBHOOK_SECRET`; exactly one of the two refuses to start. With neither, billing is disabled (logged at boot): `GET /api/orgs/{org}/billing` reports `billingEnabled: false`, and `POST /api/orgs/{org}/billing/setup` and `POST /api/stripe/webhook` answer `503 billing_disabled`. |
 | `STRIPE_WEBHOOK_SECRET` | unset | Secret. The Stripe webhook endpoint's signing secret (`whsec_...`). Set together with `STRIPE_SECRET_KEY`. |
 
 On startup it will:
@@ -252,8 +252,11 @@ last one `inf`. The meter must already be declared by its service. Only a
 future month can be priced, judged by the database's clock: the current month
 and earlier ones are refused, so a period being billed, or already billed,
 never changes price, and a meter with no price gets its first one from next
-month. Running `set` again for a future month replaces that version with a new
-one (a new id). `list` marks each version `in-effect`, `scheduled` or
+month at the earliest. The month must also start at least 24 hours later, so
+Stripe has the switch scheduled in time (on a month's last day the earliest is
+the month after next). Running `set` again for a future month replaces that
+version with a new one (a new id). `set` prints, and logs at info, what the
+month cost before and after. `list` marks each version `in-effect`, `scheduled` or
 `superseded`, lists declared meters with no price in effect as `unpriced` (or
 `unpriced (scheduled YYYY-MM)`), and shows a stored version that cannot be
 priced as `corrupt: <reason>`. Like `resource ...`, it needs only
@@ -269,8 +272,13 @@ mode, for cards only. When Stripe reports the card on the webhook (`POST
 /api/stripe/webhook`, signature-verified and idempotent by event id), the org
 gets a Stripe subscription with one metered item per priced meter, anchored to
 00:00 UTC on the first of next month with no proration, so usage is invoiced
-monthly in arrears. A canceled subscription stops billing until the owner puts
-a card on file again.
+monthly in arrears. The first subscription is backdated to the start of the
+month and the month's usage so far is queued for it, so the whole month is
+billed through one set of tiers. Each month's invoice is held as a draft
+(`invoice.created`) until the month's usage has reached Stripe, then finalized
+by sync (72 hours at most). A canceled subscription stops billing until the
+owner puts a card on file again. With billing disabled, usage-status never
+answers `payment_required`.
 
 `stripe sync` makes Stripe match the price book. With billing enabled the
 server runs it itself, at boot, every 15 minutes and just after each month
@@ -286,10 +294,12 @@ that have a card on file and no subscription, and puts each subscription on a
 Stripe subscription schedule that switches it to a new version's prices at
 exactly 00:00 UTC on the first of that version's month. It adopts a Stripe
 meter, customer or subscription left by an interrupted earlier attempt rather
-than making a second. It is idempotent (`nothing to do` when Stripe already
-matches), warns as a subscription nears Stripe's 20 items, and exits non-zero
-after listing what it could not do. It needs `DATABASE_URL` and
-`STRIPE_SECRET_KEY`. The Stripe account, the restricted key and the webhook
+than making a second, and finalizes held invoices whose usage has reached
+Stripe. It is idempotent (`nothing to do` when Stripe already matches), warns as
+a subscription nears Stripe's 20 items, and exits non-zero after listing what
+it could not do. It needs `DATABASE_URL` and `STRIPE_SECRET_KEY`, and like the
+server refuses a key whose mode (live or test) differs from the one recorded in
+the database. The Stripe account, the restricted key and the webhook
 endpoint are set up by hand: see
 [`docs/deploy/fly.md`](docs/deploy/fly.md#stripe-setup).
 

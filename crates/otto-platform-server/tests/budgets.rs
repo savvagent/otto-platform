@@ -132,7 +132,15 @@ fn basic(uri: &str, secret: &str) -> String {
 }
 
 async fn send(db: &Db, req: Request<Body>) -> (StatusCode, Value) {
-    let res = otto_platform_server::router(db.clone())
+    send_with(db, otto_platform_server::Billing::Enabled, req).await
+}
+
+async fn send_with(
+    db: &Db,
+    billing: otto_platform_server::Billing,
+    req: Request<Body>,
+) -> (StatusCode, Value) {
+    let res = otto_platform_server::router(db.clone(), billing)
         .oneshot(req)
         .await
         .unwrap();
@@ -187,8 +195,14 @@ impl World {
     }
 
     async fn status(&self, auth: &str) -> Value {
-        let (status, body) = send(
+        self.status_with(auth, otto_platform_server::Billing::Enabled)
+            .await
+    }
+
+    async fn status_with(&self, auth: &str, billing: otto_platform_server::Billing) -> Value {
+        let (status, body) = send_with(
             &self.db,
+            billing,
             Request::get(format!("/internal/orgs/{}/usage-status", self.org))
                 .header("authorization", auth)
                 .body(Body::empty())
@@ -428,7 +442,7 @@ async fn a_hard_stop_on_one_service_leaves_another_unblocked(pool: PgPool) {
     // Through the client, as a resource server reads it.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let app = otto_platform_server::router(w.db.clone());
+    let app = otto_platform_server::router(w.db.clone(), otto_platform_server::Billing::Enabled);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let org = w.org.as_uuid();
     let flags_client =
@@ -772,6 +786,35 @@ async fn billable_use_past_free_tiers_needs_a_payment_method(pool: PgPool) {
         reason(&w.status(&w.factory).await),
         Some(json!("payment_required"))
     );
+}
+
+/// With billing disabled (no Stripe secrets) no card can be put on file, so
+/// payment is never required, however far past its free tiers a service is;
+/// a budget's hard stop still blocks.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn payment_is_never_required_with_billing_disabled(pool: PgPool) {
+    use otto_platform_server::Billing;
+    let w = world(pool).await;
+    price(&w.db, JOBS, 0, &[(Some(10), 0), (None, CENT)]).await;
+    let reason = |status: &Value| status.get("blocked_reason").cloned();
+    w.ship(&w.factory, vec![event(w.org, Some(JOBS), Some(50))])
+        .await;
+    // The same org and usage: required with billing on, not with it off.
+    assert_eq!(
+        reason(&w.status_with(&w.factory, Billing::Enabled).await),
+        Some(json!("payment_required"))
+    );
+    let off = w.status_with(&w.factory, Billing::Disabled).await;
+    assert_eq!(reason(&off), None, "{off}");
+    assert!(off.get("budget").is_none(), "{off}");
+    let parsed: otto_resource::UsageStatus = serde_json::from_value(off).unwrap();
+    assert!(!parsed.billable_blocked());
+
+    // A hard stop still blocks with billing off, and reports its budget.
+    w.set_budget("otto-factory", 10, true).await;
+    let off = w.status_with(&w.factory, Billing::Disabled).await;
+    assert_eq!(reason(&off), Some(json!("budget_exceeded")), "{off}");
+    assert_eq!(off["budget"]["blocked"], true);
 }
 
 /// With a live subscription and no budget, usage-status does not rate spend

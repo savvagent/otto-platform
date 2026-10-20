@@ -22,6 +22,7 @@ use otto_tenant::ids::OrgId;
 use otto_tenant::Db;
 use serde_json::{json, Value};
 
+use super::invoices::invoice_created;
 use super::sync::reconcile_org;
 use super::{
     actions, idem, lock_row, org_of_customer, read_row, Error, OrgLease, PaymentMethodStatus,
@@ -41,23 +42,24 @@ pub enum EventOutcome {
     Ignored(String),
 }
 
-fn ignored(why: impl Into<String>) -> EventOutcome {
+pub(super) fn ignored(why: impl Into<String>) -> EventOutcome {
     EventOutcome::Ignored(why.into())
 }
 
 /// The event types [`handle_event`] acts on. Register the webhook endpoint for
 /// exactly these.
-pub const HANDLED_EVENT_TYPES: [&str; 6] = [
+pub const HANDLED_EVENT_TYPES: [&str; 7] = [
     "checkout.session.completed",
     "customer.subscription.updated",
     "customer.subscription.deleted",
+    "invoice.created",
     "invoice.paid",
     "invoice.payment_failed",
     "payment_method.detached",
 ];
 
 /// A string field of a Stripe object, or the `id` of an expanded one.
-fn id_field<'a>(object: &'a Value, field: &str) -> Option<&'a str> {
+pub(super) fn id_field<'a>(object: &'a Value, field: &str) -> Option<&'a str> {
     match object.get(field)? {
         Value::String(s) => Some(s.as_str()),
         Value::Object(o) => o.get("id")?.as_str(),
@@ -68,7 +70,7 @@ fn id_field<'a>(object: &'a Value, field: &str) -> Option<&'a str> {
 
 /// The subscription an invoice bills: `parent.subscription_details.
 /// subscription` from API version 2025-03-31.basil on, `subscription` before.
-fn invoice_subscription(invoice: &Value) -> Option<&str> {
+pub(super) fn invoice_subscription(invoice: &Value) -> Option<&str> {
     invoice
         .get("parent")
         .and_then(|p| p.get("subscription_details"))
@@ -131,6 +133,9 @@ pub async fn handle_event(
                     Kind::Subscription => {
                         subscription_changed(db, &lease, org, object, created).await
                     }
+                    Kind::InvoiceCreated => {
+                        invoice_created(db, client, &lease, org, object, created).await
+                    }
                     Kind::InvoicePaid => {
                         invoice_settled(db, &lease, org, object, created, true).await
                     }
@@ -153,6 +158,7 @@ pub async fn handle_event(
 enum Kind {
     Checkout,
     Subscription,
+    InvoiceCreated,
     InvoicePaid,
     InvoiceFailed,
     Detached,
@@ -164,6 +170,7 @@ impl Kind {
         match event_type {
             "checkout.session.completed" => Self::Checkout,
             "customer.subscription.updated" | "customer.subscription.deleted" => Self::Subscription,
+            "invoice.created" => Self::InvoiceCreated,
             "invoice.paid" => Self::InvoicePaid,
             "invoice.payment_failed" => Self::InvoiceFailed,
             "payment_method.detached" => Self::Detached,
