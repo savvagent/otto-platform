@@ -43,11 +43,12 @@ export type ParsedDollars = { ok: true; cents: number } | { ok: false; reason: D
 
 /**
  * Whole dollars, then optionally a decimal mark (`.` or `,`, since half the
- * console's languages write `250,50`) and one or two digits of cents.
- * Grouping separators are refused rather than guessed at: `1,234` is a
+ * console's languages write `250,50`) and up to two digits of cents. Either
+ * side may be empty, so `.5` and `12.` read as people mean them, but not
+ * both. Grouping separators are refused rather than guessed at: `1,234` is a
  * thousand-odd dollars in English and one dollar and change in German.
  */
-const DOLLARS = /^(\d+)(?:[.,](\d{1,2}))?$/;
+const DOLLARS = /^(?=[.,]?\d)(\d*)(?:[.,](\d{0,2}))?$/;
 
 /**
  * A typed dollar amount, as exact integer cents within the server's range.
@@ -56,11 +57,15 @@ const DOLLARS = /^(\d+)(?:[.,](\d{1,2}))?$/;
  * rather than wrapping or losing digits on its way to the bound check.
  */
 export function parseDollars(input: string): ParsedDollars {
-  const trimmed = input.trim().replace(/^\$\s*/, '');
+  // A dollar sign either side, as `$250` or the `250 $` some locales write.
+  const trimmed = input
+    .trim()
+    .replace(/^\$\s*/, '')
+    .replace(/\s*\$$/, '');
   if (trimmed === '') return { ok: false, reason: 'empty' };
   const match = DOLLARS.exec(trimmed);
   if (!match) return { ok: false, reason: 'invalid' };
-  const whole = BigInt(match[1]!);
+  const whole = BigInt(match[1] || '0');
   const fraction = BigInt((match[2] ?? '').padEnd(2, '0'));
   const cents = whole * 100n + fraction;
   if (cents < BigInt(MIN_MONTHLY_BUDGET_CENTS)) return { ok: false, reason: 'too_small' };

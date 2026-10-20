@@ -31,6 +31,11 @@
    * focus goes back to it. After a save or a removal focus moves to the
    * confirmation, a live region, so a keyboard or screen-reader user hears
    * that it worked and is not left on a button that may have just vanished.
+   * The region stays in the tree, empty until there is something to say, and
+   * is cleared as soon as the form is edited again.
+   *
+   * The hard stop is a plain checkbox, not a switch: it takes effect on Save,
+   * with the amount, rather than the moment it is toggled.
    */
   interface Props {
     /** The org slug. */
@@ -134,6 +139,7 @@
     <input
       bind:this={input}
       bind:value={amount}
+      oninput={() => (notice = undefined)}
       id="{id}-amount"
       name="amount"
       class="otto-input mt-1 w-full max-w-60"
@@ -153,9 +159,9 @@
   <div class="flex items-start gap-2">
     <input
       bind:checked={hardStop}
+      onchange={() => (notice = undefined)}
       id="{id}-hard-stop"
       type="checkbox"
-      role="switch"
       class="mt-0.5 size-4 accent-accent"
       aria-describedby="{id}-hard-stop-hint"
     />
@@ -187,13 +193,7 @@
     {/if}
   </div>
 
-  <p
-    bind:this={status}
-    tabindex="-1"
-    role="status"
-    class="text-sm text-ok outline-none"
-    class:hidden={!notice}
-  >
+  <p bind:this={status} tabindex="-1" role="status" class="min-h-5 text-sm text-ok outline-none">
     {notice ?? ''}
   </p>
 </form>

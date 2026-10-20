@@ -24,14 +24,17 @@
    * bucket fields the server still sends are not read (see `UsageStatus`).
    *
    * The budgets read rides along for its fired thresholds, so an alert shows
-   * here as well as on the budgets page.
+   * here as well as on the budgets page. It is optional: if it fails, the
+   * usage still shows, with a quiet note that alerts could not be read,
+   * rather than a page blanked over a secondary read.
    */
 
   const org = useOrg();
 
   interface Report {
     usage: UsageStatus;
-    budgets: BudgetsResponse;
+    /** `undefined` when the budgets read failed. */
+    budgets: BudgetsResponse | undefined;
   }
 
   let report = $state<Report | undefined>(undefined);
@@ -46,10 +49,14 @@
 
     void (async () => {
       try {
-        const [usage, budgets] = await Promise.all([api.usage(slug), api.budgets(slug)]);
+        const [usage, budgets] = await Promise.allSettled([api.usage(slug), api.budgets(slug)]);
+        if (usage.status === 'rejected') throw usage.reason;
         // A fast navigation between two orgs can land the first fetch after the second.
         if (org.slug !== slug) return;
-        report = { usage, budgets };
+        report = {
+          usage: usage.value,
+          budgets: budgets.status === 'fulfilled' ? budgets.value : undefined
+        };
       } catch (e) {
         if (org.slug === slug) error = messageFor(e, m.usage_load_failed());
       }
@@ -75,7 +82,11 @@
   {:else if !report}
     <Loading what={m.usage_reading_meter()} />
   {:else}
-    <BudgetAlerts services={report.budgets.services} />
+    {#if report.budgets}
+      <BudgetAlerts services={report.budgets.services} />
+    {:else}
+      <p class="text-xs text-faint">{m.usage_alerts_unavailable()}</p>
+    {/if}
 
     <p class="text-xs text-faint">
       {m.usage_period_since({ date: day(report.usage.periodStart) })}

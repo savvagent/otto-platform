@@ -64,8 +64,9 @@ describe('the budgets page', () => {
     expect(
       document.getElementById(amount.getAttribute('aria-describedby')!)?.textContent
     ).toContain('$10,000,000.00');
-    const hardStop = flags.querySelector<HTMLInputElement>('input[role="switch"]')!;
-    expect(hardStop.type).toBe('checkbox');
+    const hardStop = flags.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    // A plain checkbox: it applies on Save, so it is not a switch.
+    expect(hardStop.getAttribute('role')).toBeNull();
     expect(hardStop.checked).toBe(false);
     expect(container.querySelector(`label[for="${hardStop.id}"]`)?.textContent).toBe('Hard stop');
     expect(flags.textContent).toContain('Remove budget');
@@ -125,7 +126,7 @@ describe('the budgets page', () => {
 
     const flags = card('Otto Flags');
     type(flags.querySelector<HTMLInputElement>('input[name="amount"]')!, '250.50');
-    const hardStop = flags.querySelector<HTMLInputElement>('input[role="switch"]')!;
+    const hardStop = flags.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
     hardStop.click();
     flushSync();
     expect(hardStop.checked).toBe(true);
@@ -133,12 +134,17 @@ describe('the budgets page', () => {
 
     await vi.waitFor(() => expect(flags.textContent).toContain('Budget saved for Otto Flags.'));
     expect(sent).toEqual({ monthlyBudgetCents: 25_050, hardStop: true });
-    const status = flags.querySelector('[role="status"][tabindex="-1"]');
+    const status = flags.querySelector('[role="status"][tabindex="-1"]')!;
     await vi.waitFor(() => expect(document.activeElement).toBe(status));
     expect(flags.querySelector('[role="meter"]')?.getAttribute('aria-valuetext')).toBe(
       '$82.50 of $250.50 spent (32%)'
     );
     expect(requests(fetchMock)).toContain('PUT /api/orgs/acme/budgets/otto-flags');
+
+    // Editing again clears the confirmation; the region itself stays.
+    type(flags.querySelector<HTMLInputElement>('input[name="amount"]')!, '300');
+    expect(status.isConnected).toBe(true);
+    expect(status.textContent?.trim()).toBe('');
 
     unmount(instance);
   });
@@ -167,6 +173,52 @@ describe('the budgets page', () => {
     expect(described).toContain(message);
     await vi.waitFor(() => expect(document.activeElement).toBe(amount));
     expect(requests(fetchMock)).toEqual(['GET /api/orgs/acme/budgets']);
+
+    unmount(instance);
+  });
+
+  it('starts with an empty confirmation region already in place', async () => {
+    vi.stubGlobal('fetch', serve({ 'GET /api/orgs/acme/budgets': () => json(BUDGETS) }));
+    const instance = render('owner');
+    await loaded();
+
+    const status = card('Otto Flags').querySelector('[role="status"][tabindex="-1"]');
+    expect(status).not.toBeNull();
+    expect(status!.textContent?.trim()).toBe('');
+    expect(status!.classList.contains('hidden')).toBe(false);
+
+    unmount(instance);
+  });
+
+  it('announces alerts present on load politely, and one the user caused assertively', async () => {
+    const blocked: ServiceBudget = {
+      ...FLAGS_ROW,
+      thresholdsReached: [50, 80, 100],
+      budget: { ...FLAGS_ROW.budget!, monthlyBudgetCents: 5_000, hardStop: true, blocked: true }
+    };
+    vi.stubGlobal(
+      'fetch',
+      serve({
+        'GET /api/orgs/acme/budgets': () => json(BUDGETS),
+        'PUT /api/orgs/acme/budgets/otto-flags': () => json(blocked)
+      })
+    );
+    const instance = render('owner');
+    await loaded();
+
+    const region = () => container.querySelector('section[aria-label="Budget alerts"]')!;
+    expect(region().querySelector('[role="status"]')?.textContent).toContain('80%');
+    expect(region().querySelector('[role="alert"]')).toBeNull();
+
+    const flags = card('Otto Flags');
+    type(flags.querySelector<HTMLInputElement>('input[name="amount"]')!, '50');
+    flags.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click();
+    submit(flags.querySelector('form')!);
+
+    await vi.waitFor(() => expect(region().querySelector('[role="alert"]')).not.toBeNull());
+    expect(region().querySelector('[role="alert"]')?.textContent).toContain(
+      'Otto Flags has reached its monthly budget and its hard stop is on'
+    );
 
     unmount(instance);
   });

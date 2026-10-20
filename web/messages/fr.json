@@ -533,5 +533,7 @@
   "billing_refresh": "Actualiser",
   "billing_error_busy": "Une autre modification de la facturation de cette organisation est en cours. Réessayez dans un instant.",
   "billing_error_stripe": "Le prestataire de paiement n’a pas pu aboutir pour le moment. Réessayez bientôt.",
-  "billing_setup_failed": "Impossible de lancer l’enregistrement de la carte."
+  "billing_setup_failed": "Impossible de lancer l’enregistrement de la carte.",
+  "billing_retry": "Réessayer",
+  "usage_alerts_unavailable": "Les alertes de budget n’ont pas pu être lues pour le moment."
 }

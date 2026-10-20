@@ -533,5 +533,7 @@
   "billing_refresh": "Actualizar",
   "billing_error_busy": "Hay otro cambio de facturación en curso para esta organización. Inténtalo de nuevo en un momento.",
   "billing_error_stripe": "El proveedor de pagos no ha podido completarlo ahora. Inténtalo de nuevo en breve.",
-  "billing_setup_failed": "No se pudo iniciar el registro de la tarjeta."
+  "billing_setup_failed": "No se pudo iniciar el registro de la tarjeta.",
+  "billing_retry": "Reintentar",
+  "usage_alerts_unavailable": "No se pudieron leer los avisos de presupuesto en este momento."
 }

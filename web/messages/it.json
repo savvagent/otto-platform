@@ -533,5 +533,7 @@
   "billing_refresh": "Aggiorna",
   "billing_error_busy": "È in corso un’altra modifica alla fatturazione di questa organizzazione. Riprova tra un momento.",
   "billing_error_stripe": "Il fornitore dei pagamenti non è riuscito a completare la richiesta. Riprova a breve.",
-  "billing_setup_failed": "Impossibile avviare la registrazione della carta."
+  "billing_setup_failed": "Impossibile avviare la registrazione della carta.",
+  "billing_retry": "Riprova",
+  "usage_alerts_unavailable": "Al momento non è stato possibile leggere gli avvisi di budget."
 }

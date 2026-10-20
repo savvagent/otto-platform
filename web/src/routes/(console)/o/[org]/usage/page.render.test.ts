@@ -109,7 +109,23 @@ describe('the usage page', () => {
     unmount(instance);
   });
 
-  it('shows an error rather than a half-drawn page when a read fails', async () => {
+  it('shows an error rather than a half-drawn page when the usage read fails', async () => {
+    vi.stubGlobal(
+      'fetch',
+      serve({
+        'GET /api/orgs/acme/usage': () => failure(502, 'unknown'),
+        'GET /api/orgs/acme/budgets': () => json(BUDGETS)
+      })
+    );
+    const instance = render('owner');
+
+    await vi.waitFor(() => expect(container.querySelector('[role="alert"]')).not.toBeNull());
+    expect(container.querySelector('table')).toBeNull();
+
+    unmount(instance);
+  });
+
+  it('still shows usage when only the budgets read fails, with a quiet note', async () => {
     vi.stubGlobal(
       'fetch',
       serve({
@@ -117,10 +133,12 @@ describe('the usage page', () => {
         'GET /api/orgs/acme/budgets': () => failure(502, 'unknown')
       })
     );
-    const instance = render('owner');
+    const instance = render('member');
 
-    await vi.waitFor(() => expect(container.querySelector('[role="alert"]')).not.toBeNull());
-    expect(container.querySelector('table')).toBeNull();
+    await vi.waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(2));
+    expect(container.textContent).toContain('Budget alerts could not be read just now.');
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.querySelector('section[aria-label="Budget alerts"]')).toBeNull();
 
     unmount(instance);
   });

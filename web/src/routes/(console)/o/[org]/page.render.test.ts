@@ -19,9 +19,11 @@ const members = [
 const teams = [{ id: 't1', orgId: 'o1', slug: 'core', name: 'Core', createdAt: '2026-01-01' }];
 let container: HTMLElement;
 
-function serve(healthy: boolean) {
+function serve(healthy: boolean, budgetsHealthy = true) {
   return vi.fn((path: string) => {
-    if (!healthy) return Promise.resolve(new Response('', { status: 502 }));
+    if (!healthy || (!budgetsHealthy && path.endsWith('/budgets'))) {
+      return Promise.resolve(new Response('', { status: 502 }));
+    }
     const body = path.endsWith('/members')
       ? members
       : path.endsWith('/teams')
@@ -113,6 +115,20 @@ describe('the organization overview', () => {
       expect(container.querySelector('[role="alert"]')).not.toBeNull();
     });
     expect(container.querySelector('[role="meter"]')).toBeNull();
+
+    unmount(instance);
+  });
+
+  it('still shows the overview when only the budgets read fails', async () => {
+    vi.stubGlobal('fetch', serve(true, false));
+    const instance = mount(Harness, { target: container, props: { slug: 'acme' } });
+
+    await vi.waitFor(() => {
+      expect(container.querySelector('[role="meter"]')).not.toBeNull();
+    });
+    expect(container.textContent).toContain('Budget alerts could not be read just now.');
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.querySelector('section[aria-label="Budget alerts"]')).toBeNull();
 
     unmount(instance);
   });

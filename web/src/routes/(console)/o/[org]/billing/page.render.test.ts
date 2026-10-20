@@ -12,6 +12,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('$app/state', async () => await import('$lib/components/marketing/fake-app-state.svelte'));
 vi.mock('./checkout', () => ({ leaveForCheckout: vi.fn(() => true) }));
+vi.mock('$app/navigation', async () => {
+  const { page } = await import('$lib/components/marketing/fake-app-state.svelte');
+  return {
+    replaceState: vi.fn((url: URL) => {
+      page.url = new URL(url);
+    })
+  };
+});
 
 import { page } from '$lib/components/marketing/fake-app-state.svelte';
 import type { BillingStatus, Role } from '$lib/types';
@@ -45,6 +53,7 @@ beforeEach(() => {
   document.body.appendChild(container);
   page.url = new URL('http://localhost/o/acme/billing');
   vi.mocked(leaveForCheckout).mockClear();
+  vi.mocked(leaveForCheckout).mockImplementation(() => true);
 });
 
 afterEach(() => {
@@ -94,6 +103,9 @@ describe('the billing page', () => {
       'GET /api/orgs/acme/billing',
       'POST /api/orgs/acme/billing/setup'
     ]);
+    // On its way to Stripe: the button stays busy, so it cannot be pressed twice.
+    await Promise.resolve();
+    expect(button('Add card')!.disabled).toBe(true);
 
     unmount(instance);
   });
@@ -168,7 +180,6 @@ describe('the billing page', () => {
 
   it.each([
     [409, 'billing_busy', 'Another billing change for this organization is in progress.'],
-    [503, 'billing_disabled', 'Billing is not enabled on this deployment.'],
     [502, 'stripe_unavailable', 'The payment provider could not complete this right now.']
   ])('explains a %i %s from setup, and stays put', async (status, code, message) => {
     vi.stubGlobal(
@@ -182,12 +193,86 @@ describe('the billing page', () => {
     await vi.waitFor(() => expect(button('Add card')).toBeDefined());
 
     button('Add card')!.click();
-    await vi.waitFor(() => expect(container.querySelector('[role="alert"]')).not.toBeNull());
-    expect(container.querySelector('[role="alert"]')?.textContent).toContain(message);
+    const error = () => container.querySelector<HTMLElement>('[data-setup-error]');
+    await vi.waitFor(() => expect(error()).not.toBeNull());
+    expect(error()!.textContent).toContain(message);
+    // Announced by taking focus, not by a live region as well.
+    expect(error()!.getAttribute('role')).toBeNull();
+    expect(error()!.querySelector('[role]')).toBeNull();
+    await vi.waitFor(() => expect(document.activeElement).toBe(error()));
     expect(leaveForCheckout).not.toHaveBeenCalled();
-    await vi.waitFor(() =>
-      expect(document.activeElement?.querySelector('[role="alert"]')).not.toBeNull()
+    expect(button('Add card')!.disabled).toBe(false);
+
+    unmount(instance);
+  });
+
+  it('says once that billing is off when setup answers 503 billing_disabled', async () => {
+    vi.stubGlobal(
+      'fetch',
+      serve({
+        'GET /api/orgs/acme/billing': () => json(NO_CARD),
+        'POST /api/orgs/acme/billing/setup': () => failure(503, 'billing_disabled')
+      })
     );
+    const instance = render('owner');
+    await vi.waitFor(() => expect(button('Add card')).toBeDefined());
+
+    button('Add card')!.click();
+    await vi.waitFor(() => expect(button('Add card')).toBeUndefined());
+    const said =
+      container.textContent!.split('Billing is not enabled on this deployment.').length - 1;
+    expect(said).toBe(1);
+    expect(container.querySelector('[data-setup-error]')).toBeNull();
+    await vi.waitFor(() =>
+      expect(document.activeElement?.textContent).toContain('Billing is not enabled')
+    );
+
+    unmount(instance);
+  });
+
+  it('refuses to follow a setup URL that is not https', async () => {
+    const actual = await vi.importActual<typeof import('./checkout')>('./checkout');
+    vi.mocked(leaveForCheckout).mockImplementation(actual.leaveForCheckout);
+    vi.stubGlobal(
+      'fetch',
+      serve({
+        'GET /api/orgs/acme/billing': () => json(NO_CARD),
+        'POST /api/orgs/acme/billing/setup': () => json({ url: 'javascript:alert(1)' })
+      })
+    );
+    const instance = render('owner');
+    await vi.waitFor(() => expect(button('Add card')).toBeDefined());
+
+    button('Add card')!.click();
+    await vi.waitFor(() =>
+      expect(container.querySelector('[data-setup-error]')?.textContent).toContain(
+        'Could not start card setup.'
+      )
+    );
+    expect(page.url.href).toBe('http://localhost/o/acme/billing');
+    expect(button('Add card')!.disabled).toBe(false);
+
+    unmount(instance);
+  });
+
+  it('offers to try again when the status cannot be read', async () => {
+    let reads = 0;
+    vi.stubGlobal(
+      'fetch',
+      serve({
+        'GET /api/orgs/acme/billing': () =>
+          ++reads === 1 ? failure(502, 'unknown') : json(NO_CARD)
+      })
+    );
+    const instance = render('owner');
+
+    await vi.waitFor(() => expect(button('Try again')).toBeDefined());
+    expect(container.querySelector('[role="alert"]')).not.toBeNull();
+
+    button('Try again')!.click();
+    await vi.waitFor(() => expect(button('Add card')).toBeDefined());
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(reads).toBe(2);
 
     unmount(instance);
   });
@@ -201,6 +286,8 @@ describe('the billing page', () => {
     expect(container.querySelector('[role="status"]')?.textContent?.trim()).toBe(
       'Card setup was cancelled. Nothing changed.'
     );
+    // Taken off the URL once read, so a reload does not say it again.
+    expect(page.url.search).toBe('');
 
     unmount(instance);
   });
@@ -230,9 +317,10 @@ describe('the billing page', () => {
       'The card is on file.'
     );
 
-    // Confirmed: no more polling.
+    // Confirmed: no more polling, and nothing left in the URL to restart it.
     await vi.advanceTimersByTimeAsync(20_000);
     expect(reads).toBe(3);
+    expect(page.url.searchParams.has('setup')).toBe(false);
 
     unmount(instance);
   });
@@ -260,5 +348,52 @@ describe('the billing page', () => {
     expect(reads).toBe(7);
 
     unmount(instance);
+  });
+
+  it('stops re-reading once the page is gone', async () => {
+    vi.useFakeTimers();
+    page.url = new URL('http://localhost/o/acme/billing?setup=success');
+    let reads = 0;
+    vi.stubGlobal(
+      'fetch',
+      serve({
+        'GET /api/orgs/acme/billing': () => {
+          reads++;
+          return json(NO_CARD);
+        }
+      })
+    );
+    const instance = render('owner');
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(reads).toBe(2);
+    unmount(instance);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(reads).toBe(2);
+  });
+
+  it('does not start polling if the page goes away during the first read', async () => {
+    vi.useFakeTimers();
+    page.url = new URL('http://localhost/o/acme/billing?setup=success');
+    let reads = 0;
+    let answer: (r: Response) => void = () => {};
+    vi.stubGlobal(
+      'fetch',
+      serve({
+        'GET /api/orgs/acme/billing': () => {
+          reads++;
+          return new Promise<Response>((resolve) => (answer = resolve));
+        }
+      })
+    );
+    const instance = render('owner');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reads).toBe(1);
+
+    unmount(instance);
+    answer(json(NO_CARD));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(reads).toBe(1);
   });
 });

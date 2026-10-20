@@ -25,14 +25,34 @@ describe('parseDollars', () => {
   it('accepts a comma as the decimal mark, a leading dollar sign and surrounding space', () => {
     expect(parseDollars(' 250,50 ')).toEqual({ ok: true, cents: 25_050 });
     expect(parseDollars('$99')).toEqual({ ok: true, cents: 9_900 });
+    expect(parseDollars('99$')).toEqual({ ok: true, cents: 9_900 });
+    expect(parseDollars('250,50 $')).toEqual({ ok: true, cents: 25_050 });
+  });
+
+  it('reads a bare fraction and a trailing decimal mark as meant', () => {
+    expect(parseDollars('.5')).toEqual({ ok: true, cents: 50 });
+    expect(parseDollars(',05')).toEqual({ ok: true, cents: 5 });
+    expect(parseDollars('12.')).toEqual({ ok: true, cents: 1_200 });
   });
 
   it('says why an amount is refused', () => {
     expect(parseDollars('')).toEqual({ ok: false, reason: 'empty' });
     expect(parseDollars('   ')).toEqual({ ok: false, reason: 'empty' });
-    for (const bad of ['abc', '1.234', '1,234,567', '-5', '1e3', '12.', '.5', '0x10', '1 000']) {
+    for (const bad of [
+      'abc',
+      '1.234',
+      '1,234,567',
+      '-5',
+      '1e3',
+      '.',
+      ',',
+      '0x10',
+      '1 000',
+      '$$5'
+    ]) {
       expect(parseDollars(bad), bad).toEqual({ ok: false, reason: 'invalid' });
     }
+    expect(parseDollars(' $ ')).toEqual({ ok: false, reason: 'empty' });
     expect(parseDollars('0')).toEqual({ ok: false, reason: 'too_small' });
     expect(parseDollars('0.00')).toEqual({ ok: false, reason: 'too_small' });
   });

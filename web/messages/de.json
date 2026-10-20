@@ -532,5 +532,7 @@
   "billing_refresh": "Aktualisieren",
   "billing_error_busy": "Für diese Organisation läuft bereits eine andere Änderung der Abrechnung. Versuche es gleich noch einmal.",
   "billing_error_stripe": "Der Zahlungsanbieter konnte das gerade nicht abschließen. Versuche es gleich noch einmal.",
-  "billing_setup_failed": "Die Einrichtung der Karte konnte nicht gestartet werden."
+  "billing_setup_failed": "Die Einrichtung der Karte konnte nicht gestartet werden.",
+  "billing_retry": "Erneut versuchen",
+  "usage_alerts_unavailable": "Die Budget-Benachrichtigungen konnten gerade nicht gelesen werden."
 }

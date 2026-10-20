@@ -532,5 +532,7 @@
   "billing_refresh": "Refresh",
   "billing_error_busy": "Another billing change for this organization is in progress. Try again in a moment.",
   "billing_error_stripe": "The payment provider could not complete this right now. Try again shortly.",
-  "billing_setup_failed": "Could not start card setup."
+  "billing_setup_failed": "Could not start card setup.",
+  "billing_retry": "Try again",
+  "usage_alerts_unavailable": "Budget alerts could not be read just now."
 }
