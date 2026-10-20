@@ -90,8 +90,32 @@ async fn main() -> Result<()> {
 
     // Lifecycle webhooks: the same key that seals IdP secrets seals each
     // resource server's signing secret.
-    let (stop_webhooks, stop_rx) = tokio::sync::watch::channel(false);
-    let webhook_task = tokio::spawn(otto_platform_server::webhooks::run(db, cipher, stop_rx));
+    let (stop_tasks, stop_rx) = tokio::sync::watch::channel(false);
+    let webhook_task = tokio::spawn(otto_platform_server::webhooks::run(
+        db.clone(),
+        cipher,
+        stop_rx.clone(),
+    ));
+
+    // Notification email, only when SMTP is configured. Without it rows wait
+    // in the outbox; saying so here is the difference between "email is off"
+    // and "email is broken" for whoever reads the boot log.
+    let email_task = match &config.email {
+        Some(email) => {
+            let mailer = otto_platform_server::email::SmtpMailer::new(email)?;
+            tracing::info!("notification email enabled");
+            Some(tokio::spawn(otto_platform_server::email::run(
+                db, mailer, stop_rx,
+            )))
+        }
+        None => {
+            tracing::warn!(
+                "notification email disabled: OTTO_SMTP_URL and OTTO_EMAIL_FROM are not set; \
+                 messages stay queued in notification_outbox until both are"
+            );
+            None
+        }
+    };
 
     let listener = TcpListener::bind(config.bind)
         .await
@@ -115,8 +139,11 @@ async fn main() -> Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .context("server error")?;
-    let _ = stop_webhooks.send(true);
+    let _ = stop_tasks.send(true);
     let _ = webhook_task.await;
+    if let Some(task) = email_task {
+        let _ = task.await;
+    }
     tracing::info!("shut down cleanly");
     Ok(())
 }

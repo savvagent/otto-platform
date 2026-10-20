@@ -66,6 +66,35 @@ pub struct Config {
 
     pub run_migrations: bool,
     pub log_format: LogFormat,
+
+    /// Outgoing notification email (`OTTO_SMTP_URL` and `OTTO_EMAIL_FROM`,
+    /// both secrets, set together or not at all). `None` disables sending:
+    /// the server says so at boot, the delivery loop does not run, and queued
+    /// rows wait in `notification_outbox` until a deployment configures it.
+    pub email: Option<EmailConfig>,
+}
+
+/// Where and as whom notification email is sent. Both values are secrets
+/// (the URL carries the SMTP credentials), so `Debug` shows neither.
+#[derive(Clone)]
+pub struct EmailConfig {
+    /// `lettre`'s URL syntax, credentials in the userinfo:
+    /// `smtps://user:pass@host:465` (implicit TLS) or
+    /// `smtp://user:pass@host:587?tls=required` (STARTTLS, refused if the
+    /// server does not offer it). A bare `smtp://` sends the password in clear,
+    /// so it is accepted only to a loopback host (a local mail catcher).
+    pub smtp_url: String,
+    /// The `From:` mailbox, e.g. `otto <alerts@savvagent.com>`.
+    pub from: String,
+}
+
+impl std::fmt::Debug for EmailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmailConfig")
+            .field("smtp_url", &"<redacted>")
+            .field("from", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,9 +131,92 @@ impl Config {
                 "text" => Ok(LogFormat::Text),
                 other => Err(anyhow!("expected json or text, got {other:?}")),
             })?,
+            email: parse_email(optional("OTTO_SMTP_URL"), optional("OTTO_EMAIL_FROM"))?,
             public_url,
         })
     }
+}
+
+/// `OTTO_SMTP_URL` and `OTTO_EMAIL_FROM`: both, or neither.
+///
+/// Exactly one is a boot error rather than "email off": an operator who set
+/// one of a pair meant to turn email on, and a deployment that quietly does
+/// not send budget alerts is the failure this file exists to prevent.
+///
+/// No message here repeats either value. The URL holds the SMTP password, and
+/// a boot error lands in the same log aggregator as everything else.
+fn parse_email(smtp_url: Option<String>, from: Option<String>) -> Result<Option<EmailConfig>> {
+    let (smtp_url, from) = match (smtp_url, from) {
+        (None, None) => return Ok(None),
+        (Some(u), Some(f)) => (u.trim().to_string(), f.trim().to_string()),
+        (Some(_), None) => {
+            return Err(anyhow!(
+                "OTTO_SMTP_URL is set but OTTO_EMAIL_FROM is not; set both to send \
+                 notification email, or neither to disable it"
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(anyhow!(
+                "OTTO_EMAIL_FROM is set but OTTO_SMTP_URL is not; set both to send \
+                 notification email, or neither to disable it"
+            ))
+        }
+    };
+    validate_smtp_url(&smtp_url)?;
+    from.parse::<lettre::message::Mailbox>().map_err(|e| {
+        anyhow!(
+            "OTTO_EMAIL_FROM is not a valid mailbox ({e}); expected an address such as \
+             alerts@example.com or `Name <alerts@example.com>` (value not shown)"
+        )
+    })?;
+    Ok(Some(EmailConfig { smtp_url, from }))
+}
+
+fn validate_smtp_url(raw: &str) -> Result<()> {
+    const SHAPE: &str = "expected smtps://user:password@host:465 or \
+                         smtp://user:password@host:587?tls=required \
+                         (value not shown: it holds credentials)";
+    let parsed =
+        url::Url::parse(raw).map_err(|e| anyhow!("OTTO_SMTP_URL is not a URL ({e}); {SHAPE}"))?;
+    if !matches!(parsed.scheme(), "smtp" | "smtps") {
+        return Err(anyhow!(
+            "OTTO_SMTP_URL must use the smtp or smtps scheme, got {:?}; {SHAPE}",
+            parsed.scheme()
+        ));
+    }
+    let Some(host) = parsed.host().filter(|h| !h.to_string().is_empty()) else {
+        return Err(anyhow!("OTTO_SMTP_URL has no host; {SHAPE}"));
+    };
+    // lettre reads `smtp://` with no `tls` parameter as plaintext, and
+    // `tls=opportunistic` as "plaintext if STARTTLS is not offered", which an
+    // attacker on the path can arrange. Either way the AUTH that follows
+    // carries the password in clear.
+    let tls_required = parsed.scheme() == "smtps"
+        || parsed
+            .query_pairs()
+            .any(|(k, v)| k == "tls" && v == "required");
+    // `smtp` is not a scheme the URL standard knows, so an IPv4 host arrives
+    // as an opaque `Domain` string rather than `Host::Ipv4`.
+    let loopback = match host {
+        url::Host::Domain(d) => {
+            d.eq_ignore_ascii_case("localhost")
+                || d.parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    if !tls_required && !loopback {
+        return Err(anyhow!(
+            "OTTO_SMTP_URL would send the SMTP password unencrypted; use smtps:// or add \
+             ?tls=required. {SHAPE}"
+        ));
+    }
+    // lettre has its own opinions (the `tls` query parameter, for one); ask it
+    // too, so a URL it would refuse fails here and not on the first send.
+    lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::from_url(raw)
+        .map_err(|_| anyhow!("OTTO_SMTP_URL is not a URL the SMTP client accepts; {SHAPE}"))?;
+    Ok(())
 }
 
 /// Parsed rather than merely stored: an `OTTO_PUBLIC_URL` with no scheme
@@ -174,6 +286,7 @@ impl Config {
             static_dir: None,
             run_migrations: true,
             log_format: LogFormat::Text,
+            email: None,
         }
     }
 }
@@ -207,6 +320,82 @@ mod tests {
         assert_eq!(
             parse_var("OTTO_TEST_ABSENT_VAR_XYZ", "7", |v| Ok(v.parse::<u8>()?)).unwrap(),
             7
+        );
+    }
+
+    const URL: &str = "smtps://mailer:hunter2-secret@smtp.example.com:465";
+    const FROM: &str = "otto <alerts@example.com>";
+
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn email_with_both_set_is_enabled() {
+        let email = parse_email(s(URL), s(FROM)).unwrap().expect("enabled");
+        assert_eq!(email.smtp_url, URL);
+        assert_eq!(email.from, FROM);
+        for url in [
+            "smtp://u:p@smtp.example.com:587?tls=required",
+            "smtp://localhost:1025",
+            "smtp://u:p@127.0.0.1:2525",
+        ] {
+            assert!(
+                parse_email(s(url), s("alerts@example.com"))
+                    .unwrap()
+                    .is_some(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn email_with_neither_set_is_disabled_not_an_error() {
+        assert!(parse_email(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn email_with_only_one_set_is_a_boot_error_naming_the_missing_one() {
+        let err = parse_email(s(URL), None).unwrap_err().to_string();
+        assert!(err.contains("OTTO_EMAIL_FROM is not"), "{err}");
+        let err = parse_email(None, s(FROM)).unwrap_err().to_string();
+        assert!(err.contains("OTTO_SMTP_URL is not"), "{err}");
+    }
+
+    #[test]
+    fn malformed_email_settings_are_errors_that_never_echo_the_secret() {
+        for (url, from) in [
+            ("hunter2-secret", FROM),
+            ("https://mailer:hunter2-secret@smtp.example.com", FROM),
+            ("smtp://mailer:hunter2-secret@", FROM),
+            ("smtp://mailer:hunter2-secret@smtp.example.com:587", FROM),
+            (
+                "smtp://mailer:hunter2-secret@smtp.example.com:587?tls=opportunistic",
+                FROM,
+            ),
+            ("smtp://mailer:hunter2-secret@127.0.0.1?tls=sometimes", FROM),
+            (URL, "not an address hunter2-secret"),
+            (URL, "alerts@"),
+        ] {
+            let err = format!("{:#}", parse_email(s(url), s(from)).expect_err(url));
+            assert!(!err.contains("hunter2"), "secret echoed: {err}");
+            assert!(!err.contains("mailer"), "username echoed: {err}");
+            let names = if from == FROM {
+                "OTTO_SMTP_URL"
+            } else {
+                "OTTO_EMAIL_FROM"
+            };
+            assert!(err.contains(names), "{err} should name {names}");
+        }
+    }
+
+    #[test]
+    fn email_config_debug_hides_both_values() {
+        let email = parse_email(s(URL), s(FROM)).unwrap().unwrap();
+        let shown = format!("{email:?}");
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("alerts@"),
+            "{shown}"
         );
     }
 

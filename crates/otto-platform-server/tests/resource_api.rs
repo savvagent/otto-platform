@@ -1553,6 +1553,7 @@ async fn resource_server_calls_are_not_subject_to_the_browser_csrf_guard(pool: P
         static_dir: None,
         run_migrations: true,
         log_format: otto_platform_server::LogFormat::Text,
+        email: None,
     };
     let app = || otto_platform_server::app(w.db.clone(), &config).unwrap();
     let token = w.oauth_token(FACTORY, &["jobs:read"]).await;

@@ -20,8 +20,9 @@
 //! The resource-server-facing endpoints authenticate with the resource
 //! server's own credential ([`api::CallingResourceServer`]), not a session
 //! cookie, and are outside `otto-web`'s CSRF guard, which only wraps its own
-//! router. Lifecycle webhooks are delivered by [`webhooks::run`], a background
-//! task the binary starts; `otto-platform-server resource ...` provisions
+//! router. Lifecycle webhooks are delivered by [`webhooks::run`], and
+//! notification email by [`email::run`] when SMTP is configured, background
+//! tasks the binary starts; `otto-platform-server resource ...` provisions
 //! resource servers ([`resource_cmd`]) and `otto-platform-server client ...`
 //! registers first-party OAuth clients ([`client_cmd`]). The console bundle is
 //! a separate piece in `web/`, served from here when `OTTO_STATIC_DIR` is set,
@@ -35,6 +36,7 @@
 pub mod api;
 pub mod client_cmd;
 pub mod config;
+pub mod email;
 pub mod health;
 pub mod internal;
 pub mod introspect;
@@ -56,7 +58,7 @@ use tower_http::services::fs::ServeFileSystemResponseBody;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
-pub use config::{Config, LogFormat};
+pub use config::{Config, EmailConfig, LogFormat};
 
 /// The routes that need nothing but a database handle: health and the
 /// resource-server API.
