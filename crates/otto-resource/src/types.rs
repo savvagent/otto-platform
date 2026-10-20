@@ -231,6 +231,107 @@ pub struct UsageStatus {
     /// service's usage never appears here. Empty from an older platform.
     #[serde(default)]
     pub meters: Vec<MeterUsage>,
+    /// The calling service's monthly budget and where its spend stands
+    /// against it. `None` when the org has set no budget for this service, or
+    /// from an older platform. Read [`budget_exceeded`](Self::budget_exceeded)
+    /// to decide whether to refuse a billable call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetStatus>,
+}
+
+/// The reason [`BudgetStatus::reason`] gives when the calling service's hard
+/// stop has refused billable work, and the error code a resource server
+/// should refuse a billable call with.
+pub const BUDGET_EXCEEDED: &str = "budget_exceeded";
+
+/// The reason [`BudgetStatus::reason`] gives when the platform could not
+/// compute this service's spend (a pricing fault on its side). The budget is
+/// still reported, [`spend_cents`](BudgetStatus::spend_cents) and
+/// [`percent_used`](BudgetStatus::percent_used) are `None`, and nothing is
+/// blocked: enforcement fails open.
+pub const SPEND_UNAVAILABLE: &str = "spend_unavailable";
+
+/// The calling service's budget this billing month, in
+/// [`UsageStatus::budget`].
+///
+/// A budget belongs to one service: another service's budget, spend or hard
+/// stop never appears here and never blocks this one. Owners and admins set
+/// budgets in the console; agents can read them (through each service's own
+/// `usage` tool) but not change them.
+///
+/// **Enforcement fails open.** The platform never refuses usage; the resource
+/// server refuses billable calls when [`blocked`](Self::blocked) is true. When
+/// the platform cannot be reached, answers without a `budget`, or cannot
+/// compute spend (reason [`SPEND_UNAVAILABLE`], `blocked` false), a resource
+/// server must treat the service as not blocked. Free calls are never
+/// refused, and reading usage is always free.
+///
+/// ```
+/// let body = serde_json::json!({
+///     "org_id": "8b5c6f8e-6a43-4f53-9a49-0f1f7a1d2b3c",
+///     "plan": "free",
+///     "period_start": "2026-10-01",
+///     "billable_count": 0,
+///     "total_count": 0,
+///     "included_ops": 500,
+///     "hard_stop": false,
+///     "service": "otto-flags",
+///     "budget": {
+///         "monthly_budget_cents": 1000,
+///         "spend_cents": 1250,
+///         "percent_used": 125,
+///         "thresholds_reached": [50, 80, 100],
+///         "hard_stop": true,
+///         "blocked": true,
+///         "reason": "budget_exceeded"
+///     }
+/// });
+/// let status: otto_resource::UsageStatus = serde_json::from_value(body).unwrap();
+/// assert!(status.budget_exceeded());
+/// assert_eq!(status.budget.unwrap().reason.as_deref(), Some(otto_resource::BUDGET_EXCEEDED));
+///
+/// // Spend the platform could not compute never blocks.
+/// let unknown = serde_json::json!({
+///     "monthly_budget_cents": 1000,
+///     "spend_cents": null,
+///     "percent_used": null,
+///     "thresholds_reached": [],
+///     "hard_stop": true,
+///     "blocked": false,
+///     "reason": "spend_unavailable"
+/// });
+/// let b: otto_resource::BudgetStatus = serde_json::from_value(unknown).unwrap();
+/// assert_eq!((b.spend_cents, b.blocked), (None, false));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetStatus {
+    /// The budget for one UTC calendar month, in US cents.
+    pub monthly_budget_cents: i64,
+    /// What this service's value meters have cost this month, in US cents,
+    /// at the prices in effect. Unpriced meters and free calls add nothing.
+    /// `None` when the platform could not compute it ([`SPEND_UNAVAILABLE`]).
+    #[serde(default)]
+    pub spend_cents: Option<i64>,
+    /// Whole percent of the budget spent, rounded down. Can exceed 100.
+    /// `None` when spend is unknown.
+    #[serde(default)]
+    pub percent_used: Option<i64>,
+    /// The alert thresholds (50, 80, 100 percent) that have fired this month,
+    /// ascending. Each fires once a month, with an email to the org's owners
+    /// and admins.
+    #[serde(default)]
+    pub thresholds_reached: Vec<u8>,
+    /// Whether the org opted in to refusing billable calls once spend reaches
+    /// the budget.
+    pub hard_stop: bool,
+    /// Whether billable calls must be refused now: only with
+    /// [`hard_stop`](Self::hard_stop) on and spend at or past the budget.
+    pub blocked: bool,
+    /// Why [`blocked`](Self::blocked) is true ([`BUDGET_EXCEEDED`]), or why
+    /// spend is unknown ([`SPEND_UNAVAILABLE`], never blocked). `None`
+    /// otherwise.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// One declared meter's usage this billing month, in [`UsageStatus::meters`].
@@ -252,6 +353,13 @@ impl UsageStatus {
             self.features.get(feature),
             Some(serde_json::Value::Bool(true))
         )
+    }
+
+    /// Whether the calling service's budget hard stop refuses billable calls
+    /// now. `false` with no budget, when spend is unknown, and from a
+    /// platform that sends none: see [`BudgetStatus`] on failing open.
+    pub fn budget_exceeded(&self) -> bool {
+        self.budget.as_ref().is_some_and(|b| b.blocked)
     }
 
     /// This month's usage of one of the caller's meters, by key.

@@ -8,7 +8,7 @@
 //! ```text
 //!   POST /internal/usage                                     batch usage ingest
 //!   PUT  /internal/meters                                    declare the caller's value meters
-//!   GET  /internal/orgs/{org}/usage-status                   the caller's meters, plan features
+//!   GET  /internal/orgs/{org}/usage-status                   the caller's meters, budget, plan features
 //!   GET  /internal/orgs/{org}/members/{user}                 whoami: user + org + role
 //!   GET  /internal/orgs/{org}/members/by-email?email=        member lookup
 //!   GET  /internal/orgs/{org}/members/{user}/teams           the member's teams in the org
@@ -35,19 +35,23 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use otto_billing::budgets::{
+    self, PendingBudgets, ServiceBudgetStatus, BUDGET_EXCEEDED, SPEND_UNAVAILABLE,
+};
 use otto_billing::meters::{self, MeterSpec};
+use otto_billing::pricebook::Month;
 use otto_billing::usage::{
     self, IngestOutcome, Metered, MeteringFields, ShippedUsage, Shipper, UsageExt,
 };
 use otto_core::orgs::{Org, OrgsExt};
 use otto_core::teams::{Team, TeamsExt};
 use otto_resource::{
-    MemberInfo, MemberTeams, MeterDeclarationBatch, MeterDeclarationReceipt, MeterUsage, OrgInfo,
-    RejectedEvent, RejectedMeter, TeamInfo, UsageBatch, UsageReceipt, UsageStatus, UserInfo,
-    MAX_METER_DECLARATIONS, MAX_USAGE_BATCH,
+    BudgetStatus, MemberInfo, MemberTeams, MeterDeclarationBatch, MeterDeclarationReceipt,
+    MeterUsage, OrgInfo, RejectedEvent, RejectedMeter, TeamInfo, UsageBatch, UsageReceipt,
+    UsageStatus, UserInfo, MAX_METER_DECLARATIONS, MAX_USAGE_BATCH,
 };
 use otto_tenant::ids::{OrgId, TeamId, UserId};
-use otto_tenant::Db;
+use otto_tenant::{Db, Tx};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -177,12 +181,13 @@ async fn ingest_usage(
         }
 
         let mut tx = db.begin(OrgId::from(org)).await?;
+        let mut budgets = PendingBudgets::default();
         let mut accepted = 0;
         let mut duplicates = 0;
         let mut rejected = Vec::new();
         for (ev, metered) in events {
             let outcome = tx
-                .ingest_usage(
+                .ingest_usage_deferred(
                     &rs.resource_uri,
                     &ShippedUsage {
                         event_id: ev.event_id,
@@ -193,6 +198,7 @@ async fn ingest_usage(
                         service,
                         metered,
                     },
+                    &mut budgets,
                 )
                 .await?;
             match outcome {
@@ -204,6 +210,9 @@ async fn ingest_usage(
                 }),
             }
         }
+        // Budget alerts, once per service and period this batch touched. It
+        // never fails the events (see `PendingBudgets::run`).
+        budgets.run(&mut tx).await?;
         tx.commit().await?;
         receipt.accepted += accepted;
         receipt.duplicates += duplicates;
@@ -318,8 +327,10 @@ fn truncate(s: &str, max: usize) -> String {
 /// a cheap read and may be slightly behind the counters. Reading it is free
 /// and works however much has been used.
 ///
-/// `service` and `meters` are the calling resource server's own meters only:
-/// another service's usage never shows here. The legacy family-wide fields are
+/// `service`, `meters` and `budget` are the calling resource server's own
+/// only: another service's usage or budget never shows here, so a hard stop on
+/// one service never blocks another. `budget` is absent when the org has set
+/// none for the caller's service. The legacy family-wide fields are
 /// all still served for clients pinned to an older `otto-resource`, but
 /// `hard_stop` is always `false`: an older client blocks on
 /// `hard_stop && billable_count >= included_ops`, and with a family-wide count
@@ -334,9 +345,13 @@ async fn usage_status(
     let mut tx = db.begin(OrgId::from(org)).await?;
     let usage = tx.current_usage().await?;
     let limits = tx.plan_limits().await?;
-    let meters = match rs.service.as_deref() {
-        Some(service) => tx.service_meter_usage(service).await?,
-        None => Vec::new(),
+    let (meters, budget) = match rs.service.as_deref() {
+        Some(service) => {
+            let meters = tx.service_meter_usage(service).await?;
+            let period = Month::containing(usage.period_start);
+            (meters, budget_status(&mut tx, service, period).await?)
+        }
+        None => (Vec::new(), None),
     };
     tx.rollback().await?;
 
@@ -367,7 +382,46 @@ async fn usage_status(
         },
         service: rs.service,
         meters,
+        budget,
     }))
+}
+
+/// The caller's budget this period, or `None` when it has none.
+///
+/// A budget whose spend cannot be computed (a malformed price version, an
+/// overflow) is still reported, with `spend_cents` and `percent_used` null,
+/// `blocked` false and reason `spend_unavailable`: enforcement fails open,
+/// visibly. A database error fails the request.
+async fn budget_status(
+    tx: &mut Tx<'_>,
+    service: &str,
+    period: Month,
+) -> Result<Option<BudgetStatus>, ApiError> {
+    budgets::service_status(tx, service, period)
+        .await
+        .map(|status| wire_budget(&status))
+        .map_err(ApiError::internal)
+}
+
+fn wire_budget(status: &ServiceBudgetStatus) -> Option<BudgetStatus> {
+    let budget = status.budget.as_ref()?;
+    let blocked = status.blocked();
+    let reason = if blocked {
+        Some(BUDGET_EXCEEDED)
+    } else if status.spend_cents.is_none() {
+        Some(SPEND_UNAVAILABLE)
+    } else {
+        None
+    };
+    Some(BudgetStatus {
+        monthly_budget_cents: budget.monthly_budget_cents,
+        spend_cents: status.spend_cents,
+        percent_used: status.percent_used(),
+        thresholds_reached: status.thresholds_reached.clone(),
+        hard_stop: budget.hard_stop,
+        blocked,
+        reason: reason.map(str::to_owned),
+    })
 }
 
 // ---------------------------------------------------------------- identity

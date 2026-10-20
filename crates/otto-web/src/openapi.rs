@@ -149,6 +149,7 @@ fn param_description(name: &str) -> &'static str {
         "team" => "Team slug.",
         "user" => "User id (UUID).",
         "id" => "Resource id (UUID).",
+        "service" => "Service slug, e.g. `otto-flags`.",
         _ => "",
     }
 }
@@ -169,6 +170,7 @@ fn tag_for(path: &str) -> &'static str {
     } else if path.contains("/invites") {
         "invites"
     } else if path.contains("/usage")
+        || path.contains("/budgets")
         || path.contains("/audit")
         || path.contains("/billing")
         || path.starts_with("/api/stripe")
@@ -194,6 +196,7 @@ fn components() -> Value {
         sso_schemas(),
         plan_schemas(),
         billing_schemas(),
+        budget_schemas(),
         response_schemas(),
         request_schemas(),
     ] {
@@ -539,8 +542,15 @@ fn entity_schemas() -> Value {
                 "warning": { "type": "boolean" },
                 "hardStop": { "type": "boolean" },
                 "enforced": { "type": "boolean" },
+                "services": {
+                    "type": "array",
+                    "items": reference("ServiceUsage"),
+                    "description":
+                        "Each service with declared meters, by slug: its own meters, \
+                         spend and budget this month.",
+                },
             },
-            "required": ["plan", "includedOps", "billableUsed", "remaining"],
+            "required": ["plan", "includedOps", "billableUsed", "remaining", "services"],
         },
         "AuditEvent": {
             "type": "object",
@@ -735,6 +745,137 @@ fn billing_schemas() -> Value {
             "description": "Stripe's event was verified and is handled (or needs nothing).",
             "properties": { "received": { "type": "boolean", "const": true } },
             "required": ["received"],
+        },
+    })
+}
+
+/// Per-service budgets, and the per-service part of the usage page.
+fn budget_schemas() -> Value {
+    json!({
+        "BudgetsResponse": {
+            "type": "object",
+            "properties": {
+                "periodStart": {
+                    "type": "string",
+                    "format": "date",
+                    "description": "First day of the UTC billing month the spend is for.",
+                },
+                "services": {
+                    "type": "array",
+                    "items": reference("ServiceBudget"),
+                    "description": "Every service with declared meters, by slug.",
+                },
+            },
+            "required": ["periodStart", "services"],
+        },
+        "ServiceBudget": {
+            "type": "object",
+            "description": "One service's budget and spend this month.",
+            "properties": {
+                "service": { "type": "string", "description": "The service slug." },
+                "spendCents": {
+                    "type": ["integer", "null"],
+                    "format": "int64",
+                    "description":
+                        "What the service's meters have cost this month, in US cents, at \
+                         the prices in effect. Unpriced meters and free calls add nothing. \
+                         Null when it cannot be computed (see `spendError`).",
+                },
+                "spendError": {
+                    "type": ["string", "null"],
+                    "enum": ["pricing_unavailable", null],
+                    "description":
+                        "`pricing_unavailable` when this service's spend could not be \
+                         computed (a pricing fault on the platform's side); null otherwise. \
+                         Other services are unaffected, and nothing is blocked on it.",
+                },
+                "thresholdsReached": {
+                    "type": "array",
+                    "items": { "type": "integer", "enum": [50, 80, 100] },
+                    "description":
+                        "The alert thresholds (percent) that have fired this month, \
+                         ascending. Each fires once a month.",
+                },
+                "budget": {
+                    "oneOf": [reference("Budget"), { "type": "null" }],
+                    "description": "Null when no budget is set.",
+                },
+            },
+            "required": ["service", "spendCents", "spendError", "thresholdsReached", "budget"],
+        },
+        "Budget": {
+            "type": "object",
+            "description": "A service's monthly budget, and where spend stands against it.",
+            "properties": {
+                "monthlyBudgetCents": { "type": "integer", "format": "int64" },
+                "hardStop": {
+                    "type": "boolean",
+                    "description":
+                        "Refuse billable calls to this service once spend reaches the budget.",
+                },
+                "percentUsed": {
+                    "type": ["integer", "null"],
+                    "description":
+                        "Whole percent spent, rounded down. Can exceed 100. Null when spend \
+                         is unknown.",
+                },
+                "blocked": {
+                    "type": "boolean",
+                    "description":
+                        "Whether the service is refusing billable calls now: hard stop on \
+                         and spend at or past the budget.",
+                },
+                "updatedAt": { "type": "string", "format": "date-time" },
+            },
+            "required": ["monthlyBudgetCents", "hardStop", "percentUsed", "blocked", "updatedAt"],
+        },
+        "SetBudgetRequest": {
+            "type": "object",
+            "properties": {
+                "monthlyBudgetCents": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 1,
+                    "maximum": 1_000_000_000,
+                    "description": "The budget for one UTC calendar month, in US cents.",
+                },
+                "hardStop": { "type": "boolean", "default": false },
+            },
+            "required": ["monthlyBudgetCents"],
+            "additionalProperties": false,
+        },
+        "ServiceUsage": {
+            "type": "object",
+            "description": "One metered service's usage this month.",
+            "properties": {
+                "service": { "type": "string" },
+                "meters": { "type": "array", "items": reference("MeterUsage") },
+                "spendCents": {
+                    "type": ["integer", "null"],
+                    "format": "int64",
+                    "description": "Null when it cannot be computed (see `spendError`).",
+                },
+                "spendError": {
+                    "type": ["string", "null"],
+                    "enum": ["pricing_unavailable", null],
+                },
+                "budget": {
+                    "oneOf": [reference("Budget"), { "type": "null" }],
+                    "description": "Null when no budget is set.",
+                },
+            },
+            "required": ["service", "meters", "spendCents", "spendError", "budget"],
+        },
+        "MeterUsage": {
+            "type": "object",
+            "description": "One declared meter's quantity this month, zero when unused.",
+            "properties": {
+                "meter": { "type": "string", "description": "`<service>/<meter>`." },
+                "displayName": { "type": "string" },
+                "unit": { "type": "string" },
+                "quantity": { "type": "integer", "format": "int64" },
+            },
+            "required": ["meter", "displayName", "unit", "quantity"],
         },
     })
 }
