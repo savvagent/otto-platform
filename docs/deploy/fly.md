@@ -241,3 +241,48 @@ nothing needs configuring. `the_console_served_directly_keeps_csrf_and_json_404s
 Deploys run from CI on a release (`flyctl deploy --remote-only -a otto-platform`). The
 image builds the console in its own stage, so one commit ships the server and the bundle
 together and they cannot drift.
+
+## Migrations and rolling back
+
+Every machine applies the schema migrations (`crates/otto-tenant/migrations`) when it
+boots, under a Postgres advisory lock, so the first machine of a new release migrates and
+the rest find nothing to do. There are no down migrations, and the schema is never rolled
+back.
+
+**Migrations are additive.** A migration adds tables, nullable columns, constraints and
+indexes; it never drops or renames anything a released binary reads. So a newer schema is
+always one the previous release can run against, and the migrator is built for it: it
+ignores applied migrations it does not know (`otto_tenant::db::MIGRATOR`), instead of
+refusing to boot. **To roll back, deploy the previous release's image** (for example
+`fly deploy -a otto-platform --image <previous image>`; `fly releases -a otto-platform
+--image` lists them). It boots against the newer schema and serves. Do not touch
+`_sqlx_migrations`. When the rolled-forward release ships again, it finds its migrations
+already applied. Every migration a release does know is still checked against its applied
+checksum, so an edited migration is still refused.
+
+A migration that has to remove or rename something needs two releases: one that stops
+using it, then one that removes it. Only the second one migrates.
+
+Migrations that lock a busy table set `lock_timeout = '5s'` first. A migration waiting
+for such a lock would queue every later query on that table behind it; instead it fails,
+the machine's boot fails, Fly restarts it, and the next boot retries. A deploy whose new
+machines keep failing their health check stops there, with the previous release's machines
+still serving.
+
+## Release notes
+
+### Per-service value meters (epic #55, migrations 0017 to 0023)
+
+- **Usage during the rolling deploy.** Until every machine runs the new release, a machine
+  still on the old release keeps ingesting usage events, and those events count only toward
+  the legacy family-wide totals (`org_period_usage`, the console usage page). They are not
+  counted in the per-service and per-meter pools (`org_service_period_usage`,
+  `org_meter_period_usage`), so budgets and Stripe metered billing do not see them, and
+  nothing backfills them. The gap is the length of the rollout, usually minutes. The same
+  applies after a rollback: events ingested while the previous release serves count only
+  toward the legacy totals.
+- **Rollback is safe.** The previous release boots against the new schema (see
+  [Migrations and rolling back](#migrations-and-rolling-back)). From this release on, the
+  migrator ignores applied migrations it does not know. A release from *before* this one
+  does not; it refuses to boot against a database with migrations it lacks. So roll back
+  no further than this release once its migrations have been applied.
