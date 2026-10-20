@@ -1,7 +1,7 @@
 # Value meters, pay-as-you-go, and spend budgets
 
 **Epic:** savvagent/otto-platform#55
-**Status:** IN PROGRESS
+**Status:** IMPLEMENTED (#84)
 
 ## Goal
 
