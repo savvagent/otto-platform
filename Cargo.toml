@@ -58,9 +58,12 @@ aes-gcm = "0.10"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # SMTP for notification email. rustls with ring and webpki roots, like reqwest
-# above: no OpenSSL from this crate, so the image needs nothing new.
+# above: no OpenSSL from this crate, so the image needs nothing new. No `pool`
+# feature: a pooled connection whose send is cancelled by our deadline goes
+# back to the pool with a reply still in flight, and the next message reads
+# that reply as its own. One connection per send closes with its future.
 lettre = { version = "0.11", default-features = false, features = [
-  "smtp-transport", "pool", "hostname", "builder", "tokio1-rustls", "ring", "webpki-roots",
+  "smtp-transport", "hostname", "builder", "tokio1-rustls", "ring", "webpki-roots",
 ] }
 jsonwebtoken = "9"
 hickory-resolver = "0.26"

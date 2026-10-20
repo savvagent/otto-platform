@@ -244,10 +244,11 @@ pub async fn mark_sent(db: &Db, id: Uuid) -> Result<()> {
 
 /// Record a failed attempt and schedule the retry, or give up when
 /// [`MAX_ATTEMPTS`] is spent or the failure is `permanent` (the server refused
-/// this recipient or message for good, e.g. `550 no such user`; asking again
-/// will not change its mind). A failure that is about the sender rather than
-/// the message, such as rejected SMTP credentials, must not be `permanent`:
-/// it would discard every queued email instead of waiting for the fix.
+/// this recipient or message for good, e.g. `550 5.1.1 user unknown`; asking
+/// again will not change its mind). A failure that is about the sender rather
+/// than the message, such as rejected SMTP credentials or an unauthorised
+/// `From:` (`5.7.x`), must not be `permanent`: it would discard every queued
+/// email instead of waiting for the fix.
 ///
 /// A row already sent or given up on is left alone.
 ///

@@ -52,10 +52,16 @@ UPDATE notification_outbox
  WHERE sent_at IS NULL AND failed_at IS NULL;
 ```
 
-**Wrong credentials.** A rejected SMTP login logs one `error` ("the SMTP server rejected
-our credentials") and keeps every message queued, retrying with backoff for about a day
-(32 attempts). Fix `OTTO_SMTP_URL` within that window and nothing is lost. A message the
-server refuses outright (`550 no such user`) is given up at once.
+**Wrong credentials or sender.** When the SMTP server refuses the platform rather than one
+message (a rejected login, an `OTTO_EMAIL_FROM` the provider does not let us send as, a
+`5.7.x` policy refusal, a refused greeting), the server logs one `error` ("the SMTP server
+refused us, not the message") and keeps every message queued, retrying with backoff for
+about a day (32 attempts). Fix the secret within that window and nothing is lost. Only a
+refusal whose enhanced status code blames that one message (`5.1.x` recipient mailbox,
+`5.2.x` mailbox state, `5.3.4` size, `5.6.x` content) is given up at once.
+
+**Duplicates.** Delivery is at-least-once: if the server accepts a message but its reply
+does not arrive within 30 s, or the result cannot be recorded, the message is sent again.
 
 **Re-queueing failed messages.** Rows that ran out of attempts stay with `failed_at` and
 `last_error` set. After fixing the cause, connect (`fly postgres connect -a otto-db -d
