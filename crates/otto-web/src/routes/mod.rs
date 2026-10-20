@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod billing;
+pub mod budgets;
 pub mod orgs;
 pub mod plans;
 pub mod sso;

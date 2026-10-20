@@ -35,6 +35,11 @@
 //! adds to no meter, so nothing priced by meters (spend, budgets, invoices)
 //! ever sees it.
 //!
+//! After the counters, a metered event runs the budget step
+//! ([`crate::budgets`]) in the same transaction: it records and emails any
+//! budget threshold the event's service has newly reached. It never rejects
+//! or fails the event.
+//!
 //! Meter declarations are add-only ([`crate::meters`] never removes one), so
 //! an event accepted once stays acceptable: a replay of it reaches the ledger
 //! claim and comes back [`IngestOutcome::Duplicate`], never `unknown_meter`.
@@ -52,6 +57,8 @@ use otto_tenant::Tx;
 use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
+
+use crate::pricebook::Month;
 
 /// The first day of the current UTC billing month, as SQL.
 ///
@@ -474,12 +481,16 @@ impl UsageExt for Tx<'_> {
         // from a server with no slug counts only in the legacy bucket, and an
         // unmetered one adds to no meter. A metered event's quantity counts
         // whatever `billable` says (module docs).
+        //
+        // The final SELECT reads the service's budget for a metered event
+        // (no row otherwise, or with no budget), so the budget step below
+        // costs nothing for the common case. It reads, it does not lock.
         let at = event.occurred_at.min(now);
         let (meter, quantity) = match event.metered {
             Some(m) => (Some(m.meter), Some(m.quantity)),
             None => (None, None),
         };
-        sqlx::query(
+        let budget: Option<crate::budgets::IngestBudget> = sqlx::query_as(
             "WITH event AS ( \
                INSERT INTO usage_events \
                  (org_id, user_id, tool, billable, created_at, resource_uri, meter, quantity) \
@@ -515,7 +526,8 @@ impl UsageExt for Tx<'_> {
                  SET quantity = org_meter_period_usage.quantity + EXCLUDED.quantity, \
                      updated_at = now() \
              ) \
-             SELECT 1",
+             SELECT b.monthly_budget_cents, b.hard_stop FROM service_budgets b \
+             WHERE $7::text IS NOT NULL AND b.org_id = $1 AND b.service = $9::text",
         )
         .bind(org)
         .bind(event.user)
@@ -526,11 +538,21 @@ impl UsageExt for Tx<'_> {
         .bind(meter)
         .bind(quantity)
         .bind(event.service)
-        .execute(self.conn())
+        .fetch_optional(self.conn())
         .await?;
 
-        // Later stories hook in here, in this same transaction: budget alerts
-        // (#63) and the Stripe meter outbox (#64).
+        // After the counters, in this same transaction: steps that read what
+        // the event just counted. Each must leave a valid event counted
+        // whatever happens to it (see `budgets::after_metered_event`).
+        //
+        // Budget alerts, for a metered event of a service with a budget
+        // only: an unmetered event adds no spend, so it can reach no
+        // threshold. The period is the event's month, the one its counters
+        // were written to.
+        if let (Some(service), Some(budget)) = (event.service, budget) {
+            crate::budgets::after_metered_event(self, service, Month::of(at), budget).await?;
+        }
+        // The Stripe meter outbox (#64) goes here.
         Ok(IngestOutcome::Counted)
     }
 

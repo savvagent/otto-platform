@@ -1,9 +1,11 @@
 //! The usage meter, read-only.
 //!
 //! The same numbers the resource servers' own `usage` reports are built from
-//! (`otto_billing::usage`), so the figure in the console and the figure an agent
-//! sees cannot disagree: one plan and one usage bucket, family-wide, whichever
-//! otto-* service the calls were made against.
+//! (`otto_billing::usage`, `otto_billing::budgets`), so the figure in the
+//! console and the figure an agent sees cannot disagree. Two generations
+//! share the body: the legacy family-wide bucket (one plan, one count across
+//! every otto-* service), and `services`, each metered service's own meters,
+//! spend and budget.
 //!
 //! **Reading your own bill is free.** Nothing here records usage, and nothing
 //! here refuses anything — enforcement belongs to the resource servers, which
@@ -13,11 +15,14 @@
 //! *why* it has run out.
 
 use axum::extract::{Json, State};
-use otto_billing::usage::{PeriodUsage, PlanLimits, UsageExt};
+use otto_billing::budgets;
+use otto_billing::pricebook::Month;
+use otto_billing::usage::{MeterPeriodUsage, PeriodUsage, PlanLimits, UsageExt};
 use otto_tenant::audit::AuditEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiResult;
+use crate::routes::budgets::{from_budgets, BudgetView};
 use crate::session::OrgCtx;
 use crate::state::AppState;
 
@@ -48,6 +53,45 @@ pub struct UsageStatus {
     /// Whether the resource servers are currently refusing calls over the
     /// bucket at all. See [`crate::state::Config::enforce_quotas`].
     pub enforced: bool,
+    /// Each service with declared meters, by slug: its meters' usage, its
+    /// spend and its budget this month. Added alongside the legacy fields
+    /// above, which keep their meaning.
+    pub services: Vec<ServiceUsage>,
+}
+
+/// One metered service's usage this month.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceUsage {
+    pub service: String,
+    /// Every meter the service has declared, by key, zero when unused.
+    pub meters: Vec<MeterUsageView>,
+    /// What the meters have cost this month, in US cents.
+    pub spend_cents: i64,
+    /// `None` when no budget is set.
+    pub budget: Option<BudgetView>,
+}
+
+/// One meter's quantity this month.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MeterUsageView {
+    /// `<service>/<meter>`.
+    pub meter: String,
+    pub display_name: String,
+    pub unit: String,
+    pub quantity: i64,
+}
+
+impl From<MeterPeriodUsage> for MeterUsageView {
+    fn from(m: MeterPeriodUsage) -> Self {
+        Self {
+            meter: m.meter,
+            display_name: m.display_name,
+            unit: m.unit,
+            quantity: m.quantity,
+        }
+    }
 }
 
 /// Fraction of the bucket at which an org is warned. Matches what the resource
@@ -55,7 +99,12 @@ pub struct UsageStatus {
 const WARN_AT: f64 = 0.8;
 
 impl UsageStatus {
-    fn new(usage: PeriodUsage, limits: PlanLimits, enforced: bool) -> Self {
+    fn new(
+        usage: PeriodUsage,
+        limits: PlanLimits,
+        enforced: bool,
+        services: Vec<ServiceUsage>,
+    ) -> Self {
         let warning = if limits.included_ops <= 0 {
             // A bucket of zero is exhausted from the first call, not a division
             // by zero.
@@ -76,6 +125,7 @@ impl UsageStatus {
             warning,
             hard_stop: limits.hard_stop,
             enforced,
+            services,
         }
     }
 }
@@ -85,11 +135,28 @@ pub async fn get_usage(State(state): State<AppState>, ctx: OrgCtx) -> ApiResult<
     let mut tx = state.db.begin(ctx.org.id).await?;
     let usage = tx.current_usage().await?;
     let limits = tx.plan_limits().await?;
+    // `now()` is fixed for the transaction, so this is the month
+    // `current_usage` just read.
+    let period = Month::containing(usage.period_start);
+    let statuses = budgets::org_status(&mut tx, period)
+        .await
+        .map_err(|e| from_budgets("read service usage", e))?;
+    let mut services = Vec::with_capacity(statuses.len());
+    for status in statuses {
+        let meters = tx.service_meter_usage(&status.service).await?;
+        services.push(ServiceUsage {
+            budget: BudgetView::of(&status),
+            meters: meters.into_iter().map(Into::into).collect(),
+            spend_cents: status.spend_cents,
+            service: status.service,
+        });
+    }
     tx.commit().await?;
     Ok(Json(UsageStatus::new(
         usage,
         limits,
         state.config.enforce_quotas,
+        services,
     )))
 }
 
@@ -143,6 +210,7 @@ mod tests {
                 features: serde_json::json!({}),
             },
             false,
+            Vec::new(),
         )
     }
 

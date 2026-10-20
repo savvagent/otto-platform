@@ -1255,8 +1255,10 @@ fn usage_status_blocking_rules() {
         features: Default::default(),
         service: None,
         meters: Vec::new(),
+        budget: None,
     };
     assert!(!s.is_blocked());
+    assert!(!s.budget_exceeded(), "no budget never blocks");
     s.billable_count = 500;
     assert!(s.is_blocked());
     s.hard_stop = false;

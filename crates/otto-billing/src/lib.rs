@@ -7,6 +7,7 @@
 //! public catalog of tiers, what each service bills by, and what it costs.
 
 pub mod billing;
+pub mod budgets;
 pub mod meters;
 pub mod plans;
 pub mod pricebook;

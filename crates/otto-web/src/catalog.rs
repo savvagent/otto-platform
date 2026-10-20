@@ -22,7 +22,9 @@
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post, put, MethodRouter};
 
-use crate::routes::{auth, billing, orgs, plans, sso, stripe_webhook, teams, tokens, usage};
+use crate::routes::{
+    auth, billing, budgets, orgs, plans, sso, stripe_webhook, teams, tokens, usage,
+};
 use crate::state::AppState;
 use crate::{oauth, openapi};
 
@@ -792,6 +794,45 @@ pub fn catalog() -> Vec<Endpoint> {
                  every other verified event with no action. `500` asks Stripe to retry; \
                  `503 billing_disabled` when this deployment has no Stripe configuration.",
             ),
+        // ----------------------------------------------------------- budgets
+        Endpoint::get("/api/orgs/{org}/budgets", budgets::list_budgets)
+            .auth(Auth::OrgMember)
+            .returns("BudgetsResponse")
+            .summary("Every metered service's budget and spend")
+            .describe(
+                "Any member. One entry per service with declared meters, budgeted or not: \
+                 this month's spend in US cents (each meter's quantity rated against the \
+                 prices in effect for the month, unpriced meters adding nothing), the \
+                 alert thresholds (50, 80, 100 percent) that have fired this month, and \
+                 the budget, or null when none is set. Free to read, and readable by an \
+                 org that is over budget.",
+            ),
+        Endpoint::put("/api/orgs/{org}/budgets/{service}", budgets::set_budget)
+            .auth(Auth::OrgAdmin)
+            .takes("SetBudgetRequest")
+            .returns("ServiceBudget")
+            .summary("Set a service's monthly budget")
+            .describe(
+                "Owner or admin, with the console session only: a bearer token or personal \
+                 access token never reaches this API, so agents can read budgets but not \
+                 change them. Audited (`billing.budget.set`). Sets or replaces the \
+                 service's budget for every month from now on, in US cents (1 to \
+                 1000000000). Alerts fire by email to owners and admins when spend first \
+                 reaches 50, 80 and 100 percent in a month, once each. `hardStop` (off by \
+                 default) makes the service refuse billable calls once spend reaches the \
+                 budget; free calls and every other service keep working. `404` for a \
+                 service with no declared meters.",
+            ),
+        Endpoint::delete("/api/orgs/{org}/budgets/{service}", budgets::clear_budget)
+            .auth(Auth::OrgAdmin)
+            .status(204)
+            .summary("Remove a service's monthly budget")
+            .describe(
+                "Owner or admin, with the console session only. Removes the budget and with \
+                 it any hard stop; `204` whether or not one was set, audited \
+                 (`billing.budget.cleared`) when one was. Alerts that already fired this \
+                 month stay fired. `404` for a service with no declared meters.",
+            ),
         // -------------------------------------------------- tokens & usage
         Endpoint::get("/api/orgs/{org}/tokens", tokens::list_tokens)
             .auth(Auth::OrgMember)
@@ -822,7 +863,12 @@ pub fn catalog() -> Vec<Endpoint> {
             .auth(Auth::OrgMember)
             .returns("UsageStatus")
             .summary("This period's usage against the plan")
-            .describe("Free to read, and readable by an org that has run out."),
+            .describe(
+                "Free to read, and readable by an org that has run out. The legacy \
+                 family-wide bucket, plus `services`: each service with declared meters, \
+                 with its meters' quantities, its spend in US cents and its budget \
+                 (null when none is set).",
+            ),
         Endpoint::get("/api/orgs/{org}/audit", usage::get_audit)
             .auth(Auth::OrgAdmin)
             .returns("AuditEventList")
