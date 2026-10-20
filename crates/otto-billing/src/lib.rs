@@ -7,4 +7,5 @@
 
 pub mod meters;
 pub mod plans;
+pub mod stripe;
 pub mod usage;
