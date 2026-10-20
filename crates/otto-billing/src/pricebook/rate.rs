@@ -1,10 +1,5 @@
 //! The pure half of the price book: months, tiers, and rating. No database.
 
-use std::fmt;
-use std::str::FromStr;
-
-use chrono::{DateTime, Datelike, Days, Months, NaiveDate, Utc};
-
 /// Millionths of a cent in one cent.
 pub const UCENTS_PER_CENT: i64 = 1_000_000;
 
@@ -14,84 +9,9 @@ pub const MAX_TIERS: usize = 64;
 
 // ---------------------------------------------------------------- months
 
-/// A calendar month, as the price book versions by: the month a price takes
-/// effect, at 00:00 UTC on its first day. Written `YYYY-MM`.
-///
-/// ```
-/// use otto_billing::pricebook::Month;
-///
-/// let m: Month = "2026-11".parse().unwrap();
-/// assert_eq!(m.to_string(), "2026-11");
-/// assert!("2026-1".parse::<Month>().is_err());
-/// assert!("2026-13".parse::<Month>().is_err());
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Month(NaiveDate);
-
-impl Month {
-    /// The month `year`-`month`, if `month` is 1 to 12 and the year is one
-    /// `chrono` can represent.
-    pub fn new(year: i32, month: u32) -> Option<Self> {
-        NaiveDate::from_ymd_opt(year, month, 1).map(Self)
-    }
-
-    /// The month `date` falls in.
-    pub fn containing(date: NaiveDate) -> Self {
-        // Subtracting at most 30 days from a valid date cannot leave chrono's
-        // range: the first of the month is itself a valid date.
-        Self(date - Days::new(u64::from(date.day0())))
-    }
-
-    /// The month (UTC) the instant `at` falls in.
-    pub fn of(at: DateTime<Utc>) -> Self {
-        Self::containing(at.date_naive())
-    }
-
-    /// The first day of the month.
-    pub fn first_day(self) -> NaiveDate {
-        self.0
-    }
-
-    /// The month `months` after this one (before it, if negative), if chrono
-    /// can represent it.
-    pub fn offset(self, months: i32) -> Option<Self> {
-        let n = Months::new(months.unsigned_abs());
-        if months >= 0 {
-            self.0.checked_add_months(n)
-        } else {
-            self.0.checked_sub_months(n)
-        }
-        .map(Self)
-    }
-}
-
-impl fmt::Display for Month {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:04}-{:02}", self.0.year(), self.0.month())
-    }
-}
-
-/// Why a `YYYY-MM` string was refused.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("expected a month as YYYY-MM, e.g. 2026-11, got {0:?}")]
-pub struct ParseMonthError(String);
-
-impl FromStr for Month {
-    type Err = ParseMonthError;
-
-    /// Exactly four digits, `-`, two digits.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let err = || ParseMonthError(s.to_owned());
-        let (y, m) = s.split_once('-').ok_or_else(err)?;
-        let digits = |t: &str, n: usize| t.len() == n && t.bytes().all(|b| b.is_ascii_digit());
-        if !digits(y, 4) || !digits(m, 2) {
-            return Err(err());
-        }
-        let year = y.parse().map_err(|_| err())?;
-        let month = m.parse().map_err(|_| err())?;
-        Month::new(year, month).ok_or_else(err)
-    }
-}
+/// Defined in [`crate::period`], where every billing period is reckoned;
+/// the price book versions by it too.
+pub use crate::period::{Month, ParseMonthError};
 
 // ----------------------------------------------------------------- tiers
 
@@ -306,6 +226,7 @@ pub fn month_in_effect(months: impl IntoIterator<Item = Month>, period: Month) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, NaiveDate, Utc};
 
     fn tier(up_to: Option<i64>, unit_amount_ucents: i64) -> Tier {
         Tier {
