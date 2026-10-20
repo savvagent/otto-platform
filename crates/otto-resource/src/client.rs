@@ -262,9 +262,13 @@ impl PlatformClient {
 
     // ------------------------------------------------------------------ usage
 
-    /// The org's usage this month against its plan, cached for
-    /// [`USAGE_STATUS_TTL`]. Check [`UsageStatus::is_blocked`] before doing
-    /// billable work.
+    /// The org's usage this month, cached for [`USAGE_STATUS_TTL`]: this
+    /// service's own meters ([`UsageStatus::meters`]) and the plan's features.
+    ///
+    /// The legacy family-wide fields are deprecated, and
+    /// [`UsageStatus::is_blocked`] is always false against a current platform,
+    /// so do not gate work on it. Per-service budget enforcement arrives with
+    /// the status's budget field (savvagent/otto-platform#63).
     pub async fn usage_status(&self, org_id: Uuid) -> Result<UsageStatus> {
         if let Some(hit) = self.usage.get(&org_id) {
             return Ok(hit);
@@ -427,8 +431,9 @@ impl PlatformClient {
     // ---------------------------------------------------------------- console
 
     /// The platform console's usage page for an org, `/o/{org_slug}/usage`
-    /// under the platform origin: where to send a user whose org is over its
-    /// plan ([`UsageStatus::is_blocked`]). Takes the org's slug
+    /// under the platform origin: where to send a user to review the org's
+    /// usage and billing (and, once per-service budgets land with
+    /// savvagent/otto-platform#63, a user whose budget is exhausted). Takes the org's slug
     /// ([`crate::OrgInfo::slug`]), not its id; the slug is percent-encoded.
     ///
     /// ```

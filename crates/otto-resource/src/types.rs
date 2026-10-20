@@ -160,7 +160,39 @@ impl IntrospectionResponse {
     }
 }
 
-/// An org's usage this billing month against its plan.
+/// An org's usage this billing month, from
+/// `GET /internal/orgs/{org}/usage-status`.
+///
+/// Two generations of fields share this body. [`service`](Self::service) and
+/// [`meters`](Self::meters) are the calling resource server's own value
+/// meters: its pool, unaffected by any other service. The rest (`plan`
+/// through `hard_stop`) are the legacy family-wide bucket, kept so resource
+/// servers pinned to an older release of this crate keep parsing the body.
+/// They are **deprecated**: during the move to value meters the platform
+/// always serves `hard_stop: false`, so [`is_blocked`](Self::is_blocked) is
+/// never true and one service's usage can never stop another's work.
+///
+/// ```
+/// let body = serde_json::json!({
+///     "org_id": "8b5c6f8e-6a43-4f53-9a49-0f1f7a1d2b3c",
+///     "plan": "free",
+///     "period_start": "2026-10-01",
+///     "billable_count": 9000,
+///     "total_count": 9000,
+///     "included_ops": 500,
+///     "hard_stop": false,
+///     "service": "otto-flags",
+///     "meters": [{
+///         "meter": "otto-flags/evaluations",
+///         "display_name": "Flag evaluations",
+///         "unit": "evaluation",
+///         "quantity": 1200
+///     }]
+/// });
+/// let status: otto_resource::UsageStatus = serde_json::from_value(body).unwrap();
+/// assert!(!status.is_blocked());
+/// assert_eq!(status.meter("otto-flags/evaluations").unwrap().quantity, 1200);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageStatus {
     pub org_id: Uuid,
@@ -169,12 +201,19 @@ pub struct UsageStatus {
     pub plan: String,
     /// First day of the UTC billing month the counts are for.
     pub period_start: NaiveDate,
+    /// **Deprecated.** Billable calls this month across every service in the
+    /// family (the legacy shared bucket). Read [`meters`](Self::meters) for
+    /// this service's own usage.
     pub billable_count: i64,
+    /// **Deprecated.** Every call this month across every service in the
+    /// family, billable or not.
     pub total_count: i64,
-    /// Billable operations the plan includes, after any negotiated override.
+    /// **Deprecated.** Billable operations the legacy plan bucket includes,
+    /// after any negotiated override.
     pub included_ops: i64,
-    /// Whether exceeding `included_ops` stops billable work (free plans)
-    /// rather than metering overage.
+    /// **Deprecated.** Always `false` from a platform that serves
+    /// [`meters`](Self::meters), so [`is_blocked`](Self::is_blocked) is never
+    /// true: a family-wide bucket would let one service's usage stop another.
     pub hard_stop: bool,
     /// Capabilities the org's plan unlocks, keyed by capability, as the
     /// platform's `plans.features` holds them. Read them with
@@ -182,6 +221,27 @@ pub struct UsageStatus {
     /// predates the field, so an older platform grants nothing.
     #[serde(default)]
     pub features: BTreeMap<String, serde_json::Value>,
+    /// The calling resource server's service slug, which [`meters`](Self::meters)
+    /// belong to. `None` from an older platform, or when no service has been
+    /// assigned yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// This month's quantity for each meter the calling service has declared,
+    /// zero for one with no usage yet. Only the caller's own meters: another
+    /// service's usage never appears here. Empty from an older platform.
+    #[serde(default)]
+    pub meters: Vec<MeterUsage>,
+}
+
+/// One declared meter's usage this billing month, in [`UsageStatus::meters`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeterUsage {
+    /// The meter's key, `<service>/<meter>`.
+    pub meter: String,
+    pub display_name: String,
+    pub unit: String,
+    /// The sum of the quantities shipped for this meter this month.
+    pub quantity: u64,
 }
 
 impl UsageStatus {
@@ -194,19 +254,59 @@ impl UsageStatus {
         )
     }
 
-    /// Whether the bucket is spent.
+    /// This month's usage of one of the caller's meters, by key.
+    pub fn meter(&self, key: &str) -> Option<&MeterUsage> {
+        self.meters.iter().find(|m| m.meter == key)
+    }
+
+    /// **Deprecated.** Whether the legacy family-wide bucket is spent.
     pub fn over_limit(&self) -> bool {
         self.billable_count >= self.included_ops
     }
 
-    /// Whether billable work must be refused: the bucket is spent and the plan
-    /// does not allow overage.
+    /// **Deprecated.** Whether billable work must be refused under the legacy
+    /// family-wide bucket: it is spent and the plan does not allow overage.
+    /// Never true against a platform that serves [`meters`](Self::meters),
+    /// which always sends `hard_stop: false`.
     pub fn is_blocked(&self) -> bool {
         self.hard_stop && self.over_limit()
     }
 }
 
+/// The largest [`UsageEvent::quantity`] the platform accepts in one event.
+pub const MAX_METER_QUANTITY: u64 = 1_000_000_000;
+
 /// One metered call, as a resource server records it in its own outbox.
+///
+/// An event with no [`meter`](Self::meter) is *unmetered*: it is recorded and
+/// counted (free) but adds to no meter. A metered event names one of the
+/// caller's declared meters by key and carries a
+/// [`quantity`](Self::quantity). The platform refuses, per event in
+/// [`UsageReceipt::rejected`], a meter the caller has not declared
+/// (`unknown_meter`), a `service` other than the caller's own
+/// (`service_mismatch`), and a quantity of 0, above [`MAX_METER_QUANTITY`], or
+/// without a meter (`invalid_quantity`).
+///
+/// ```
+/// use otto_resource::UsageEvent;
+///
+/// let ev = UsageEvent {
+///     event_id: uuid::Uuid::new_v4(),
+///     org_id: uuid::Uuid::new_v4(),
+///     user_id: None,
+///     tool: "flag.evaluate".into(),
+///     billable: true,
+///     occurred_at: chrono::Utc::now(),
+///     service: Some("otto-flags".into()),
+///     meter: Some("otto-flags/evaluations".into()),
+///     quantity: Some(40),
+/// };
+/// // Unset metering fields are left off the wire, so an older platform reads
+/// // the event exactly as before.
+/// let unmetered = UsageEvent { service: None, meter: None, quantity: None, ..ev };
+/// let json = serde_json::to_value(&unmetered).unwrap();
+/// assert!(json.get("meter").is_none());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageEvent {
     /// Minted once, when the outbox row is written, and reused on every
@@ -215,9 +315,29 @@ pub struct UsageEvent {
     pub org_id: Uuid,
     pub user_id: Option<Uuid>,
     pub tool: String,
+    /// Feeds the legacy family-wide counters and this service's billable
+    /// count. A metered event's quantity counts whatever this says.
     pub billable: bool,
     /// When the work happened (decides the billing month).
     pub occurred_at: DateTime<Utc>,
+    /// The shipping resource server's service slug. Optional: the platform
+    /// knows who is calling, and only checks that this, when sent, matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// The declared meter this event counts toward, by its full key
+    /// `<service>/<meter>` (see [`MeterDeclaration::key`]). `None` for an
+    /// unmetered (free) event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meter: Option<String>,
+    /// How many units of [`meter`](Self::meter) this event used, 1 to
+    /// [`MAX_METER_QUANTITY`]. Defaults to 1 when a meter is named without
+    /// one; must be `None` when [`meter`](Self::meter) is. Out-of-range values
+    /// are refused per event (`invalid_quantity`), but a JSON value that is not
+    /// a `u64` at all (negative, fractional, a string) fails the *whole*
+    /// request at parse time, like any other malformed body. This type cannot
+    /// produce one; only a hand-built shipper can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<u64>,
 }
 
 /// The most events one `POST /internal/usage` accepts.
