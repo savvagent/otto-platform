@@ -6,8 +6,9 @@
 //! server, and the resource-server API (see `lib.rs`). The console is the rest
 //! of Phase 4 of `docs/plans/2026-10-06-platform-cutover.md`.
 //!
-//! `otto-platform-server resource ...` and `client ...` are operator commands
-//! instead: they provision resource servers and OAuth clients and exit.
+//! `otto-platform-server resource ...`, `client ...` and `pricebook ...` are
+//! operator commands instead: they provision resource servers and OAuth
+//! clients, or set what each value meter costs, and exit.
 
 use std::net::SocketAddr;
 
@@ -15,6 +16,8 @@ use anyhow::{Context, Result};
 use otto_platform_server::{app, Config, LogFormat};
 use otto_tenant::Db;
 use tokio::net::TcpListener;
+
+mod pricebook_cmd;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,9 +38,13 @@ async fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("client") {
         return run_client_command(&args[1..]).await;
     }
+    if args.first().map(String::as_str) == Some("pricebook") {
+        return run_pricebook_command(&args[1..]).await;
+    }
     if !args.is_empty() {
         anyhow::bail!(
-            "unknown arguments {args:?}; run with none to serve, or `resource ...` / `client ...`"
+            "unknown arguments {args:?}; run with none to serve, or `resource ...` / \
+             `client ...` / `pricebook ...`"
         );
     }
 
@@ -177,6 +184,16 @@ async fn run_client_command(args: &[String]) -> Result<()> {
         .await
         .context("could not connect to DATABASE_URL")?;
     client_cmd::execute(&db, cmd, &mut std::io::stdout()).await
+}
+
+async fn run_pricebook_command(args: &[String]) -> Result<()> {
+    let cmd = pricebook_cmd::parse(args)
+        .map_err(|e| anyhow::anyhow!("{e}\n\n{}", pricebook_cmd::USAGE))?;
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+    let db = Db::connect(&database_url)
+        .await
+        .context("could not connect to DATABASE_URL")?;
+    pricebook_cmd::execute(&db, cmd, chrono::Utc::now(), &mut std::io::stdout()).await
 }
 
 /// Resolves on SIGINT or SIGTERM.

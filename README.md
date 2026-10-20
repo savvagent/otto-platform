@@ -39,7 +39,8 @@ authorization server, sign-in (passkeys and enterprise SSO), and the
 account/org API — for every registered resource server, plus the
 resource-server API (introspection, usage ingest, member lookup, lifecycle
 webhooks) and the public plan catalog, `GET /api/plans` (no credential;
-allowlisted features only; cached in-process for a minute and sent with
+each plan's name, list price and allowlisted features, plus the metered prices
+in effect this month as `meters`; cached in-process for a minute and sent with
 `max-age=300`). With `OTTO_STATIC_DIR` set, as on Fly, it also serves the
 bundle built from `web/` (see `web/README.md`): the public marketing pages,
 prerendered (`/`, `/pricing`, a page per product, each in every language),
@@ -84,9 +85,10 @@ crates/
                           resource-server API (`POST /oauth/introspect`,
                           `/internal/*`), and, with OTTO_STATIC_DIR, the
                           web/ bundle. Delivers lifecycle webhooks and
-                          provisions resource servers and first-party
-                          OAuth clients
-                          (`otto-platform-server resource ...`, `client ...`).
+                          provisions resource servers, first-party
+                          OAuth clients and the price book
+                          (`otto-platform-server resource ...`,
+                          `client ...`, `pricebook ...`).
 ```
 
 Dependency direction: `otto-tenant` ← `otto-core` ← `otto-billing`,
@@ -223,6 +225,32 @@ refused per meter in the receipt. A resource server with no slug gets
 releases a version that declares meters. Otherwise its declarations are
 refused, its metered events are rejected as unknown meters, and the shipper
 drops them: that usage is lost, not delayed.
+
+### The price book
+
+Plans buy features, not usage: usage is priced per value meter, the same on
+every plan, by the price book. A meter's price is a version of graduated tiers
+that takes effect at 00:00 UTC on the first of a month and lasts until the
+meter's next version. Unit amounts are millionths of a US cent (`ucents`); a
+meter's monthly line is rounded to whole cents once, half up. A meter with no
+price in effect charges nothing and is reported as unpriced. Prices are set by
+the owner; the repository ships none.
+
+```sh
+# Illustrative only: the first 1,000 units each month free, then 0.15 cents each.
+otto-platform-server pricebook set example-service/requests --effective 2026-12 \
+  --tier 1000:0 --tier inf:150000
+otto-platform-server pricebook list
+```
+
+Each `--tier` is `<up_to>:<ucents>`, with strictly increasing bounds and the
+last one `inf`. The meter must already be declared by its service. A month
+before the current one is refused, and the current month's price cannot be
+replaced once set, so a billed period never changes price; running `set` again
+for a future month replaces that version with a new one (a new id). `list`
+marks each version `in-effect`, `scheduled` or `superseded`, and lists declared
+meters with no price as `unpriced`. Like `resource ...`, it needs only
+`DATABASE_URL`, pointed at a database a server has already migrated.
 
 ### Running just the migrations
 

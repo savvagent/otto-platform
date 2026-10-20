@@ -1502,11 +1502,24 @@ async fn the_plan_catalog_is_public_ordered_and_cacheable(pool: PgPool) {
 
     let team = &plans[1];
     assert_eq!(team["displayName"], "Team");
-    assert_eq!(team["includedOps"], 10_000);
-    assert_eq!(team["hardStop"], false);
     assert_eq!(team["monthlyCents"], 2900);
     assert_eq!(team["features"]["auto_rollback"], true);
-    assert_eq!(plans[0]["hardStop"], true);
+    // Plans buy features, not usage: no bucket, no hard stop.
+    for plan in plans {
+        let mut keys: Vec<&str> = plan
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["displayName", "features", "monthlyCents", "plan"]);
+    }
+    assert_eq!(
+        reply.body["meters"],
+        serde_json::json!([]),
+        "with an empty price book there are no metered prices, and the key is still there"
+    );
 
     let doc = Call::get("/api/openapi.json").send(&h.router).await;
     doc.expect(StatusCode::OK);
@@ -1515,6 +1528,81 @@ async fn the_plan_catalog_is_public_ordered_and_cacheable(pool: PgPool) {
         "the catalog route is documented"
     );
     assert_eq!(doc.body["paths"]["/api/plans"]["get"]["tags"][0], "billing");
+    let schemas = &doc.body["components"]["schemas"];
+    assert_eq!(
+        schemas["PlansResponse"]["required"],
+        serde_json::json!(["plans", "meters"])
+    );
+    assert!(schemas["PublicPlan"]["properties"]["includedOps"].is_null());
+    assert!(schemas["PublicPlan"]["properties"]["hardStop"].is_null());
+    assert!(schemas["PublicMeter"]["properties"]["tiers"].is_object());
+    assert!(schemas["PublicTier"]["properties"]["unitAmountUcents"].is_object());
+}
+
+/// The catalog lists each priced meter once, with the tiers in effect this
+/// month: not a version that starts next month, and not a meter with no price.
+/// Written as the test pool's superuser (`otto_app` cannot write the price
+/// book); the prices are fixtures.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_plan_catalog_lists_the_metered_prices_in_effect(pool: PgPool) {
+    let h = harness(pool).await;
+    let db = h.db.pool();
+    sqlx::query(
+        "INSERT INTO resource_servers (resource_uri, name, scopes, default_scopes, service) \
+         VALUES ('https://flags.example/mcp', 'flags', '{a}', '{}', 'otto-flags')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO meters (key, service, meter, display_name, unit) VALUES \
+         ('otto-flags/evaluations', 'otto-flags', 'evaluations', 'Flag evaluations', 'evaluation'), \
+         ('otto-flags/unpriced', 'otto-flags', 'unpriced', 'Unpriced', 'thing')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    for (offset, tiers) in [
+        // Last month's price, superseded by this month's.
+        ("-1 month", "($1, 0, NULL, 9)"),
+        ("0 months", "($1, 0, 1000, 0), ($1, 1, NULL, 7)"),
+        // Not yet in effect.
+        ("1 month", "($1, 0, NULL, 1)"),
+    ] {
+        let version: uuid::Uuid = sqlx::query_scalar(&format!(
+            "INSERT INTO price_versions (meter, effective_month) VALUES \
+             ('otto-flags/evaluations', \
+              (date_trunc('month', now() AT TIME ZONE 'UTC') + interval '{offset}')::date) \
+             RETURNING id"
+        ))
+        .fetch_one(db)
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO price_tiers (version_id, position, up_to, unit_amount_ucents) \
+             VALUES {tiers}"
+        ))
+        .bind(version)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    let reply = Call::get("/api/plans").send(&h.router).await;
+    reply.expect(StatusCode::OK);
+    assert_eq!(
+        reply.body["meters"],
+        serde_json::json!([{
+            "service": "otto-flags",
+            "meter": "evaluations",
+            "displayName": "Flag evaluations",
+            "unit": "evaluation",
+            "tiers": [
+                { "upTo": 1000, "unitAmountUcents": 0 },
+                { "upTo": null, "unitAmountUcents": 7 },
+            ],
+        }])
+    );
 }
 
 /// `plans.features` keys belong to the services that read them (migration
