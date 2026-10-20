@@ -14,6 +14,29 @@
 //! what makes both halves of the billing promise true: a call that fails is
 //! never billed (the row rolls back with the work), and a call that succeeds
 //! is never billed twice (there is no second transaction to retry).
+//!
+//! # Value meters and per-service pools
+//!
+//! A shipped event may name one of the shipping service's declared meters
+//! (`meters`, see [`crate::meters`]) and a quantity. [`check_metering`] decides,
+//! without a query, whether the event is acceptable; [`UsageExt::ingest_usage`]
+//! then counts it in three places, all in the ingest transaction:
+//!
+//! - `org_period_usage`, the legacy family-wide bucket, exactly as before
+//!   (its `billable` flag included), for the console usage page;
+//! - `org_service_period_usage`, the shipping service's own pool
+//!   (`billable_count` from the `billable` flag, `total_count` always), when
+//!   the shipper has a service slug;
+//! - `org_meter_period_usage`, the meter's quantity, for a metered event.
+//!
+//! A metered event's quantity always counts toward its meter, whatever its
+//! `billable` flag says: the flag is the legacy call classification and only
+//! feeds the call counters. An event with no meter is unmetered and free: it
+//! adds to no meter, so nothing priced by meters (spend, budgets, invoices)
+//! ever sees it.
+
+use std::collections::HashSet;
+use std::fmt;
 
 use chrono::{DateTime, Datelike, Duration, Months, NaiveTime, Utc};
 use otto_core::error::{Error, Result};
@@ -84,6 +107,162 @@ pub struct ShippedUsage<'a> {
     /// sat in an outbox across midnight on the 1st belongs to the month it was
     /// earned in. Bounded by [`earliest_occurred_at`] and [`MAX_FUTURE_SKEW`].
     pub occurred_at: DateTime<Utc>,
+    /// The *shipping* resource server's service slug, whose pool the event
+    /// counts in. `None` for a server with no slug yet: the event then counts
+    /// only in the legacy family-wide bucket.
+    pub service: Option<&'a str>,
+    /// The meter and quantity, for a metered event that passed
+    /// [`check_metering`]; `None` for an unmetered (free) one.
+    pub metered: Option<Metered<'a>>,
+}
+
+/// The largest quantity one event may carry. Large enough for any real batch
+/// of work, small enough that no plausible number of events overflows a
+/// `bigint` total.
+pub const MAX_METER_QUANTITY: u64 = 1_000_000_000;
+
+/// Rejection code: the event names a meter its shipper has not declared.
+pub const UNKNOWN_METER: &str = "unknown_meter";
+/// Rejection code: the event's `service` is not its shipper's.
+pub const SERVICE_MISMATCH: &str = "service_mismatch";
+/// Rejection code: a quantity of 0, above [`MAX_METER_QUANTITY`], or sent
+/// without a meter.
+pub const INVALID_QUANTITY: &str = "invalid_quantity";
+
+/// How much of a refused meter key is echoed back. A valid key is at most
+/// 63 + 1 + 63 bytes.
+const MAX_ECHOED_METER: usize = 128;
+
+/// A metered event's meter key and quantity, as [`check_metering`] accepted
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Metered<'a> {
+    /// A declared `meters.key`.
+    pub meter: &'a str,
+    /// 1 to [`MAX_METER_QUANTITY`].
+    pub quantity: i64,
+}
+
+/// Why [`check_metering`] refused an event: a machine-readable `code`
+/// ([`UNKNOWN_METER`], [`SERVICE_MISMATCH`] or [`INVALID_QUANTITY`]) and a
+/// sentence for the shipper's log. Displays as `<code>: <detail>`, which is the
+/// `reason` a rejected event carries in the ingest receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeteringRejection {
+    pub code: &'static str,
+    pub detail: String,
+}
+
+impl fmt::Display for MeteringRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for MeteringRejection {}
+
+fn reject(code: &'static str, detail: impl Into<String>) -> MeteringRejection {
+    MeteringRejection {
+        code,
+        detail: detail.into(),
+    }
+}
+
+/// Check an event's metering fields against its shipper.
+///
+/// `caller_service` is the shipping resource server's service slug and
+/// `declared` the meter keys that service has declared, loaded once per batch
+/// so no event costs a query. Returns the meter and quantity for a metered
+/// event, `None` for an unmetered one, or why the event must be refused.
+/// A meter named without a quantity counts 1.
+///
+/// ```
+/// use std::collections::HashSet;
+/// use otto_billing::usage::{check_metering, Metered, UNKNOWN_METER};
+///
+/// let declared: HashSet<String> = ["otto-flags/evaluations".to_owned()].into();
+/// let ok = check_metering(Some("otto-flags"), &declared, None, Some("otto-flags/evaluations"), Some(3));
+/// assert_eq!(ok, Ok(Some(Metered { meter: "otto-flags/evaluations", quantity: 3 })));
+///
+/// // Unmetered events are free and always fine.
+/// assert_eq!(check_metering(None, &declared, None, None, None), Ok(None));
+///
+/// let refused = check_metering(Some("otto-flags"), &declared, None, Some("otto-flags/nope"), Some(1));
+/// assert_eq!(refused.unwrap_err().code, UNKNOWN_METER);
+/// ```
+pub fn check_metering<'a>(
+    caller_service: Option<&str>,
+    declared: &HashSet<String>,
+    service: Option<&str>,
+    meter: Option<&'a str>,
+    quantity: Option<u64>,
+) -> std::result::Result<Option<Metered<'a>>, MeteringRejection> {
+    if let Some(claimed) = service {
+        if caller_service != Some(claimed) {
+            return Err(reject(
+                SERVICE_MISMATCH,
+                match caller_service {
+                    Some(own) => format!("`service` must be this resource server's own, `{own}`"),
+                    None => "this resource server has no service slug yet; leave `service` unset"
+                        .to_owned(),
+                },
+            ));
+        }
+    }
+    let Some(meter) = meter else {
+        return match quantity {
+            Some(_) => Err(reject(INVALID_QUANTITY, "`quantity` requires a `meter`")),
+            None => Ok(None),
+        };
+    };
+    // A server with no service slug cannot have declared anything, and a key
+    // outside the caller's namespace is never its meter, whatever `declared`
+    // holds.
+    let own = caller_service.is_some_and(|svc| {
+        meter
+            .split_once('/')
+            .is_some_and(|(prefix, _)| prefix == svc)
+    });
+    if !own || !declared.contains(meter) {
+        return Err(reject(
+            UNKNOWN_METER,
+            format!(
+                "`{}` is not a meter this resource server has declared",
+                truncate(meter, MAX_ECHOED_METER)
+            ),
+        ));
+    }
+    match quantity.unwrap_or(1) {
+        q @ 1..=MAX_METER_QUANTITY => Ok(Some(Metered {
+            meter,
+            quantity: i64::try_from(q).expect("MAX_METER_QUANTITY fits in i64"),
+        })),
+        _ => Err(reject(
+            INVALID_QUANTITY,
+            format!("`quantity` must be 1 to {MAX_METER_QUANTITY}"),
+        )),
+    }
+}
+
+/// At most `max` bytes of `s`, cut on a character boundary.
+fn truncate(s: &str, max: usize) -> &str {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// One declared meter's quantity this month, for the usage-status of the
+/// service that declared it.
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct MeterPeriodUsage {
+    /// The meter's key, `<service>/<meter>`.
+    pub meter: String,
+    pub display_name: String,
+    pub unit: String,
+    /// Zero when nothing has been shipped for it this month.
+    pub quantity: i64,
 }
 
 /// How far ahead of the platform's clock an event's `occurred_at` may be.
@@ -132,6 +311,13 @@ pub trait UsageExt {
     ) -> impl std::future::Future<Output = Result<IngestOutcome>> + Send;
 
     fn current_usage(&mut self) -> impl std::future::Future<Output = Result<PeriodUsage>> + Send;
+
+    /// This month's quantity of every meter `service` has declared, by key,
+    /// zero for one with no usage yet. Only that service's meters.
+    fn service_meter_usage(
+        &mut self,
+        service: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<MeterPeriodUsage>>> + Send;
 
     fn plan_limits(&mut self) -> impl std::future::Future<Output = Result<PlanLimits>> + Send;
 }
@@ -224,18 +410,29 @@ impl UsageExt for Tx<'_> {
         // `user_id` is resolved through a subselect so an account deleted
         // since the event was written leaves it NULL instead of failing the
         // foreign key (the same trade `record_usage` documents).
+        let at = event.occurred_at.min(now);
+        let (meter, quantity) = match event.metered {
+            Some(m) => (Some(m.meter), Some(m.quantity)),
+            None => (None, None),
+        };
         sqlx::query(
-            "INSERT INTO usage_events (org_id, user_id, tool, billable, created_at) \
-             VALUES ($1, (SELECT id FROM users WHERE id = $2), $3, $4, $5)",
+            "INSERT INTO usage_events \
+               (org_id, user_id, tool, billable, created_at, resource_uri, meter, quantity) \
+             VALUES ($1, (SELECT id FROM users WHERE id = $2), $3, $4, $5, $6, $7, $8)",
         )
         .bind(org)
         .bind(event.user)
         .bind(event.tool)
         .bind(event.billable)
-        .bind(event.occurred_at.min(now))
+        .bind(at)
+        .bind(resource_uri)
+        .bind(meter)
+        .bind(quantity)
         .execute(self.conn())
         .await?;
 
+        // The legacy family-wide bucket, unchanged: the console usage page
+        // and older clients still read it.
         sqlx::query(
             "INSERT INTO org_period_usage (org_id, period_start, billable_count, total_count) \
              VALUES ($1, date_trunc('month', $2::timestamptz AT TIME ZONE 'utc')::date, $3, 1) \
@@ -245,10 +442,50 @@ impl UsageExt for Tx<'_> {
                    updated_at = now()",
         )
         .bind(org)
-        .bind(event.occurred_at.min(now))
+        .bind(at)
         .bind(i64::from(event.billable))
         .execute(self.conn())
         .await?;
+
+        // The shipping service's own pool. Keyed by the shipper, never by
+        // anything in the event, so one service cannot count in another's.
+        if let Some(service) = event.service {
+            sqlx::query(
+                "INSERT INTO org_service_period_usage \
+                   (org_id, service, period_start, billable_count, total_count) \
+                 VALUES ($1, $2, date_trunc('month', $3::timestamptz AT TIME ZONE 'utc')::date, $4, 1) \
+                 ON CONFLICT (org_id, service, period_start) DO UPDATE \
+                   SET billable_count = org_service_period_usage.billable_count \
+                                        + EXCLUDED.billable_count, \
+                       total_count = org_service_period_usage.total_count + 1, \
+                       updated_at = now()",
+            )
+            .bind(org)
+            .bind(service)
+            .bind(at)
+            .bind(i64::from(event.billable))
+            .execute(self.conn())
+            .await?;
+        }
+
+        // The meter's quantity, whatever `billable` says (module docs).
+        if let Some(m) = event.metered {
+            sqlx::query(
+                "INSERT INTO org_meter_period_usage (org_id, meter, period_start, quantity) \
+                 VALUES ($1, $2, date_trunc('month', $3::timestamptz AT TIME ZONE 'utc')::date, $4) \
+                 ON CONFLICT (org_id, meter, period_start) DO UPDATE \
+                   SET quantity = org_meter_period_usage.quantity + EXCLUDED.quantity, \
+                       updated_at = now()",
+            )
+            .bind(org)
+            .bind(m.meter)
+            .bind(at)
+            .bind(m.quantity)
+            .execute(self.conn())
+            .await?;
+        }
+        // Later stories hook in here, in this same transaction: budget alerts
+        // (#63) and the Stripe meter outbox (#64).
         Ok(IngestOutcome::Counted)
     }
 
@@ -276,6 +513,26 @@ impl UsageExt for Tx<'_> {
                 Ok(PeriodUsage::empty(period_start))
             }
         }
+    }
+
+    /// `meters` is global reference data `otto_app` may read; the usage side
+    /// is this org's rows only, through the pinned transaction's RLS.
+    async fn service_meter_usage(&mut self, service: &str) -> Result<Vec<MeterPeriodUsage>> {
+        let org = self.org();
+        let rows = sqlx::query_as(&format!(
+            "SELECT m.key AS meter, m.display_name, m.unit, \
+                    COALESCE(u.quantity, 0) AS quantity \
+             FROM meters m \
+             LEFT JOIN org_meter_period_usage u \
+               ON u.meter = m.key AND u.org_id = $1 AND u.period_start = {PERIOD} \
+             WHERE m.service = $2 \
+             ORDER BY m.key"
+        ))
+        .bind(org)
+        .bind(service)
+        .fetch_all(self.conn())
+        .await?;
+        Ok(rows)
     }
 
     /// The org's plan and its bucket.
@@ -316,5 +573,111 @@ mod tests {
         assert_eq!(earliest_occurred_at(at(2026, 10, 1)), start(2026, 9));
         assert_eq!(earliest_occurred_at(at(2026, 1, 31)), start(2025, 12));
         assert_eq!(earliest_occurred_at(at(2026, 3, 31)), start(2026, 2));
+    }
+
+    fn declared() -> HashSet<String> {
+        ["otto-flags/evaluations".to_owned()].into()
+    }
+
+    fn code<T: fmt::Debug>(r: std::result::Result<T, MeteringRejection>) -> &'static str {
+        r.unwrap_err().code
+    }
+
+    const EVALS: &str = "otto-flags/evaluations";
+
+    #[test]
+    fn an_unmetered_event_is_free_and_needs_no_service() {
+        assert_eq!(
+            check_metering(None, &declared(), None, None, None),
+            Ok(None)
+        );
+        assert_eq!(
+            check_metering(Some("otto-flags"), &declared(), None, None, None),
+            Ok(None)
+        );
+        assert_eq!(
+            check_metering(
+                Some("otto-flags"),
+                &declared(),
+                Some("otto-flags"),
+                None,
+                None
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_declared_meter_counts_its_quantity_or_one() {
+        let ok = |q| check_metering(Some("otto-flags"), &declared(), None, Some(EVALS), q);
+        assert_eq!(
+            ok(Some(7)),
+            Ok(Some(Metered {
+                meter: EVALS,
+                quantity: 7
+            }))
+        );
+        assert_eq!(ok(None).unwrap().unwrap().quantity, 1);
+    }
+
+    #[test]
+    fn an_undeclared_meter_is_unknown() {
+        let d = declared();
+        let f = |caller, meter| check_metering(caller, &d, None, Some(meter), Some(1));
+        assert_eq!(
+            code(f(Some("otto-flags"), "otto-flags/other")),
+            UNKNOWN_METER
+        );
+        // Another service's meter is unknown to this one, even if declared there.
+        assert_eq!(code(f(Some("otto-cxp"), EVALS)), UNKNOWN_METER);
+        // A server with no slug cannot have declared anything.
+        assert_eq!(code(f(None, EVALS)), UNKNOWN_METER);
+        // An absurd key is echoed bounded.
+        let long = format!("otto-flags/{}", "é".repeat(500));
+        let r = f(Some("otto-flags"), &long).unwrap_err();
+        assert!(r.detail.len() < MAX_ECHOED_METER + 100, "{}", r.detail);
+    }
+
+    #[test]
+    fn a_service_other_than_the_shippers_is_a_mismatch() {
+        let d = declared();
+        let f = |caller, claimed| check_metering(caller, &d, Some(claimed), Some(EVALS), Some(1));
+        assert_eq!(code(f(Some("otto-flags"), "otto-cxp")), SERVICE_MISMATCH);
+        assert_eq!(code(f(None, "otto-flags")), SERVICE_MISMATCH);
+        // Checked for unmetered events too.
+        assert_eq!(
+            code(check_metering(
+                Some("otto-flags"),
+                &d,
+                Some("otto-cxp"),
+                None,
+                None
+            )),
+            SERVICE_MISMATCH
+        );
+    }
+
+    #[test]
+    fn quantity_bounds() {
+        let d = declared();
+        let f = |q| check_metering(Some("otto-flags"), &d, None, Some(EVALS), Some(q));
+        assert_eq!(code(f(0)), INVALID_QUANTITY);
+        assert_eq!(code(f(MAX_METER_QUANTITY + 1)), INVALID_QUANTITY);
+        assert_eq!(code(f(u64::MAX)), INVALID_QUANTITY);
+        assert_eq!(f(1).unwrap().unwrap().quantity, 1);
+        assert_eq!(
+            f(MAX_METER_QUANTITY).unwrap().unwrap().quantity,
+            1_000_000_000
+        );
+        assert_eq!(
+            code(check_metering(Some("otto-flags"), &d, None, None, Some(1))),
+            INVALID_QUANTITY
+        );
+    }
+
+    #[test]
+    fn a_rejection_reads_code_first() {
+        let r = reject(UNKNOWN_METER, "x");
+        assert_eq!(r.to_string(), "unknown_meter: x");
     }
 }

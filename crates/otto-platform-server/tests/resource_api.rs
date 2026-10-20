@@ -453,7 +453,9 @@ async fn usage_status_reports_the_plan_and_its_features_and_oversized_batches_ar
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["plan"], "free");
     assert_eq!(body["included_ops"], 500);
-    assert_eq!(body["hard_stop"], true);
+    // The free plan's legacy hard stop is never served (#59): a family-wide
+    // bucket would let one service's usage stop another's work.
+    assert_eq!(body["hard_stop"], false);
     assert_eq!(body["billable_count"], 0);
     // The free plan unlocks nothing.
     assert_eq!(body["features"], serde_json::json!({}));
@@ -1060,6 +1062,9 @@ async fn the_client_ships_usage_and_reads_status_lookups(pool: PgPool) {
             tool: "queue.enqueue".into(),
             billable: i != 0,
             occurred_at: Utc::now(),
+            service: None,
+            meter: None,
+            quantity: None,
         })
         .collect();
     let receipt = client.ship_usage(&events).await.unwrap();
@@ -1248,6 +1253,8 @@ fn usage_status_blocking_rules() {
         included_ops: 500,
         hard_stop: true,
         features: Default::default(),
+        service: None,
+        meters: Vec::new(),
     };
     assert!(!s.is_blocked());
     s.billable_count = 500;
@@ -1962,4 +1969,528 @@ async fn the_operator_cli_assigns_service_slugs(pool: PgPool) {
             .as_deref(),
         Some("otto-factory")
     );
+}
+
+// ---------------------------------------------------------- metered usage
+
+const EVALS: &str = "otto-flags/evaluations";
+const JOBS: &str = "otto-factory/jobs";
+
+/// `world()` with service slugs assigned and one meter declared per service:
+/// otto-flags declares `evaluations`, otto-factory declares `jobs`.
+async fn metered_world(pool: PgPool) -> World {
+    let w = world(pool).await;
+    for (uri, service, secret, key, name, unit) in [
+        (
+            FLAGS,
+            "otto-flags",
+            &w.flags_secret,
+            EVALS,
+            "Flag evaluations",
+            "evaluation",
+        ),
+        (
+            FACTORY,
+            "otto-factory",
+            &w.factory_secret,
+            JOBS,
+            "Jobs completed",
+            "job",
+        ),
+    ] {
+        resources::set_service(&w.db, uri, service).await.unwrap();
+        let (status, body) = put_meters(
+            &w.db,
+            &basic(uri, secret),
+            json!([{"key": key, "display_name": name, "unit": unit}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["declared"], json!([key]));
+    }
+    w
+}
+
+impl World {
+    fn flags_basic(&self) -> String {
+        basic(FLAGS, &self.flags_secret)
+    }
+
+    async fn status(&self, auth: &str) -> Value {
+        let (status, body) = get(
+            &self.db,
+            auth,
+            &format!("/internal/orgs/{}/usage-status", self.org),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+}
+
+fn metered(org: OrgId, meter: &str, quantity: Option<u64>) -> Value {
+    let mut ev = usage_event(org, None, Uuid::new_v4(), true);
+    ev["meter"] = json!(meter);
+    if let Some(q) = quantity {
+        ev["quantity"] = json!(q);
+    }
+    ev
+}
+
+/// The reason codes of a receipt's rejections, in order.
+fn rejection_codes(receipt: &Value) -> Vec<String> {
+    receipt["rejected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let reason = r["reason"].as_str().unwrap();
+            reason.split(':').next().unwrap().to_owned()
+        })
+        .collect()
+}
+
+async fn meter_quantity(db: &Db, meter: &str) -> Option<i64> {
+    sqlx::query_scalar("SELECT quantity FROM org_meter_period_usage WHERE meter = $1")
+        .bind(meter)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap()
+}
+
+async fn service_pool(db: &Db, service: &str) -> Option<(i64, i64)> {
+    sqlx::query_as(
+        "SELECT billable_count, total_count FROM org_service_period_usage WHERE service = $1",
+    )
+    .bind(service)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_undeclared_meter_is_rejected_per_event_and_the_rest_counted(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let auth = w.flags_basic();
+    let undeclared = metered(w.org, "otto-flags/clicks", Some(3));
+    let undeclared_id = undeclared["event_id"].clone();
+    let mut free = usage_event(w.org, None, Uuid::new_v4(), false);
+    free["service"] = json!("otto-flags");
+    let batch = vec![
+        metered(w.org, EVALS, Some(5)),
+        undeclared,
+        free,
+        // Another service's declared meter is not this caller's.
+        metered(w.org, JOBS, Some(1)),
+        // A meter with no quantity counts one.
+        metered(w.org, EVALS, None),
+    ];
+
+    let (status, receipt) = post_usage(&w.db, &auth, batch.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["accepted"], 3, "{receipt}");
+    assert_eq!(
+        rejection_codes(&receipt),
+        ["unknown_meter", "unknown_meter"]
+    );
+    assert_eq!(receipt["rejected"][0]["event_id"], undeclared_id);
+    assert!(receipt["rejected"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("otto-flags/clicks"));
+
+    assert_eq!(meter_quantity(&w.db, EVALS).await, Some(6));
+    assert_eq!(meter_quantity(&w.db, JOBS).await, None);
+    assert_eq!(meter_quantity(&w.db, "otto-flags/clicks").await, None);
+    // Every accepted event counts in the shipper's pool, metered or not.
+    assert_eq!(service_pool(&w.db, "otto-flags").await, Some((2, 3)));
+    assert_eq!(service_pool(&w.db, "otto-factory").await, None);
+    // And in the legacy family-wide bucket, exactly as before.
+    let legacy: (i64, i64) =
+        sqlx::query_as("SELECT billable_count, total_count FROM org_period_usage")
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(legacy, (2, 3));
+
+    // The event rows carry who shipped them and what they metered.
+    let rows: Vec<(Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT resource_uri, meter, quantity FROM usage_events ORDER BY quantity NULLS FIRST",
+    )
+    .fetch_all(w.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (Some(FLAGS.to_owned()), None, None),
+            (Some(FLAGS.to_owned()), Some(EVALS.to_owned()), Some(1)),
+            (Some(FLAGS.to_owned()), Some(EVALS.to_owned()), Some(5)),
+        ]
+    );
+
+    // A replay counts nothing twice, meters included; the rejected events are
+    // still rejected, not duplicates.
+    let (_, again) = post_usage(&w.db, &auth, batch).await;
+    assert_eq!(
+        (again["accepted"].clone(), again["duplicates"].clone()),
+        (json!(0), json!(3))
+    );
+    assert_eq!(rejection_codes(&again), ["unknown_meter", "unknown_meter"]);
+    assert_eq!(meter_quantity(&w.db, EVALS).await, Some(6));
+    assert_eq!(service_pool(&w.db, "otto-flags").await, Some((2, 3)));
+
+    // A rejected event left no trace, so it can be corrected and resent under
+    // the same id.
+    let mut fixed = metered(w.org, EVALS, Some(3));
+    fixed["event_id"] = undeclared_id;
+    assert_eq!(post_usage(&w.db, &auth, vec![fixed]).await.1["accepted"], 1);
+    assert_eq!(meter_quantity(&w.db, EVALS).await, Some(9));
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_service_other_than_the_callers_is_a_mismatch(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let mut theirs = metered(w.org, EVALS, Some(1));
+    theirs["service"] = json!("otto-factory");
+    let mut unmetered_theirs = usage_event(w.org, None, Uuid::new_v4(), true);
+    unmetered_theirs["service"] = json!("otto-factory");
+    let mut mine = metered(w.org, EVALS, Some(2));
+    mine["service"] = json!("otto-flags");
+
+    let (_, receipt) = post_usage(
+        &w.db,
+        &w.flags_basic(),
+        vec![theirs, unmetered_theirs, mine],
+    )
+    .await;
+    assert_eq!(receipt["accepted"], 1, "{receipt}");
+    assert_eq!(
+        rejection_codes(&receipt),
+        ["service_mismatch", "service_mismatch"]
+    );
+    assert_eq!(meter_quantity(&w.db, EVALS).await, Some(2));
+    assert_eq!(service_pool(&w.db, "otto-factory").await, None);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_caller_without_a_service_ships_only_unmetered_usage(pool: PgPool) {
+    let w = world(pool).await;
+    let auth = w.factory_basic();
+    let mut named = usage_event(w.org, None, Uuid::new_v4(), true);
+    named["service"] = json!("otto-factory");
+    let (_, receipt) = post_usage(
+        &w.db,
+        &auth,
+        vec![
+            usage_event(w.org, None, Uuid::new_v4(), true),
+            metered(w.org, JOBS, Some(1)),
+            named,
+        ],
+    )
+    .await;
+    assert_eq!(receipt["accepted"], 1, "{receipt}");
+    assert_eq!(
+        rejection_codes(&receipt),
+        ["unknown_meter", "service_mismatch"]
+    );
+    // No pool to count in: only the legacy bucket moved.
+    let pools: i64 = sqlx::query_scalar("SELECT count(*) FROM org_service_period_usage")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(pools, 0);
+
+    let status = w.status(&auth).await;
+    assert_eq!(status["total_count"], 1);
+    assert!(status.get("service").is_none(), "{status}");
+    assert_eq!(status["meters"], json!([]));
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn quantities_are_bounded_per_event(pool: PgPool) {
+    let w = metered_world(pool).await;
+    assert_eq!(
+        otto_resource::MAX_METER_QUANTITY,
+        otto_billing::usage::MAX_METER_QUANTITY
+    );
+    let mut quantity_without_meter = usage_event(w.org, None, Uuid::new_v4(), true);
+    quantity_without_meter["quantity"] = json!(4);
+    let mut negative = metered(w.org, EVALS, None);
+    negative["quantity"] = json!(-1);
+
+    let (status, receipt) = post_usage(
+        &w.db,
+        &w.flags_basic(),
+        vec![
+            metered(w.org, EVALS, Some(0)),
+            metered(w.org, EVALS, Some(1_000_000_001)),
+            quantity_without_meter,
+            metered(w.org, EVALS, Some(1)),
+            metered(w.org, EVALS, Some(1_000_000_000)),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt["accepted"], 2, "{receipt}");
+    assert_eq!(
+        rejection_codes(&receipt),
+        ["invalid_quantity", "invalid_quantity", "invalid_quantity"]
+    );
+    assert_eq!(meter_quantity(&w.db, EVALS).await, Some(1_000_000_001));
+
+    // A quantity that is not a u64 at all is a malformed body, like any other
+    // type error, and counts nothing.
+    let (status, _) = post_usage(&w.db, &w.flags_basic(), vec![negative]).await;
+    assert!(status.is_client_error(), "{status}");
+    assert_eq!(meter_quantity(&w.db, EVALS).await, Some(1_000_000_001));
+}
+
+/// `UsageEvent` exactly as `otto-resource` shipped it before value meters.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OldUsageEvent {
+    event_id: Uuid,
+    org_id: Uuid,
+    user_id: Option<Uuid>,
+    tool: String,
+    billable: bool,
+    occurred_at: chrono::DateTime<Utc>,
+}
+
+/// `UsageStatus` exactly as a resource server pinned before value meters
+/// parses it, with its blocking rule.
+#[derive(serde::Deserialize)]
+struct OldUsageStatus {
+    #[allow(dead_code)]
+    org_id: Uuid,
+    #[allow(dead_code)]
+    plan: String,
+    #[allow(dead_code)]
+    period_start: chrono::NaiveDate,
+    billable_count: i64,
+    #[allow(dead_code)]
+    total_count: i64,
+    included_ops: i64,
+    hard_stop: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    features: std::collections::BTreeMap<String, Value>,
+}
+
+impl OldUsageStatus {
+    fn is_blocked(&self) -> bool {
+        self.hard_stop && self.billable_count >= self.included_ops
+    }
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn old_and_new_shapes_round_trip(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let base = serve(&w.db).await;
+    let auth = w.flags_basic();
+
+    // An old client's event, serialized by the old type, ingests as unmetered.
+    let old = OldUsageEvent {
+        event_id: Uuid::new_v4(),
+        org_id: w.org.as_uuid(),
+        user_id: Some(w.user.as_uuid()),
+        tool: "flag.set".into(),
+        billable: true,
+        occurred_at: Utc::now(),
+    };
+    let old_json = serde_json::to_value(&old).unwrap();
+    let parsed: UsageEvent = serde_json::from_value(old_json.clone()).unwrap();
+    assert_eq!(
+        (parsed.service, parsed.meter, parsed.quantity),
+        (None, None, None)
+    );
+    let (_, receipt) = post_usage(&w.db, &auth, vec![old_json]).await;
+    assert_eq!(receipt["accepted"], 1, "{receipt}");
+
+    // A new unmetered event is byte-for-byte the old shape on the wire, and a
+    // new metered one still parses as the old type.
+    let new_unmetered = UsageEvent {
+        event_id: old.event_id,
+        org_id: old.org_id,
+        user_id: old.user_id,
+        tool: old.tool.clone(),
+        billable: old.billable,
+        occurred_at: old.occurred_at,
+        service: None,
+        meter: None,
+        quantity: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&new_unmetered).unwrap(),
+        serde_json::to_value(&old).unwrap()
+    );
+    let new_metered = UsageEvent {
+        service: Some("otto-flags".into()),
+        meter: Some(EVALS.into()),
+        quantity: Some(12),
+        event_id: Uuid::new_v4(),
+        ..new_unmetered
+    };
+    let wire = serde_json::to_value(&new_metered).unwrap();
+    assert_eq!(wire["meter"], EVALS);
+    serde_json::from_value::<OldUsageEvent>(wire).unwrap();
+
+    // Shipped through the client, the metered event counts in its meter.
+    let client = PlatformClient::new(ClientConfig::new(&base, FLAGS, &w.flags_secret)).unwrap();
+    let receipt = client.ship_usage(&[new_metered]).await.unwrap();
+    assert_eq!(receipt.accepted, 1);
+
+    // The new status body parses as the old shape, and as the new one.
+    let body = w.status(&auth).await;
+    let old_status: OldUsageStatus = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(old_status.billable_count, 2);
+    assert!(!old_status.hard_stop);
+    let status = client.usage_status(w.org.as_uuid()).await.unwrap();
+    assert_eq!(status.service.as_deref(), Some("otto-flags"));
+    assert_eq!(
+        status.meters,
+        [otto_resource::MeterUsage {
+            meter: EVALS.into(),
+            display_name: "Flag evaluations".into(),
+            unit: "evaluation".into(),
+            quantity: 12,
+        }]
+    );
+    assert_eq!(status.meter(EVALS).unwrap().quantity, 12);
+
+    // And an old platform's body (no `service`, no `meters`, no `features`)
+    // still parses as the new type.
+    let older = json!({
+        "org_id": w.org,
+        "plan": "free",
+        "period_start": "2026-10-01",
+        "billable_count": 1,
+        "total_count": 1,
+        "included_ops": 500,
+        "hard_stop": true,
+    });
+    let s: otto_resource::UsageStatus = serde_json::from_value(older).unwrap();
+    assert!(s.service.is_none() && s.meters.is_empty());
+    // A new status re-serialized is readable by the old type too.
+    serde_json::from_value::<OldUsageStatus>(serde_json::to_value(&status).unwrap()).unwrap();
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn heavy_usage_never_blocks_an_old_client(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let base = serve(&w.db).await;
+    let auth = w.flags_basic();
+
+    // Well past the free plan's 500-operation bucket, which hard-stops.
+    for _ in 0..2 {
+        let batch: Vec<Value> = (0..400)
+            .map(|i| {
+                if i % 2 == 0 {
+                    metered(w.org, EVALS, Some(1000))
+                } else {
+                    usage_event(w.org, None, Uuid::new_v4(), true)
+                }
+            })
+            .collect();
+        assert_eq!(post_usage(&w.db, &auth, batch).await.1["accepted"], 400);
+    }
+    let plan_hard_stop: bool =
+        sqlx::query_scalar("SELECT hard_stop FROM plans WHERE plan = 'free'")
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert!(
+        plan_hard_stop,
+        "the free plan still hard-stops in the plan table"
+    );
+
+    let old: OldUsageStatus = serde_json::from_value(w.status(&auth).await).unwrap();
+    assert!(old.billable_count >= old.included_ops);
+    assert!(!old.hard_stop);
+    assert!(!old.is_blocked());
+
+    let client = PlatformClient::new(ClientConfig::new(&base, FLAGS, &w.flags_secret)).unwrap();
+    let status = client.usage_status(w.org.as_uuid()).await.unwrap();
+    assert!(status.over_limit() && !status.is_blocked());
+    assert_eq!(status.meter(EVALS).unwrap().quantity, 400_000);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn usage_from_one_service_never_changes_anothers_status(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let flags = w.flags_basic();
+    let factory = w.factory_basic();
+
+    // The service-scoped part of a status, and the old client's verdict.
+    let scoped = |body: &Value| {
+        let old: OldUsageStatus = serde_json::from_value(body.clone()).unwrap();
+        (
+            body["service"].clone(),
+            body["meters"].clone(),
+            body["hard_stop"].clone(),
+            old.is_blocked(),
+        )
+    };
+
+    let factory_before = w.status(&factory).await;
+    assert_eq!(factory_before["service"], "otto-factory");
+    assert_eq!(
+        factory_before["meters"],
+        json!([{"meter": JOBS, "display_name": "Jobs completed", "unit": "job", "quantity": 0}])
+    );
+
+    for _ in 0..2 {
+        let batch: Vec<Value> = (0..300)
+            .map(|_| metered(w.org, EVALS, Some(1_000)))
+            .collect();
+        assert_eq!(post_usage(&w.db, &flags, batch).await.1["accepted"], 300);
+    }
+
+    let factory_after = w.status(&factory).await;
+    assert_eq!(scoped(&factory_after), scoped(&factory_before));
+    assert_eq!(service_pool(&w.db, "otto-factory").await, None);
+
+    // The shipper sees its own usage, and only its own meters.
+    let flags_status = w.status(&flags).await;
+    assert_eq!(flags_status["service"], "otto-flags");
+    assert_eq!(
+        flags_status["meters"],
+        json!([{
+            "meter": EVALS,
+            "display_name": "Flag evaluations",
+            "unit": "evaluation",
+            "quantity": 600_000,
+        }])
+    );
+    assert_eq!(service_pool(&w.db, "otto-flags").await, Some((600, 600)));
+
+    // And the other way round.
+    let (_, r) = post_usage(&w.db, &factory, vec![metered(w.org, JOBS, Some(7))]).await;
+    assert_eq!(r["accepted"], 1);
+    assert_eq!(scoped(&w.status(&flags).await), scoped(&flags_status));
+    assert_eq!(w.status(&factory).await["meters"][0]["quantity"], 7);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn meter_usage_is_counted_per_org(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let other = w.db.create_org("globex", "Globex").await.unwrap();
+    let (_, r) = post_usage(
+        &w.db,
+        &w.flags_basic(),
+        vec![
+            metered(w.org, EVALS, Some(5)),
+            metered(other.id, EVALS, Some(11)),
+        ],
+    )
+    .await;
+    assert_eq!(r["accepted"], 2, "{r}");
+    assert_eq!(w.status(&w.flags_basic()).await["meters"][0]["quantity"], 5);
+    let (_, theirs) = get(
+        &w.db,
+        &w.flags_basic(),
+        &format!("/internal/orgs/{}/usage-status", other.id),
+    )
+    .await;
+    assert_eq!(theirs["meters"][0]["quantity"], 11);
 }

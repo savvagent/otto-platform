@@ -8,7 +8,7 @@
 //! ```text
 //!   POST /internal/usage                                     batch usage ingest
 //!   PUT  /internal/meters                                    declare the caller's value meters
-//!   GET  /internal/orgs/{org}/usage-status                   period usage vs plan, plan features
+//!   GET  /internal/orgs/{org}/usage-status                   the caller's meters, plan features
 //!   GET  /internal/orgs/{org}/members/{user}                 whoami: user + org + role
 //!   GET  /internal/orgs/{org}/members/by-email?email=        member lookup
 //!   GET  /internal/orgs/{org}/members/{user}/teams           the member's teams in the org
@@ -27,7 +27,7 @@
 //! unguessable UUIDs, which is the whole of the defence; see the PR for the
 //! open question.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::CACHE_CONTROL;
@@ -36,11 +36,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use otto_billing::meters::{self, MeterSpec};
-use otto_billing::usage::{IngestOutcome, ShippedUsage, UsageExt};
+use otto_billing::usage::{self, IngestOutcome, Metered, ShippedUsage, UsageExt};
 use otto_core::orgs::{Org, OrgsExt};
 use otto_core::teams::{Team, TeamsExt};
 use otto_resource::{
-    MemberInfo, MemberTeams, MeterDeclarationBatch, MeterDeclarationReceipt, OrgInfo,
+    MemberInfo, MemberTeams, MeterDeclarationBatch, MeterDeclarationReceipt, MeterUsage, OrgInfo,
     RejectedEvent, RejectedMeter, TeamInfo, UsageBatch, UsageReceipt, UsageStatus, UserInfo,
     MAX_METER_DECLARATIONS, MAX_USAGE_BATCH,
 };
@@ -109,8 +109,14 @@ async fn live_org(db: &Db, org: Uuid) -> Result<Org, ApiError> {
 /// An event the platform can never accept is reported in `rejected` instead
 /// of failing the batch, so one poison event cannot wedge the shipper's
 /// outbox. That covers an unknown or deleted org, a bad tool name, an
-/// `occurred_at` outside the accepted window (see `otto_billing::usage`), and
-/// an `event_id` already used for a different org.
+/// `occurred_at` outside the accepted window (see `otto_billing::usage`), an
+/// `event_id` already used for a different org, and the metering refusals of
+/// [`usage::check_metering`] (`unknown_meter`, `service_mismatch`,
+/// `invalid_quantity`), whose reason starts with that code.
+///
+/// Every event counts in the caller's own per-service pool, keyed by the
+/// caller's service slug and never by anything the event says. The caller's
+/// declared meters are read once per request, not once per event.
 async fn ingest_usage(
     State(db): State<Db>,
     CallingResourceServer(rs): CallingResourceServer,
@@ -122,8 +128,12 @@ async fn ingest_usage(
         )));
     }
 
+    let service = rs.service.as_deref();
+    let declared = declared_meters(&db, service, &batch.events).await?;
+
     let mut receipt = UsageReceipt::default();
-    let mut by_org: BTreeMap<Uuid, Vec<&otto_resource::UsageEvent>> = BTreeMap::new();
+    let mut by_org: BTreeMap<Uuid, Vec<(&otto_resource::UsageEvent, Option<Metered<'_>>)>> =
+        BTreeMap::new();
     for ev in &batch.events {
         let tool = ev.tool.trim();
         if tool.is_empty() || tool.len() > MAX_TOOL_LEN {
@@ -131,8 +141,20 @@ async fn ingest_usage(
                 event_id: ev.event_id,
                 reason: format!("`tool` must be 1 to {MAX_TOOL_LEN} characters"),
             });
-        } else {
-            by_org.entry(ev.org_id).or_default().push(ev);
+            continue;
+        }
+        match usage::check_metering(
+            service,
+            &declared,
+            ev.service.as_deref(),
+            ev.meter.as_deref(),
+            ev.quantity,
+        ) {
+            Ok(metered) => by_org.entry(ev.org_id).or_default().push((ev, metered)),
+            Err(refused) => receipt.rejected.push(RejectedEvent {
+                event_id: ev.event_id,
+                reason: refused.to_string(),
+            }),
         }
     }
 
@@ -140,7 +162,7 @@ async fn ingest_usage(
         if db.get_active_org(OrgId::from(org)).await?.is_none() {
             receipt
                 .rejected
-                .extend(events.iter().map(|ev| RejectedEvent {
+                .extend(events.iter().map(|(ev, _)| RejectedEvent {
                     event_id: ev.event_id,
                     reason: format!("org {org} does not exist"),
                 }));
@@ -151,7 +173,7 @@ async fn ingest_usage(
         let mut accepted = 0;
         let mut duplicates = 0;
         let mut rejected = Vec::new();
-        for ev in events {
+        for (ev, metered) in events {
             let outcome = tx
                 .ingest_usage(
                     &rs.resource_uri,
@@ -161,6 +183,8 @@ async fn ingest_usage(
                         tool: ev.tool.trim(),
                         billable: ev.billable,
                         occurred_at: ev.occurred_at,
+                        service,
+                        metered,
                     },
                 )
                 .await?;
@@ -180,6 +204,26 @@ async fn ingest_usage(
     }
 
     Ok(Json(receipt))
+}
+
+/// The meter keys `service` has declared, read only when the batch names a
+/// meter at all: an unmetered batch, or a caller with no service (which can
+/// have declared nothing), costs no query.
+async fn declared_meters(
+    db: &Db,
+    service: Option<&str>,
+    events: &[otto_resource::UsageEvent],
+) -> Result<HashSet<String>, ApiError> {
+    let Some(service) = service else {
+        return Ok(HashSet::new());
+    };
+    if events.iter().all(|ev| ev.meter.is_none()) {
+        return Ok(HashSet::new());
+    }
+    let mut tx = db.begin_unpinned().await?;
+    let declared = meters::list_meters(&mut tx, service).await?;
+    tx.rollback().await?;
+    Ok(declared.into_iter().map(|m| m.key).collect())
 }
 
 // ------------------------------------------------------------------ meters
@@ -263,11 +307,19 @@ fn truncate(s: &str, max: usize) -> String {
     s[..end].to_owned()
 }
 
-/// The org's usage this month against its plan. Resource servers cache this
-/// for 60 s, so it is a cheap read and may be slightly behind the counters.
+/// The org's usage this month. Resource servers cache this for 60 s, so it is
+/// a cheap read and may be slightly behind the counters. Reading it is free
+/// and works however much has been used.
+///
+/// `service` and `meters` are the calling resource server's own meters only:
+/// another service's usage never shows here. The legacy family-wide fields are
+/// all still served for clients pinned to an older `otto-resource`, but
+/// `hard_stop` is always `false`: an older client blocks on
+/// `hard_stop && billable_count >= included_ops`, and with a family-wide count
+/// that would let one service's usage stop work in another.
 async fn usage_status(
     State(db): State<Db>,
-    CallingResourceServer(_rs): CallingResourceServer,
+    CallingResourceServer(rs): CallingResourceServer,
     Path(org): Path<Uuid>,
 ) -> Result<Json<UsageStatus>, ApiError> {
     live_org(&db, org).await?;
@@ -275,7 +327,23 @@ async fn usage_status(
     let mut tx = db.begin(OrgId::from(org)).await?;
     let usage = tx.current_usage().await?;
     let limits = tx.plan_limits().await?;
+    let meters = match rs.service.as_deref() {
+        Some(service) => tx.service_meter_usage(service).await?,
+        None => Vec::new(),
+    };
     tx.rollback().await?;
+
+    let meters = meters
+        .into_iter()
+        .map(|m| {
+            Ok(MeterUsage {
+                quantity: u64::try_from(m.quantity).map_err(ApiError::internal)?,
+                meter: m.meter,
+                display_name: m.display_name,
+                unit: m.unit,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
 
     Ok(Json(UsageStatus {
         org_id: org,
@@ -284,11 +352,14 @@ async fn usage_status(
         billable_count: usage.billable_count,
         total_count: usage.total_count,
         included_ops: limits.included_ops,
-        hard_stop: limits.hard_stop,
+        // Never the plan's flag; see above.
+        hard_stop: false,
         features: match limits.features {
             serde_json::Value::Object(map) => map.into_iter().collect(),
             _ => Default::default(),
         },
+        service: rs.service,
+        meters,
     }))
 }
 
