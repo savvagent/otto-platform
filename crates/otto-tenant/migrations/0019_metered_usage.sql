@@ -25,19 +25,20 @@ ALTER TABLE usage_events
   ADD COLUMN meter        text,
   ADD COLUMN quantity     bigint;
 
--- The constraints are added NOT VALID (enforced for new rows, no scan) and
--- validated as separate statements. VALIDATE CONSTRAINT scans the table under
--- SHARE UPDATE EXCLUSIVE rather than the ACCESS EXCLUSIVE an ADD CONSTRAINT
--- scan holds, so where the two run in separate transactions ingest is not
--- stalled behind the scan of `usage_events`, the largest table there is.
+-- The constraints are added NOT VALID and deliberately never validated here.
+-- A NOT VALID check is still enforced on every row inserted or updated from
+-- now on; it only skips proving the rows already there. Those rows all predate
+-- these columns, so both columns are NULL and both checks hold for them
+-- trivially. Validating would buy nothing and cost a full scan of
+-- `usage_events`, the largest table there is, under the ACCESS EXCLUSIVE lock
+-- this migration's ADD COLUMN holds until commit (sqlx runs a migration in one
+-- transaction), stalling every ingest for the duration.
 ALTER TABLE usage_events
   ADD CONSTRAINT usage_events_meter_quantity
     CHECK ((meter IS NULL) = (quantity IS NULL)) NOT VALID;
 ALTER TABLE usage_events
   ADD CONSTRAINT usage_events_quantity_range
     CHECK (quantity IS NULL OR quantity BETWEEN 1 AND 1000000000) NOT VALID;
-ALTER TABLE usage_events VALIDATE CONSTRAINT usage_events_meter_quantity;
-ALTER TABLE usage_events VALIDATE CONSTRAINT usage_events_quantity_range;
 
 -- Each meter's quantity per org and UTC billing month: what budgets and Stripe
 -- metering are computed from.
