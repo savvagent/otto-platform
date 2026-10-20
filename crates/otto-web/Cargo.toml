@@ -37,6 +37,9 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 # local server — never enabled by the production dependency above. See that
 # feature's doc comment in crates/otto-auth/Cargo.toml.
 otto-auth = { workspace = true, features = ["test-support"] }
+# test-support compiles `otto_billing::billing::mock`, the local Stripe stand-in
+# tests/billing.rs runs the card-on-file flow and the webhook against.
+otto-billing = { workspace = true, features = ["test-support"] }
 jsonwebtoken.workspace = true
 # `ServiceExt::oneshot`, for driving the assembled router without binding a port.
 tower = { workspace = true, features = ["util"] }

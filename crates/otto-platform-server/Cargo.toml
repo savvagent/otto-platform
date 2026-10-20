@@ -34,6 +34,9 @@ http.workspace = true
 tower-http = { workspace = true, features = ["trace", "fs"] }
 
 [dev-dependencies]
+# test-support compiles `otto_billing::billing::mock`, the local Stripe
+# stand-in `stripe_cmd`'s tests sync against.
+otto-billing = { workspace = true, features = ["test-support"] }
 base64.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["full"] }

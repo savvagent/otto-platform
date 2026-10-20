@@ -86,9 +86,10 @@ crates/
                           `/internal/*`), and, with OTTO_STATIC_DIR, the
                           web/ bundle. Delivers lifecycle webhooks and
                           provisions resource servers, first-party
-                          OAuth clients and the price book
+                          OAuth clients and the price book, and syncs
+                          the price book to Stripe
                           (`otto-platform-server resource ...`,
-                          `client ...`, `pricebook ...`).
+                          `client ...`, `pricebook ...`, `stripe sync`).
 ```
 
 Dependency direction: `otto-tenant` ← `otto-core` ← `otto-billing`,
@@ -125,7 +126,8 @@ cp .env.example .env
 cargo run -p otto-platform-server
 ```
 
-Configuration is all `OTTO_*` (plus `DATABASE_URL` and `RUST_LOG`):
+Configuration is all `OTTO_*` (plus `DATABASE_URL`, `RUST_LOG` and the two
+Stripe secrets):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -140,6 +142,8 @@ Configuration is all `OTTO_*` (plus `DATABASE_URL` and `RUST_LOG`):
 | `OTTO_LOG_FORMAT` | `text` | `json` for structured logs. |
 | `OTTO_SMTP_URL` | unset | Secret. SMTP server for notification email, credentials in the URL: `smtps://user:pass@host:465` or `smtp://user:pass@host:587?tls=required` (plain `smtp://` only to a loopback host). Set together with `OTTO_EMAIL_FROM`; exactly one of the two refuses to start. With neither, email is disabled (logged at boot) and messages stay queued in `notification_outbox`. |
 | `OTTO_EMAIL_FROM` | unset | Secret. The `From:` mailbox for notification email, e.g. `otto <alerts@savvagent.com>`. Set together with `OTTO_SMTP_URL`. |
+| `STRIPE_SECRET_KEY` | unset | Secret. Billing's Stripe API key (`sk_...`, or a restricted `rk_...`). Set together with `STRIPE_WEBHOOK_SECRET`; exactly one of the two refuses to start. With neither, billing is disabled (logged at boot): `GET /api/orgs/{org}/billing` reports `billingEnabled: false`, and `POST /api/orgs/{org}/billing/setup` and `POST /api/stripe/webhook` answer `503 billing_disabled`. |
+| `STRIPE_WEBHOOK_SECRET` | unset | Secret. The Stripe webhook endpoint's signing secret (`whsec_...`). Set together with `STRIPE_SECRET_KEY`. |
 
 On startup it will:
 
@@ -256,6 +260,33 @@ priced as `corrupt: <reason>`. Like `resource ...`, it needs only
 `DATABASE_URL`, pointed at a database a server has already migrated.
 `GET /api/plans` can show the previous month's prices for up to about six
 minutes after a month begins, because of its caches.
+
+### Stripe billing
+
+An org's owner puts a card on file through `POST
+/api/orgs/{org}/billing/setup`, which returns a Stripe Checkout URL in setup
+mode.
+When Stripe reports the card on the webhook (`POST /api/stripe/webhook`,
+signature-verified and idempotent by event id), the org gets a Stripe
+subscription with one metered item per priced meter, anchored to 00:00 UTC
+on the first of next month with no proration, so usage is invoiced monthly
+in arrears. `stripe sync` makes Stripe match the price book:
+
+```sh
+otto-platform-server stripe sync
+```
+
+It creates a Stripe billing meter for every declared meter and a Stripe Price
+for every price-book version (Stripe prices are immutable), subscribes orgs
+that have a card on file and no subscription, and moves every live
+subscription's items to the version in effect this month, adding an item for
+each newly priced meter. Run it after `pricebook set` and again early on the
+first of a month in which a new version takes effect. It is idempotent
+(`nothing to do` when Stripe already matches), warns as a subscription nears
+Stripe's 20 items, and exits non-zero after listing what it could not do. It
+needs `DATABASE_URL` and `STRIPE_SECRET_KEY`. The Stripe account, the
+restricted key and the webhook endpoint are set up by hand: see
+[`docs/deploy/fly.md`](docs/deploy/fly.md#stripe-setup).
 
 ### Running just the migrations
 

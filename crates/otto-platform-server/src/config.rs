@@ -27,6 +27,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
+use otto_billing::stripe::{SecretKey, WebhookSecret};
 
 /// The whole deployment, resolved.
 #[derive(Debug, Clone)]
@@ -72,6 +73,23 @@ pub struct Config {
     /// the server says so at boot, the delivery loop does not run, and queued
     /// rows wait in `notification_outbox` until a deployment configures it.
     pub email: Option<EmailConfig>,
+
+    /// Stripe billing (`STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`, both
+    /// secrets, set together or not at all). `None` disables billing: the
+    /// server says so at boot, `GET /api/orgs/{org}/billing` reports
+    /// `billingEnabled: false`, and the setup route and the Stripe webhook
+    /// answer `503 billing_disabled`. Production boots either way.
+    pub stripe: Option<StripeConfig>,
+}
+
+/// The Stripe secrets. Both types redact themselves, so `Debug` shows
+/// neither.
+#[derive(Debug, Clone)]
+pub struct StripeConfig {
+    /// A secret (`sk_...`) or, preferably, restricted (`rk_...`) API key.
+    pub secret_key: SecretKey,
+    /// The webhook endpoint's signing secret (`whsec_...`).
+    pub webhook_secret: WebhookSecret,
 }
 
 /// Where and as whom notification email is sent. Both values are secrets
@@ -132,6 +150,10 @@ impl Config {
                 other => Err(anyhow!("expected json or text, got {other:?}")),
             })?,
             email: parse_email(optional("OTTO_SMTP_URL"), optional("OTTO_EMAIL_FROM"))?,
+            stripe: parse_stripe(
+                optional("STRIPE_SECRET_KEY"),
+                optional("STRIPE_WEBHOOK_SECRET"),
+            )?,
             public_url,
         })
     }
@@ -170,6 +192,62 @@ fn parse_email(smtp_url: Option<String>, from: Option<String>) -> Result<Option<
         )
     })?;
     Ok(Some(EmailConfig { smtp_url, from }))
+}
+
+/// `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`: both, or neither.
+///
+/// Exactly one is a boot error rather than "billing off", for the reason
+/// [`parse_email`] gives: an operator who set one meant billing on. With only
+/// the key, cards would go on file and nothing would ever confirm them; with
+/// only the webhook secret, nothing could be put on file at all.
+///
+/// No message repeats either value.
+pub fn parse_stripe(
+    secret_key: Option<String>,
+    webhook_secret: Option<String>,
+) -> Result<Option<StripeConfig>> {
+    let (key, whsec) = match (secret_key, webhook_secret) {
+        (None, None) => return Ok(None),
+        (Some(k), Some(w)) => (k, w),
+        (Some(_), None) => {
+            return Err(anyhow!(
+                "STRIPE_SECRET_KEY is set but STRIPE_WEBHOOK_SECRET is not; set both to \
+                 enable billing, or neither to disable it"
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(anyhow!(
+                "STRIPE_WEBHOOK_SECRET is set but STRIPE_SECRET_KEY is not; set both to \
+                 enable billing, or neither to disable it"
+            ))
+        }
+    };
+    Ok(Some(StripeConfig {
+        secret_key: parse_stripe_key(Some(key))?,
+        webhook_secret: WebhookSecret::new(whsec.trim()).map_err(|_| {
+            anyhow!(
+                "STRIPE_WEBHOOK_SECRET is not a Stripe webhook signing secret; expected \
+                 whsec_... (value not shown)"
+            )
+        })?,
+    }))
+}
+
+/// `STRIPE_SECRET_KEY` alone, for `stripe sync`, which needs no webhook
+/// secret.
+pub fn parse_stripe_key(secret_key: Option<String>) -> Result<SecretKey> {
+    let key = secret_key.ok_or_else(|| anyhow!("STRIPE_SECRET_KEY is required and not set"))?;
+    SecretKey::new(key.trim()).map_err(|_| {
+        anyhow!(
+            "STRIPE_SECRET_KEY is not a Stripe secret key; expected sk_... or (restricted) \
+             rk_... (value not shown)"
+        )
+    })
+}
+
+/// [`parse_stripe_key`] from the environment.
+pub fn stripe_key_from_env() -> Result<SecretKey> {
+    parse_stripe_key(optional("STRIPE_SECRET_KEY"))
 }
 
 fn validate_smtp_url(raw: &str) -> Result<()> {
@@ -287,6 +365,7 @@ impl Config {
             run_migrations: true,
             log_format: LogFormat::Text,
             email: None,
+            stripe: None,
         }
     }
 }
@@ -397,6 +476,45 @@ mod tests {
             !shown.contains("hunter2") && !shown.contains("alerts@"),
             "{shown}"
         );
+    }
+
+    const SK: &str = "rk_live_hunter2stripekey";
+    const WH: &str = "whsec_hunter2webhooksecret";
+
+    #[test]
+    fn stripe_with_both_set_is_enabled_and_with_neither_disabled() {
+        let stripe = parse_stripe(s(SK), s(WH)).unwrap().expect("enabled");
+        let shown = format!("{stripe:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(parse_stripe(Some(" sk_test_x ".into()), s(WH))
+            .unwrap()
+            .is_some());
+        assert!(parse_stripe(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn stripe_with_only_one_set_is_a_boot_error_naming_the_missing_one() {
+        let err = parse_stripe(s(SK), None).unwrap_err().to_string();
+        assert!(err.contains("STRIPE_WEBHOOK_SECRET is not"), "{err}");
+        let err = parse_stripe(None, s(WH)).unwrap_err().to_string();
+        assert!(err.contains("STRIPE_SECRET_KEY is not"), "{err}");
+    }
+
+    #[test]
+    fn malformed_stripe_secrets_are_errors_that_never_echo_them() {
+        for (key, whsec, names) in [
+            ("pk_live_hunter2publishable", WH, "STRIPE_SECRET_KEY"),
+            ("hunter2", WH, "STRIPE_SECRET_KEY"),
+            ("sk_live_hunter2 with space", WH, "STRIPE_SECRET_KEY"),
+            (SK, "hunter2-not-a-whsec", "STRIPE_WEBHOOK_SECRET"),
+            (SK, "whsec_hunter2\nnewline", "STRIPE_WEBHOOK_SECRET"),
+        ] {
+            let err = format!("{:#}", parse_stripe(s(key), s(whsec)).expect_err(key));
+            assert!(!err.contains("hunter2"), "secret echoed: {err}");
+            assert!(err.contains(names), "{err} should name {names}");
+        }
+        let err = parse_stripe_key(None).unwrap_err().to_string();
+        assert!(err.contains("STRIPE_SECRET_KEY"), "{err}");
     }
 
     #[test]

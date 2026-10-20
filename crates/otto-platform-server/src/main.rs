@@ -6,9 +6,10 @@
 //! server, and the resource-server API (see `lib.rs`). The console is the rest
 //! of Phase 4 of `docs/plans/2026-10-06-platform-cutover.md`.
 //!
-//! `otto-platform-server resource ...`, `client ...` and `pricebook ...` are
-//! operator commands instead: they provision resource servers and OAuth
-//! clients, or set what each value meter costs, and exit.
+//! `otto-platform-server resource ...`, `client ...`, `pricebook ...` and
+//! `stripe ...` are operator commands instead: they provision resource servers
+//! and OAuth clients, set what each value meter costs, or make Stripe match
+//! the price book, and exit.
 
 use std::net::SocketAddr;
 
@@ -39,10 +40,13 @@ async fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("pricebook") {
         return run_pricebook_command(&args[1..]).await;
     }
+    if args.first().map(String::as_str) == Some("stripe") {
+        return run_stripe_command(&args[1..]).await;
+    }
     if !args.is_empty() {
         anyhow::bail!(
             "unknown arguments {args:?}; run with none to serve, or `resource ...` / \
-             `client ...` / `pricebook ...`"
+             `client ...` / `pricebook ...` / `stripe ...`"
         );
     }
 
@@ -122,6 +126,18 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Billing, only when both Stripe secrets are set (`Config` refuses one
+    // without the other). Off is a supported state, not a fault: production
+    // boots and serves without it.
+    if config.stripe.is_some() {
+        tracing::info!("billing enabled: Stripe is configured");
+    } else {
+        tracing::warn!(
+            "billing disabled: STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET are not set; no card \
+             can be put on file and the Stripe webhook answers 503 billing_disabled"
+        );
+    }
+
     let listener = TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("could not bind {}", config.bind))?;
@@ -129,6 +145,7 @@ async fn main() -> Result<()> {
         bind = %config.bind,
         public_url = %config.public_url,
         enforce_quotas = config.enforce_quotas,
+        billing_enabled = config.stripe.is_some(),
         "otto-platform-server ready: schema migrated, tenant isolation verified"
     );
 
@@ -194,6 +211,21 @@ async fn run_pricebook_command(args: &[String]) -> Result<()> {
         .await
         .context("could not connect to DATABASE_URL")?;
     pricebook_cmd::execute(&db, cmd, &mut std::io::stdout()).await
+}
+
+async fn run_stripe_command(args: &[String]) -> Result<()> {
+    use otto_platform_server::stripe_cmd;
+
+    let cmd =
+        stripe_cmd::parse(args).map_err(|e| anyhow::anyhow!("{e}\n\n{}", stripe_cmd::USAGE))?;
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+    let key = otto_platform_server::config::stripe_key_from_env()?;
+    let client =
+        otto_billing::stripe::Client::new(key).context("could not build the Stripe client")?;
+    let db = Db::connect(&database_url)
+        .await
+        .context("could not connect to DATABASE_URL")?;
+    stripe_cmd::execute(&db, &client, cmd, &mut std::io::stdout()).await
 }
 
 /// Resolves on SIGINT or SIGTERM.
