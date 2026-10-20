@@ -162,7 +162,9 @@ pub async fn get_usage(State(state): State<AppState>, ctx: OrgCtx) -> ApiResult<
     for status in statuses {
         let meters = tx.service_meter_usage(&status.service).await?;
         services.push(ServiceUsage {
-            payment_required: status.payment_required(live),
+            // Only with billing on: with no Stripe configured nobody can put a
+            // card on file, so asking for one would lock every org out.
+            payment_required: state.stripe.is_some() && status.payment_required(live),
             budget: BudgetView::of(&status),
             spend_error: spend_error(&status),
             meters: meters.into_iter().map(Into::into).collect(),

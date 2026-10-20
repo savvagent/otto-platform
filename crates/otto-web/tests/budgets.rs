@@ -7,6 +7,7 @@ mod common;
 use chrono::Utc;
 use common::{add_member, onboard, org_with_owner, Call, Harness};
 use http::StatusCode;
+use otto_billing::billing::mock::MockStripe;
 use otto_billing::budgets::PendingBudgets;
 use otto_billing::usage::{Metered, ShippedUsage, UsageExt};
 use otto_core::orgs::Role;
@@ -458,8 +459,9 @@ async fn spend_thresholds_and_the_usage_page_are_per_service(pool: PgPool) {
             "spendCents": 1050,
             "spendError": null,
             "budget": usage.body["services"][0]["budget"].clone(),
-            // No subscription, and spend past zero: add a card.
-            "paymentRequired": true,
+            // Billing is off in this harness, so nobody could add a card and
+            // none is asked for (the billing-on case follows).
+            "paymentRequired": false,
         })
     );
     assert_eq!(
@@ -480,6 +482,28 @@ async fn spend_thresholds_and_the_usage_page_are_per_service(pool: PgPool) {
         "free usage never needs a card"
     );
 
+    // With billing on, the same org, with no subscription and spend past
+    // zero, is asked for a card for that service only.
+    let mock = MockStripe::start().await;
+    let config = otto_web::Config::new(common::PUBLIC_URL);
+    let webauthn = otto_web::relying_party(&config).unwrap();
+    let billed = otto_web::router(
+        otto_web::AppState::new(h.db.clone(), common::cipher(), webauthn, config).with_stripe(
+            Some(otto_billing::billing::Stripe {
+                client: mock.client(),
+                webhook_secret: otto_billing::stripe::WebhookSecret::new("whsec_test_budgets")
+                    .unwrap(),
+            }),
+        ),
+    );
+    let usage = Call::get("/api/orgs/acme/usage")
+        .with_session(&owner.session)
+        .send(&billed)
+        .await;
+    usage.expect(StatusCode::OK);
+    assert_eq!(usage.body["services"][0]["paymentRequired"], true);
+    assert_eq!(usage.body["services"][1]["paymentRequired"], false);
+
     // A live subscription: nothing needs a card.
     sqlx::query(
         "INSERT INTO subscriptions (org_id, stripe_customer_id, stripe_subscription_id, status) \
@@ -493,7 +517,7 @@ async fn spend_thresholds_and_the_usage_page_are_per_service(pool: PgPool) {
     .unwrap();
     let usage = Call::get("/api/orgs/acme/usage")
         .with_session(&owner.session)
-        .send(&h.router)
+        .send(&billed)
         .await;
     usage.expect(StatusCode::OK);
     assert_eq!(usage.body["services"][0]["paymentRequired"], false);
