@@ -22,8 +22,9 @@
 //! cookie, and are outside `otto-web`'s CSRF guard, which only wraps its own
 //! router. Lifecycle webhooks are delivered by [`webhooks::run`], and
 //! notification email by [`email::run`] when SMTP is configured, and Stripe
-//! sync by [`stripe_cmd::run_loop`] when billing is enabled, background tasks
-//! the binary starts; `otto-platform-server resource ...` provisions
+//! sync by [`stripe_cmd::run_loop`] and metered usage to Stripe meter events
+//! by [`stripe_shipper::run`] when billing is enabled, background tasks the
+//! binary starts; `otto-platform-server resource ...` provisions
 //! resource servers ([`resource_cmd`]), `otto-platform-server client ...`
 //! registers first-party OAuth clients ([`client_cmd`]),
 //! `otto-platform-server pricebook ...` sets what each value meter costs
@@ -47,6 +48,7 @@ pub mod introspect;
 pub mod pricebook_cmd;
 pub mod resource_cmd;
 pub mod stripe_cmd;
+pub mod stripe_shipper;
 pub mod webhooks;
 
 use std::convert::Infallible;

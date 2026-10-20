@@ -142,6 +142,13 @@ of them is done by CI or by the server.
    price for next month, let sync run, advance the clock past 00:00 UTC on the first, and
    check that the closing invoice is rated at the old price and the new month's usage at
    the new one. The tests here run against a local stand-in for Stripe, not Stripe.
+6. **Verify meter events once in test mode**: ingest metered usage for that subscribed
+   test org, wait for `stripe outbox` to show it `sent`, and check that it appears in the
+   meter's event summaries and on the upcoming invoice as quantity x rate. Then send one
+   event's identifier twice (for example by resetting its outbox row to `pending` with
+   `attempts` raised by one) and confirm Stripe counts it once, noting whether Stripe
+   answered the repeat with `200` or a duplicate-identifier `400`: the shipper treats
+   both as sent.
 
 **When a new price takes effect.** A price-book version can only be set for a future
 month, and sync puts each live subscription under a Stripe subscription schedule as soon
@@ -171,6 +178,32 @@ Notes:
   usage is still metered and kept.
 - Deleting an org does not yet cancel its Stripe subscription. Cancel it in the dashboard.
 - The webhook ledger (`stripe_events`) keeps every handled event id; it is not swept.
+- Metered usage reaches Stripe as meter events. Ingest queues every metered event of an
+  org with a live subscription in `stripe_meter_outbox`, and every machine runs a shipper
+  that sends them, once `stripe sync` has made the event's Stripe meter (a newly declared
+  meter's events wait for the next sync). It retries 5xx and timeouts for up to 12 hours
+  from the first attempt Stripe may have received (inside Stripe's 24-hour identifier
+  dedupe, so nothing is counted twice), and 429s and 401/403s, which Stripe never
+  processed, until the event is 34 days old. Usage of an org with no live subscription
+  (free, or no card yet) is metered but not billed, and is not billed later when it
+  subscribes; neither is an event already 34 days old when it is ingested. An event
+  Stripe refuses (a 4xx) or that could not be sent in time is kept as `rejected` or
+  `expired` with its error, logged at error level, and not invoiced. To see how many, and
+  how long the oldest unsent one has waited:
+
+  ```bash
+  fly ssh console -a otto-platform -C "otto-platform-server stripe outbox"
+  ```
+
+  `sent` means Stripe accepted the event for processing. Stripe validates meter events
+  asynchronously (an unknown customer, an archived meter) and reports failures only as
+  `v1.billing.meter.error_report_triggered` events, which the platform does not read yet:
+  check the meter's error reports in the dashboard.
+
+  A 401/403 (the restricted key lacks *Billing Meter Events: write*) is retried and logged
+  at error, backing off to one pass every 5 minutes; fix the key and nothing is lost.
+- Deleting an org deletes its queued meter events with it: usage it had not yet shipped
+  to Stripe is not invoiced.
 
 ## The hostname
 

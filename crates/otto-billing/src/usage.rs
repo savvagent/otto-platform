@@ -41,6 +41,11 @@
 //! emails any budget threshold the service has newly reached. It never
 //! rejects or fails an event.
 //!
+//! A metered event of an org with a live Stripe subscription is also queued
+//! for Stripe (`stripe_meter_outbox`, see [`crate::stripe_outbox`]) by the
+//! same statement that counts it, at no extra round trip. An org without one
+//! is not billed through Stripe, and queues nothing.
+//!
 //! Meter declarations are add-only ([`crate::meters`] never removes one), so
 //! an event accepted once stays acceptable: a replay of it reaches the ledger
 //! claim and comes back [`IngestOutcome::Duplicate`], never `unknown_meter`.
@@ -59,8 +64,10 @@ use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::billing::LIVE_STATUSES;
 use crate::budgets::PendingBudgets;
 use crate::pricebook::Month;
+use crate::stripe_outbox;
 
 /// The first day of the current UTC billing month, as SQL.
 ///
@@ -510,6 +517,18 @@ impl UsageExt for Tx<'_> {
         // unmetered one adds to no meter. A metered event's quantity counts
         // whatever `billable` says (module docs).
         //
+        // `stripe` queues the event for Stripe (`stripe_meter_outbox`) when it
+        // is metered ($10 is its Stripe event name, NULL otherwise) and the
+        // org has a live subscription: a customer, and a subscription whose
+        // status is one of $12, as `billing::live_subscription` reads it. An
+        // org with none inserts nothing, and the read costs no round trip.
+        // It cannot fail the event: the values satisfy the table's checks by
+        // construction (`stripe_outbox::enqueue_fields`), the row is new (the
+        // claim above just said so; a replayed identifier does nothing), it
+        // reads `subscriptions` without locking it, and it locks no row any
+        // other ingest takes, so the lock order above is unchanged. The
+        // timestamp is the event's, as counted ($5).
+        //
         // The final SELECT reads the service's budget for a metered event
         // (no row otherwise, or with no budget), and the highest threshold
         // already fired for the event's period, so the budget step costs
@@ -520,6 +539,11 @@ impl UsageExt for Tx<'_> {
             Some(m) => (Some(m.meter), Some(m.quantity)),
             None => (None, None),
         };
+        // An event already too old for Stripe is not queued (see
+        // `stripe_outbox`): it would only expire.
+        let (event_name, identifier) =
+            stripe_outbox::enqueue_fields(event.service, event.metered, event.event_id, at, now)
+                .unzip();
         let budget: Option<crate::budgets::IngestBudget> = sqlx::query_as(
             "WITH event AS ( \
                INSERT INTO usage_events \
@@ -555,6 +579,16 @@ impl UsageExt for Tx<'_> {
                ON CONFLICT (org_id, meter, period_start) DO UPDATE \
                  SET quantity = org_meter_period_usage.quantity + EXCLUDED.quantity, \
                      updated_at = now() \
+             ), stripe AS ( \
+               INSERT INTO stripe_meter_outbox \
+                 (org_id, identifier, event_name, stripe_customer_id, value, occurred_at) \
+               SELECT $1, $11::text, $10::text, s.stripe_customer_id, $8::bigint, $5 \
+               FROM subscriptions s \
+               WHERE $10::text IS NOT NULL AND s.org_id = $1 \
+                 AND s.stripe_customer_id IS NOT NULL \
+                 AND s.stripe_subscription_id IS NOT NULL \
+                 AND s.status = ANY($12::text[]) \
+               ON CONFLICT (identifier) DO NOTHING \
              ) \
              SELECT b.monthly_budget_cents, b.hard_stop, \
                     (SELECT max(a.threshold) FROM budget_alerts a \
@@ -574,6 +608,9 @@ impl UsageExt for Tx<'_> {
         .bind(meter)
         .bind(quantity)
         .bind(event.service)
+        .bind(event_name)
+        .bind(identifier)
+        .bind(&LIVE_STATUSES[..])
         .fetch_optional(self.conn())
         .await?;
 
@@ -589,7 +626,8 @@ impl UsageExt for Tx<'_> {
         if let (Some(service), Some(budget)) = (event.service, budget) {
             budgets.note(service, Month::of(at), budget);
         }
-        // The Stripe meter outbox (#64) goes here.
+        // The Stripe meter outbox row, if any, was written by the statement
+        // above.
         Ok(IngestOutcome::Counted)
     }
 

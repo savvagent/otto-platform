@@ -45,6 +45,8 @@ commands:
   sync    create missing Stripe meters and prices from the price book, subscribe
           orgs with a card on file, and schedule every subscription's price
           switches (needs STRIPE_SECRET_KEY)
+  outbox  count queued, sent and lost metered usage events by status
+          (needs only DATABASE_URL)
 ";
 
 /// How often the background loop syncs.
