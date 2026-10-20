@@ -26,7 +26,8 @@
 //!   are.
 //! - **A row closes at its first claim.** A row is open only while it is
 //!   pending, has never been claimed (`attempts = 0 AND sending_since IS
-//!   NULL`) and is not full ([`OPEN_ROW_MAX_VALUE`]); the claim sets
+//!   NULL`) and is not full (`NOT is_full`, a stored generated column that is
+//!   `value > `[`OPEN_ROW_MAX_VALUE`]); the claim sets
 //!   `sending_since`, which takes it out of the index for good. From then on
 //!   its value never changes, so every retry sends what the first attempt
 //!   sent; an event counted after the claim opens a new row (with a new
@@ -40,7 +41,11 @@
 //!   of it) takes no more additions, and one addition is at most the other
 //!   half ([`MAX_ADDITION`]; an event's quantity is at most
 //!   [`crate::usage::MAX_METER_QUANTITY`], far below it), so a sum can never
-//!   overflow the table's check, and ingest can never fail on it.
+//!   overflow the table's check, and ingest can never fail on it. "Full" is
+//!   the generated column `is_full` rather than a `value` comparison in the
+//!   index predicate so that adding to an open row touches no indexed
+//!   column, which lets Postgres make the upsert a HOT update (migration
+//!   0023 measures the difference).
 //!
 //! The insert is a data-modifying CTE of the event's own counter statement,
 //! so it costs no round trip at all, for orgs with or without a subscription,
@@ -127,9 +132,10 @@
 //!
 //! # Invoicing
 //!
-//! [`has_pending_before`] tells Stripe invoicing whether an org still has
-//! usage for a period on its way to Stripe; [`backfill_period`] queues the
-//! usage an org accrued before its subscription went live.
+//! [`invoice_shipping`] tells Stripe invoicing whether usage that can be on
+//! one held invoice is still on its way to Stripe, and when the last of it
+//! was sent; [`backfill_period`] queues the usage an org accrued before its
+//! subscription went live.
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -184,9 +190,12 @@ pub const MAX_ADDITION: i64 = MAX_OUTBOX_VALUE - OPEN_ROW_MAX_VALUE;
 
 /// The predicate of `stripe_meter_outbox_open_idx` (migration 0023), which
 /// every `ON CONFLICT` adding to an open row must repeat for Postgres to
-/// infer that index.
-pub(crate) const OPEN_ROW: &str = "status = 'pending' AND attempts = 0 AND sending_since IS NULL \
-                                   AND value <= 500000000000000";
+/// infer that index. `is_full` is the stored generated column
+/// `value > 500000000000000` ([`OPEN_ROW_MAX_VALUE`]), so an open row's
+/// value is at most [`OPEN_ROW_MAX_VALUE`] and one more addition (at most
+/// [`MAX_ADDITION`]) cannot pass [`MAX_OUTBOX_VALUE`].
+pub(crate) const OPEN_ROW: &str =
+    "status = 'pending' AND attempts = 0 AND sending_since IS NULL AND NOT is_full";
 
 /// The conflict target and action that add a new row's value to the open row
 /// for its key, if there is one.
@@ -504,18 +513,23 @@ const DUE_COLS: &str = "o.id, o.org_id, o.identifier, o.event_name, o.stripe_cus
 /// lapsed and was claimed again can therefore never record over the new claim
 /// (and clear the evidence that the new claim's send may be in flight).
 ///
-/// **Cost.** It walks `stripe_meter_outbox_due_idx` (pending rows by
-/// `next_attempt_at`) in order and stops after `limit` claimable rows,
-/// probing `stripe_meters` (its unique `event_name`) per row, however large
-/// the due backlog (a Stripe outage) grows. The meter check is a correlated
-/// subquery rather than `EXISTS` on purpose: as a semi-join the planner joins
-/// every due row to the (tiny) `stripe_meters` first and sorts them all
-/// (measured under `otto_app`'s row-level security at 300k due rows: 330 ms
-/// and a spill to disk, against an index walk of the first rows). The
-/// delivery policies' quals are a per-row filter that does not block the
-/// ordered index scan, so no BYPASSRLS or SECURITY DEFINER route is needed.
-/// Due rows whose meter is unsynced are pushed out of its way by
-/// [`defer_unsynced`].
+/// **Cost.** The plan aims to walk `stripe_meter_outbox_due_idx` (pending
+/// rows by `next_attempt_at`) in order and stop after `limit` claimable
+/// rows, probing `stripe_meters` (its unique `event_name`) per row. The
+/// meter check is a correlated subquery rather than `EXISTS` on purpose: as
+/// a semi-join the planner joins every due row to the (tiny) `stripe_meters`
+/// first and sorts them all (measured under `otto_app`'s row-level security
+/// at 300k due rows: 330 ms and a spill to disk).
+///
+/// That is what Fly runs: the server connects as the database's owner, a
+/// superuser, to which row-level security does not apply, and the ordered
+/// index walk is chosen. **Under row-level security** (connecting as
+/// `otto_app`) on Postgres 16 the planner may instead read the whole due
+/// backlog, filter it through the delivery policies and sort it; measured at
+/// 80k due rows: 226 ms per claim. The cost then grows with the backlog,
+/// which is only large after a long Stripe outage; each claim is still one
+/// short statement, and the backlog drains as rows are sent. Due rows whose
+/// meter is unsynced are pushed out of the way by [`defer_unsynced`].
 pub async fn claim_due(db: &Db, limit: i64) -> Result<Vec<DueMeterEvent>> {
     let mut tx = delivery_tx(db).await?;
     let rows = sqlx::query_as(&format!(
@@ -762,27 +776,52 @@ pub async fn sweep(db: &Db, keep_days: i32) -> Result<u64> {
     }
 }
 
-/// Whether `org_id` has usage still waiting to reach Stripe (a `pending`
-/// row, claimed or not, due or not) billed before `before`: a row whose hour
-/// starts before `before`. Every event a row carries lies in its hour, so for
-/// an hour-aligned `before` (a period's start, [`period::starts_at`]) this is
-/// exactly "usage billed before `before`". `rejected` and `expired` rows will
-/// never reach Stripe and do not count; neither do `sent` ones.
+/// Where the usage that can be on one held invoice stands: the usage of
+/// `org_id` billed in `month` for Stripe customer `customer`
+/// ([`invoice_shipping`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InvoiceShipping {
+    /// Some of it is `pending` (claimed or not, due or not) for a meter
+    /// Stripe knows (`stripe_meters`): it will reach Stripe, so it holds the
+    /// invoice.
+    pub pending: bool,
+    /// Rows of it `pending` for a meter Stripe does not know yet. They are
+    /// never sent until `stripe sync` makes the meter, so waiting for them
+    /// could hold the invoice for nothing; they are reported (logged by the
+    /// caller) and do not hold it.
+    pub unsynced: i64,
+    /// When the last of its rows was sent (`finished_at` of its `sent`
+    /// rows): Stripe applies meter events asynchronously, so an invoice is
+    /// released only a while after it.
+    pub last_sent_at: Option<DateTime<Utc>>,
+}
+
+/// [`InvoiceShipping`] for the invoice of `month` for `org_id`'s Stripe
+/// customer `customer`.
 ///
-/// For Stripe invoicing: hold an invoice for a period until this is `false`
-/// for the instant the period ends, so the invoice carries all its usage.
-/// Usage can still be added for a period until it closes
+/// **Scope.** Only rows that can be on that invoice count: the org's rows of
+/// that customer whose hour lies in `month` (`bucket_start >=
+/// starts_at(month) AND < starts_at(month + 1)`; every event a row carries
+/// lies in its hour). A row stuck in an older month, another customer's row
+/// (a previous subscription's) or a row of a meter Stripe does not know
+/// cannot be on it and never holds it. `rejected` and `expired` rows will
+/// never reach Stripe and do not count either. The pending rows are found
+/// through `stripe_meter_outbox_pending_period_idx` (migration 0023).
+///
+/// For Stripe invoicing: hold an invoice for `month` until `pending` is
+/// false. Usage can still be added for a period until it closes
 /// ([`period::closes_at`]); ask after that.
 ///
 /// `conn` must be a transaction pinned to `org_id` (`otto_tenant::Tx::conn`),
 /// or an unpinned transaction opted in to the outbox's delivery policies.
 /// Any other connection would see no rows under row-level security and
-/// answer a false `false`, so it is refused with an error instead.
-pub async fn has_pending_before(
+/// answer a false "nothing pending", so it is refused with an error instead.
+pub async fn invoice_shipping(
     conn: &mut sqlx::PgConnection,
     org_id: OrgId,
-    before: DateTime<Utc>,
-) -> Result<bool> {
+    customer: &str,
+    month: Month,
+) -> Result<InvoiceShipping> {
     let (pinned, opted_in): (Option<Uuid>, bool) = sqlx::query_as(
         "SELECT current_org(), \
                 COALESCE(current_setting('app.stripe_meter_delivery', true) = 'on', false)",
@@ -795,18 +834,42 @@ pub async fn has_pending_before(
     };
     if !sees_org {
         return Err(Error::Tenant(otto_tenant::Error::Invalid(format!(
-            "has_pending_before needs a transaction pinned to org {org_id} (or one opted in to \
+            "invoice_shipping needs a transaction pinned to org {org_id} (or one opted in to \
              the stripe meter outbox's delivery policies)"
         ))));
     }
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM stripe_meter_outbox \
-                         WHERE org_id = $1 AND status = 'pending' AND bucket_start < $2)",
+    let end = month
+        .offset(1)
+        .map(period::starts_at)
+        .ok_or_else(|| Error::Unexpected(format!("no month after {month}")))?;
+    let (pending, unsynced, last_sent_at): (bool, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+        "WITH waiting AS ( \
+           SELECT (SELECT true FROM stripe_meters m WHERE m.event_name = o.event_name) \
+                    IS NOT NULL AS synced \
+             FROM stripe_meter_outbox o \
+            WHERE o.org_id = $1 AND o.status = 'pending' \
+              AND o.bucket_start >= $3 AND o.bucket_start < $4 \
+              AND o.stripe_customer_id = $2 \
+         ) \
+         SELECT COALESCE(bool_or(synced), false), \
+                count(*) FILTER (WHERE NOT synced), \
+                (SELECT max(s.finished_at) FROM stripe_meter_outbox s \
+                  WHERE s.org_id = $1 AND s.status = 'sent' \
+                    AND s.bucket_start >= $3 AND s.bucket_start < $4 \
+                    AND s.stripe_customer_id = $2) \
+           FROM waiting",
     )
     .bind(org_id)
-    .bind(before)
+    .bind(customer)
+    .bind(period::starts_at(month))
+    .bind(end)
     .fetch_one(&mut *conn)
-    .await?)
+    .await?;
+    Ok(InvoiceShipping {
+        pending,
+        unsynced,
+        last_sent_at,
+    })
 }
 
 /// Queue for Stripe whatever of the org's metered usage in `month` is
@@ -1111,8 +1174,24 @@ mod tests {
         const { assert!(OPEN_ROW_MAX_VALUE + MAX_ADDITION == MAX_OUTBOX_VALUE) };
         let per_event = i64::try_from(crate::usage::MAX_METER_QUANTITY).unwrap();
         assert!(per_event <= MAX_ADDITION);
-        // The index predicate repeats the constant (migration 0023 too).
-        assert!(OPEN_ROW.ends_with(&format!("value <= {OPEN_ROW_MAX_VALUE}")));
+        // The open index's predicate is OPEN_ROW, verbatim, and its `is_full`
+        // is exactly "past OPEN_ROW_MAX_VALUE" (migration 0023).
+        let migration = include_str!("../../otto-tenant/migrations/0023_stripe_meter_outbox.sql");
+        assert!(
+            migration.contains(&format!(
+                "is_full            boolean     GENERATED ALWAYS AS \
+                 (value > {OPEN_ROW_MAX_VALUE}) STORED"
+            )),
+            "is_full must be `value > OPEN_ROW_MAX_VALUE`"
+        );
+        assert!(
+            migration.contains(&format!("\n  WHERE {OPEN_ROW};\n")),
+            "the open index's predicate must be OPEN_ROW"
+        );
+        assert_eq!(
+            OPEN_ROW,
+            "status = 'pending' AND attempts = 0 AND sending_since IS NULL AND NOT is_full"
+        );
         assert!(add_to_open_row().contains(OPEN_ROW));
     }
 

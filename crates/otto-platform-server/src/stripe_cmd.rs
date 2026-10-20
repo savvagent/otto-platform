@@ -1266,6 +1266,20 @@ mod tests {
         tx.commit().await.unwrap();
     }
 
+    /// As if every sent outbox row had been sent `ago` earlier.
+    async fn sent_since(db: &Db, org: OrgId, ago: chrono::Duration) {
+        let mut tx = db.begin(org).await.unwrap();
+        sqlx::query(
+            "UPDATE stripe_meter_outbox SET finished_at = now() - make_interval(secs => $1) \
+             WHERE status = 'sent'",
+        )
+        .bind(ago.num_seconds() as f64)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
     async fn held(pool: &PgPool) -> Vec<(String, Option<String>)> {
         sqlx::query_as("SELECT stripe_invoice_id, outcome FROM stripe_held_invoices ORDER BY 1")
             .fetch_all(pool)
@@ -1355,6 +1369,19 @@ mod tests {
             .requests("POST", "/v1/invoices/in_1/finalize")
             .is_empty());
         held_since(&db, org, "clear_since", billing::INVOICE_SETTLE).await;
+        // Clear long enough, but the last of its usage was sent only just
+        // now: Stripe may not have applied it yet, so it still waits.
+        run(&db, &mock).await.0.unwrap();
+        assert_eq!(mock.invoice("in_1").unwrap()["status"], "draft");
+        sent_since(
+            &db,
+            org,
+            billing::INVOICE_SETTLE - chrono::Duration::seconds(5),
+        )
+        .await;
+        run(&db, &mock).await.0.unwrap();
+        assert_eq!(mock.invoice("in_1").unwrap()["status"], "draft");
+        sent_since(&db, org, billing::INVOICE_SETTLE).await;
         let (r, out) = run(&db, &mock).await;
         r.unwrap();
         assert!(
@@ -1478,6 +1505,49 @@ mod tests {
         }
         assert!(held(&pool).await.is_empty());
         assert!(mock.posts_under("/v1/invoices").is_empty());
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn an_invoice_that_advanced_before_its_hold_is_touched_only_if_open(pool: PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let mock = MockStripe::start().await;
+        let (_, customer, sub) = subscribed(&db, &pool, &mock).await;
+        let (_, end) = closed_month();
+
+        // Paid (or void, or uncollectible) before the webhook reached it:
+        // only the hold call, which Stripe answers with its status, and
+        // nothing after it.
+        let paid = mock.add_invoice("in_paid", &customer, &sub, end);
+        mock.set_invoice_status("in_paid", "paid");
+        let outcome = invoice_event(&db, &mock, "evt_paid", &paid).await;
+        assert!(
+            matches!(&outcome, billing::EventOutcome::Ignored(why) if why.contains("(paid)")),
+            "{outcome:?}"
+        );
+        let calls = mock.posts_under("/v1/invoices/in_paid");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].field("auto_advance"), Some("false"));
+
+        // Open: collection is handed back to Stripe.
+        let open = mock.add_invoice("in_open", &customer, &sub, end);
+        mock.set_invoice_status("in_open", "open");
+        invoice_event(&db, &mock, "evt_open", &open).await;
+        let calls = mock.posts_under("/v1/invoices/in_open");
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[1].field("auto_advance"), Some("true"));
+        assert_eq!(mock.invoice("in_open").unwrap()["auto_advance"], true);
+
+        assert_eq!(
+            held(&pool).await,
+            [
+                ("in_open".to_owned(), Some("not_draft".to_owned())),
+                ("in_paid".to_owned(), Some("not_draft".to_owned())),
+            ]
+        );
+        // Sync never touches them again.
+        run(&db, &mock).await.0.unwrap();
+        assert_eq!(mock.posts_under("/v1/invoices").len(), 3);
+        assert_eq!(mock.invoice("in_paid").unwrap()["auto_advance"], false);
     }
 
     #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
