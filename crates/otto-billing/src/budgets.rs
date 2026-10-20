@@ -507,6 +507,7 @@ pub(crate) struct IngestBudget {
 /// # }
 /// ```
 #[derive(Debug, Default)]
+#[must_use = "budget alerts never fire unless `run` is called before commit"]
 pub struct PendingBudgets {
     touched: BTreeMap<(String, Month), IngestBudget>,
     tiers: TierCache,
