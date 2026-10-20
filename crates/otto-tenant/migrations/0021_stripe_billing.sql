@@ -4,8 +4,8 @@
 -- invoices its metered usage monthly in arrears. The Stripe API calls and every
 -- statement against these tables live in `otto_billing::billing`.
 --
--- Additive only: new columns on `subscriptions` (0003) and five new global
--- tables.
+-- Additive only: new columns on `subscriptions` (0003), six new global
+-- tables and one new tenant table (`stripe_held_invoices`).
 
 -- Fail fast rather than queue: a migration waiting for a lock on a busy table
 -- makes every later query on that table wait behind it. Failing the boot lets
@@ -144,17 +144,88 @@ CREATE TABLE stripe_sync_lease (
   until timestamptz NOT NULL
 );
 
+-- Which Stripe mode (`live` or `test`) this database's Stripe objects were
+-- made in. One row, written at the first boot (or `stripe sync`) with a Stripe
+-- key, from the key's prefix; every later boot compares its key's mode with it
+-- and refuses to start on a mismatch, because the customer, subscription,
+-- meter and price ids recorded here do not exist in the other mode. Resetting
+-- it is a deliberate operator act (docs/deploy/fly.md, "Stripe setup").
+-- `otto_app` gets no access.
+CREATE TABLE stripe_account_mode (
+  singleton   boolean     PRIMARY KEY DEFAULT true,
+  mode        text        NOT NULL,
+  recorded_at timestamptz NOT NULL DEFAULT now(),
+
+  CONSTRAINT stripe_account_mode_one_row CHECK (singleton),
+  CONSTRAINT stripe_account_mode_mode CHECK (mode IN ('live', 'test'))
+);
+
+-- ------------------------------------------------------------ held invoices
+--
+-- Stripe makes a subscription's invoice for month M at 00:00 UTC on the
+-- first of M+1, as a draft that it would finalize about an hour later. Usage
+-- for M can still reach Stripe after that: the meter outbox sends an hour's
+-- usage after the hour ends, and M stays open for late events until 02:00 UTC
+-- (`otto_billing::period`). Usage that reaches Stripe after M's invoice is
+-- finalized is never invoiced. So the `invoice.created` webhook turns
+-- `auto_advance` off for each subscription-cycle invoice of an org's recorded
+-- subscription and records it here, and `stripe sync` finalizes it (turning
+-- `auto_advance` back on, so Stripe collects it) once M has closed and none of
+-- the org's usage before the end of M is still waiting to be sent, or after a
+-- maximum hold. See `otto_billing::billing` ("Invoices wait for their usage").
+--
+-- TENANT-scoped, with the standard policy: the webhook and sync write it in
+-- the org's pinned transaction, under the org's billing lease, so a write
+-- after a Stripe call is refused once the lease is lost.
+CREATE TABLE stripe_held_invoices (
+  stripe_invoice_id      text        PRIMARY KEY,
+  org_id                 uuid        NOT NULL REFERENCES orgs (id) ON DELETE CASCADE,
+  stripe_subscription_id text        NOT NULL,
+  -- The first day of the month the invoice bills.
+  period_month           date        NOT NULL,
+  held_at                timestamptz NOT NULL DEFAULT now(),
+  -- When sync first saw no usage of the period waiting to be sent, and has
+  -- seen none since. Cleared whenever some is seen again.
+  clear_since            timestamptz,
+  -- When sync let the invoice go, and how:
+  --   finalized       finalized once its usage had been sent
+  --   finalized_late  finalized at the maximum hold with usage still waiting
+  --                   (logged at error: that usage is not on it)
+  --   not_draft       already finalized or voided by someone else; left alone
+  released_at            timestamptz,
+  outcome                text,
+
+  CONSTRAINT stripe_held_invoices_id_len
+    CHECK (char_length(stripe_invoice_id) BETWEEN 1 AND 255),
+  CONSTRAINT stripe_held_invoices_sub_len
+    CHECK (char_length(stripe_subscription_id) BETWEEN 1 AND 255),
+  CONSTRAINT stripe_held_invoices_month CHECK (extract(day FROM period_month) = 1),
+  CONSTRAINT stripe_held_invoices_outcome
+    CHECK (outcome IN ('finalized', 'finalized_late', 'not_draft')),
+  CONSTRAINT stripe_held_invoices_released CHECK ((released_at IS NULL) = (outcome IS NULL))
+);
+
+-- What sync looks for: each org's invoices still held.
+CREATE INDEX stripe_held_invoices_open_idx
+  ON stripe_held_invoices (org_id) WHERE released_at IS NULL;
+
+ALTER TABLE stripe_held_invoices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE stripe_held_invoices FORCE ROW LEVEL SECURITY;
+CREATE POLICY stripe_held_invoices_tenant_isolation ON stripe_held_invoices
+  USING (org_id = current_org()) WITH CHECK (org_id = current_org());
+
 -- `otto_app` may read the meter and price ids (what a price is in Stripe is
 -- not a secret, and a tenant transaction shipping meter events needs the event
--- names) but not change them. The customer map, the event ledger and the sync
--- lease are cross-tenant and get nothing. Conditional because a managed
+-- names) but not change them. The customer map, the event ledger, the sync
+-- lease and the account mode are cross-tenant and get nothing. The held
+-- invoices are tenant rows and keep 0004's default grants, under RLS. Conditional because a managed
 -- deployment has no such role (0004).
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'otto_app') THEN
     -- 0004's default privileges granted the new tables to otto_app.
     EXECUTE 'REVOKE ALL ON stripe_customers, stripe_events, stripe_meters, stripe_prices, '
-         || 'stripe_sync_lease FROM otto_app';
+         || 'stripe_sync_lease, stripe_account_mode FROM otto_app';
     EXECUTE 'GRANT SELECT ON stripe_meters, stripe_prices TO otto_app';
   END IF;
 END $$;

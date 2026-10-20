@@ -17,7 +17,10 @@
 //! Only a future month can be priced, judged by the database's clock: the
 //! current month and earlier ones are refused, so a period being billed, or
 //! already billed, never changes price, and a meter with no price gets its
-//! first one from next month. Running `set` again for the same future month
+//! first one from next month at the earliest. The month must also start at
+//! least 24 hours after now, so Stripe has its price switch scheduled in
+//! time: on the last day of a month, the earliest is the month after next.
+//! `set` prints, and logs at info, what the month cost before and after. Running `set` again for the same future month
 //! replaces that version with a new one (a new id). See
 //! `otto_billing::pricebook::set_version`.
 //!
@@ -159,6 +162,20 @@ fn format_tiers(tiers: &Tiers) -> String {
         .join(" ")
 }
 
+/// What a month cost before a `set`: the version in effect for it then.
+fn describe_before(before: Option<&VersionRecord>) -> String {
+    match before {
+        None => "unpriced".to_owned(),
+        Some(v) => {
+            let tiers = match &v.tiers {
+                Ok(tiers) => format_tiers(tiers),
+                Err(reason) => format!("corrupt: {reason}"),
+            };
+            format!("{tiers} (version {} from {})", v.id, v.effective_month)
+        }
+    }
+}
+
 /// Run a parsed command, writing human-readable output to `out`. Which months
 /// are past, current or future is the database's call
 /// ([`pricebook::current_month`]), not this machine's clock.
@@ -172,11 +189,21 @@ pub async fn execute(db: &Db, cmd: Command, out: &mut impl Write) -> anyhow::Res
             let mut tx = db.begin_unpinned().await?;
             let outcome = pricebook::set_version(&mut tx, &meter, effective, &tiers).await?;
             tx.commit().await?;
-            writeln!(
-                out,
-                "{meter} from {effective}: {}",
-                format_tiers(&outcome.version.tiers)
-            )?;
+            let after = format_tiers(&outcome.version.tiers);
+            let before = describe_before(outcome.before.as_ref());
+            // A price change is worth a trace of its own, beyond the shell
+            // that ran it: who changed what a month costs, from what to what.
+            tracing::info!(
+                meter = %meter,
+                effective = %effective,
+                version = %outcome.version.id,
+                replaced = ?outcome.replaced,
+                before = %before,
+                after = %after,
+                "price book set"
+            );
+            writeln!(out, "{meter} from {effective}: {after}")?;
+            writeln!(out, "before: {before}")?;
             writeln!(out, "version {}", outcome.version.id)?;
             if let Some(old) = outcome.replaced {
                 writeln!(out, "replaced version {old}")?;
@@ -370,6 +397,12 @@ mod tests {
         pricebook::current_month(tx.conn()).await.unwrap()
     }
 
+    /// The earliest month `set` accepts now.
+    async fn earliest(db: &Db) -> Month {
+        let mut tx = db.begin_unpinned().await.unwrap();
+        pricebook::store::earliest_month(tx.conn()).await.unwrap()
+    }
+
     /// Registers `svc` and declares `svc/calls`, `svc/bytes` and `svc/later`.
     /// Fixtures, not real meters or rates.
     async fn seed_meters(pool: &PgPool) {
@@ -421,7 +454,7 @@ mod tests {
         let (prev2, prev, next) = (
             current.offset(-2).unwrap(),
             current.offset(-1).unwrap(),
-            current.offset(1).unwrap(),
+            earliest(&db).await,
         );
         insert_flat(&pool, "svc/calls", prev2, 3000).await;
         insert_flat(&pool, "svc/calls", prev, 2500).await;
@@ -444,6 +477,9 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("replaced"), "{out}");
+        // What the month cost before: the version in effect from last month.
+        assert!(out.contains("\nbefore: inf:2500 (version "), "{out}");
+        assert!(out.contains(&format!(" from {prev})\n")), "{out}");
         let replaced = run(
             &db,
             &format!("set svc/calls --effective {next} --tier inf:1900"),
@@ -451,6 +487,21 @@ mod tests {
         .await
         .unwrap();
         assert!(replaced.contains("replaced version "), "{replaced}");
+        assert!(
+            replaced.contains("before: 100:0 inf:2000 (version "),
+            "{replaced}"
+        );
+        assert!(replaced.contains(&format!(" from {next})\n")), "{replaced}");
+        let first_price = run(
+            &db,
+            &format!("set svc/later --effective {next} --tier inf:4"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            first_price.contains("\nbefore: unpriced\n"),
+            "{first_price}"
+        );
         run(
             &db,
             &format!("set svc/later --effective {next} --tier inf:5"),
@@ -498,7 +549,7 @@ mod tests {
         seed_meters(&pool).await;
         let db = Db::from_pool(pool.clone());
         let current = now_month(&db).await;
-        let next = current.offset(1).unwrap();
+        let next = earliest(&db).await;
         insert_flat(&pool, "svc/calls", current.offset(-1).unwrap(), 1).await;
 
         let err = run(

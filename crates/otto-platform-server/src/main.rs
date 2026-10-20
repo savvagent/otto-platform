@@ -95,6 +95,10 @@ async fn main() -> Result<()> {
         .context("refusing to serve: tenant isolation is not enforced by this database")?;
     tracing::info!("{}", isolation.summary());
 
+    // A live key against test-mode records (or the reverse) would bill
+    // nobody correctly: refuse to start, saying how to switch on purpose.
+    otto_platform_server::verify_stripe_mode(&db, &config).await?;
+
     let router = app(db.clone(), &config)?;
 
     // Lifecycle webhooks: the same key that seals IdP secrets seals each
@@ -228,6 +232,9 @@ async fn run_pricebook_command(args: &[String]) -> Result<()> {
 
     let cmd = pricebook_cmd::parse(args)
         .map_err(|e| anyhow::anyhow!("{e}\n\n{}", pricebook_cmd::USAGE))?;
+    // `set` logs what it changed (before and after) at info; to stderr, so
+    // the command's own output on stdout stays clean.
+    init_cli_tracing()?;
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
     let db = Db::connect(&database_url)
         .await
@@ -253,11 +260,16 @@ async fn run_stripe_command(args: &[String]) -> Result<()> {
         stripe_cmd::parse(args).map_err(|e| anyhow::anyhow!("{e}\n\n{}", stripe_cmd::USAGE))?;
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
     let key = otto_platform_server::config::stripe_key_from_env()?;
-    let client =
-        otto_billing::stripe::Client::new(key).context("could not build the Stripe client")?;
     let db = Db::connect(&database_url)
         .await
         .context("could not connect to DATABASE_URL")?;
+    // The same guard as the server's boot: never sync a test-mode database
+    // with a live key, or the reverse.
+    otto_billing::billing::check_key_mode(&db, &key)
+        .await
+        .context("refusing to sync: the Stripe key does not fit this database")?;
+    let client =
+        otto_billing::stripe::Client::new(key).context("could not build the Stripe client")?;
     stripe_cmd::execute(&db, &client, cmd, &mut std::io::stdout()).await
 }
 
@@ -289,6 +301,18 @@ async fn shutdown_signal() {
         _ = ctrl_c => tracing::info!("SIGINT; shutting down"),
         _ = terminate => tracing::info!("SIGTERM; shutting down"),
     }
+}
+
+/// Text logs on stderr at `info` (or `RUST_LOG`), for an operator command.
+fn init_cli_tracing() -> Result<()> {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init()
+        .map_err(|e| anyhow::anyhow!("could not initialize tracing: {e}"))
 }
 
 fn init_tracing(format: LogFormat) -> Result<()> {

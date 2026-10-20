@@ -168,6 +168,27 @@ impl SubscriptionSchedule {
     }
 }
 
+/// An invoice, with the fields invoicing reads.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Invoice {
+    pub id: String,
+    /// A `cus_...` id (never expanded by this client).
+    pub customer: Option<String>,
+    /// `draft`, `open`, `paid`, `uncollectible` or `void`.
+    pub status: Option<String>,
+    /// Whether Stripe advances the invoice on its own (finalizes a draft,
+    /// then collects it).
+    #[serde(default)]
+    pub auto_advance: Option<bool>,
+    /// e.g. `subscription_cycle`, `subscription_create`, `manual`.
+    pub billing_reason: Option<String>,
+    /// The usage period the invoice bills, Unix seconds. For a subscription
+    /// invoice it looks back one period: an invoice made at 00:00 UTC on
+    /// 1 November has `period_end` at that instant.
+    pub period_start: Option<i64>,
+    pub period_end: Option<i64>,
+}
+
 /// Stripe's acknowledgement of a meter event.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct MeterEventRecord {
@@ -263,6 +284,10 @@ pub struct CreateSubscription {
     pub prices: Vec<String>,
     /// When the first full period starts. Proration is always off.
     pub billing_cycle_anchor: Option<DateTime<Utc>>,
+    /// Start the subscription in the past (`backdate_start_date`), so its
+    /// first period covers metered usage from then on. Must be before now
+    /// and before `billing_cycle_anchor`.
+    pub backdate_start_date: Option<DateTime<Utc>>,
     pub metadata: Metadata,
 }
 
@@ -506,6 +531,17 @@ impl Client {
         if let Some(anchor) = params.billing_cycle_anchor {
             form.push("billing_cycle_anchor", anchor.timestamp().to_string());
         }
+        if let Some(start) = params.backdate_start_date {
+            if params
+                .billing_cycle_anchor
+                .is_some_and(|anchor| anchor <= start)
+            {
+                return Err(invalid(
+                    "backdate_start_date must be before billing_cycle_anchor",
+                ));
+            }
+            form.push("backdate_start_date", start.timestamp().to_string());
+        }
         form.push("proration_behavior", "none");
         push_metadata(&mut form, &params.metadata)?;
         self.post("/v1/subscriptions", form, idempotency_key).await
@@ -723,6 +759,47 @@ impl Client {
         self.post(
             &format!("/v1/subscription_schedules/{id}/release"),
             Form::default(),
+            idempotency_key,
+        )
+        .await
+    }
+
+    /// `GET /v1/invoices/{id}`
+    pub async fn retrieve_invoice(&self, id: &str) -> Result<Invoice, StripeError> {
+        check_id("invoice", id)?;
+        self.get(&format!("/v1/invoices/{id}")).await
+    }
+
+    /// `POST /v1/invoices/{id}` setting `auto_advance`: `false` keeps a draft
+    /// invoice a draft until it is finalized explicitly.
+    pub async fn set_invoice_auto_advance(
+        &self,
+        id: &str,
+        auto_advance: bool,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Invoice, StripeError> {
+        check_id("invoice", id)?;
+        let mut form = Form::default();
+        form.push("auto_advance", auto_advance.to_string());
+        self.post(&format!("/v1/invoices/{id}"), form, idempotency_key)
+            .await
+    }
+
+    /// `POST /v1/invoices/{id}/finalize`: turn a draft into an open invoice,
+    /// with `auto_advance` deciding whether Stripe then collects it on its
+    /// own.
+    pub async fn finalize_invoice(
+        &self,
+        id: &str,
+        auto_advance: bool,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Invoice, StripeError> {
+        check_id("invoice", id)?;
+        let mut form = Form::default();
+        form.push("auto_advance", auto_advance.to_string());
+        self.post(
+            &format!("/v1/invoices/{id}/finalize"),
+            form,
             idempotency_key,
         )
         .await

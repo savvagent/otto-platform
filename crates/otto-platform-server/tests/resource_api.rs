@@ -103,7 +103,7 @@ fn basic(uri: &str, secret: &str) -> String {
 }
 
 async fn send(db: &Db, req: Request<Body>) -> (StatusCode, Value) {
-    let res = otto_platform_server::router(db.clone())
+    let res = otto_platform_server::router(db.clone(), otto_platform_server::Billing::Enabled)
         .oneshot(req)
         .await
         .unwrap();
@@ -967,7 +967,7 @@ async fn webhook_config_is_validated_and_clearable(pool: PgPool) {
 async fn serve(db: &Db) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let app = otto_platform_server::router(db.clone());
+    let app = otto_platform_server::router(db.clone(), otto_platform_server::Billing::Enabled);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     base
 }

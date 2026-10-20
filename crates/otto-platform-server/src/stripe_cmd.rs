@@ -17,10 +17,17 @@
 //! 2. creates a Stripe Price for every price-book version that has none
 //!    (Stripe prices are immutable, so a version's price is created once);
 //! 3. subscribes every org with an active card, no live subscription and
-//!    billing not stopped (adopting a live subscription already tagged with
-//!    the org), and puts every live subscription on a schedule that switches
-//!    its prices at 00:00 UTC on the first of each month a new version takes
-//!    effect.
+//!    billing not stopped (adopting the recorded subscription when Stripe
+//!    says it is live, or a live one tagged with the org; a new one is
+//!    backdated to the start of the month and the month's usage so far is
+//!    queued for it), and puts every live subscription on a schedule that
+//!    switches its prices at 00:00 UTC on the first of each month a new
+//!    version takes effect;
+//! 4. finalizes every invoice held as a draft (`invoice.created`) whose
+//!    month's usage has all reached Stripe, or whose 72-hour hold is up.
+//!
+//! The server's loop also sweeps the webhook ledger (`stripe_events`) of
+//! events past their retention, about once an hour.
 //!
 //! See `otto_billing::billing::sync`. Only one sync runs at a time across
 //! every machine; a second is refused (`another stripe sync is running`).
@@ -43,8 +50,9 @@ usage: otto-platform-server stripe <command>
 
 commands:
   sync    create missing Stripe meters and prices from the price book, subscribe
-          orgs with a card on file, and schedule every subscription's price
-          switches (needs STRIPE_SECRET_KEY)
+          orgs with a card on file, schedule every subscription's price
+          switches, and finalize held invoices whose usage has reached Stripe
+          (needs STRIPE_SECRET_KEY)
   outbox  count queued, sent and lost metered usage events by status
           (needs only DATABASE_URL)
 ";
@@ -54,6 +62,9 @@ pub const SYNC_EVERY: Duration = Duration::from_secs(15 * 60);
 
 /// How long after 00:00 UTC on the first the loop runs an extra sync.
 const AFTER_MONTH_START: Duration = Duration::from_secs(30);
+
+/// How often the loop sweeps the webhook ledger.
+pub const SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -123,6 +134,15 @@ fn write_report(r: &SyncReport, out: &mut impl Write) -> std::io::Result<()> {
     for (org, meter) in &r.items_changed {
         writeln!(out, "corrected      org {org}  {meter}  this month's price")?;
     }
+    for (org, units) in &r.usage_backfilled {
+        writeln!(
+            out,
+            "backfilled     org {org}  {units} unit(s) of this month's usage queued"
+        )?;
+    }
+    for (org, invoice, outcome) in &r.invoices_released {
+        writeln!(out, "invoice        org {org}  {invoice}  {outcome}")?;
+    }
     for w in &r.warnings {
         writeln!(out, "warning: {w}")?;
     }
@@ -153,12 +173,36 @@ pub fn next_wait(now: DateTime<Utc>) -> Duration {
     until.clamp(Duration::from_secs(1), SYNC_EVERY)
 }
 
+/// Whether the loop should sweep the webhook ledger now, having last swept
+/// at `last` (never: `None`).
+pub fn sweep_due(last: Option<tokio::time::Instant>, now: tokio::time::Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= SWEEP_EVERY)
+}
+
+/// Forget webhook events past [`billing::EVENT_RETENTION_DAYS`]. A failure is
+/// a warning: the ledger only grows until the next sweep.
+async fn sweep_ledger(db: &Db) {
+    match billing::sweep_events(db, billing::EVENT_RETENTION_DAYS).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(deleted = n, "swept old Stripe webhook events"),
+        Err(e) => tracing::warn!(error = %e, "could not sweep old Stripe webhook events"),
+    }
+}
+
 /// Run sync now and then on [`next_wait`]'s rhythm until `shutdown` flips to
-/// `true`. Only when billing is enabled. Every machine runs it; the sync lease
-/// makes all but one skip each round.
+/// `true`, sweeping the webhook ledger about once every [`SWEEP_EVERY`]. Only
+/// when billing is enabled. Every machine runs it; the sync lease makes all
+/// but one skip each round (the sweep is batched and skips locked rows, so
+/// machines sweeping at once only share the work).
 pub async fn run_loop(db: Db, client: Client, mut shutdown: watch::Receiver<bool>) {
     tracing::info!("stripe sync task started");
+    let mut last_sweep = None;
     loop {
+        let now = tokio::time::Instant::now();
+        if sweep_due(last_sweep, now) {
+            sweep_ledger(&db).await;
+            last_sweep = Some(now);
+        }
         // Checked between orgs, so a shutdown mid-run gives every lease back.
         let stopping = shutdown.clone();
         let stop = move || *stopping.borrow();
@@ -188,6 +232,8 @@ fn log_report(r: &SyncReport) {
             schedules_set = r.schedules_set.len(),
             schedules_released = r.schedules_released.len(),
             items_corrected = r.items_changed.len(),
+            usage_backfilled = r.usage_backfilled.len(),
+            invoices_released = r.invoices_released.len(),
             "stripe sync changed Stripe"
         );
     }
@@ -208,7 +254,7 @@ mod tests {
     use otto_billing::stripe::{CreateMeter, CreateSubscription, IdempotencyKey};
     use otto_tenant::audit::Entry;
     use otto_tenant::ids::OrgId;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use sqlx::PgPool;
 
     fn args(s: &str) -> Vec<String> {
@@ -221,6 +267,17 @@ mod tests {
         assert!(parse(&args("sync now")).is_err());
         assert!(parse(&args("push")).is_err());
         assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn the_ledger_is_swept_at_once_and_then_hourly() {
+        let t = tokio::time::Instant::now();
+        assert!(sweep_due(None, t));
+        assert!(!sweep_due(
+            Some(t),
+            t + SWEEP_EVERY - Duration::from_secs(1)
+        ));
+        assert!(sweep_due(Some(t), t + SWEEP_EVERY));
     }
 
     #[test]
@@ -245,6 +302,12 @@ mod tests {
     async fn now_month(db: &Db) -> Month {
         let mut tx = db.begin_unpinned().await.unwrap();
         pricebook::current_month(tx.conn()).await.unwrap()
+    }
+
+    /// The earliest month `pricebook set` accepts now.
+    async fn earliest(db: &Db) -> Month {
+        let mut tx = db.begin_unpinned().await.unwrap();
+        pricebook::store::earliest_month(tx.conn()).await.unwrap()
     }
 
     fn ts(month: Month) -> i64 {
@@ -437,6 +500,11 @@ mod tests {
             created.field("billing_cycle_anchor"),
             Some(ts(next).to_string().as_str())
         );
+        // A first subscription covers the whole month.
+        assert_eq!(
+            created.field("backdate_start_date"),
+            Some(ts(now).to_string().as_str())
+        );
         assert_eq!(
             created.field("metadata[org_id]"),
             Some(org.to_string().as_str())
@@ -457,8 +525,8 @@ mod tests {
         let db = Db::from_pool(pool.clone());
         let mock = MockStripe::start().await;
         let now = now_month(&db).await;
-        let next = now.offset(1).unwrap();
-        let after = now.offset(2).unwrap();
+        let next = earliest(&db).await;
+        let after = next.offset(1).unwrap();
         declare(&pool, "svc", &["calls", "bytes"]).await;
         let old = price(&pool, "svc/calls", now, 7).await;
         let org = org_with_card(&db, &pool, &mock, "acme").await;
@@ -541,8 +609,8 @@ mod tests {
         let db = Db::from_pool(pool.clone());
         let mock = MockStripe::start().await;
         let now = now_month(&db).await;
-        let next = now.offset(1).unwrap();
-        let later = now.offset(3).unwrap();
+        let next = earliest(&db).await;
+        let later = next.offset(2).unwrap();
         declare(&pool, "svc", &["calls"]).await;
         let old = price(&pool, "svc/calls", now, 7).await;
         let org = org_with_card(&db, &pool, &mock, "acme").await;
@@ -618,8 +686,59 @@ mod tests {
         // apply now: the item moved, the new meter's item added, no proration.
         let new = price(&pool, "svc/calls", now, 6).await;
         let bytes = price(&pool, "svc/bytes", now, 3).await;
+        // An item on a price the price book does not know (added by hand in
+        // the dashboard): sync never removes an item.
+        let stray_meter = mock
+            .client()
+            .create_meter(
+                &CreateMeter {
+                    display_name: "stray".into(),
+                    event_name: "stray__meter".into(),
+                },
+                &IdempotencyKey::random(),
+            )
+            .await
+            .unwrap();
+        let stray = mock
+            .client()
+            .create_metered_price(
+                &otto_billing::stripe::CreateMeteredPrice {
+                    currency: "usd".into(),
+                    product: otto_billing::stripe::PriceProduct::New {
+                        name: "stray".into(),
+                    },
+                    meter: stray_meter.id,
+                    tiers: vec![otto_billing::stripe::PriceTier {
+                        up_to: otto_billing::stripe::TierUpTo::Inf,
+                        unit_amount_ucents: 1,
+                    }],
+                    lookup_key: None,
+                    nickname: None,
+                    metadata: Default::default(),
+                },
+                &IdempotencyKey::random(),
+            )
+            .await
+            .unwrap();
+        mock.client()
+            .add_subscription_item(&sub, &stray.id, &IdempotencyKey::random())
+            .await
+            .unwrap();
         let (r, out) = run(&db, &mock).await;
         r.unwrap();
+        // A price changing inside its month is called out.
+        assert!(
+            out.contains(&format!(
+                "warning: org {org}: svc/calls changed price in the middle of {now}"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "warning: org {org}: svc/bytes changed price in the middle of {now} (from no item)"
+            )),
+            "{out}"
+        );
         assert!(
             out.contains(&format!("corrected      org {org}  svc/calls")),
             "{out}"
@@ -632,8 +751,10 @@ mod tests {
             mock.subscription_prices(&sub),
             sorted(vec![
                 stripe_price_of(&pool, new).await,
-                stripe_price_of(&pool, bytes).await
-            ])
+                stripe_price_of(&pool, bytes).await,
+                stray.id.clone(),
+            ]),
+            "the stray item is left alone"
         );
         for p in mock.posts_under("/v1/subscription_items") {
             assert_eq!(p.field("proration_behavior"), Some("none"));
@@ -696,6 +817,7 @@ mod tests {
                     customer,
                     prices: vec![price_id],
                     billing_cycle_anchor: None,
+                    backdate_start_date: None,
                     metadata: [("org_id".to_owned(), org.to_string())].into(),
                 },
                 &IdempotencyKey::random(),
@@ -738,6 +860,7 @@ mod tests {
                     customer: customer.clone(),
                     prices: vec![price_id.clone()],
                     billing_cycle_anchor: None,
+                    backdate_start_date: None,
                     metadata: [("org_id".to_owned(), org.to_string())].into(),
                 },
                 &IdempotencyKey::random(),
@@ -865,6 +988,496 @@ mod tests {
             Some("sub_gone")
         );
         assert!(mock.requests("POST", "/v1/subscriptions").is_empty());
+    }
+
+    /// Usage counted for `org` this month, as ingest leaves it before the
+    /// org has a subscription. A fixture.
+    async fn counted(db: &Db, org: OrgId, meter: &str, month: Month, quantity: i64) {
+        let mut tx = db.begin(org).await.unwrap();
+        sqlx::query(
+            "INSERT INTO org_meter_period_usage (org_id, meter, period_start, quantity) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(org)
+        .bind(meter)
+        .bind(month.first_day())
+        .bind(quantity)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn queued(pool: &PgPool, org: OrgId) -> (i64, Vec<String>) {
+        let (sum, customers): (Option<i64>, Vec<String>) = sqlx::query_as(
+            "SELECT sum(value)::bigint, coalesce(array_agg(DISTINCT stripe_customer_id), '{}') \
+             FROM stripe_meter_outbox WHERE org_id = $1",
+        )
+        .bind(org)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (sum.unwrap_or(0), customers)
+    }
+
+    async fn customer_of(pool: &PgPool, org: OrgId) -> String {
+        sqlx::query_scalar("SELECT stripe_customer_id FROM subscriptions WHERE org_id = $1")
+            .bind(org)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn a_first_subscription_is_backdated_and_its_month_backfilled_once(pool: PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let mock = MockStripe::start().await;
+        let now = Month::of(Utc::now());
+        declare(&pool, "svc", &["calls", "bytes"]).await;
+        price(&pool, "svc/calls", now, 7).await;
+        let org = org_with_card(&db, &pool, &mock, "acme").await;
+        // Used before the card went on file: counted, never queued.
+        counted(&db, org, "svc/calls", now, 1_234).await;
+        counted(&db, org, "svc/bytes", now, 5).await;
+        assert_eq!(queued(&pool, org).await.0, 0);
+
+        let (r, out) = run(&db, &mock).await;
+        r.unwrap();
+        let sub = subscription_of(&pool, org).await.expect("subscribed");
+        assert_eq!(
+            mock.subscription(&sub).unwrap()["start_date"],
+            ts(now),
+            "Stripe rates the whole month"
+        );
+        // Every counted unit is queued for the org's customer, once; an
+        // unpriced meter's usage is queued too (Stripe bills it at nothing).
+        let customer = customer_of(&pool, org).await;
+        assert_eq!(queued(&pool, org).await, (1_239, vec![customer]));
+        assert!(
+            out.contains(&format!(
+                "backfilled     org {org}  1239 unit(s) of this month's usage queued"
+            )),
+            "{out}"
+        );
+        let detail: Value = sqlx::query_scalar(
+            "SELECT detail FROM audit_events \
+             WHERE org_id = $1 AND action = 'billing.subscription.created'",
+        )
+        .bind(org)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(detail["usageBackfilled"], 1_239);
+        assert_eq!(
+            detail["backdatedTo"],
+            json!(Utc.timestamp_opt(ts(now), 0).unwrap())
+        );
+
+        // Again, directly and through sync: nothing more is queued.
+        let mut tx = db.begin(org).await.unwrap();
+        assert_eq!(
+            otto_billing::stripe_outbox::backfill_period(&mut tx, now)
+                .await
+                .unwrap(),
+            0
+        );
+        tx.commit().await.unwrap();
+        let (r, out) = run(&db, &mock).await;
+        r.unwrap();
+        assert!(out.contains("nothing to do"), "{out}");
+        assert_eq!(queued(&pool, org).await.0, 1_239);
+    }
+
+    #[test]
+    fn a_resubscription_is_backdated_only_past_the_old_one() {
+        use otto_billing::billing::backdate_start_for;
+        let oct = Month::new(2026, 10).unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 20, 13, 47, 0).unwrap();
+        let hour = Utc.with_ymd_and_hms(2026, 10, 20, 13, 0, 0).unwrap();
+        // A first subscription: the whole month.
+        assert_eq!(backdate_start_for(false, None, oct, now), Some(start));
+        // The old one ended before the month: the whole month.
+        let sept = start - chrono::Duration::days(3);
+        assert_eq!(backdate_start_for(true, Some(sept), oct, now), Some(start));
+        // It ended this month: from this hour, never overlapping it.
+        let earlier = Utc.with_ymd_and_hms(2026, 10, 9, 8, 0, 0).unwrap();
+        assert_eq!(
+            backdate_start_for(true, Some(earlier), oct, now),
+            Some(hour)
+        );
+        let this_hour = Utc.with_ymd_and_hms(2026, 10, 20, 13, 5, 0).unwrap();
+        assert_eq!(backdate_start_for(true, Some(this_hour), oct, now), None);
+        assert_eq!(backdate_start_for(true, None, oct, now), Some(hour));
+        // At the very start of the month there is nothing to backdate.
+        assert_eq!(backdate_start_for(false, None, oct, start), None);
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn a_live_subscription_with_a_stale_local_status_is_adopted_not_doubled(pool: PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let mock = MockStripe::start().await;
+        let now = now_month(&db).await;
+        declare(&pool, "svc", &["calls"]).await;
+        price(&pool, "svc/calls", now, 7).await;
+        let org = org_with_card(&db, &pool, &mock, "acme").await;
+        run(&db, &mock).await.0.unwrap();
+        let sub = subscription_of(&pool, org).await.unwrap();
+
+        // Our copy says it is not live (a webhook lost, or one still on its
+        // way); Stripe says it is.
+        for stale in ["incomplete", "incomplete_expired", "paused"] {
+            sqlx::query(
+                "UPDATE subscriptions SET status = $2, subscription_event_at = now() \
+                 WHERE org_id = $1",
+            )
+            .bind(org)
+            .bind(stale)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let (r, out) = run(&db, &mock).await;
+            r.unwrap();
+            assert!(
+                out.contains(&format!("adopted        org {org}  {sub}")),
+                "{stale}: {out}"
+            );
+            assert_eq!(
+                subscription_of(&pool, org).await.as_deref(),
+                Some(sub.as_str())
+            );
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM subscriptions WHERE org_id = $1")
+                    .bind(org)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(status, "active", "{stale}");
+        }
+        assert_eq!(
+            mock.requests("POST", "/v1/subscriptions").len(),
+            1,
+            "never a second subscription"
+        );
+        assert_eq!(mock.subscription_ids(), [sub]);
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn another_live_metered_subscription_blocks_creating_one(pool: PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let mock = MockStripe::start().await;
+        let now = now_month(&db).await;
+        declare(&pool, "svc", &["calls"]).await;
+        price(&pool, "svc/calls", now, 7).await;
+        run(&db, &mock).await.0.unwrap_or_default();
+        let org = org_with_card(&db, &pool, &mock, "acme").await;
+        let price_id: String = sqlx::query_scalar("SELECT stripe_price_id FROM stripe_prices")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // Made by hand in the dashboard, not tagged with the org.
+        let manual = mock
+            .client()
+            .create_subscription(
+                &CreateSubscription {
+                    customer: customer_of(&pool, org).await,
+                    prices: vec![price_id],
+                    billing_cycle_anchor: None,
+                    backdate_start_date: None,
+                    metadata: Default::default(),
+                },
+                &IdempotencyKey::random(),
+            )
+            .await
+            .unwrap();
+        let (r, out) = run(&db, &mock).await;
+        assert!(r.is_err(), "{out}");
+        assert!(
+            out.contains(&format!("already has live subscription {}", manual.id)),
+            "{out}"
+        );
+        assert!(out.contains("bill the same usage twice"), "{out}");
+        assert!(subscription_of(&pool, org).await.is_none());
+        assert_eq!(mock.requests("POST", "/v1/subscriptions").len(), 1);
+    }
+
+    // ------------------------------------------------------- held invoices
+
+    /// An org subscribed through sync, with its customer and subscription.
+    async fn subscribed(db: &Db, pool: &PgPool, mock: &MockStripe) -> (OrgId, String, String) {
+        let now = now_month(db).await;
+        declare(pool, "svc", &["calls"]).await;
+        price(pool, "svc/calls", now.offset(-3).unwrap(), 7).await;
+        let org = org_with_card(db, pool, mock, "acme").await;
+        run(db, mock).await.0.unwrap();
+        let sub = subscription_of(pool, org).await.unwrap();
+        (org, customer_of(pool, org).await, sub)
+    }
+
+    /// A month whose period has long closed, and the instant it ends.
+    fn closed_month() -> (Month, i64) {
+        let m = Month::of(Utc::now()).offset(-2).unwrap();
+        (m, ts(m.offset(1).unwrap()))
+    }
+
+    /// One outbox row of the org's usage in `month`, `pending` or `sent`.
+    async fn outbox_row(db: &Db, org: OrgId, customer: &str, month: Month, status: &str) {
+        let mut tx = db.begin(org).await.unwrap();
+        sqlx::query(
+            "INSERT INTO stripe_meter_outbox \
+               (org_id, event_name, stripe_customer_id, value, bucket_start, status, \
+                finished_at) \
+             VALUES ($1, 'svc__calls', $2, 3, $3, $4, \
+                     CASE WHEN $4 = 'pending' THEN NULL ELSE now() END)",
+        )
+        .bind(org)
+        .bind(customer)
+        .bind(Utc.timestamp_opt(ts(month) + 5 * 3600, 0).unwrap())
+        .bind(status)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn ship_all(db: &Db, org: OrgId) {
+        let mut tx = db.begin(org).await.unwrap();
+        sqlx::query(
+            "UPDATE stripe_meter_outbox SET status = 'sent', finished_at = now() \
+             WHERE status = 'pending'",
+        )
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    /// Run the held invoices' clock forward: as if usage had been seen clear
+    /// (or the hold begun) `ago` earlier.
+    async fn held_since(db: &Db, org: OrgId, column: &str, ago: chrono::Duration) {
+        let mut tx = db.begin(org).await.unwrap();
+        sqlx::query(&format!(
+            "UPDATE stripe_held_invoices SET {column} = now() - make_interval(secs => $1)"
+        ))
+        .bind(ago.num_seconds() as f64)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn held(pool: &PgPool) -> Vec<(String, Option<String>)> {
+        sqlx::query_as("SELECT stripe_invoice_id, outcome FROM stripe_held_invoices ORDER BY 1")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn invoice_event(
+        db: &Db,
+        mock: &MockStripe,
+        event_id: &str,
+        invoice: &Value,
+    ) -> billing::EventOutcome {
+        let event = otto_billing::stripe::WebhookEvent {
+            id: event_id.into(),
+            event_type: "invoice.created".into(),
+            created: Utc::now().timestamp(),
+            data: otto_billing::stripe::EventData {
+                object: invoice.clone(),
+            },
+        };
+        billing::handle_event(db, &mock.client(), &event, b"{}")
+            .await
+            .unwrap()
+    }
+
+    async fn billing_audit(pool: &PgPool, org: OrgId, action: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE org_id = $1 AND action = $2")
+            .bind(org)
+            .bind(action)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn an_invoice_is_held_until_its_usage_has_reached_stripe(pool: PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let mock = MockStripe::start().await;
+        let (org, customer, sub) = subscribed(&db, &pool, &mock).await;
+        let (month, end) = closed_month();
+        outbox_row(&db, org, &customer, month, "sent").await;
+        outbox_row(&db, org, &customer, month, "pending").await;
+
+        // Stripe makes the month's invoice and tells us.
+        let invoice = mock.add_invoice("in_1", &customer, &sub, end);
+        assert_eq!(
+            invoice_event(&db, &mock, "evt_inv_1", &invoice).await,
+            billing::EventOutcome::Handled
+        );
+        assert_eq!(mock.invoice("in_1").unwrap()["auto_advance"], false);
+        assert_eq!(held(&pool).await, [("in_1".to_owned(), None)]);
+        // Redelivered, and the same invoice under another event id: held
+        // once, audited once.
+        assert_eq!(
+            invoice_event(&db, &mock, "evt_inv_1", &invoice).await,
+            billing::EventOutcome::Duplicate
+        );
+        assert_eq!(
+            invoice_event(&db, &mock, "evt_inv_1b", &invoice).await,
+            billing::EventOutcome::Handled
+        );
+        assert_eq!(held(&pool).await.len(), 1);
+        assert_eq!(
+            billing_audit(&pool, org, billing::actions::INVOICE_HELD).await,
+            1
+        );
+
+        // Stripe would have finalized it an hour later; held, it stays a
+        // draft, and sync leaves it while usage is waiting.
+        mock.advance_to(end + 3 * 3600);
+        let (r, out) = run(&db, &mock).await;
+        r.unwrap();
+        assert!(!out.contains("invoice "), "{out}");
+        assert_eq!(mock.invoice("in_1").unwrap()["status"], "draft");
+        // Even after the settle time.
+        held_since(&db, org, "held_at", chrono::Duration::hours(1)).await;
+        run(&db, &mock).await.0.unwrap();
+        assert_eq!(mock.invoice("in_1").unwrap()["status"], "draft");
+
+        // The usage is sent. The first run sees it clear, and waits one more
+        // interval in case anything else is on its way.
+        ship_all(&db, org).await;
+        run(&db, &mock).await.0.unwrap();
+        assert_eq!(mock.invoice("in_1").unwrap()["status"], "draft");
+        assert!(mock
+            .requests("POST", "/v1/invoices/in_1/finalize")
+            .is_empty());
+        held_since(&db, org, "clear_since", billing::INVOICE_SETTLE).await;
+        let (r, out) = run(&db, &mock).await;
+        r.unwrap();
+        assert!(
+            out.contains(&format!("invoice        org {org}  in_1  finalized")),
+            "{out}"
+        );
+        let inv = mock.invoice("in_1").unwrap();
+        assert_eq!(
+            (inv["status"].clone(), inv["auto_advance"].clone()),
+            (json!("open"), json!(true))
+        );
+        let finalize = mock.requests("POST", "/v1/invoices/in_1/finalize");
+        assert_eq!(finalize.len(), 1);
+        assert_eq!(finalize[0].field("auto_advance"), Some("true"));
+        assert_eq!(
+            held(&pool).await,
+            [("in_1".to_owned(), Some("finalized".to_owned()))]
+        );
+        assert_eq!(
+            billing_audit(&pool, org, billing::actions::INVOICE_RELEASED).await,
+            1
+        );
+
+        // Once released: no more calls, and a late redelivery holds nothing.
+        let before = mock.seen().len();
+        let (r, out) = run(&db, &mock).await;
+        r.unwrap();
+        assert!(out.contains("nothing to do"), "{out}");
+        assert_eq!(
+            invoice_event(&db, &mock, "evt_inv_1c", &invoice).await,
+            billing::EventOutcome::Ignored("the invoice was already released".into())
+        );
+        assert_eq!(mock.seen().len(), before);
+        assert_eq!(mock.invoice("in_1").unwrap()["auto_advance"], true);
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn an_invoice_held_too_long_is_finalized_anyway(pool: PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let mock = MockStripe::start().await;
+        let (org, customer, sub) = subscribed(&db, &pool, &mock).await;
+        let (month, end) = closed_month();
+        outbox_row(&db, org, &customer, month, "pending").await;
+        let invoice = mock.add_invoice("in_2", &customer, &sub, end);
+        invoice_event(&db, &mock, "evt_inv_2", &invoice).await;
+
+        held_since(
+            &db,
+            org,
+            "held_at",
+            billing::MAX_INVOICE_HOLD - chrono::Duration::minutes(1),
+        )
+        .await;
+        run(&db, &mock).await.0.unwrap();
+        assert_eq!(mock.invoice("in_2").unwrap()["status"], "draft");
+
+        held_since(&db, org, "held_at", billing::MAX_INVOICE_HOLD).await;
+        let (r, out) = run(&db, &mock).await;
+        r.unwrap();
+        assert!(
+            out.contains(&format!("invoice        org {org}  in_2  finalized_late")),
+            "{out}"
+        );
+        assert!(
+            out.contains("maximum hold with usage still waiting"),
+            "{out}"
+        );
+        assert_eq!(mock.invoice("in_2").unwrap()["status"], "open");
+        assert_eq!(
+            held(&pool).await,
+            [("in_2".to_owned(), Some("finalized_late".to_owned()))]
+        );
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn an_invoice_finalized_by_someone_else_is_left_alone(pool: PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let mock = MockStripe::start().await;
+        let (org, customer, sub) = subscribed(&db, &pool, &mock).await;
+        let (_, end) = closed_month();
+        let invoice = mock.add_invoice("in_3", &customer, &sub, end);
+        invoice_event(&db, &mock, "evt_inv_3", &invoice).await;
+        // Finalized by hand in the dashboard.
+        mock.set_invoice_status("in_3", "open");
+        run(&db, &mock).await.0.unwrap();
+        held_since(&db, org, "clear_since", billing::INVOICE_SETTLE).await;
+        let (r, out) = run(&db, &mock).await;
+        r.unwrap();
+        assert!(
+            out.contains(&format!("invoice        org {org}  in_3  not_draft")),
+            "{out}"
+        );
+        assert!(mock
+            .requests("POST", "/v1/invoices/in_3/finalize")
+            .is_empty());
+        assert_eq!(
+            held(&pool).await,
+            [("in_3".to_owned(), Some("not_draft".to_owned()))]
+        );
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn only_cycle_drafts_of_the_recorded_subscription_are_held(pool: PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let mock = MockStripe::start().await;
+        let (_, customer, sub) = subscribed(&db, &pool, &mock).await;
+        let (_, end) = closed_month();
+        let mut first = mock.add_invoice("in_4", &customer, &sub, end);
+        first["billing_reason"] = json!("subscription_create");
+        let other = mock.add_invoice("in_5", &customer, "sub_someone_else", end);
+        let mut open = mock.add_invoice("in_6", &customer, &sub, end);
+        open["status"] = json!("open");
+        for (i, inv) in [first, other, open].iter().enumerate() {
+            assert!(
+                matches!(
+                    invoice_event(&db, &mock, &format!("evt_x{i}"), inv).await,
+                    billing::EventOutcome::Ignored(_)
+                ),
+                "{inv}"
+            );
+        }
+        assert!(held(&pool).await.is_empty());
+        assert!(mock.posts_under("/v1/invoices").is_empty());
     }
 
     #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]

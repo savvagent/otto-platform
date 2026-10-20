@@ -44,8 +44,65 @@ impl SecretKey {
         Ok(Self(key))
     }
 
+    /// Whether the key is a live-mode or a test-mode key, from its prefix
+    /// (`sk_live_`, `rk_live_`, `sk_test_`, `rk_test_`). `None` for a key of
+    /// neither shape. The mode is not a secret; the key is never shown.
+    ///
+    /// ```
+    /// use otto_billing::stripe::{KeyMode, SecretKey};
+    ///
+    /// assert_eq!(SecretKey::new("rk_live_abc").unwrap().mode(), Some(KeyMode::Live));
+    /// assert_eq!(SecretKey::new("sk_test_abc").unwrap().mode(), Some(KeyMode::Test));
+    /// assert_eq!(SecretKey::new("sk_abc").unwrap().mode(), None);
+    /// ```
+    pub fn mode(&self) -> Option<KeyMode> {
+        let rest = self
+            .0
+            .strip_prefix("sk_")
+            .or_else(|| self.0.strip_prefix("rk_"))?;
+        if rest.starts_with("live_") {
+            Some(KeyMode::Live)
+        } else if rest.starts_with("test_") {
+            Some(KeyMode::Test)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn expose(&self) -> &str {
         &self.0
+    }
+}
+
+/// Which of a Stripe account's two worlds a key acts in. Objects made in one
+/// (customers, prices, subscriptions) do not exist in the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyMode {
+    Live,
+    Test,
+}
+
+impl KeyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Test => "test",
+        }
+    }
+
+    /// The inverse of [`Self::as_str`].
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "live" => Some(Self::Live),
+            "test" => Some(Self::Test),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for KeyMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -154,6 +211,24 @@ mod tests {
         assert!(SecretKey::new("sk_live abc").is_err());
         assert!(SecretKey::new("sk_live_\nabc").is_err());
         assert!(SecretKey::new(format!("sk_{}", "a".repeat(300))).is_err());
+    }
+
+    #[test]
+    fn a_keys_mode_is_read_from_its_prefix() {
+        for (key, mode) in [
+            ("sk_live_a", Some(KeyMode::Live)),
+            ("rk_live_a", Some(KeyMode::Live)),
+            ("sk_test_a", Some(KeyMode::Test)),
+            ("rk_test_a", Some(KeyMode::Test)),
+            ("sk_a", None),
+            ("sk_livex", None),
+        ] {
+            assert_eq!(SecretKey::new(key).unwrap().mode(), mode, "{key}");
+        }
+        for m in [KeyMode::Live, KeyMode::Test] {
+            assert_eq!(KeyMode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(KeyMode::parse("LIVE"), None);
     }
 
     #[test]

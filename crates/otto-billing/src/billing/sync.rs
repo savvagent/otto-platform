@@ -19,11 +19,25 @@
 //!
 //! A switch is exact once its schedule is in Stripe. It is in Stripe within
 //! one sync run of the version's Stripe Price existing, and sync runs every
-//! 15 minutes in the server, so the window is a version set (`pricebook set`)
-//! in the last ~15 minutes before the month it takes effect: those minutes
-//! of usage, from 00:00 UTC until the next run, are billed at the previous
-//! price. `pricebook set` only accepts a future month, so setting prices any
-//! earlier than that leaves no window at all.
+//! 15 minutes in the server. `pricebook set` only accepts a month that starts
+//! at least 24 hours later (by the database's clock), so a schedule is in
+//! place long before its month unless every sync fails for that whole day
+//! (Stripe down, a bad key). If it is not in place when the month starts, the
+//! subscription simply keeps the previous month's prices into the new month;
+//! the first sync that succeeds afterwards moves the items to the new prices
+//! then and there ([`fix_items`], without proration), and logs that at error
+//! level, because a price changed inside the month it applies to. How Stripe
+//! rates the usage on either side of such a mid-period change is Stripe's
+//! rule for metered items, not ours: check it in test mode before relying on
+//! it (docs/deploy/fly.md, "Verify in test mode").
+//!
+//! # Items are never removed
+//!
+//! Sync adds and moves items; it never deletes one. A meter's price can only
+//! be superseded, never withdrawn, so the only items a plan leaves out are a
+//! meter past Stripe's 20 items or one whose version has no Stripe Price yet:
+//! both reported, and both better left billing at the price they had than
+//! deleted mid-period, which would drop the usage already on them.
 
 use std::collections::BTreeMap;
 
@@ -35,15 +49,17 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    actions, idem, idem_stable, is_live_status, month_after, month_start, read_row, Error,
-    OrgLease, PaymentMethodStatus, Result, SubRow, ITEMS_WARN_AT, MAX_SCHEDULE_PHASES,
+    actions, idem, idem_stable, invoices, is_live_status, month_after, month_start, read_row,
+    Error, OrgLease, PaymentMethodStatus, Result, SubRow, ITEMS_WARN_AT, MAX_SCHEDULE_PHASES,
     MAX_SUBSCRIPTION_ITEMS, SYNC_ACTOR,
 };
+use crate::period;
 use crate::pricebook::{self, Month, Tiers};
 use crate::stripe::{
     meter_event_name, Client, CreateMeter, CreateMeteredPrice, CreateSubscription, PriceProduct,
-    PriceTier, SchedulePhaseParams, SubscriptionSchedule, TierUpTo, UpdateSchedule,
+    PriceTier, SchedulePhaseParams, Subscription, SubscriptionSchedule, TierUpTo, UpdateSchedule,
 };
+use crate::stripe_outbox;
 
 /// How long one sync run may hold the sync lease before another may take
 /// over (a crashed run).
@@ -74,6 +90,12 @@ pub struct SyncReport {
     pub schedules_released: Vec<OrgId>,
     /// `(org, meter)`: this month's item added or moved to the right price.
     pub items_changed: Vec<(OrgId, String)>,
+    /// `(org, units)`: usage the org accrued this month before its
+    /// subscription went live, queued for Stripe as it did.
+    pub usage_backfilled: Vec<(OrgId, u64)>,
+    /// `(org, stripe invoice id, outcome)`: held invoices let go (see
+    /// [`super::invoice_outcomes`]).
+    pub invoices_released: Vec<(OrgId, String, String)>,
     /// Worth an operator's attention; nothing failed.
     pub warnings: Vec<String>,
     /// What could not be done. The rest of the run went ahead; the next run
@@ -92,6 +114,8 @@ impl SyncReport {
             && self.schedules_set.is_empty()
             && self.schedules_released.is_empty()
             && self.items_changed.is_empty()
+            && self.usage_backfilled.is_empty()
+            && self.invoices_released.is_empty()
     }
 }
 
@@ -106,6 +130,8 @@ impl SyncReport {
 /// 3. For every org with a Stripe customer: a subscription if it has an
 ///    active card, is not stopped and has no live subscription; and every
 ///    live subscription brought to its plan (see the module docs).
+/// 4. Every held invoice whose usage has reached Stripe (or whose hold is
+///    up) finalized (see [`super::MAX_INVOICE_HOLD`]).
 ///
 /// One run at a time across every machine (a lease in `stripe_sync_lease`):
 /// [`Error::Busy`] if another is running. Per-meter, per-version and per-org
@@ -209,6 +235,9 @@ async fn run(
         if let Err(e) = result {
             report.errors.push(format!("org {org}: {e}"));
         }
+    }
+    if let Err(e) = invoices::release_held(db, client, stop, &mut report).await {
+        report.errors.push(format!("held invoices: {e}"));
     }
     Ok(report)
 }
@@ -651,14 +680,26 @@ async fn reconcile_with(
     reconcile_prices(db, client, lease, org, &sub, &row, plan, actor, report).await
 }
 
-/// Create the org's subscription, or adopt a live one already tagged with the
-/// org (left by an earlier attempt whose write did not happen), and record it
-/// at once. One item per meter priced this month, `billing_cycle_anchor` at
-/// 00:00 UTC on the first of next month, `proration_behavior=none` (the
-/// client always sends it).
+/// Create the org's subscription, or adopt a live one, and record it at once.
 ///
-/// More than one live subscription tagged with the org is an error, not a
+/// **Adopt first.** The recorded subscription is retrieved: if Stripe says it
+/// is live, our copy of its status was stale (a webhook lost or not yet
+/// delivered), and it is re-recorded, never replaced. Otherwise a live
+/// subscription tagged with the org (left by an earlier attempt whose write
+/// did not happen) is adopted. More than one candidate is an error, not a
 /// choice: billing would double, and only a person can say which to keep.
+///
+/// **Create only when nothing is live.** One item per meter priced this
+/// month, `billing_cycle_anchor` at 00:00 UTC on the first of next month,
+/// `proration_behavior=none` (the client always sends it), backdated to the
+/// start of the month for a first subscription ([`backdate_start`]). Refused
+/// when the customer has any other live subscription carrying a metered
+/// price: Stripe meters count per customer, so both would bill the same
+/// usage.
+///
+/// As the subscription is recorded live, in the same transaction, the
+/// month's usage counted before it went live is queued for Stripe
+/// ([`stripe_outbox::backfill_period`]; idempotent).
 #[allow(clippy::too_many_arguments)]
 async fn ensure_subscription(
     db: &Db,
@@ -677,21 +718,29 @@ async fn ensure_subscription(
         return Ok(None);
     };
     let org_id = org.to_string();
+
+    let mut live: Vec<Subscription> = Vec::new();
+    if let Some(recorded) = &row.stripe_subscription_id {
+        lease.renew(db).await?;
+        match client.retrieve_subscription(recorded).await {
+            Ok(s) if is_live_status(&s.status) => live.push(s),
+            Ok(_) => {}
+            Err(e) if e.api().is_some_and(|a| a.status == 404) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
     lease.renew(db).await?;
-    let mut tagged: Vec<_> = client
-        .list_subscriptions(&customer)
-        .await?
-        .data
-        .into_iter()
-        .filter(|s| {
-            s.metadata.get("org_id") == Some(&org_id)
-                && is_live_status(&s.status)
-                // Never the one Stripe already told us is gone.
-                && Some(&s.id) != row.stripe_subscription_id.as_ref()
-        })
-        .collect();
-    if tagged.len() > 1 {
-        let ids: Vec<&str> = tagged.iter().map(|s| s.id.as_str()).collect();
+    let all = client.list_subscriptions(&customer).await?.data;
+    for s in &all {
+        if s.metadata.get("org_id") == Some(&org_id)
+            && is_live_status(&s.status)
+            && !live.iter().any(|l| l.id == s.id)
+        {
+            live.push(s.clone());
+        }
+    }
+    if live.len() > 1 {
+        let ids: Vec<&str> = live.iter().map(|s| s.id.as_str()).collect();
         return Err(Error::Unexpected(format!(
             "{} live Stripe subscriptions are tagged with org {org} ({}); cancel all but \
              one in the Stripe dashboard",
@@ -699,16 +748,36 @@ async fn ensure_subscription(
             ids.join(", ")
         )));
     }
-    let existing = tagged.pop();
+    let existing = live.pop();
     let now = plan.now();
     let (_, anchor) = month_after(now.month)?;
+    let mut backdated = None;
     let (sub, status, adopted, stripe_plan) = match existing {
         Some(s) => (s.id, s.status, true, None),
         None => {
+            if let Some(other) = all.iter().find(|s| {
+                is_live_status(&s.status)
+                    && s.items.data.iter().any(|i| {
+                        i.price
+                            .recurring
+                            .as_ref()
+                            .is_some_and(|r| r.meter.is_some())
+                    })
+            }) {
+                return Err(Error::Unexpected(format!(
+                    "customer {customer} of org {org} already has live subscription {} carrying \
+                     a metered price, not tagged with the org; a second subscription would bill \
+                     the same usage twice. Cancel it, or tag it with metadata org_id={org} to \
+                     have it adopted",
+                    other.id
+                )));
+            }
+            backdated = backdate_start(row, now.month, chrono::Utc::now());
             let params = CreateSubscription {
                 customer,
                 prices: now.price_ids(),
                 billing_cycle_anchor: Some(anchor),
+                backdate_start_date: backdated,
                 metadata: [("org_id".to_owned(), org_id)].into(),
             };
             // The card and the subscription this replaces are part of the
@@ -721,20 +790,33 @@ async fn ensure_subscription(
             (s.id, s.status, false, Some(plan.only_now().fingerprint()))
         }
     };
+    // The recorded subscription, re-read from Stripe just now: its status is
+    // as of now, so a webhook event older than this read must not undo it.
+    let refreshed = adopted && row.stripe_subscription_id.as_deref() == Some(sub.as_str());
 
     let mut tx = lease.begin(db).await?;
     sqlx::query(
         "UPDATE subscriptions SET stripe_subscription_id = $2, status = $3, \
-           subscription_event_at = NULL, stripe_schedule_id = NULL, stripe_plan = $4, \
-           updated_at = now() \
+           subscription_event_at = CASE WHEN $5 THEN now() ELSE NULL END, \
+           stripe_schedule_id = NULL, stripe_plan = $4, updated_at = now() \
          WHERE org_id = $1",
     )
     .bind(org)
     .bind(&sub)
     .bind(&status)
     .bind(&stripe_plan)
+    .bind(refreshed)
     .execute(tx.conn())
     .await?;
+    // Usage of this month counted before the subscription was live in our
+    // records was never queued; queue it now, in this transaction, so the
+    // subscription is recorded live exactly when its backlog is queued. The
+    // wall-clock month, as the outbox reckons it.
+    let backfilled = if is_live_status(&status) {
+        stripe_outbox::backfill_period(&mut tx, Month::of(chrono::Utc::now())).await?
+    } else {
+        0
+    };
     tx.audit(
         Entry::new(actions::SUBSCRIPTION_CREATED)
             .actor_label(actor)
@@ -743,13 +825,19 @@ async fn ensure_subscription(
                 "stripeSubscriptionId": sub,
                 "status": status,
                 "adopted": adopted,
+                "statusRefreshed": refreshed,
                 "billingCycleAnchor": anchor,
+                "backdatedTo": backdated,
+                "usageBackfilled": backfilled,
                 "meters": now.prices.iter().map(|p| p.meter.as_str()).collect::<Vec<_>>(),
             })),
     )
     .await?;
     tx.commit().await?;
 
+    if backfilled > 0 {
+        report.usage_backfilled.push((org, backfilled));
+    }
     if adopted {
         report.subscriptions_adopted.push((org, sub.clone()));
     } else {
@@ -761,6 +849,60 @@ async fn ensure_subscription(
         }
     }
     Ok(Some(sub))
+}
+
+/// Where a new subscription for `month` starts, created at `now`: the start
+/// of the month for the org's first subscription (`had_subscription` false),
+/// so it covers the whole month's usage (see "The first month" in
+/// [`super`]). For a re-subscription, the start of the month only if the
+/// earlier subscription's last status change (`last_status_change`) was
+/// before it; else the start of the current hour, if that change was before
+/// the hour; else not backdated. `None` also when `now` is the month's start
+/// itself.
+///
+/// ```
+/// use chrono::{TimeZone, Utc};
+/// use otto_billing::billing::backdate_start_for;
+/// use otto_billing::period::Month;
+///
+/// let oct = Month::new(2026, 10).unwrap();
+/// let now = Utc.with_ymd_and_hms(2026, 10, 20, 13, 47, 0).unwrap();
+/// assert_eq!(
+///     backdate_start_for(false, None, oct, now),
+///     Some(Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap())
+/// );
+/// ```
+pub fn backdate_start_for(
+    had_subscription: bool,
+    last_status_change: Option<chrono::DateTime<Utc>>,
+    month: Month,
+    now: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    let start = month_start(month);
+    if now <= start {
+        return None;
+    }
+    let hour = period::hour_bucket(now).max(start);
+    match (had_subscription, last_status_change) {
+        (false, _) => Some(start),
+        (true, Some(ended)) if ended < start => Some(start),
+        (true, Some(ended)) => (ended < hour && hour < now).then_some(hour),
+        (true, None) => (hour < now).then_some(hour),
+    }
+}
+
+/// [`backdate_start_for`] the org's row.
+fn backdate_start(
+    row: &SubRow,
+    month: Month,
+    now: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    backdate_start_for(
+        row.stripe_subscription_id.is_some(),
+        row.subscription_event_at,
+        month,
+        now,
+    )
 }
 
 fn items_warning(org: OrgId, sub: &str, items: usize) -> String {
@@ -807,6 +949,14 @@ async fn reconcile_prices(
     let desired = plan.fingerprint();
     if row.stripe_plan.as_deref() == Some(desired.as_str()) {
         return Ok(());
+    }
+    // Meter prices go on the recorded subscription and nowhere else: a second
+    // subscription carrying them would bill the same usage twice.
+    if row.stripe_subscription_id.as_deref() != Some(sub) {
+        return Err(Error::Unexpected(format!(
+            "refusing to change the items of subscription {sub}: it is not org {org}'s \
+             recorded subscription"
+        )));
     }
     lease.renew(db).await?;
     let existing = open_schedule(client, sub, row.stripe_schedule_id.as_deref()).await?;
@@ -889,7 +1039,13 @@ async fn reconcile_prices(
 
 /// Bring this month's items to `phase` directly (no switch is pending): add
 /// an item for a meter with none, move an item on the wrong price. Without
-/// proration. Returns the meters changed.
+/// proration. Never removes an item (see the module docs). Returns the meters
+/// changed.
+///
+/// Any change here is a price changing inside the month it applies to (the
+/// month's schedule was not in Stripe in time, or a version was written for
+/// a month already under way), so each one is logged at error level for an
+/// operator to look at, as well as reported.
 #[allow(clippy::too_many_arguments)]
 async fn fix_items(
     db: &Db,
@@ -913,7 +1069,7 @@ async fn fix_items(
     for p in &phase.prices {
         match by_meter.get(&p.stripe_meter_id) {
             Some((_, price)) if *price == p.stripe_price_id => {}
-            Some((item, _)) => {
+            Some((item, old)) => {
                 lease.renew(db).await?;
                 client
                     .change_subscription_item_price(
@@ -922,6 +1078,7 @@ async fn fix_items(
                         &idem("item-price", &(item, &p.stripe_price_id))?,
                     )
                     .await?;
+                mid_period_change(org, sub, phase.month, &p.meter, Some(old), report);
                 changed.push(p.meter.clone());
             }
             None if count >= MAX_SUBSCRIPTION_ITEMS => report.errors.push(format!(
@@ -938,6 +1095,7 @@ async fn fix_items(
                         &idem("item-add", &(sub, &p.stripe_price_id))?,
                     )
                     .await?;
+                mid_period_change(org, sub, phase.month, &p.meter, None, report);
                 count += 1;
                 changed.push(p.meter.clone());
             }
@@ -950,4 +1108,30 @@ async fn fix_items(
         report.warnings.push(items_warning(org, sub, count));
     }
     Ok(changed)
+}
+
+/// Say, loudly, that a subscription's price changed inside the month it
+/// applies to.
+fn mid_period_change(
+    org: OrgId,
+    sub: &str,
+    month: Month,
+    meter: &str,
+    from: Option<&str>,
+    report: &mut SyncReport,
+) {
+    tracing::error!(
+        %org,
+        subscription = %sub,
+        %month,
+        meter,
+        from_price = from.unwrap_or("none"),
+        "changed a Stripe subscription's price in the middle of {month}: its price switch was \
+         not scheduled before the month began. Check the month's invoice for this meter"
+    );
+    report.warnings.push(format!(
+        "org {org}: {meter} changed price in the middle of {month} (from {}); its switch was \
+         not scheduled in time",
+        from.unwrap_or("no item")
+    ));
 }

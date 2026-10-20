@@ -1065,6 +1065,7 @@ async fn stripe_objects_left_by_an_interrupted_attempt_are_adopted(pool: PgPool)
                 customer: orphan.id.clone(),
                 prices: vec![price],
                 billing_cycle_anchor: None,
+                backdate_start_date: None,
                 metadata: [("org_id".to_owned(), org.to_string())].into(),
             },
             &IdempotencyKey::random(),
@@ -1200,4 +1201,34 @@ async fn a_stripe_failure_while_handling_is_retried(pool: PgPool) {
     complete(&s, "evt_done", now).await.expect(StatusCode::OK);
     assert_eq!(billing_view(&s).await["cardStatus"], "active");
     assert_eq!(ledger(&s.pool).await, ["evt_done"]);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_cycle_invoice_is_held_as_a_draft_through_the_webhook(pool: PgPool) {
+    let s = started(pool).await;
+    complete(&s, "evt_done", Utc::now().timestamp())
+        .await
+        .expect(StatusCode::OK);
+    let sub = current_subscription(&s).await;
+    let invoice = s
+        .mock
+        .add_invoice("in_cycle", &s.customer, &sub, next_first(&s.pool).await);
+    deliver_event(
+        &s,
+        "evt_inv",
+        "invoice.created",
+        Utc::now().timestamp(),
+        invoice,
+    )
+    .await
+    .expect(StatusCode::OK);
+    assert_eq!(s.mock.invoice("in_cycle").unwrap()["auto_advance"], false);
+    assert_eq!(
+        audit_actions(&s.pool, s.org)
+            .await
+            .last()
+            .map(String::as_str),
+        Some("billing.invoice.held")
+    );
+    assert!(billing::HANDLED_EVENT_TYPES.contains(&"invoice.created"));
 }

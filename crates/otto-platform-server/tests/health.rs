@@ -8,7 +8,7 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 
 async fn get(db: Db, path: &str) -> (StatusCode, serde_json::Value) {
-    let res = otto_platform_server::router(db)
+    let res = otto_platform_server::router(db, otto_platform_server::Billing::Enabled)
         .oneshot(Request::get(path).body(Body::empty()).unwrap())
         .await
         .unwrap();

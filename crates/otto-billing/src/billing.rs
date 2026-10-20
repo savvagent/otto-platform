@@ -5,11 +5,64 @@
 //! `setup` mode, cards only ([`start_setup`]); when Stripe reports it complete
 //! ([`handle_event`], `checkout.session.completed`) the card becomes the Stripe
 //! customer's default payment method and the org gets a Stripe subscription
-//! with one metered item per priced meter, anchored to 00:00 UTC on the first
-//! of next month with proration off, so usage is invoiced monthly in arrears.
-//! [`sync`] makes Stripe match the price book: a billing meter per platform
-//! meter, an immutable Stripe Price per price-book version, and every live
-//! subscription on the right prices.
+//! with one metered item per priced meter, started at 00:00 UTC on the first
+//! of this month and anchored to 00:00 UTC on the first of next month with
+//! proration off, so usage is invoiced monthly in arrears (see "The first
+//! month" below). [`sync`] makes Stripe match the price book: a billing meter
+//! per platform meter, an immutable Stripe Price per price-book version, and
+//! every live subscription on the right prices. It never removes an item.
+//!
+//! # One subscription per org, and only one carries meter prices
+//!
+//! An org has exactly one Stripe subscription, the one recorded in
+//! `subscriptions`. Stripe meters count usage per **customer**, not per
+//! subscription, so a second live subscription of the same customer holding
+//! the same meters' prices would bill the same usage twice. Hence:
+//!
+//! - sync adopts a live subscription already in Stripe (the recorded one, or
+//!   one tagged with the org) before it ever creates one, and reports more
+//!   than one tagged live subscription as an error;
+//! - it refuses to create a subscription for a customer that already has any
+//!   other live subscription carrying a metered price;
+//! - it only ever adds or moves items on the recorded subscription.
+//!
+//! **A future paid plan must reuse this subscription** (add its licensed
+//! price as one more item), never start a second one alongside it.
+//!
+//! # The first month
+//!
+//! An org that puts a card on file mid-month has used the platform since the
+//! month began, and that usage was counted (budgets, the console) but not
+//! queued for Stripe, as it had no live subscription. Its first subscription
+//! is therefore backdated (`backdate_start_date`) to 00:00 UTC on the first
+//! of the current month, and as it is recorded live, in the same transaction,
+//! [`crate::stripe_outbox::backfill_period`] queues the month's counted usage
+//! that is not yet in the outbox. Stripe then rates the whole month through
+//! one set of graduated tiers, with one free allowance, exactly as the
+//! platform rates it.
+//!
+//! - **The previous month during its grace.** A subscription made between
+//!   00:00 and 02:00 UTC on the first (while the previous month is still open
+//!   for late events, [`crate::period`]) starts at the new month. The
+//!   previous month's usage was accrued with no card on file and is not
+//!   billed: it is neither backfilled nor covered by the subscription.
+//! - **A re-subscription** (after Stripe canceled an earlier subscription)
+//!   is backdated to the start of the month only if the earlier one's last
+//!   status change was before the month began; otherwise to the start of the
+//!   current hour (or not at all if the earlier one changed status within
+//!   this hour), so no stretch of the month is covered by both. Usage between
+//!   the cancellation and the new start is billed only as far as the backfill
+//!   reaches it (the current hour); a month split across two subscriptions
+//!   gets each one's free allowance.
+//!
+//! # Invoices wait for their usage
+//!
+//! A month's invoice is made at 00:00 UTC on the first of the next, but its
+//! last usage reaches Stripe up to a couple of hours later. Each
+//! subscription-cycle invoice is therefore held as a draft (the
+//! `invoice.created` webhook) and finalized by sync once its usage has
+//! shipped ([`INVOICE_SETTLE`]), or after [`MAX_INVOICE_HOLD`], with an
+//! error log.
 //!
 //! # Prices switch at exactly 00:00 UTC on the first
 //!
@@ -41,6 +94,11 @@
 //! - `stripe_meters`, `stripe_prices` (global, read-only to `otto_app`): the
 //!   Stripe ids of meters and price-book versions.
 //! - `stripe_sync_lease` (global): who is running sync.
+//! - `stripe_held_invoices` (tenant): invoices held as drafts until their
+//!   usage has reached Stripe, and how each was released.
+//! - `stripe_account_mode` (global, no `otto_app` access): whether the ids
+//!   recorded here are live-mode or test-mode Stripe objects
+//!   ([`check_key_mode`]).
 //!
 //! # Exactly once, with an API in the middle
 //!
@@ -59,8 +117,9 @@
 //!   transaction right after the call that made it.
 //! - **Creation looks before it leaps.** Before creating a customer, the org's
 //!   customer is searched for by `metadata[org_id]`; before creating a
-//!   subscription, the customer's subscriptions are listed and a live one
-//!   tagged with the org is adopted. A crash between Stripe's answer and our
+//!   subscription, the recorded subscription is retrieved and the customer's
+//!   subscriptions are listed, and a live one (the recorded one, even if our
+//!   copy of its status is stale, or one tagged with the org) is adopted. A crash between Stripe's answer and our
 //!   write therefore never leads to a second customer or subscription.
 //! - **Idempotency keys are derived from the request**: a hash of every
 //!   parameter, plus the hour ([`idem`]). A retry with the same parameters
@@ -81,8 +140,10 @@
 //! [`live_subscription`]. Cancelling a deleted org's subscription is not done
 //! anywhere yet.
 
+mod invoices;
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
+mod mode;
 mod setup;
 mod status;
 mod sync;
@@ -99,14 +160,16 @@ use uuid::Uuid;
 
 use crate::pricebook::{self, Month};
 
-use crate::stripe::{Client, EventNameError, IdempotencyKey, StripeError, WebhookSecret};
+use crate::stripe::{Client, EventNameError, IdempotencyKey, KeyMode, StripeError, WebhookSecret};
 
+pub use invoices::{outcomes as invoice_outcomes, INVOICE_SETTLE, MAX_INVOICE_HOLD};
+pub use mode::{check_key_mode, recorded_key_mode, RESET_MODE_SQL};
 pub use setup::{start_setup, SetupParams};
 pub use status::{
     is_live_status, live_subscription, status, BillingStatus, LiveSubscription,
     PaymentMethodStatus, SubscriptionState,
 };
-pub use sync::{sync, sync_until, SyncReport};
+pub use sync::{backdate_start_for, sync, sync_until, SyncReport};
 pub use webhook::{
     handle_event, sweep_events, EventOutcome, EVENT_RETENTION_DAYS, HANDLED_EVENT_TYPES,
     MIN_EVENT_RETENTION_DAYS,
@@ -161,6 +224,12 @@ pub mod actions {
     /// Sync changed the subscription's prices: scheduled future switches,
     /// released a schedule, or corrected this month's items.
     pub const SUBSCRIPTION_ITEMS_SYNCED: &str = "billing.subscription.items_synced";
+    /// A subscription-cycle invoice was held as a draft until its usage has
+    /// reached Stripe.
+    pub const INVOICE_HELD: &str = "billing.invoice.held";
+    /// A held invoice was let go (`detail.outcome`: `finalized`,
+    /// `finalized_late` or `not_draft`).
+    pub const INVOICE_RELEASED: &str = "billing.invoice.released";
 }
 
 /// The label audit entries written on Stripe's behalf carry as their actor.
@@ -204,6 +273,21 @@ pub enum Error {
     /// Stripe answered with something billing cannot use.
     #[error("unexpected Stripe response: {0}")]
     Unexpected(String),
+    /// The Stripe key is in a different mode from the one this database's
+    /// Stripe objects were made in ([`check_key_mode`]).
+    #[error(
+        "STRIPE_SECRET_KEY is a {key}-mode key, but this database's Stripe customers, \
+         subscriptions, meters and prices were made in {recorded} mode and do not exist in \
+         {key} mode. Use a {recorded}-mode key, or, to switch this database to {key} mode on \
+         purpose, see \"Switching Stripe modes\" in docs/deploy/fly.md"
+    )]
+    ModeMismatch { recorded: KeyMode, key: KeyMode },
+    /// A Stripe key whose prefix says neither live nor test.
+    #[error(
+        "STRIPE_SECRET_KEY is neither a live-mode nor a test-mode key (expected sk_live_, \
+         rk_live_, sk_test_ or rk_test_)"
+    )]
+    UnknownKeyMode,
 }
 
 /// A billing result.

@@ -69,6 +69,37 @@ async fn insert_flat(pool: &PgPool, meter: &str, m: Month, ucents: i64) -> Uuid 
     id
 }
 
+/// The earliest month `set_version` accepts now: next month, or the one
+/// after when next month starts within a day.
+async fn earliest(db: &Db) -> Month {
+    let mut tx = db.begin_unpinned().await.unwrap();
+    otto_billing::pricebook::store::earliest_month(tx.conn())
+        .await
+        .unwrap()
+}
+
+/// A month that starts within a day is refused, so Stripe has its switch
+/// scheduled in time. Only observable near a month's end, so this checks
+/// whichever of the two answers the database's clock gives now.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_month_that_starts_within_a_day_cannot_be_priced(pool: PgPool) {
+    seed_meters(&pool).await;
+    let db = Db::from_pool(pool);
+    let next = now_month(&db).await.offset(1).unwrap();
+    let earliest = earliest(&db).await;
+    if earliest == next {
+        set(&db, "svc/calls", next, &flat(1)).await.unwrap();
+    } else {
+        assert_eq!(earliest, next.offset(1).unwrap());
+        let err = set(&db, "svc/calls", next, &flat(1)).await.unwrap_err();
+        assert!(
+            matches!(err, Error::TooSoon { month, earliest: e } if month == next && e == earliest),
+            "{err}"
+        );
+        set(&db, "svc/calls", earliest, &flat(1)).await.unwrap();
+    }
+}
+
 async fn set(db: &Db, meter: &str, m: Month, tiers: &Tiers) -> Result<(), Error> {
     let mut tx = db.begin_unpinned().await.unwrap();
     set_version(&mut tx, meter, m, tiers).await?;
@@ -154,7 +185,7 @@ async fn the_latest_version_not_after_the_month_is_in_effect(pool: PgPool) {
 async fn tiers_round_trip_in_order(pool: PgPool) {
     seed_meters(&pool).await;
     let db = Db::from_pool(pool);
-    let next = now_month(&db).await.offset(1).unwrap();
+    let next = earliest(&db).await;
     let tiers = Tiers::new(vec![
         Tier {
             up_to: Some(1_000),
@@ -190,8 +221,8 @@ async fn only_a_future_month_can_be_priced(pool: PgPool) {
     let db = Db::from_pool(pool.clone());
     let current = now_month(&db).await;
     let last = current.offset(-1).unwrap();
-    let next = current.offset(1).unwrap();
-    insert_flat(&pool, "svc/calls", last, 1).await;
+    let next = earliest(&db).await;
+    let old = insert_flat(&pool, "svc/calls", last, 1).await;
 
     for m in [last, current] {
         let err = set(&db, "svc/calls", m, &flat(2)).await.unwrap_err();
@@ -218,6 +249,9 @@ async fn only_a_future_month_can_be_priced(pool: PgPool) {
         .unwrap();
     tx.commit().await.unwrap();
     assert_eq!(first.replaced, None);
+    // What the month would have cost before: the earlier month's version.
+    let before = first.before.as_ref().expect("a version was in effect");
+    assert_eq!((before.id, before.effective_month), (old, last));
     let mut tx = db.begin_unpinned().await.unwrap();
     let second = set_version(&mut tx, "svc/calls", next, &flat(6))
         .await
@@ -225,6 +259,11 @@ async fn only_a_future_month_can_be_priced(pool: PgPool) {
     tx.commit().await.unwrap();
     assert_eq!(second.replaced, Some(first.version.id));
     assert_ne!(second.version.id, first.version.id);
+    assert_eq!(
+        second.before.as_ref().map(|b| (b.id, b.tiers.clone())),
+        Some((first.version.id, Ok(flat(5)))),
+        "a replacement reports the version it replaced"
+    );
     assert_eq!(
         in_effect(&db, "svc/calls", &next.to_string()).await,
         Some(6)
@@ -240,7 +279,7 @@ async fn only_a_future_month_can_be_priced(pool: PgPool) {
 async fn an_unknown_meter_cannot_be_priced(pool: PgPool) {
     seed_meters(&pool).await;
     let db = Db::from_pool(pool);
-    let next = now_month(&db).await.offset(1).unwrap();
+    let next = earliest(&db).await;
     let err = set(&db, "svc/nope", next, &flat(1)).await.unwrap_err();
     assert!(
         matches!(err, Error::UnknownMeter(ref m) if m == "svc/nope"),
@@ -254,7 +293,7 @@ async fn an_unknown_meter_cannot_be_priced(pool: PgPool) {
 async fn a_concurrent_set_is_reported_as_such(pool: PgPool) {
     seed_meters(&pool).await;
     let db = Db::from_pool(pool.clone());
-    let next = now_month(&db).await.offset(1).unwrap();
+    let next = earliest(&db).await;
 
     let mut first = db.begin_unpinned().await.unwrap();
     set_version(&mut first, "svc/calls", next, &flat(1))

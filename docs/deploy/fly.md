@@ -25,14 +25,14 @@ the host of `OTTO_PUBLIC_URL`, so passkeys only work when the browser is on
 Never in `fly.toml`. Staged with `fly secrets set -a otto-platform`; see also the header of
 `fly.toml`.
 
-| Secret                  | Required                        | What                                                                                                                                                                                                                                                                                                                                               |
-| ----------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`          | yes                             | Staged by `fly postgres attach`.                                                                                                                                                                                                                                                                                                                   |
-| `OTTO_ENCRYPTION_KEY`   | yes                             | 32 random bytes, base64 (`openssl rand -base64 32`). Encrypts secrets at rest; losing it makes them unreadable.                                                                                                                                                                                                                                    |
-| `OTTO_SMTP_URL`         | no; together with the next one  | Notification email's SMTP server, credentials in the URL: `smtps://user:pass@host:465` or `smtp://user:pass@host:587?tls=required`. Unset (with `OTTO_EMAIL_FROM` also unset), email is disabled: the boot log says so and budget-alert emails wait in `notification_outbox` until it is set.                                                      |
-| `OTTO_EMAIL_FROM`       | no; together with the one above | The `From:` mailbox, e.g. `otto <alerts@savvagent.com>`. Setting exactly one of the two email secrets fails the deploy's health check by refusing to start.                                                                                                                                                                                        |
-| `STRIPE_SECRET_KEY`     | no; together with the next one  | Billing's Stripe API key: a restricted key (`rk_live_...`) with the permissions under [Stripe setup](#stripe-setup). Unset (with `STRIPE_WEBHOOK_SECRET` also unset), billing is disabled: the boot log says so, `GET /api/orgs/{org}/billing` reports `billingEnabled: false`, and the setup route and the webhook answer `503 billing_disabled`. |
-| `STRIPE_WEBHOOK_SECRET` | no; together with the one above | The webhook endpoint's signing secret (`whsec_...`), shown by Stripe when the endpoint is created. Setting exactly one of the two Stripe secrets fails the deploy's health check by refusing to start.                                                                                                                                             |
+| Secret                  | Required                        | What                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`          | yes                             | Staged by `fly postgres attach`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `OTTO_ENCRYPTION_KEY`   | yes                             | 32 random bytes, base64 (`openssl rand -base64 32`). Encrypts secrets at rest; losing it makes them unreadable.                                                                                                                                                                                                                                                                                                                                                                                             |
+| `OTTO_SMTP_URL`         | no; together with the next one  | Notification email's SMTP server, credentials in the URL: `smtps://user:pass@host:465` or `smtp://user:pass@host:587?tls=required`. Unset (with `OTTO_EMAIL_FROM` also unset), email is disabled: the boot log says so and budget-alert emails wait in `notification_outbox` until it is set.                                                                                                                                                                                                               |
+| `OTTO_EMAIL_FROM`       | no; together with the one above | The `From:` mailbox, e.g. `otto <alerts@savvagent.com>`. Setting exactly one of the two email secrets fails the deploy's health check by refusing to start.                                                                                                                                                                                                                                                                                                                                                 |
+| `STRIPE_SECRET_KEY`     | no; together with the next one  | Billing's Stripe API key: a restricted key (`rk_live_...`) with the permissions under [Stripe setup](#stripe-setup). Its mode (live or test) must match the one recorded in the database ([Switching Stripe modes](#switching-stripe-modes)), or the server refuses to start. Unset (with `STRIPE_WEBHOOK_SECRET` also unset), billing is disabled: the boot log says so, `GET /api/orgs/{org}/billing` reports `billingEnabled: false`, and the setup route and the webhook answer `503 billing_disabled`. |
+| `STRIPE_WEBHOOK_SECRET` | no; together with the one above | The webhook endpoint's signing secret (`whsec_...`), shown by Stripe when the endpoint is created. Setting exactly one of the two Stripe secrets fails the deploy's health check by refusing to start.                                                                                                                                                                                                                                                                                                      |
 
 Set the two email secrets in one command so no release boots with only one of them:
 
@@ -97,38 +97,57 @@ subscription, once the org's owner has put a card on file (`POST
 these steps, in this order, all done by a person with access to the Stripe dashboard. None
 of them is done by CI or by the server.
 
-1. **Restricted key.** Dashboard → Developers → API keys → Create restricted key, named
-   `otto-platform`. Grant **Write** on exactly:
-   - Customers (create and search customers, set the default payment method)
-   - Payment Methods (detach the card a new one replaces)
-   - Checkout Sessions (setup-mode sessions)
-   - Setup Intents (read the card a session collected; Write includes the Read needed)
-   - Subscriptions, including subscription schedules (create and list subscriptions,
-     list and change their items, and schedule each month's price switch)
-   - Prices and Products (one price per price-book version, one product per meter)
-   - Billing Meters, and Billing Meter Events (meters now; meter events for usage
-     shipping, #64)
+1. **Account.** Activate the account for live payments (Settings → Business: business
+   details, bank account, identity verification) and fill in the public details customers
+   see on invoices, receipts and card statements (Settings → Business → Public details:
+   business name, statement descriptor, support email and URL). Then set up billing as
+   under [Billing settings](#billing-settings).
+2. **Restricted key.** Dashboard → Developers → API keys → Create restricted key, named
+   `otto-platform`. Grant **Write** on exactly these (Write includes the Read each needs):
+   - Customers: create and search customers, set the default payment method
+   - Payment Methods: detach the card a new one replaces
+   - Checkout Sessions: setup-mode sessions
+   - Setup Intents: read the card a session collected
+   - Subscriptions: create, read and list subscriptions; list, add and change their
+     **subscription items**; create, update and release **subscription schedules** (each
+     month's price switch). If your dashboard lists Subscription items or Subscription
+     schedules as resources of their own, grant Write on those too.
+   - Invoices: read invoices, set `auto_advance` on a draft and **finalize** it (invoices
+     are held as drafts until their usage has reached Stripe; see below)
+   - Prices and Products: one price per price-book version, one product per meter
+   - Billing Meters, and Billing Meter Events: meters, and usage shipping
 
-   Everything else stays **None**. Use the live-mode key in production and a test-mode
-   key anywhere else.
-2. **Webhook endpoint.** Dashboard → Developers → Webhooks → Add endpoint:
+   Everything else stays **None**. Use the live-mode key (`rk_live_...`) in production and
+   a test-mode key (`rk_test_...`) anywhere else. Check the key in test mode first: run
+   through [Verify in test mode](#verify-in-test-mode) with the test-mode key made with the
+   same permissions; a missing permission shows up as a `403` in `stripe sync`'s errors or
+   in the shipper's logs.
+3. **Webhook endpoint.** Dashboard → Developers → Webhooks → Add endpoint:
    - URL: `https://otto.savvagent.com/api/stripe/webhook`
    - API version: `2025-03-31.basil` (the version the client is pinned to)
-   - Events, exactly these six: `checkout.session.completed`,
-     `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid`,
-     `invoice.payment_failed`, `payment_method.detached`
+   - Events, exactly these seven: `checkout.session.completed`,
+     `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.created`,
+     `invoice.paid`, `invoice.payment_failed`, `payment_method.detached`
 
-   Copy the endpoint's signing secret (`whsec_...`).
-3. **Secrets.** Set `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` together (above). The
+   Copy the endpoint's signing secret (`whsec_...`). Without `invoice.created` nothing is
+   held: Stripe finalizes each invoice about an hour after it makes it, and usage that
+   reaches Stripe later (see [How usage reaches an invoice](#how-usage-reaches-an-invoice))
+   is never invoiced.
+4. **Secrets.** Set `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` together (above). The
    next release logs `billing enabled: Stripe is configured`, and from then on every
    machine runs `stripe sync` on its own: at boot, every 15 minutes, and 30 seconds after
    00:00 UTC on the first of each month. A lease in the database lets only one machine
-   sync at a time.
-4. **Prices.** Set the price book (`otto-platform-server pricebook set ...`, see the
-   README). The next automatic sync creates a Stripe meter per declared meter and a Stripe
-   Price per price-book version, subscribes every org that already has a card on file, and
-   schedules every subscription's switch to the new prices. To see it happen, run it by
-   hand on the app's machine, which has `DATABASE_URL` and `STRIPE_SECRET_KEY` as secrets:
+   sync at a time. The first boot with a key records the key's mode (live or test) in the
+   database; see [Switching Stripe modes](#switching-stripe-modes).
+5. **Prices.** Set the price book (`otto-platform-server pricebook set ...`, see the
+   README). A price must be set at least 24 hours before the month it takes effect (by
+   the database's clock), so **the first billable month is next month at the earliest**,
+   or the month after that if you set prices on a month's last day. `set` prints what the
+   month cost before and after (and logs it at info). The next automatic sync creates a
+   Stripe meter per declared meter and a Stripe Price per price-book version, subscribes
+   every org that already has a card on file, and schedules every subscription's switch
+   to the new prices. To see it happen, run it by hand on the app's machine, which has
+   `DATABASE_URL` and `STRIPE_SECRET_KEY` as secrets:
 
    ```bash
    fly ssh console -a otto-platform -C "otto-platform-server stripe sync"
@@ -138,34 +157,88 @@ of them is done by CI or by the server.
    running` if a machine is mid-run. It exits non-zero after listing anything it could not
    do (for example a meter key too long to be a Stripe event name), having done the rest;
    the logs show the same for the automatic runs.
-5. **Verify once in test mode** with a Stripe test clock: subscribe a test org, set a
-   price for next month, let sync run, advance the clock past 00:00 UTC on the first, and
-   check that the closing invoice is rated at the old price and the new month's usage at
-   the new one. The tests here run against a local stand-in for Stripe, not Stripe.
-6. **Verify meter events once in test mode**: ingest metered usage for that subscribed
-   test org, wait for `stripe outbox` to show it `sent`, and check that it appears in the
-   meter's event summaries and on the upcoming invoice as quantity x rate. Then send one
-   event's identifier twice (for example by resetting its outbox row to `pending` with
-   `attempts` raised by one) and confirm Stripe counts it once, noting whether Stripe
-   answered the repeat with `200` or a duplicate-identifier `400`: the shipper treats
-   both as sent.
+6. **Verify once in test mode**, as below, before setting the live secrets.
 
-**When a new price takes effect.** A price-book version can only be set for a future
-month, and sync puts each live subscription under a Stripe subscription schedule as soon
-as the version has its Stripe Price: the schedule switches the subscription's items to
-the new prices at exactly 00:00 UTC on the first of that month, without proration, then
-releases the subscription. The billing period is anchored to the first, so the closing
-month is invoiced at the old prices and the new month is rated at the new ones. The one
-window: a version set in the last ~15 minutes before its month may not be scheduled before
-the month starts; then the usage from 00:00 UTC until the sync 30 seconds later (or the
-next regular one, if that run fails) is billed at the previous price. Set prices earlier
-than that.
+### Billing settings
+
+Dashboard → Settings → Billing, in live mode (and the same in test mode, so the test
+matches):
+
+- **Failed payments** (Subscriptions and emails → Manage failed payments): use Smart
+  Retries (or a fixed schedule of a few attempts over two weeks). For the final action
+  choose **cancel the subscription**. The platform treats a canceled subscription as
+  billing stopped: the org's billable use past its free tiers answers `payment_required`
+  until its owner puts a card on file again, which starts a new subscription. "Mark as
+  unpaid" or "leave past due" keep the subscription live here, so usage keeps being
+  billed onto invoices nobody pays and nothing blocks it.
+- **Invoice finalization**: leave Stripe's automatic finalization of subscription
+  invoices on. Stripe makes each month's invoice as a draft at 00:00 UTC on the first and
+  would finalize it about an hour later (it waits for a successful answer to the
+  `invoice.created` webhook first, up to 72 hours). The platform turns `auto_advance`
+  off on each subscription-cycle draft when that webhook arrives and finalizes it itself
+  once the month's usage has reached Stripe (about 02:15 to 02:45 UTC on the first, after
+  the month closes at 02:00), or after 72 hours at most, turning `auto_advance` back on so
+  Stripe collects it. Do not finalize held drafts by hand unless one is stuck: sync then
+  finds it no longer a draft and leaves it (`not_draft`).
+- **Customer emails** (Settings → Customer emails): turn on emails for finalized
+  invoices, successful payments (receipts), failed payments, and expiring or updated
+  cards. They go to the customer's email, which is the owner's address when they started
+  setup.
+- **Customer portal**: not used; owners manage their card through the console.
+
+### How usage reaches an invoice
+
+Metered usage reaches Stripe as one meter event per org, meter, customer and UTC hour, sent after the hour ends (expect up to ~1 h of lag). A billing month closes 2 h after 00:00 UTC on the 1st; usage arriving later is billed in the current month. `otto-platform-server stripe outbox` counts these hourly rows, not individual usage events. Sent rows are swept after 35 days, 5,000 per batch.
+
+Ingest queues the metered usage of every org with a live subscription in
+`stripe_meter_outbox`, and every machine runs a shipper that sends it, once `stripe sync`
+has made the meter's Stripe meter (a newly declared meter's usage waits for the next
+sync). It retries 5xx and timeouts for up to 12 hours from the first attempt Stripe may
+have received (inside Stripe's 24-hour identifier dedupe, so nothing is counted twice),
+and 429s and 401/403s, which Stripe never processed, until the usage is 34 days old. A
+row Stripe refuses (a 4xx) or that could not be sent in time is kept as `rejected` or
+`expired` with its error, logged at error level, and not invoiced.
+
+**The first month.** An org's first subscription is backdated to 00:00 UTC on the first
+of the month it is made in, and the usage it had already accrued that month (counted,
+but not queued while it had no card) is queued as the subscription is recorded, so
+Stripe rates the whole month through one set of tiers with one free allowance, as the
+platform does. Usage of a month before the subscription is not billed; that includes the
+previous month when the card goes on file between 00:00 and 02:00 UTC on the first (that
+month is still open for late events, but the org had no card during it). A
+re-subscription after a cancellation is backdated only past the earlier subscription
+(see `otto_billing::billing`, "The first month").
+
+**Invoices wait for their usage.** See *Invoice finalization* above. A held invoice is
+finalized once the month has closed and two sync runs at least 10 minutes apart have seen
+none of the org's usage from before the month's end waiting to be sent. One still waiting
+after 72 hours is finalized anyway, logged at error ("finalized a Stripe invoice at its
+maximum hold") and shown by `stripe sync` as `finalized_late`: that usage is not on it.
+
+### When a new price takes effect
+
+A price-book version can only be set for a month that starts at least 24 hours later,
+and sync puts each live subscription under a Stripe subscription schedule as soon as the
+version has its Stripe Price (within 15 minutes): the schedule switches the
+subscription's items to the new prices at exactly 00:00 UTC on the first of that month,
+without proration, then releases the subscription. The billing period is anchored to the
+first, so the closing month is invoiced at the old prices and the new month is rated at
+the new ones.
+
+The one way that can fail is for every sync to fail for the whole day before the month
+starts (Stripe down, a broken key). Then the subscription carries the previous month's
+prices into the new month, and the first sync that succeeds afterwards moves its items to
+the new prices in the middle of the month, without proration, and logs that at error
+("changed a Stripe subscription's price in the middle of ..."). How Stripe then rates the
+month's usage on either side of that change is Stripe's rule for a mid-period price
+change on a metered item; check it once in test mode (below) and look at those orgs'
+invoices for that month.
 
 Notes:
 
 - A Stripe price is immutable, and each price-book version gets its own. A future version
   replaced with `pricebook set` before its month leaves its Stripe price unused; the
-  schedule is updated to the replacement.
+  schedule is updated to the replacement. Sync never removes a subscription item.
 - Stripe is never sent a card number: the owner types it into Stripe Checkout. Checkout
   offers cards only, because a bank debit confirms days later and its setup could finish
   in Checkout without ever reaching the platform as a card on file.
@@ -174,36 +247,144 @@ Notes:
 - When Stripe cancels a subscription (from the dashboard, or after failed retries),
   billing for that org stops: nothing re-subscribes it until its owner puts a card on file
   again.
-- With billing disabled, `GET /api/orgs/{org}/billing` says so and nothing is invoiced;
-  usage is still metered and kept.
+- An org has one subscription. Sync adopts a live one it finds (the recorded one, even if
+  our copy of its status is stale, or one tagged `metadata[org_id]`) rather than making a
+  second, and refuses to make one for a customer that already has another live
+  subscription carrying a metered price: Stripe meters count per customer, so both would
+  bill the same usage. A future paid plan must be added to this subscription, never
+  sold as a second one.
+- With billing disabled, `GET /api/orgs/{org}/billing` says so, nothing is invoiced, and
+  usage-status never answers `payment_required` (nobody can put a card on file); usage is
+  still metered and kept, and budgets still apply.
 - Deleting an org does not yet cancel its Stripe subscription. Cancel it in the dashboard.
-- The webhook ledger (`stripe_events`) keeps every handled event id; it is not swept.
-- Metered usage reaches Stripe as meter events. Ingest queues every metered event of an
-  org with a live subscription in `stripe_meter_outbox`, and every machine runs a shipper
-  that sends them, once `stripe sync` has made the event's Stripe meter (a newly declared
-  meter's events wait for the next sync). It retries 5xx and timeouts for up to 12 hours
-  from the first attempt Stripe may have received (inside Stripe's 24-hour identifier
-  dedupe, so nothing is counted twice), and 429s and 401/403s, which Stripe never
-  processed, until the event is 34 days old. Usage of an org with no live subscription
-  (free, or no card yet) is metered but not billed, and is not billed later when it
-  subscribes; neither is an event already 34 days old when it is ingested. An event
-  Stripe refuses (a 4xx) or that could not be sent in time is kept as `rejected` or
-  `expired` with its error, logged at error level, and not invoiced. To see how many, and
-  how long the oldest unsent one has waited:
-
-  ```bash
-  fly ssh console -a otto-platform -C "otto-platform-server stripe outbox"
-  ```
-
-  `sent` means Stripe accepted the event for processing. Stripe validates meter events
-  asynchronously (an unknown customer, an archived meter) and reports failures only as
-  `v1.billing.meter.error_report_triggered` events, which the platform does not read yet:
-  check the meter's error reports in the dashboard.
-
-  A 401/403 (the restricted key lacks *Billing Meter Events: write*) is retried and logged
-  at error, backing off to one pass every 5 minutes; fix the key and nothing is lost.
 - Deleting an org deletes its queued meter events with it: usage it had not yet shipped
   to Stripe is not invoiced.
+- The webhook ledger (`stripe_events`) is swept about once an hour of events handled more
+  than 90 days ago.
+
+### Monitoring
+
+- `fly ssh console -a otto-platform -C "otto-platform-server stripe outbox"`: rows by
+  status and the oldest pending row's age. Any `rejected` or `expired` rows are usage that
+  will not be invoiced (each row's `last_error` says why). The oldest pending row should
+  be under about two hours old (an hour's usage waits for its hour to end); much older
+  means the shipper is failing (look for its errors) or a meter has no Stripe meter yet
+  (run `stripe sync`).
+- Logs at error level from `stripe sync:` (anything sync could not do), "finalized a
+  Stripe invoice at its maximum hold", "changed a Stripe subscription's price in the
+  middle of", and the shipper's rejected/expired rows and 401/403s. A 401/403 (the key
+  lacks *Billing Meter Events: write*) is retried, backing off to one pass every 5
+  minutes; fix the key and nothing is lost.
+- Stripe accepts meter events for processing and validates them asynchronously (an
+  unknown customer, an archived meter); `sent` means accepted. Failures appear only as
+  the meters' **error reports** (Dashboard → Billing → Meters → a meter → Error reports)
+  and `v1.billing.meter.error_report_triggered` events, which the platform does not read
+  yet (#76). Check them after a deploy that adds meters, and weekly.
+
+### Verify in test mode
+
+With a test-mode key and webhook (a staging deployment, or a local server reachable by
+`stripe listen --forward-to localhost:<port>/api/stripe/webhook`). The tests in this
+repository run against a local stand-in for Stripe, not Stripe, so do this once before
+going live and after any change to billing.
+
+1. **A customer on a test clock.** In the dashboard, in test mode, create a test clock
+   (Billing → Subscriptions → Test clocks; search "test clocks" if it has moved), frozen at **the current time** (the platform computes the subscription's
+   start and anchor from the real clock, and Stripe refuses an anchor before the clock's
+   time). Add a customer to the clock. Map it to a test org (its id is in the console's
+   URL or `SELECT id FROM orgs WHERE slug = '...'`), connected as the database superuser
+   (`fly postgres connect -a otto-db -d otto_platform`):
+
+   ```sql
+   BEGIN;
+   INSERT INTO subscriptions (org_id) VALUES ('<org-id>') ON CONFLICT (org_id) DO NOTHING;
+   UPDATE subscriptions SET stripe_customer_id = '<cus_...>' WHERE org_id = '<org-id>';
+   INSERT INTO stripe_customers (stripe_customer_id, org_id) VALUES ('<cus_...>', '<org-id>')
+     ON CONFLICT (org_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id;
+   COMMIT;
+   ```
+
+   (Setting the customer's metadata `org_id` to the org's id in the dashboard works too:
+   setup adopts a customer tagged with the org, once Stripe's search sees it, about a
+   minute later.) Have the org's owner put a test card (`4242 4242 4242 4242`) on file in
+   the console; the subscription is made on that customer, so it runs on the clock.
+2. **Usage.** Ingest metered usage for the org, wait for `stripe outbox` to show it
+   `sent`, and check the meter's event summaries and the upcoming invoice. The shipper
+   stamps each meter event with the start of its real UTC hour, so send usage before you
+   advance the clock past it; to put usage on a clock time the shipper cannot reach, send
+   it by hand for that customer, with the meter's event name, `stripe_customer_id` and
+   `value` in the payload and a timestamp at the clock's time (the dashboard's meter
+   page, or a `POST /v1/billing/meter_events` from the Stripe CLI). Then send one event's identifier twice (reset its outbox
+   row to `pending` with `attempts` raised by one) and confirm Stripe counts it once,
+   noting whether Stripe answered the repeat with `200` or a duplicate-identifier `400`
+   (the shipper treats both as sent).
+3. **First-month backdating.** Before step 1's card goes on file, ingest some usage for
+   the org. After it subscribes, the subscription's start in the dashboard is 00:00 UTC
+   on the first of the month, `stripe sync` printed (or the audit log's
+   `billing.subscription.created` shows) the units backfilled, and the upcoming invoice
+   carries that usage, with the free tier applied once.
+4. **Rounding parity.** Price a test meter `--tier 3:500000 --tier inf:250000` (0.5¢ each
+   for the first 3, then 0.25¢). With quantity 5 in a month, the platform says 2¢ (1.5¢ +
+   0.5¢ = 2.0¢, rounded once). Check that Stripe's invoice line says 2¢ too, not 3¢ (which
+   would mean Stripe rounds each tier on its own); if it differs, record it and file an
+   issue before going live.
+5. **Month-boundary price switch.** Set a new price for next month (at least 24 hours
+   ahead), let sync run, and check the subscription's schedule: one phase to 00:00 UTC on
+   the first, the next from then, no proration. Advance the clock past 00:00 UTC on the
+   first. Stripe makes the closing month's invoice; the `invoice.created` webhook holds
+   it (Dashboard: draft, automatic collection off). The closing month's usage is rated at
+   the old price and the new month's at the new one.
+6. **Release of the held invoice.** The platform releases a held invoice by the real
+   clock, so an invoice for a month that has not ended in real time waits for its
+   72-hour maximum. To release it in the test, move its hold back and run sync:
+
+   ```sql
+   UPDATE stripe_held_invoices SET held_at = now() - interval '72 hours'
+    WHERE stripe_invoice_id = '<in_...>';
+   ```
+
+   `stripe sync` then prints an `invoice` line for it ending `finalized_late` (and logs
+   the expected error); the invoice is open with automatic collection on, and the test card
+   is charged.
+7. **Mid-period item change.** Simulate a missed switch: write a version for the
+   current month straight into the database (`pricebook set` refuses it), as the
+   superuser, then run `stripe sync`. It moves the item in the middle of the month and
+   prints a `changed price in the middle of` warning (logged at error). Advance the clock
+   to the month's end and record here how Stripe rated the usage before and after the
+   change.
+
+### Switching Stripe modes
+
+The first boot (or `stripe sync`) with a Stripe key records the key's mode, `live` or
+`test` (from its `sk_live_`/`rk_live_` or `sk_test_`/`rk_test_` prefix), in
+`stripe_account_mode`. A later boot with a key of the other mode refuses to start ("is a
+live-mode key, but this database's Stripe customers ... were made in test mode"), as
+does `stripe sync`: the customer, subscription, meter and price ids recorded here do not
+exist in the other mode.
+
+To move a database from test mode to live mode on purpose, forget every test-mode
+Stripe object, as the database superuser, then deploy with the live key. Owners put
+their cards on file again (live), and sync makes meters, prices and subscriptions anew:
+
+```sql
+BEGIN;
+DELETE FROM stripe_account_mode;
+DELETE FROM stripe_held_invoices;
+DELETE FROM stripe_meter_outbox WHERE status = 'pending';
+DELETE FROM stripe_prices;
+DELETE FROM stripe_meters;
+DELETE FROM stripe_customers;
+UPDATE subscriptions
+   SET stripe_customer_id = NULL, stripe_subscription_id = NULL, status = 'active',
+       payment_method_status = 'none', stripe_payment_method_id = NULL,
+       payment_method_event_at = NULL, subscription_event_at = NULL,
+       billing_stopped_at = NULL, stripe_schedule_id = NULL, stripe_plan = NULL,
+       lease_until = NULL, lease_token = NULL;
+COMMIT;
+```
+
+If the database never held objects of the other mode (the mode was recorded by mistake),
+`DELETE FROM stripe_account_mode;` alone lets the next boot record the new one.
 
 ## The hostname
 

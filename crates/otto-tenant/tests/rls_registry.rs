@@ -76,6 +76,7 @@ async fn tenant_pinned_code_cannot_read_the_cross_tenant_tables(pool: PgPool) {
         "stripe_customers",
         "stripe_events",
         "stripe_sync_lease",
+        "stripe_account_mode",
     ] {
         let mut tx = db.begin(OrgId::new()).await.unwrap();
         let read = sqlx::query(&format!("SELECT * FROM {table}"))
@@ -433,12 +434,102 @@ async fn tenant_pinned_code_cannot_write_the_stripe_ledgers(pool: PgPool) {
         "DELETE FROM stripe_events",
         "INSERT INTO stripe_sync_lease (name, token, until) \
          VALUES ('sync', gen_random_uuid(), now())",
+        "INSERT INTO stripe_account_mode (mode) VALUES ('live')",
+        "UPDATE stripe_account_mode SET mode = 'live'",
+        "DELETE FROM stripe_account_mode",
     ] {
         let mut tx = db.begin(OrgId::from(org)).await.unwrap();
         let err = sqlx::query(stmt).execute(tx.conn()).await.expect_err(stmt);
         assert!(
             err.to_string().contains("permission denied"),
             "{stmt}: {err}"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn held_invoices_are_seen_and_written_only_by_their_own_org(pool: PgPool) {
+    let db = Db::from_pool(pool.clone());
+    let mut orgs = Vec::new();
+    for slug in ["acme", "beta"] {
+        let id: uuid::Uuid =
+            sqlx::query_scalar("INSERT INTO orgs (slug, name) VALUES ($1, $1) RETURNING id")
+                .bind(slug)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        orgs.push(OrgId::from(id));
+    }
+    let (acme, beta) = (orgs[0], orgs[1]);
+    let mut tx = db.begin(acme).await.unwrap();
+    sqlx::query(
+        "INSERT INTO stripe_held_invoices \
+           (stripe_invoice_id, org_id, stripe_subscription_id, period_month) \
+         VALUES ('in_acme', $1, 'sub_1', '2026-10-01')",
+    )
+    .bind(acme)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // Another org neither sees it nor can write one for acme.
+    let mut tx = db.begin(beta).await.unwrap();
+    let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM stripe_held_invoices")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert_eq!(seen, 0);
+    let n =
+        sqlx::query("UPDATE stripe_held_invoices SET outcome = 'finalized', released_at = now()")
+            .execute(tx.conn())
+            .await
+            .unwrap()
+            .rows_affected();
+    assert_eq!(n, 0);
+    let err = sqlx::query(
+        "INSERT INTO stripe_held_invoices \
+           (stripe_invoice_id, org_id, stripe_subscription_id, period_month) \
+         VALUES ('in_forged', $1, 'sub_1', '2026-10-01')",
+    )
+    .bind(acme)
+    .execute(tx.conn())
+    .await
+    .expect_err("wrote another org's held invoice");
+    assert!(err.to_string().contains("row-level security"), "{err}");
+    drop(tx);
+
+    // The outcome vocabulary is closed, and a release names its outcome.
+    for stmt in [
+        "UPDATE stripe_held_invoices SET outcome = 'paid', released_at = now()",
+        "UPDATE stripe_held_invoices SET released_at = now()",
+        "UPDATE stripe_held_invoices SET period_month = '2026-10-02'",
+    ] {
+        let mut tx = db.begin(acme).await.unwrap();
+        let err = sqlx::query(stmt).execute(tx.conn()).await.expect_err(stmt);
+        assert!(
+            err.to_string().contains("check constraint"),
+            "{stmt}: {err}"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_stripe_mode_is_one_row_of_live_or_test(pool: PgPool) {
+    sqlx::query("INSERT INTO stripe_account_mode (mode) VALUES ('test')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for stmt in [
+        "INSERT INTO stripe_account_mode (mode) VALUES ('live')",
+        "INSERT INTO stripe_account_mode (singleton, mode) VALUES (false, 'live')",
+        "UPDATE stripe_account_mode SET mode = 'sandbox'",
+    ] {
+        let err = sqlx::query(stmt).execute(&pool).await.expect_err(stmt);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("check constraint") || msg.contains("duplicate key"),
+            "{stmt}: {msg}"
         );
     }
 }

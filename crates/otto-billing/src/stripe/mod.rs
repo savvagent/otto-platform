@@ -32,10 +32,10 @@ mod tests;
 
 pub use api::{
     CheckoutSession, CreateCustomer, CreateMeter, CreateMeteredPrice, CreateSetupCheckoutSession,
-    CreateSubscription, Customer, InvoiceSettings, List, Meter, MeterEvent, MeterEventRecord,
-    PaymentMethod, PhaseWindow, Price, PriceProduct, PriceTier, Recurring, SchedulePhase,
-    SchedulePhaseItem, SchedulePhaseParams, SetupIntent, SetupPaymentMethods, Subscription,
-    SubscriptionItem, SubscriptionSchedule, TierUpTo, UpdateSchedule,
+    CreateSubscription, Customer, Invoice, InvoiceSettings, List, Meter, MeterEvent,
+    MeterEventRecord, PaymentMethod, PhaseWindow, Price, PriceProduct, PriceTier, Recurring,
+    SchedulePhase, SchedulePhaseItem, SchedulePhaseParams, SetupIntent, SetupPaymentMethods,
+    Subscription, SubscriptionItem, SubscriptionSchedule, TierUpTo, UpdateSchedule,
 };
 pub use client::{Client, DEFAULT_BASE_URL, MAX_RESPONSE_BYTES, STRIPE_VERSION};
 pub use error::{ApiError, StripeError};
@@ -43,7 +43,7 @@ pub use event_name::{
     meter_event_name, parse_meter_event_name, EventNameError, MAX_EVENT_NAME_LEN,
 };
 pub use money::ucents_to_unit_amount_decimal;
-pub use secret::{IdempotencyKey, SecretKey, WebhookSecret};
+pub use secret::{IdempotencyKey, KeyMode, SecretKey, WebhookSecret};
 pub use webhook::{
     sign_webhook, verify_webhook, verify_webhook_at, EventData, WebhookError, WebhookEvent,
     MAX_SIGNATURES, MAX_SIGNATURE_HEADER_BYTES, MAX_WEBHOOK_PAYLOAD_BYTES, SIGNATURE_HEADER,
