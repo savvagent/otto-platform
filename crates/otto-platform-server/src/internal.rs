@@ -36,7 +36,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use otto_billing::meters::{self, MeterSpec};
-use otto_billing::usage::{self, IngestOutcome, Metered, ShippedUsage, UsageExt};
+use otto_billing::usage::{
+    self, IngestOutcome, Metered, MeteringFields, ShippedUsage, Shipper, UsageExt,
+};
 use otto_core::orgs::{Org, OrgsExt};
 use otto_core::teams::{Team, TeamsExt};
 use otto_resource::{
@@ -130,6 +132,10 @@ async fn ingest_usage(
 
     let service = rs.service.as_deref();
     let declared = declared_meters(&db, service, &batch.events).await?;
+    let shipper = Shipper {
+        service,
+        declared: &declared,
+    };
 
     let mut receipt = UsageReceipt::default();
     let mut by_org: BTreeMap<Uuid, Vec<(&otto_resource::UsageEvent, Option<Metered<'_>>)>> =
@@ -144,11 +150,12 @@ async fn ingest_usage(
             continue;
         }
         match usage::check_metering(
-            service,
-            &declared,
-            ev.service.as_deref(),
-            ev.meter.as_deref(),
-            ev.quantity,
+            &shipper,
+            MeteringFields {
+                service: ev.service.as_deref(),
+                meter: ev.meter.as_deref(),
+                quantity: ev.quantity,
+            },
         ) {
             Ok(metered) => by_org.entry(ev.org_id).or_default().push((ev, metered)),
             Err(refused) => receipt.rejected.push(RejectedEvent {

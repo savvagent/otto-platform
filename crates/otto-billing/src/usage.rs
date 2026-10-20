@@ -34,6 +34,12 @@
 //! feeds the call counters. An event with no meter is unmetered and free: it
 //! adds to no meter, so nothing priced by meters (spend, budgets, invoices)
 //! ever sees it.
+//!
+//! Meter declarations are add-only ([`crate::meters`] never removes one), so
+//! an event accepted once stays acceptable: a replay of it reaches the ledger
+//! claim and comes back [`IngestOutcome::Duplicate`], never `unknown_meter`.
+//! Removing meters would break that, and with it the shipper's ability to
+//! retry a batch blindly.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -119,6 +125,14 @@ pub struct ShippedUsage<'a> {
 /// The largest quantity one event may carry. Large enough for any real batch
 /// of work, small enough that no plausible number of events overflows a
 /// `bigint` total.
+///
+/// The wire contract's copy is `otto_resource::MAX_METER_QUANTITY`. It is
+/// repeated here rather than imported because the dependency cannot run either
+/// way cleanly: `otto-resource` is the database-free client every resource
+/// server links, so it must not depend on this crate (sqlx, otto-tenant), and
+/// this crate is the SQL layer, which should not take on the HTTP client crate
+/// for one number. `otto-platform-server`'s `quantities_are_bounded_per_event`
+/// test asserts the two are equal, as does migration 0019's CHECK.
 pub const MAX_METER_QUANTITY: u64 = 1_000_000_000;
 
 /// Rejection code: the event names a meter its shipper has not declared.
@@ -168,35 +182,65 @@ fn reject(code: &'static str, detail: impl Into<String>) -> MeteringRejection {
     }
 }
 
+/// The resource server shipping a batch, as [`check_metering`] needs it.
+#[derive(Debug, Clone, Copy)]
+pub struct Shipper<'a> {
+    /// Its service slug, `None` until an operator assigns one.
+    pub service: Option<&'a str>,
+    /// The meter keys that service has declared, loaded once per batch so no
+    /// event costs a query. Empty for a shipper with no service.
+    pub declared: &'a HashSet<String>,
+}
+
+/// One event's metering fields, as it was shipped.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MeteringFields<'a> {
+    /// The service the event claims to come from.
+    pub service: Option<&'a str>,
+    /// The meter key it counts toward, `<service>/<meter>`.
+    pub meter: Option<&'a str>,
+    pub quantity: Option<u64>,
+}
+
 /// Check an event's metering fields against its shipper.
 ///
-/// `caller_service` is the shipping resource server's service slug and
-/// `declared` the meter keys that service has declared, loaded once per batch
-/// so no event costs a query. Returns the meter and quantity for a metered
-/// event, `None` for an unmetered one, or why the event must be refused.
-/// A meter named without a quantity counts 1.
+/// Returns the meter and quantity for a metered event, `None` for an
+/// unmetered one, or why the event must be refused. A meter named without a
+/// quantity counts 1.
 ///
 /// ```
 /// use std::collections::HashSet;
-/// use otto_billing::usage::{check_metering, Metered, UNKNOWN_METER};
+/// use otto_billing::usage::{check_metering, Metered, MeteringFields, Shipper, UNKNOWN_METER};
 ///
 /// let declared: HashSet<String> = ["otto-flags/evaluations".to_owned()].into();
-/// let ok = check_metering(Some("otto-flags"), &declared, None, Some("otto-flags/evaluations"), Some(3));
+/// let flags = Shipper { service: Some("otto-flags"), declared: &declared };
+///
+/// let ok = check_metering(&flags, MeteringFields {
+///     meter: Some("otto-flags/evaluations"),
+///     quantity: Some(3),
+///     ..Default::default()
+/// });
 /// assert_eq!(ok, Ok(Some(Metered { meter: "otto-flags/evaluations", quantity: 3 })));
 ///
 /// // Unmetered events are free and always fine.
-/// assert_eq!(check_metering(None, &declared, None, None, None), Ok(None));
+/// assert_eq!(check_metering(&flags, MeteringFields::default()), Ok(None));
 ///
-/// let refused = check_metering(Some("otto-flags"), &declared, None, Some("otto-flags/nope"), Some(1));
+/// let refused = check_metering(&flags, MeteringFields {
+///     meter: Some("otto-flags/nope"),
+///     ..Default::default()
+/// });
 /// assert_eq!(refused.unwrap_err().code, UNKNOWN_METER);
 /// ```
 pub fn check_metering<'a>(
-    caller_service: Option<&str>,
-    declared: &HashSet<String>,
-    service: Option<&str>,
-    meter: Option<&'a str>,
-    quantity: Option<u64>,
+    shipper: &Shipper<'_>,
+    event: MeteringFields<'a>,
 ) -> std::result::Result<Option<Metered<'a>>, MeteringRejection> {
+    let caller_service = shipper.service;
+    let MeteringFields {
+        service,
+        meter,
+        quantity,
+    } = event;
     if let Some(claimed) = service {
         if caller_service != Some(claimed) {
             return Err(reject(
@@ -223,7 +267,7 @@ pub fn check_metering<'a>(
             .split_once('/')
             .is_some_and(|(prefix, _)| prefix == svc)
     });
-    if !own || !declared.contains(meter) {
+    if !own || !shipper.declared.contains(meter) {
         return Err(reject(
             UNKNOWN_METER,
             format!(
@@ -407,18 +451,71 @@ impl UsageExt for Tx<'_> {
             }
         }
 
+        // One statement after the claim, so an event costs two round trips
+        // while this transaction holds the org's counter row locks.
+        //
         // `user_id` is resolved through a subselect so an account deleted
         // since the event was written leaves it NULL instead of failing the
         // foreign key (the same trade `record_usage` documents).
+        //
+        // LOCK ORDER. The three counter upserts each lock one row, and every
+        // ingest takes them in the same order so two concurrent ingests can
+        // never deadlock: the legacy `org_period_usage` row first, then the
+        // service's `org_service_period_usage` row, then the meter's
+        // `org_meter_period_usage` row. Data-modifying CTEs run in no
+        // guaranteed order on their own, so the order is forced by data
+        // dependencies: `service` selects from `legacy`'s RETURNING, and
+        // `meter` cannot produce its row until it has read both `legacy` and
+        // the completed `service`. Whoever retires the legacy bucket must keep
+        // `service` ahead of `meter` the same way (have `meter` read
+        // `service`), not just delete the `legacy` CTE.
+        //
+        // `service` and `meter` insert nothing when $9 / $7 is NULL: an event
+        // from a server with no slug counts only in the legacy bucket, and an
+        // unmetered one adds to no meter. A metered event's quantity counts
+        // whatever `billable` says (module docs).
         let at = event.occurred_at.min(now);
         let (meter, quantity) = match event.metered {
             Some(m) => (Some(m.meter), Some(m.quantity)),
             None => (None, None),
         };
         sqlx::query(
-            "INSERT INTO usage_events \
-               (org_id, user_id, tool, billable, created_at, resource_uri, meter, quantity) \
-             VALUES ($1, (SELECT id FROM users WHERE id = $2), $3, $4, $5, $6, $7, $8)",
+            "WITH event AS ( \
+               INSERT INTO usage_events \
+                 (org_id, user_id, tool, billable, created_at, resource_uri, meter, quantity) \
+               VALUES ($1, (SELECT id FROM users WHERE id = $2), $3, $4, $5, $6, \
+                       $7::text, $8::bigint) \
+             ), legacy AS ( \
+               INSERT INTO org_period_usage (org_id, period_start, billable_count, total_count) \
+               VALUES ($1, date_trunc('month', $5::timestamptz AT TIME ZONE 'utc')::date, \
+                       $4::boolean::int, 1) \
+               ON CONFLICT (org_id, period_start) DO UPDATE \
+                 SET billable_count = org_period_usage.billable_count + EXCLUDED.billable_count, \
+                     total_count = org_period_usage.total_count + 1, \
+                     updated_at = now() \
+               RETURNING period_start \
+             ), service AS ( \
+               INSERT INTO org_service_period_usage \
+                 (org_id, service, period_start, billable_count, total_count) \
+               SELECT $1, $9::text, legacy.period_start, $4::boolean::int, 1 \
+               FROM legacy \
+               WHERE $9::text IS NOT NULL \
+               ON CONFLICT (org_id, service, period_start) DO UPDATE \
+                 SET billable_count = org_service_period_usage.billable_count \
+                                      + EXCLUDED.billable_count, \
+                     total_count = org_service_period_usage.total_count + 1, \
+                     updated_at = now() \
+               RETURNING 1 \
+             ), meter AS ( \
+               INSERT INTO org_meter_period_usage (org_id, meter, period_start, quantity) \
+               SELECT $1, $7::text, legacy.period_start, $8::bigint \
+               FROM legacy CROSS JOIN (SELECT count(*) FROM service) AS service_done \
+               WHERE $7::text IS NOT NULL \
+               ON CONFLICT (org_id, meter, period_start) DO UPDATE \
+                 SET quantity = org_meter_period_usage.quantity + EXCLUDED.quantity, \
+                     updated_at = now() \
+             ) \
+             SELECT 1",
         )
         .bind(org)
         .bind(event.user)
@@ -428,62 +525,10 @@ impl UsageExt for Tx<'_> {
         .bind(resource_uri)
         .bind(meter)
         .bind(quantity)
+        .bind(event.service)
         .execute(self.conn())
         .await?;
 
-        // The legacy family-wide bucket, unchanged: the console usage page
-        // and older clients still read it.
-        sqlx::query(
-            "INSERT INTO org_period_usage (org_id, period_start, billable_count, total_count) \
-             VALUES ($1, date_trunc('month', $2::timestamptz AT TIME ZONE 'utc')::date, $3, 1) \
-             ON CONFLICT (org_id, period_start) DO UPDATE \
-               SET billable_count = org_period_usage.billable_count + EXCLUDED.billable_count, \
-                   total_count = org_period_usage.total_count + 1, \
-                   updated_at = now()",
-        )
-        .bind(org)
-        .bind(at)
-        .bind(i64::from(event.billable))
-        .execute(self.conn())
-        .await?;
-
-        // The shipping service's own pool. Keyed by the shipper, never by
-        // anything in the event, so one service cannot count in another's.
-        if let Some(service) = event.service {
-            sqlx::query(
-                "INSERT INTO org_service_period_usage \
-                   (org_id, service, period_start, billable_count, total_count) \
-                 VALUES ($1, $2, date_trunc('month', $3::timestamptz AT TIME ZONE 'utc')::date, $4, 1) \
-                 ON CONFLICT (org_id, service, period_start) DO UPDATE \
-                   SET billable_count = org_service_period_usage.billable_count \
-                                        + EXCLUDED.billable_count, \
-                       total_count = org_service_period_usage.total_count + 1, \
-                       updated_at = now()",
-            )
-            .bind(org)
-            .bind(service)
-            .bind(at)
-            .bind(i64::from(event.billable))
-            .execute(self.conn())
-            .await?;
-        }
-
-        // The meter's quantity, whatever `billable` says (module docs).
-        if let Some(m) = event.metered {
-            sqlx::query(
-                "INSERT INTO org_meter_period_usage (org_id, meter, period_start, quantity) \
-                 VALUES ($1, $2, date_trunc('month', $3::timestamptz AT TIME ZONE 'utc')::date, $4) \
-                 ON CONFLICT (org_id, meter, period_start) DO UPDATE \
-                   SET quantity = org_meter_period_usage.quantity + EXCLUDED.quantity, \
-                       updated_at = now()",
-            )
-            .bind(org)
-            .bind(m.meter)
-            .bind(at)
-            .bind(m.quantity)
-            .execute(self.conn())
-            .await?;
-        }
         // Later stories hook in here, in this same transaction: budget alerts
         // (#63) and the Stripe meter outbox (#64).
         Ok(IngestOutcome::Counted)
@@ -575,104 +620,114 @@ mod tests {
         assert_eq!(earliest_occurred_at(at(2026, 3, 31)), start(2026, 2));
     }
 
+    const EVALS: &str = "otto-flags/evaluations";
+
     fn declared() -> HashSet<String> {
-        ["otto-flags/evaluations".to_owned()].into()
+        [EVALS.to_owned()].into()
+    }
+
+    /// `check_metering` for a shipper with service `caller`, which declared
+    /// [`EVALS`] (ignored when `caller` is `None`, as in production).
+    fn check(
+        caller: Option<&str>,
+        service: Option<&str>,
+        meter: Option<&str>,
+        quantity: Option<u64>,
+    ) -> std::result::Result<Option<(String, i64)>, MeteringRejection> {
+        let declared = if caller.is_some() {
+            declared()
+        } else {
+            HashSet::new()
+        };
+        check_metering(
+            &Shipper {
+                service: caller,
+                declared: &declared,
+            },
+            MeteringFields {
+                service,
+                meter,
+                quantity,
+            },
+        )
+        .map(|m| m.map(|m| (m.meter.to_owned(), m.quantity)))
     }
 
     fn code<T: fmt::Debug>(r: std::result::Result<T, MeteringRejection>) -> &'static str {
         r.unwrap_err().code
     }
 
-    const EVALS: &str = "otto-flags/evaluations";
+    const FLAGS: Option<&str> = Some("otto-flags");
 
     #[test]
     fn an_unmetered_event_is_free_and_needs_no_service() {
-        assert_eq!(
-            check_metering(None, &declared(), None, None, None),
-            Ok(None)
-        );
-        assert_eq!(
-            check_metering(Some("otto-flags"), &declared(), None, None, None),
-            Ok(None)
-        );
-        assert_eq!(
-            check_metering(
-                Some("otto-flags"),
-                &declared(),
-                Some("otto-flags"),
-                None,
-                None
-            ),
-            Ok(None)
-        );
+        assert_eq!(check(None, None, None, None), Ok(None));
+        assert_eq!(check(FLAGS, None, None, None), Ok(None));
+        assert_eq!(check(FLAGS, FLAGS, None, None), Ok(None));
     }
 
     #[test]
     fn a_declared_meter_counts_its_quantity_or_one() {
-        let ok = |q| check_metering(Some("otto-flags"), &declared(), None, Some(EVALS), q);
         assert_eq!(
-            ok(Some(7)),
-            Ok(Some(Metered {
-                meter: EVALS,
-                quantity: 7
-            }))
+            check(FLAGS, None, Some(EVALS), Some(7)),
+            Ok(Some((EVALS.to_owned(), 7)))
         );
-        assert_eq!(ok(None).unwrap().unwrap().quantity, 1);
+        assert_eq!(
+            check(FLAGS, FLAGS, Some(EVALS), None),
+            Ok(Some((EVALS.to_owned(), 1)))
+        );
     }
 
     #[test]
     fn an_undeclared_meter_is_unknown() {
-        let d = declared();
-        let f = |caller, meter| check_metering(caller, &d, None, Some(meter), Some(1));
         assert_eq!(
-            code(f(Some("otto-flags"), "otto-flags/other")),
+            code(check(FLAGS, None, Some("otto-flags/other"), Some(1))),
             UNKNOWN_METER
         );
-        // Another service's meter is unknown to this one, even if declared there.
-        assert_eq!(code(f(Some("otto-cxp"), EVALS)), UNKNOWN_METER);
         // A server with no slug cannot have declared anything.
-        assert_eq!(code(f(None, EVALS)), UNKNOWN_METER);
+        assert_eq!(code(check(None, None, Some(EVALS), Some(1))), UNKNOWN_METER);
+        // Another service's key is never this caller's, whatever `declared`
+        // holds.
+        let declared = declared();
+        let cxp = Shipper {
+            service: Some("otto-cxp"),
+            declared: &declared,
+        };
+        let fields = MeteringFields {
+            meter: Some(EVALS),
+            ..Default::default()
+        };
+        assert_eq!(code(check_metering(&cxp, fields)), UNKNOWN_METER);
         // An absurd key is echoed bounded.
         let long = format!("otto-flags/{}", "é".repeat(500));
-        let r = f(Some("otto-flags"), &long).unwrap_err();
+        let r = check(FLAGS, None, Some(&long), Some(1)).unwrap_err();
         assert!(r.detail.len() < MAX_ECHOED_METER + 100, "{}", r.detail);
     }
 
     #[test]
     fn a_service_other_than_the_shippers_is_a_mismatch() {
-        let d = declared();
-        let f = |caller, claimed| check_metering(caller, &d, Some(claimed), Some(EVALS), Some(1));
-        assert_eq!(code(f(Some("otto-flags"), "otto-cxp")), SERVICE_MISMATCH);
-        assert_eq!(code(f(None, "otto-flags")), SERVICE_MISMATCH);
-        // Checked for unmetered events too.
+        let cxp = Some("otto-cxp");
         assert_eq!(
-            code(check_metering(
-                Some("otto-flags"),
-                &d,
-                Some("otto-cxp"),
-                None,
-                None
-            )),
+            code(check(FLAGS, cxp, Some(EVALS), Some(1))),
             SERVICE_MISMATCH
         );
+        assert_eq!(code(check(None, FLAGS, None, None)), SERVICE_MISMATCH);
+        // Checked for unmetered events too.
+        assert_eq!(code(check(FLAGS, cxp, None, None)), SERVICE_MISMATCH);
     }
 
     #[test]
     fn quantity_bounds() {
-        let d = declared();
-        let f = |q| check_metering(Some("otto-flags"), &d, None, Some(EVALS), Some(q));
-        assert_eq!(code(f(0)), INVALID_QUANTITY);
-        assert_eq!(code(f(MAX_METER_QUANTITY + 1)), INVALID_QUANTITY);
-        assert_eq!(code(f(u64::MAX)), INVALID_QUANTITY);
-        assert_eq!(f(1).unwrap().unwrap().quantity, 1);
+        let q = |n| check(FLAGS, None, Some(EVALS), Some(n));
+        assert_eq!(code(q(0)), INVALID_QUANTITY);
+        assert_eq!(code(q(MAX_METER_QUANTITY + 1)), INVALID_QUANTITY);
+        assert_eq!(code(q(u64::MAX)), INVALID_QUANTITY);
+        assert_eq!(q(1), Ok(Some((EVALS.to_owned(), 1))));
         assert_eq!(
-            f(MAX_METER_QUANTITY).unwrap().unwrap().quantity,
-            1_000_000_000
+            q(MAX_METER_QUANTITY),
+            Ok(Some((EVALS.to_owned(), 1_000_000_000)))
         );
-        assert_eq!(
-            code(check_metering(Some("otto-flags"), &d, None, None, Some(1))),
-            INVALID_QUANTITY
-        );
+        assert_eq!(code(check(FLAGS, None, None, Some(1))), INVALID_QUANTITY);
     }
 
     #[test]

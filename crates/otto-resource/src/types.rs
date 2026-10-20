@@ -331,7 +331,11 @@ pub struct UsageEvent {
     pub meter: Option<String>,
     /// How many units of [`meter`](Self::meter) this event used, 1 to
     /// [`MAX_METER_QUANTITY`]. Defaults to 1 when a meter is named without
-    /// one; must be `None` when [`meter`](Self::meter) is.
+    /// one; must be `None` when [`meter`](Self::meter) is. Out-of-range values
+    /// are refused per event (`invalid_quantity`), but a JSON value that is not
+    /// a `u64` at all (negative, fractional, a string) fails the *whole*
+    /// request at parse time, like any other malformed body. This type cannot
+    /// produce one; only a hand-built shipper can.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quantity: Option<u64>,
 }
