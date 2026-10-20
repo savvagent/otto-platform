@@ -136,3 +136,78 @@ async fn tenant_pinned_code_reads_plans_but_cannot_change_them(pool: PgPool) {
         );
     }
 }
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn tenant_pinned_code_reads_meters_but_cannot_change_them(pool: PgPool) {
+    let db = Db::from_pool(pool.clone());
+
+    // A declaration, written the way the platform writes one: unpinned, as the
+    // connecting role.
+    sqlx::query(
+        "INSERT INTO resource_servers (resource_uri, name, scopes, default_scopes, service) \
+         VALUES ('https://svc.example/mcp', 'svc', '{a}', '{}', 'svc')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut tx = db.begin_unpinned().await.unwrap();
+    sqlx::query(
+        "INSERT INTO meters (key, service, meter, display_name, unit) \
+         VALUES ('svc/calls', 'svc', 'calls', 'Calls', 'call')",
+    )
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // Meters are readable from a tenant transaction (usage ingest checks an
+    // event's meter against them) ...
+    let mut tx = db.begin(OrgId::new()).await.unwrap();
+    let unit: String = sqlx::query_scalar("SELECT unit FROM meters WHERE key = 'svc/calls'")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert_eq!(unit, "call");
+    drop(tx);
+
+    // ... but not writable: one org's transaction must not invent, rename, or
+    // remove what every org is charged for.
+    for stmt in [
+        "INSERT INTO meters (key, service, meter, display_name, unit) \
+         VALUES ('svc/free', 'svc', 'free', 'Free', 'x')",
+        "UPDATE meters SET unit = 'byte' WHERE key = 'svc/calls'",
+        "DELETE FROM meters WHERE key = 'svc/calls'",
+        "TRUNCATE meters",
+    ] {
+        let mut tx = db.begin(OrgId::new()).await.unwrap();
+        let err = sqlx::query(stmt).execute(tx.conn()).await.expect_err(stmt);
+        assert!(
+            err.to_string().contains("permission denied"),
+            "{stmt}: {err}"
+        );
+    }
+
+    // The key is always `<service>/<meter>`, and both parts are slugs.
+    for (key, service, meter) in [
+        ("svc/other", "svc", "calls"),
+        ("svc/Calls", "svc", "Calls"),
+        ("svc/1calls", "svc", "1calls"),
+        ("nope/calls", "nope", "calls"),
+    ] {
+        let err = sqlx::query(
+            "INSERT INTO meters (key, service, meter, display_name, unit) \
+             VALUES ($1, $2, $3, 'X', 'x')",
+        )
+        .bind(key)
+        .bind(service)
+        .bind(meter)
+        .execute(&pool)
+        .await
+        .expect_err(key);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("check constraint") || msg.contains("foreign key"),
+            "{key}: {msg}"
+        );
+    }
+}

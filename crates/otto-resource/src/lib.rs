@@ -13,6 +13,7 @@
 //! |---|---|
 //! | Authenticate a request's bearer token | [`PlatformClient::introspect`] (cached 60 s) |
 //! | Refuse work over the plan's quota | [`PlatformClient::usage_status`] (cached 60 s), [`UsageStatus::is_blocked`] |
+//! | Declare value meters, at startup | [`PlatformClient::declare_meters`] |
 //! | Report metered calls | [`PlatformClient::ship_usage`] from your own outbox |
 //! | Resolve members and teams | [`PlatformClient::member`], [`member_teams`](PlatformClient::member_teams), [`member_by_email`](PlatformClient::member_by_email), [`team`](PlatformClient::team), [`team_by_slug`](PlatformClient::team_by_slug) |
 //! | Link to the platform console | [`PlatformClient::usage_page_url`] |
@@ -26,6 +27,13 @@
 //! told about (accepted, duplicate, or rejected). Because the platform dedupes
 //! on `(resource server, event_id)`, the task can retry anything, forever.
 //! This crate deliberately does not own that table.
+//!
+//! Declare your value meters ([`MeterDeclaration`], keyed
+//! `<service>/<meter>`) with [`PlatformClient::declare_meters`] at startup,
+//! before starting that task: the platform rejects usage for an undeclared
+//! meter, and the task drops what is rejected. Your service slug is assigned
+//! by the platform operator (`otto-platform-server resource set-service`);
+//! until it is, declaring fails with HTTP 409 `service_not_set`.
 //!
 //! # Revocation latency
 //!
