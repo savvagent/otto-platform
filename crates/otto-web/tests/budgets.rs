@@ -131,8 +131,14 @@ async fn members_read_budgets_and_only_owners_and_admins_change_them(pool: PgPoo
     assert_eq!(
         r.body["services"],
         json!([
-            { "service": THINGS, "spendCents": 0, "thresholdsReached": [], "budget": null },
-            { "service": WIDGETS, "spendCents": 0, "thresholdsReached": [], "budget": null },
+            {
+                "service": THINGS, "spendCents": 0, "spendError": null,
+                "thresholdsReached": [], "budget": null,
+            },
+            {
+                "service": WIDGETS, "spendCents": 0, "spendError": null,
+                "thresholdsReached": [], "budget": null,
+            },
         ])
     );
     assert!(r.body["periodStart"].as_str().unwrap().ends_with("-01"));
@@ -236,7 +242,15 @@ async fn unknown_services_and_out_of_range_budgets_are_refused(pool: PgPool) {
     .await
     .unwrap();
 
-    for service in ["nope", "bare", "things%2Fcalls"] {
+    let long = "a".repeat(64);
+    for service in [
+        "nope",
+        "bare",
+        "things%2Fcalls",
+        "Things",
+        "a%00b",
+        long.as_str(),
+    ] {
         let r = put(
             &owner.session,
             service,
@@ -277,14 +291,16 @@ async fn unknown_services_and_out_of_range_budgets_are_refused(pool: PgPool) {
     .await
     .expect(StatusCode::OK);
 
-    // Malformed bodies change nothing.
+    // Malformed bodies are a 400 in the console's error shape, and change
+    // nothing.
     for body in [
         json!({}),
         json!({ "monthlyBudgetCents": "100" }),
         json!({ "monthlyBudgetCents": 100, "surprise": true }),
     ] {
         let r = put(&owner.session, THINGS, body).send(&h.router).await;
-        assert!(r.status.is_client_error(), "{}", r.status);
+        r.expect(StatusCode::BAD_REQUEST);
+        assert_eq!(r.error_code(), Some("invalid_request"));
     }
     assert_eq!(stored_budget(&h, org).await, Some((1_000_000_000, false)));
     assert_eq!(budget_actions(&h, org).await.len(), 1);
@@ -436,6 +452,7 @@ async fn spend_thresholds_and_the_usage_page_are_per_service(pool: PgPool) {
                 "meter": CALLS, "displayName": "Things", "unit": "thing", "quantity": 1050,
             }],
             "spendCents": 1050,
+            "spendError": null,
             "budget": usage.body["services"][0]["budget"].clone(),
         })
     );
@@ -448,4 +465,110 @@ async fn spend_thresholds_and_the_usage_page_are_per_service(pool: PgPool) {
     );
     assert_eq!(usage.body["services"][1]["spendCents"], 0);
     assert_eq!(usage.body["services"][1]["budget"]["blocked"], false);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_member_is_refused_before_the_body_is_read(pool: PgPool) {
+    let h = harness(pool).await;
+    let owner = onboard(&h, "owner@acme.test").await;
+    let org = org_with_owner(&h, "acme", &owner).await;
+    let member = onboard(&h, "member@acme.test").await;
+    add_member(&h, org, member.user, Role::Member).await;
+
+    for body in [json!({}), json!("junk")] {
+        put(&member.session, THINGS, body)
+            .send(&h.router)
+            .await
+            .expect(StatusCode::FORBIDDEN);
+    }
+    // And before the service is looked at.
+    put(&member.session, "nope", json!({ "monthlyBudgetCents": 1 }))
+        .send(&h.router)
+        .await
+        .expect(StatusCode::FORBIDDEN);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_pricing_fault_degrades_only_its_own_service(pool: PgPool) {
+    let h = harness(pool).await;
+    let owner = onboard(&h, "owner@acme.test").await;
+    let org = org_with_owner(&h, "acme", &owner).await;
+    put(
+        &owner.session,
+        WIDGETS,
+        json!({ "monthlyBudgetCents": 100, "hardStop": true }),
+    )
+    .send(&h.router)
+    .await
+    .expect(StatusCode::OK);
+    put(
+        &owner.session,
+        THINGS,
+        json!({ "monthlyBudgetCents": 1000 }),
+    )
+    .send(&h.router)
+    .await
+    .expect(StatusCode::OK);
+    ingest(&h, org, common::RESOURCE, THINGS, CALLS, 300).await;
+    ingest(&h, org, common::OTHER_RESOURCE, WIDGETS, SPINS, 5).await;
+    // A widgets price edited by hand into a shape the rater refuses: a
+    // bounded last tier.
+    let version: Uuid = sqlx::query_scalar(
+        "INSERT INTO price_versions (meter, effective_month) \
+         VALUES ($1, date_trunc('month', now() AT TIME ZONE 'UTC')::date) RETURNING id",
+    )
+    .bind(SPINS)
+    .fetch_one(h.db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO price_tiers (version_id, position, up_to, unit_amount_ucents) \
+         VALUES ($1, 0, 10, 1000000)",
+    )
+    .bind(version)
+    .execute(h.db.pool())
+    .await
+    .unwrap();
+
+    let usage = Call::get("/api/orgs/acme/usage")
+        .with_session(&owner.session)
+        .send(&h.router)
+        .await;
+    usage.expect(StatusCode::OK);
+    assert_eq!(
+        usage.body["billableUsed"], 2,
+        "the legacy fields still answer"
+    );
+    assert_eq!(usage.body["plan"], "Free");
+    let things = &usage.body["services"][0];
+    assert_eq!(
+        (things["spendCents"].clone(), things["spendError"].clone()),
+        (json!(300), Value::Null)
+    );
+    let widgets = &usage.body["services"][1];
+    assert_eq!(widgets["service"], WIDGETS);
+    assert_eq!(widgets["meters"][0]["quantity"], 5);
+    assert_eq!(widgets["spendCents"], Value::Null);
+    assert_eq!(widgets["spendError"], "pricing_unavailable");
+    assert_eq!(widgets["budget"]["percentUsed"], Value::Null);
+    assert_eq!(
+        widgets["budget"]["blocked"], false,
+        "unknown spend never blocks"
+    );
+
+    let budgets = Call::get("/api/orgs/acme/budgets")
+        .with_session(&owner.session)
+        .send(&h.router)
+        .await;
+    budgets.expect(StatusCode::OK);
+    assert_eq!(budgets.body["services"][0]["spendCents"], 300);
+    assert_eq!(budgets.body["services"][0]["budget"]["percentUsed"], 30);
+    assert_eq!(
+        budgets.body["services"][1]["spendError"],
+        "pricing_unavailable"
+    );
+    assert_eq!(
+        budgets.body["services"][1]["budget"]["monthlyBudgetCents"],
+        100
+    );
 }

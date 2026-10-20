@@ -32,10 +32,12 @@ CREATE TABLE service_budgets (
 
 -- One row per threshold a service's spend has reached in a period: the
 -- record that its alert fired, which is what makes it fire exactly once.
--- Written in the ingest transaction with `ON CONFLICT DO NOTHING`, so of two
--- events crossing the same threshold only one inserts, and only that one
--- enqueues the email. Kept when a budget is changed or cleared: a threshold
--- fires at most once per service and period.
+-- The primary key is the once-only guarantee. Written in the ingest
+-- transaction with `ON CONFLICT DO NOTHING`, so of two events crossing the
+-- same threshold only one inserts, and only that one enqueues the email. A
+-- row whose emails cannot be queued rolls back with them, so the next ingest
+-- retries. Kept when a budget is changed or cleared: a threshold fires at
+-- most once per service and period.
 CREATE TABLE budget_alerts (
   org_id       uuid        NOT NULL REFERENCES orgs (id) ON DELETE CASCADE,
   service      text        NOT NULL,
@@ -47,7 +49,7 @@ CREATE TABLE budget_alerts (
   threshold    smallint    NOT NULL
     CONSTRAINT budget_alerts_threshold CHECK (threshold IN (50, 80, 100)),
   fired_at     timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT budget_alerts_once UNIQUE (org_id, service, period_start, threshold)
+  CONSTRAINT budget_alerts_once PRIMARY KEY (org_id, service, period_start, threshold)
 );
 
 -- Tenant tables: the standard isolation policy (0004), which is also how

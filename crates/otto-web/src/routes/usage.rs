@@ -22,7 +22,7 @@ use otto_tenant::audit::AuditEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiResult;
-use crate::routes::budgets::{from_budgets, BudgetView};
+use crate::routes::budgets::{from_budgets, spend_error, BudgetView};
 use crate::session::OrgCtx;
 use crate::state::AppState;
 
@@ -66,8 +66,12 @@ pub struct ServiceUsage {
     pub service: String,
     /// Every meter the service has declared, by key, zero when unused.
     pub meters: Vec<MeterUsageView>,
-    /// What the meters have cost this month, in US cents.
-    pub spend_cents: i64,
+    /// What the meters have cost this month, in US cents. `None` when it
+    /// cannot be computed; [`spend_error`](Self::spend_error) says so.
+    pub spend_cents: Option<i64>,
+    /// `pricing_unavailable` when [`spend_cents`](Self::spend_cents) is
+    /// `None`, otherwise `None`.
+    pub spend_error: Option<&'static str>,
     /// `None` when no budget is set.
     pub budget: Option<BudgetView>,
 }
@@ -146,6 +150,7 @@ pub async fn get_usage(State(state): State<AppState>, ctx: OrgCtx) -> ApiResult<
         let meters = tx.service_meter_usage(&status.service).await?;
         services.push(ServiceUsage {
             budget: BudgetView::of(&status),
+            spend_error: spend_error(&status),
             meters: meters.into_iter().map(Into::into).collect(),
             spend_cents: status.spend_cents,
             service: status.service,

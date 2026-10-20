@@ -774,11 +774,20 @@ fn budget_schemas() -> Value {
             "properties": {
                 "service": { "type": "string", "description": "The service slug." },
                 "spendCents": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "format": "int64",
                     "description":
                         "What the service's meters have cost this month, in US cents, at \
-                         the prices in effect. Unpriced meters and free calls add nothing.",
+                         the prices in effect. Unpriced meters and free calls add nothing. \
+                         Null when it cannot be computed (see `spendError`).",
+                },
+                "spendError": {
+                    "type": ["string", "null"],
+                    "enum": ["pricing_unavailable", null],
+                    "description":
+                        "`pricing_unavailable` when this service's spend could not be \
+                         computed (a pricing fault on the platform's side); null otherwise. \
+                         Other services are unaffected, and nothing is blocked on it.",
                 },
                 "thresholdsReached": {
                     "type": "array",
@@ -792,7 +801,7 @@ fn budget_schemas() -> Value {
                     "description": "Null when no budget is set.",
                 },
             },
-            "required": ["service", "spendCents", "thresholdsReached", "budget"],
+            "required": ["service", "spendCents", "spendError", "thresholdsReached", "budget"],
         },
         "Budget": {
             "type": "object",
@@ -805,8 +814,10 @@ fn budget_schemas() -> Value {
                         "Refuse billable calls to this service once spend reaches the budget.",
                 },
                 "percentUsed": {
-                    "type": "integer",
-                    "description": "Whole percent spent, rounded down. Can exceed 100.",
+                    "type": ["integer", "null"],
+                    "description":
+                        "Whole percent spent, rounded down. Can exceed 100. Null when spend \
+                         is unknown.",
                 },
                 "blocked": {
                     "type": "boolean",
@@ -839,13 +850,21 @@ fn budget_schemas() -> Value {
             "properties": {
                 "service": { "type": "string" },
                 "meters": { "type": "array", "items": reference("MeterUsage") },
-                "spendCents": { "type": "integer", "format": "int64" },
+                "spendCents": {
+                    "type": ["integer", "null"],
+                    "format": "int64",
+                    "description": "Null when it cannot be computed (see `spendError`).",
+                },
+                "spendError": {
+                    "type": ["string", "null"],
+                    "enum": ["pricing_unavailable", null],
+                },
                 "budget": {
                     "oneOf": [reference("Budget"), { "type": "null" }],
                     "description": "Null when no budget is set.",
                 },
             },
-            "required": ["service", "meters", "spendCents", "budget"],
+            "required": ["service", "meters", "spendCents", "spendError", "budget"],
         },
         "MeterUsage": {
             "type": "object",

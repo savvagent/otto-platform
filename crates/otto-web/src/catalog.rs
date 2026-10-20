@@ -804,8 +804,10 @@ pub fn catalog() -> Vec<Endpoint> {
                  this month's spend in US cents (each meter's quantity rated against the \
                  prices in effect for the month, unpriced meters adding nothing), the \
                  alert thresholds (50, 80, 100 percent) that have fired this month, and \
-                 the budget, or null when none is set. Free to read, and readable by an \
-                 org that is over budget.",
+                 the budget, or null when none is set. A service whose spend cannot be \
+                 computed (a pricing fault) reports `spendCents: null` and `spendError: \
+                 \"pricing_unavailable\"` without affecting the others. Free to read, and \
+                 readable by an org that is over budget.",
             ),
         Endpoint::put("/api/orgs/{org}/budgets/{service}", budgets::set_budget)
             .auth(Auth::OrgAdmin)
@@ -820,7 +822,9 @@ pub fn catalog() -> Vec<Endpoint> {
                  1000000000). Alerts fire by email to owners and admins when spend first \
                  reaches 50, 80 and 100 percent in a month, once each. `hardStop` (off by \
                  default) makes the service refuse billable calls once spend reaches the \
-                 budget; free calls and every other service keep working. `404` for a \
+                 budget; free calls and every other service keep working. Alerts that \
+                 already fired this month do not fire again after the budget is raised or \
+                 lowered; only thresholds not yet reached this month can. `404` for a \
                  service with no declared meters.",
             ),
         Endpoint::delete("/api/orgs/{org}/budgets/{service}", budgets::clear_budget)

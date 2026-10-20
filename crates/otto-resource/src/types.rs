@@ -244,6 +244,13 @@ pub struct UsageStatus {
 /// should refuse a billable call with.
 pub const BUDGET_EXCEEDED: &str = "budget_exceeded";
 
+/// The reason [`BudgetStatus::reason`] gives when the platform could not
+/// compute this service's spend (a pricing fault on its side). The budget is
+/// still reported, [`spend_cents`](BudgetStatus::spend_cents) and
+/// [`percent_used`](BudgetStatus::percent_used) are `None`, and nothing is
+/// blocked: enforcement fails open.
+pub const SPEND_UNAVAILABLE: &str = "spend_unavailable";
+
 /// The calling service's budget this billing month, in
 /// [`UsageStatus::budget`].
 ///
@@ -254,9 +261,10 @@ pub const BUDGET_EXCEEDED: &str = "budget_exceeded";
 ///
 /// **Enforcement fails open.** The platform never refuses usage; the resource
 /// server refuses billable calls when [`blocked`](Self::blocked) is true. When
-/// the platform cannot be reached, or answers without a `budget`, a resource
-/// server must treat the service as not blocked. Free calls are never refused,
-/// and reading usage is always free.
+/// the platform cannot be reached, answers without a `budget`, or cannot
+/// compute spend (reason [`SPEND_UNAVAILABLE`], `blocked` false), a resource
+/// server must treat the service as not blocked. Free calls are never
+/// refused, and reading usage is always free.
 ///
 /// ```
 /// let body = serde_json::json!({
@@ -281,6 +289,19 @@ pub const BUDGET_EXCEEDED: &str = "budget_exceeded";
 /// let status: otto_resource::UsageStatus = serde_json::from_value(body).unwrap();
 /// assert!(status.budget_exceeded());
 /// assert_eq!(status.budget.unwrap().reason.as_deref(), Some(otto_resource::BUDGET_EXCEEDED));
+///
+/// // Spend the platform could not compute never blocks.
+/// let unknown = serde_json::json!({
+///     "monthly_budget_cents": 1000,
+///     "spend_cents": null,
+///     "percent_used": null,
+///     "thresholds_reached": [],
+///     "hard_stop": true,
+///     "blocked": false,
+///     "reason": "spend_unavailable"
+/// });
+/// let b: otto_resource::BudgetStatus = serde_json::from_value(unknown).unwrap();
+/// assert_eq!((b.spend_cents, b.blocked), (None, false));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetStatus {
@@ -288,9 +309,13 @@ pub struct BudgetStatus {
     pub monthly_budget_cents: i64,
     /// What this service's value meters have cost this month, in US cents,
     /// at the prices in effect. Unpriced meters and free calls add nothing.
-    pub spend_cents: i64,
+    /// `None` when the platform could not compute it ([`SPEND_UNAVAILABLE`]).
+    #[serde(default)]
+    pub spend_cents: Option<i64>,
     /// Whole percent of the budget spent, rounded down. Can exceed 100.
-    pub percent_used: i64,
+    /// `None` when spend is unknown.
+    #[serde(default)]
+    pub percent_used: Option<i64>,
     /// The alert thresholds (50, 80, 100 percent) that have fired this month,
     /// ascending. Each fires once a month, with an email to the org's owners
     /// and admins.
@@ -302,8 +327,9 @@ pub struct BudgetStatus {
     /// Whether billable calls must be refused now: only with
     /// [`hard_stop`](Self::hard_stop) on and spend at or past the budget.
     pub blocked: bool,
-    /// Why [`blocked`](Self::blocked) is true: [`BUDGET_EXCEEDED`]. `None`
-    /// when not blocked.
+    /// Why [`blocked`](Self::blocked) is true ([`BUDGET_EXCEEDED`]), or why
+    /// spend is unknown ([`SPEND_UNAVAILABLE`], never blocked). `None`
+    /// otherwise.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -330,8 +356,8 @@ impl UsageStatus {
     }
 
     /// Whether the calling service's budget hard stop refuses billable calls
-    /// now. `false` with no budget, and from a platform that sends none: see
-    /// [`BudgetStatus`] on failing open.
+    /// now. `false` with no budget, when spend is unknown, and from a
+    /// platform that sends none: see [`BudgetStatus`] on failing open.
     pub fn budget_exceeded(&self) -> bool {
         self.budget.as_ref().is_some_and(|b| b.blocked)
     }

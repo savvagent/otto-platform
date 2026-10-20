@@ -35,10 +35,11 @@
 //! adds to no meter, so nothing priced by meters (spend, budgets, invoices)
 //! ever sees it.
 //!
-//! After the counters, a metered event runs the budget step
-//! ([`crate::budgets`]) in the same transaction: it records and emails any
-//! budget threshold the event's service has newly reached. It never rejects
-//! or fails the event.
+//! After the counters, a metered event of a budgeted service is noted for
+//! the budget step ([`crate::budgets::PendingBudgets`]), which runs once per
+//! service and period in the same transaction before commit: it records and
+//! emails any budget threshold the service has newly reached. It never
+//! rejects or fails an event.
 //!
 //! Meter declarations are add-only ([`crate::meters`] never removes one), so
 //! an event accepted once stays acceptable: a replay of it reaches the ledger
@@ -58,6 +59,7 @@ use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::budgets::PendingBudgets;
 use crate::pricebook::Month;
 
 /// The first day of the current UTC billing month, as SQL.
@@ -354,11 +356,23 @@ pub trait UsageExt {
     ) -> impl std::future::Future<Output = Result<PeriodUsage>> + Send;
 
     /// Record a usage event shipped from a resource server's outbox,
-    /// idempotently. See [`IngestOutcome`].
+    /// idempotently, and run its budget step at once. See [`IngestOutcome`].
+    /// A batch should use [`ingest_usage_deferred`](Self::ingest_usage_deferred)
+    /// instead, which runs the budget step once per service and period.
     fn ingest_usage(
         &mut self,
         resource_uri: &str,
         event: &ShippedUsage<'_>,
+    ) -> impl std::future::Future<Output = Result<IngestOutcome>> + Send;
+
+    /// [`ingest_usage`](Self::ingest_usage), with the budget step noted in
+    /// `budgets` rather than run: call [`PendingBudgets::run`] on this
+    /// transaction once the batch's events are counted, before committing.
+    fn ingest_usage_deferred(
+        &mut self,
+        resource_uri: &str,
+        event: &ShippedUsage<'_>,
+        budgets: &mut PendingBudgets,
     ) -> impl std::future::Future<Output = Result<IngestOutcome>> + Send;
 
     fn current_usage(&mut self) -> impl std::future::Future<Output = Result<PeriodUsage>> + Send;
@@ -429,6 +443,20 @@ impl UsageExt for Tx<'_> {
         resource_uri: &str,
         event: &ShippedUsage<'_>,
     ) -> Result<IngestOutcome> {
+        let mut budgets = PendingBudgets::default();
+        let outcome = self
+            .ingest_usage_deferred(resource_uri, event, &mut budgets)
+            .await?;
+        budgets.run(self).await?;
+        Ok(outcome)
+    }
+
+    async fn ingest_usage_deferred(
+        &mut self,
+        resource_uri: &str,
+        event: &ShippedUsage<'_>,
+        budgets: &mut PendingBudgets,
+    ) -> Result<IngestOutcome> {
         let org = self.org();
         let now = Utc::now();
         // Checked before the claim so a rejected event leaves no trace and can
@@ -483,8 +511,10 @@ impl UsageExt for Tx<'_> {
         // whatever `billable` says (module docs).
         //
         // The final SELECT reads the service's budget for a metered event
-        // (no row otherwise, or with no budget), so the budget step below
-        // costs nothing for the common case. It reads, it does not lock.
+        // (no row otherwise, or with no budget), and the highest threshold
+        // already fired for the event's period, so the budget step costs
+        // nothing for the common case and nothing once 100% has fired. It
+        // reads, it does not lock.
         let at = event.occurred_at.min(now);
         let (meter, quantity) = match event.metered {
             Some(m) => (Some(m.meter), Some(m.quantity)),
@@ -526,7 +556,13 @@ impl UsageExt for Tx<'_> {
                  SET quantity = org_meter_period_usage.quantity + EXCLUDED.quantity, \
                      updated_at = now() \
              ) \
-             SELECT b.monthly_budget_cents, b.hard_stop FROM service_budgets b \
+             SELECT b.monthly_budget_cents, b.hard_stop, \
+                    (SELECT max(a.threshold) FROM budget_alerts a \
+                     WHERE a.org_id = $1 AND a.service = $9::text \
+                       AND a.period_start = \
+                           date_trunc('month', $5::timestamptz AT TIME ZONE 'utc')::date) \
+                      AS max_fired \
+             FROM service_budgets b \
              WHERE $7::text IS NOT NULL AND b.org_id = $1 AND b.service = $9::text",
         )
         .bind(org)
@@ -543,14 +579,15 @@ impl UsageExt for Tx<'_> {
 
         // After the counters, in this same transaction: steps that read what
         // the event just counted. Each must leave a valid event counted
-        // whatever happens to it (see `budgets::after_metered_event`).
+        // whatever happens to it (see `PendingBudgets::run`).
         //
         // Budget alerts, for a metered event of a service with a budget
         // only: an unmetered event adds no spend, so it can reach no
-        // threshold. The period is the event's month, the one its counters
-        // were written to.
+        // threshold. Noted here and run once per service and period before
+        // commit. The period is the event's month, the one its counters were
+        // written to.
         if let (Some(service), Some(budget)) = (event.service, budget) {
-            crate::budgets::after_metered_event(self, service, Month::of(at), budget).await?;
+            budgets.note(service, Month::of(at), budget);
         }
         // The Stripe meter outbox (#64) goes here.
         Ok(IngestOutcome::Counted)

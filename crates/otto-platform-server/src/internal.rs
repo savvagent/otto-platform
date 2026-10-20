@@ -35,7 +35,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use otto_billing::budgets::{self, ServiceBudgetStatus, BUDGET_EXCEEDED};
+use otto_billing::budgets::{
+    self, PendingBudgets, ServiceBudgetStatus, BUDGET_EXCEEDED, SPEND_UNAVAILABLE,
+};
 use otto_billing::meters::{self, MeterSpec};
 use otto_billing::pricebook::Month;
 use otto_billing::usage::{
@@ -179,12 +181,13 @@ async fn ingest_usage(
         }
 
         let mut tx = db.begin(OrgId::from(org)).await?;
+        let mut budgets = PendingBudgets::default();
         let mut accepted = 0;
         let mut duplicates = 0;
         let mut rejected = Vec::new();
         for (ev, metered) in events {
             let outcome = tx
-                .ingest_usage(
+                .ingest_usage_deferred(
                     &rs.resource_uri,
                     &ShippedUsage {
                         event_id: ev.event_id,
@@ -195,6 +198,7 @@ async fn ingest_usage(
                         service,
                         metered,
                     },
+                    &mut budgets,
                 )
                 .await?;
             match outcome {
@@ -206,6 +210,9 @@ async fn ingest_usage(
                 }),
             }
         }
+        // Budget alerts, once per service and period this batch touched. It
+        // never fails the events (see `PendingBudgets::run`).
+        budgets.run(&mut tx).await?;
         tx.commit().await?;
         receipt.accepted += accepted;
         receipt.duplicates += duplicates;
@@ -382,39 +389,38 @@ async fn usage_status(
 /// The caller's budget this period, or `None` when it has none.
 ///
 /// A budget whose spend cannot be computed (a malformed price version, an
-/// overflow) is logged and reported as absent rather than failing the whole
-/// status: enforcement fails open, and reading usage must keep working. A
-/// database error still fails the request.
+/// overflow) is still reported, with `spend_cents` and `percent_used` null,
+/// `blocked` false and reason `spend_unavailable`: enforcement fails open,
+/// visibly. A database error fails the request.
 async fn budget_status(
     tx: &mut Tx<'_>,
     service: &str,
     period: Month,
 ) -> Result<Option<BudgetStatus>, ApiError> {
-    match budgets::service_status(tx, service, period).await {
-        Ok(status) => Ok(wire_budget(&status)),
-        Err(e) if e.is_database() => Err(ApiError::internal(e)),
-        Err(e) => {
-            tracing::error!(error = %e, service, "budget spend could not be computed");
-            Ok(None)
-        }
-    }
+    budgets::service_status(tx, service, period)
+        .await
+        .map(|status| wire_budget(&status))
+        .map_err(ApiError::internal)
 }
 
 fn wire_budget(status: &ServiceBudgetStatus) -> Option<BudgetStatus> {
     let budget = status.budget.as_ref()?;
     let blocked = status.blocked();
+    let reason = if blocked {
+        Some(BUDGET_EXCEEDED)
+    } else if status.spend_cents.is_none() {
+        Some(SPEND_UNAVAILABLE)
+    } else {
+        None
+    };
     Some(BudgetStatus {
         monthly_budget_cents: budget.monthly_budget_cents,
         spend_cents: status.spend_cents,
-        percent_used: status.percent_used().unwrap_or_default(),
-        thresholds_reached: status
-            .thresholds_reached
-            .iter()
-            .filter_map(|&t| u8::try_from(t).ok())
-            .collect(),
+        percent_used: status.percent_used(),
+        thresholds_reached: status.thresholds_reached.clone(),
         hard_stop: budget.hard_stop,
         blocked,
-        reason: blocked.then(|| BUDGET_EXCEEDED.to_owned()),
+        reason: reason.map(str::to_owned),
     })
 }
 

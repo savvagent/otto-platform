@@ -536,7 +536,206 @@ async fn a_failing_budget_step_never_fails_the_event(pool: PgPool) {
         .await;
     let status = w.status(&w.factory).await;
     assert_eq!(status["meters"][0]["quantity"], 1_000);
-    // The budget it cannot compute is left out: enforcement fails open.
-    assert!(status.get("budget").is_none(), "{status}");
+    // The budget is still reported, visibly unknown, and never blocks.
+    assert_eq!(
+        status["budget"],
+        json!({
+            "monthly_budget_cents": 1,
+            "spend_cents": null,
+            "percent_used": null,
+            "thresholds_reached": [],
+            "hard_stop": true,
+            "blocked": false,
+            "reason": "spend_unavailable",
+        })
+    );
+    let parsed: otto_resource::UsageStatus = serde_json::from_value(status).unwrap();
+    assert!(!parsed.budget_exceeded());
     assert_eq!(w.alerts().await.len(), 1);
+    // The other service is unaffected.
+    assert_eq!(w.status(&w.flags).await["budget"]["spend_cents"], 50);
+}
+
+/// Make every insert into `table` fail, as a broken table or a full disk
+/// would. Returns the SQL that undoes it.
+async fn break_inserts(db: &Db, table: &str) -> String {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION test_refuse_insert() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused by test'; END $$",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER test_refuse BEFORE INSERT ON {table} \
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_insert()"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    format!("DROP TRIGGER test_refuse ON {table}")
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_database_error_in_the_alert_step_never_fails_the_batch(pool: PgPool) {
+    let w = world(pool).await;
+    w.set_budget("otto-flags", 100, false).await;
+    let undo = break_inserts(&w.db, "budget_alerts").await;
+
+    // The whole batch counts and commits, the events after the crossing ones
+    // and the unmetered one included.
+    let receipt = w
+        .ship(
+            &w.flags,
+            vec![
+                event(w.org, Some(EVALS), Some(60)),
+                event(w.org, Some(EVALS), Some(60)),
+                event(w.org, None, None),
+            ],
+        )
+        .await;
+    assert_eq!(receipt["accepted"], 3, "{receipt}");
+    assert_eq!(w.status(&w.flags).await["budget"]["spend_cents"], 120);
+    assert!(w.alerts().await.is_empty());
+    assert!(w.emails().await.is_empty());
+
+    // Once the table accepts rows again, the next event fires what was missed.
+    sqlx::query(&undo).execute(w.db.pool()).await.unwrap();
+    w.evals(1).await;
+    assert_eq!(
+        w.alerts().await,
+        [
+            ("otto-flags".into(), 50),
+            ("otto-flags".into(), 80),
+            ("otto-flags".into(), 100)
+        ]
+    );
+    assert_eq!(w.emails().await.len(), 1);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_alert_whose_emails_cannot_be_queued_is_retried(pool: PgPool) {
+    let w = world(pool).await;
+    w.add("owner@acme.example", Role::Owner).await;
+    w.set_budget("otto-flags", 100, false).await;
+    let undo = break_inserts(&w.db, "notification_outbox").await;
+
+    let receipt = w
+        .ship(&w.flags, vec![event(w.org, Some(EVALS), Some(60))])
+        .await;
+    assert_eq!(receipt["accepted"], 1);
+    assert_eq!(w.status(&w.flags).await["meters"][0]["quantity"], 60);
+    // The alert rolled back with its emails rather than firing silently.
+    assert!(w.alerts().await.is_empty());
+    assert!(w.emails().await.is_empty());
+
+    sqlx::query(&undo).execute(w.db.pool()).await.unwrap();
+    w.evals(1).await;
+    assert_eq!(w.alerts().await, [("otto-flags".into(), 50)]);
+    let fifty = "otto-flags has reached 50% of its monthly budget in acme";
+    assert_eq!(
+        subjects(&w.emails().await),
+        [("admin@acme.example", fifty), ("owner@acme.example", fifty)]
+    );
+}
+
+/// Ingest `events` of `meter` in one transaction, the way the batch endpoint
+/// does, and return how many budget steps ran.
+async fn ingest_batch(w: &World, uri: &str, service: &str, meter: &str, events: usize) -> usize {
+    use otto_billing::budgets::PendingBudgets;
+    use otto_billing::usage::{IngestOutcome, Metered, ShippedUsage, UsageExt};
+
+    let mut tx = w.db.begin(w.org).await.unwrap();
+    let mut pending = PendingBudgets::default();
+    for _ in 0..events {
+        let outcome = tx
+            .ingest_usage_deferred(
+                uri,
+                &ShippedUsage {
+                    event_id: Uuid::new_v4(),
+                    user: None,
+                    tool: "t",
+                    billable: true,
+                    occurred_at: Utc::now(),
+                    service: Some(service),
+                    metered: Some(Metered {
+                        meter,
+                        quantity: 10,
+                    }),
+                },
+                &mut pending,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, IngestOutcome::Counted);
+    }
+    let steps = pending.run(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    steps
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_budget_step_runs_once_per_service_and_period_per_batch(pool: PgPool) {
+    let w = world(pool).await;
+    // No budget: no step at all.
+    assert_eq!(ingest_batch(&w, FLAGS, "otto-flags", EVALS, 20).await, 0);
+
+    w.set_budget("otto-flags", 300, false).await;
+    // 20 more events, 400 cents in all: one step, which fires all three
+    // thresholds.
+    assert_eq!(ingest_batch(&w, FLAGS, "otto-flags", EVALS, 20).await, 1);
+    assert_eq!(w.alerts().await.len(), 3);
+    assert_eq!(w.emails().await.len(), 1);
+    // Once 100% has fired nothing more can, and the step is skipped.
+    assert_eq!(ingest_batch(&w, FLAGS, "otto-flags", EVALS, 20).await, 0);
+
+    // Another budgeted service in its own batch: one step for it.
+    w.set_budget("otto-factory", 1_000, false).await;
+    assert_eq!(ingest_batch(&w, FACTORY, "otto-factory", JOBS, 5).await, 1);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn two_concurrent_ingests_crossing_a_threshold_fire_it_once(pool: PgPool) {
+    use otto_billing::usage::{Metered, ShippedUsage, UsageExt};
+
+    let w = world(pool).await;
+    w.set_budget("otto-flags", 100, false).await;
+    w.evals(49).await;
+
+    let ingest = |db: Db, org: OrgId| async move {
+        let mut tx = db.begin(org).await.unwrap();
+        tx.ingest_usage(
+            FLAGS,
+            &ShippedUsage {
+                event_id: Uuid::new_v4(),
+                user: None,
+                tool: "t",
+                billable: true,
+                occurred_at: Utc::now(),
+                service: Some("otto-flags"),
+                metered: Some(Metered {
+                    meter: EVALS,
+                    quantity: 1,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        tx
+    };
+    // The first holds its transaction open across the threshold; the second
+    // waits on the first's counter row, then sees the alert already fired.
+    let first = ingest(w.db.clone(), w.org).await;
+    let second = tokio::spawn(ingest(w.db.clone(), w.org));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !second.is_finished(),
+        "the second ingest waits for the first"
+    );
+    first.commit().await.unwrap();
+    second.await.unwrap().commit().await.unwrap();
+
+    assert_eq!(w.alerts().await, [("otto-flags".into(), 50)]);
+    assert_eq!(w.emails().await.len(), 1);
+    assert_eq!(w.status(&w.flags).await["budget"]["spend_cents"], 51);
 }

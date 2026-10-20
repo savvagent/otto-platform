@@ -18,12 +18,13 @@
 //! **Reading is free** and works however far over budget the org is. All SQL
 //! is in `otto_billing::budgets`.
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, NaiveDate, Utc};
 use http::request::Parts;
 use http::StatusCode;
-use otto_billing::budgets::{self, actions, Budget, ServiceBudgetStatus};
+use otto_billing::budgets::{self, actions, Budget, ServiceBudgetStatus, PRICING_UNAVAILABLE};
 use otto_billing::pricebook::{self, Month};
 use otto_tenant::audit::Entry;
 use otto_tenant::Tx;
@@ -49,10 +50,14 @@ pub struct BudgetsView {
 #[serde(rename_all = "camelCase")]
 pub struct ServiceBudgetView {
     pub service: String,
-    /// What the service's meters have cost this month, in US cents.
-    pub spend_cents: i64,
+    /// What the service's meters have cost this month, in US cents. `None`
+    /// when it cannot be computed; [`spend_error`](Self::spend_error) says so.
+    pub spend_cents: Option<i64>,
+    /// `pricing_unavailable` when [`spend_cents`](Self::spend_cents) is
+    /// `None`, otherwise `None`.
+    pub spend_error: Option<&'static str>,
     /// The alert thresholds (percent) that have fired this month, ascending.
-    pub thresholds_reached: Vec<i16>,
+    pub thresholds_reached: Vec<u8>,
     /// `None` when no budget is set.
     pub budget: Option<BudgetView>,
 }
@@ -63,8 +68,9 @@ pub struct ServiceBudgetView {
 pub struct BudgetView {
     pub monthly_budget_cents: i64,
     pub hard_stop: bool,
-    /// Whole percent spent, rounded down. Can exceed 100.
-    pub percent_used: i64,
+    /// Whole percent spent, rounded down. Can exceed 100. `None` when spend
+    /// is unknown.
+    pub percent_used: Option<i64>,
     /// Whether the service is refusing billable calls: hard stop on and spend
     /// at or past the budget.
     pub blocked: bool,
@@ -78,7 +84,7 @@ impl BudgetView {
         Some(Self {
             monthly_budget_cents: budget.monthly_budget_cents,
             hard_stop: budget.hard_stop,
-            percent_used: status.percent_used().unwrap_or_default(),
+            percent_used: status.percent_used(),
             blocked: status.blocked(),
             updated_at: budget.updated_at,
         })
@@ -88,9 +94,11 @@ impl BudgetView {
 impl From<ServiceBudgetStatus> for ServiceBudgetView {
     fn from(status: ServiceBudgetStatus) -> Self {
         let budget = BudgetView::of(&status);
+        let spend_error = spend_error(&status);
         Self {
             service: status.service,
             spend_cents: status.spend_cents,
+            spend_error,
             thresholds_reached: status.thresholds_reached,
             budget,
         }
@@ -108,14 +116,31 @@ pub struct SetBudgetRequest {
     pub hard_stop: bool,
 }
 
+/// The console's `spendError` for `status`.
+pub(crate) fn spend_error(status: &ServiceBudgetStatus) -> Option<&'static str> {
+    status.spend_cents.is_none().then_some(PRICING_UNAVAILABLE)
+}
+
+/// `404` for a `{service}` that cannot be a service slug, before any query.
+/// The slug is not echoed: it is whatever the caller put in the path.
+fn require_slug(service: &str) -> ApiResult<()> {
+    if budgets::is_service_slug(service) {
+        Ok(())
+    } else {
+        Err(unknown_service())
+    }
+}
+
+fn unknown_service() -> ApiError {
+    ApiError::not_found("this org has no service of that name with metered usage")
+}
+
 /// A budget failure, for a console caller. The database's words are logged,
 /// never sent.
 pub(crate) fn from_budgets(context: &str, e: budgets::Error) -> ApiError {
     match e {
         // The slug is not echoed: it is whatever the caller put in the path.
-        budgets::Error::UnknownService(_) => {
-            ApiError::not_found("this org has no service of that name with metered usage")
-        }
+        budgets::Error::UnknownService(_) => unknown_service(),
         budgets::Error::OutOfRange => ApiError::bad_request(e.to_string()),
         other => ApiError::internal(context, other),
     }
@@ -151,9 +176,12 @@ pub async fn set_budget(
     ctx: OrgCtx,
     parts: Parts,
     Path((_org, service)): Path<(String, String)>,
-    Json(req): Json<SetBudgetRequest>,
+    body: Result<Json<SetBudgetRequest>, JsonRejection>,
 ) -> ApiResult<Json<ServiceBudgetView>> {
+    // Who may, then what: a member learns nothing about the body's shape.
     ctx.require_admin()?;
+    require_slug(&service)?;
+    let Json(req) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
 
     let mut tx = state.db.begin(ctx.org.id).await?;
     let previous = budgets::get_budget(&mut tx, &service)
@@ -201,6 +229,7 @@ pub async fn clear_budget(
     Path((_org, service)): Path<(String, String)>,
 ) -> ApiResult<Response> {
     ctx.require_admin()?;
+    require_slug(&service)?;
 
     let mut tx = state.db.begin(ctx.org.id).await?;
     let removed = budgets::clear_budget(&mut tx, &service)
