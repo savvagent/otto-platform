@@ -24,6 +24,9 @@ const GLOBAL_TABLES: &[&str] = &[
     // Cross-tenant outbox and ledger (0009, 0011): `otto_app` has no read access.
     "lifecycle_events",
     "usage_event_ids",
+    // Which org a Stripe customer belongs to (0021): webhook handling resolves
+    // it before an org can be pinned. `otto_app` has no access.
+    "stripe_customers",
 ];
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
@@ -66,7 +69,14 @@ async fn every_org_scoped_table_is_rls_protected_or_explicitly_global(pool: PgPo
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn tenant_pinned_code_cannot_read_the_cross_tenant_tables(pool: PgPool) {
     let db = Db::from_pool(pool);
-    for table in ["lifecycle_events", "webhook_deliveries", "usage_event_ids"] {
+    for table in [
+        "lifecycle_events",
+        "webhook_deliveries",
+        "usage_event_ids",
+        "stripe_customers",
+        "stripe_events",
+        "stripe_sync_lease",
+    ] {
         let mut tx = db.begin(OrgId::new()).await.unwrap();
         let read = sqlx::query(&format!("SELECT * FROM {table}"))
             .fetch_all(tx.conn())
@@ -330,4 +340,130 @@ async fn tenant_pinned_code_reads_the_price_book_but_cannot_change_it(pool: PgPo
             "{position} {up_to:?} {amount}: {msg}"
         );
     }
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn tenant_pinned_code_cannot_write_the_stripe_ledgers(pool: PgPool) {
+    let db = Db::from_pool(pool.clone());
+
+    // An org, a meter and a priced version, written the way the platform and
+    // the operator CLI write them: unpinned, as the connecting role.
+    let org: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO orgs (slug, name) VALUES ('acme', 'Acme') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_servers (resource_uri, name, scopes, default_scopes, service) \
+         VALUES ('https://svc.example/mcp', 'svc', '{a}', '{}', 'svc')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut tx = db.begin_unpinned().await.unwrap();
+    for stmt in [
+        "INSERT INTO meters (key, service, meter, display_name, unit) \
+         VALUES ('svc/calls', 'svc', 'calls', 'Calls', 'call')",
+        "INSERT INTO stripe_meters (meter, stripe_meter_id, event_name) \
+         VALUES ('svc/calls', 'mtr_1', 'svc__calls')",
+        "INSERT INTO stripe_events (event_id, event_type, stripe_created_at) \
+         VALUES ('evt_1', 'invoice.payment_failed', now())",
+    ] {
+        sqlx::query(stmt).execute(tx.conn()).await.unwrap();
+    }
+    let version: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO price_versions (meter, effective_month) \
+         VALUES ('svc/calls', '2026-11-01') RETURNING id",
+    )
+    .fetch_one(tx.conn())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO stripe_prices (price_version_id, meter, stripe_price_id) \
+         VALUES ($1, 'svc/calls', 'price_1')",
+    )
+    .bind(version)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO stripe_customers (stripe_customer_id, org_id) VALUES ('cus_1', $1)")
+        .bind(org)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // The Stripe ids of meters and prices are readable from a tenant
+    // transaction (shipping meter events names them) ...
+    let mut tx = db.begin(OrgId::from(org)).await.unwrap();
+    let ids: (String, String) = sqlx::query_as(
+        "SELECT m.event_name, p.stripe_price_id FROM stripe_meters m \
+         JOIN stripe_prices p ON p.meter = m.meter",
+    )
+    .fetch_one(tx.conn())
+    .await
+    .unwrap();
+    assert_eq!(ids, ("svc__calls".into(), "price_1".into()));
+    drop(tx);
+
+    // ... but no tenant transaction may change what a meter is called in
+    // Stripe, what a price version is billed at, which org a customer is, or
+    // which events have been handled.
+    let insert_price = format!(
+        "INSERT INTO stripe_prices (price_version_id, meter, stripe_price_id) \
+         VALUES ('{version}', 'svc/calls', 'price_2')"
+    );
+    let claim_customer = format!(
+        "INSERT INTO stripe_customers (stripe_customer_id, org_id) VALUES ('cus_2', '{org}')"
+    );
+    for stmt in [
+        "INSERT INTO stripe_meters (meter, stripe_meter_id, event_name) \
+         VALUES ('svc/calls', 'mtr_2', 'x')",
+        "UPDATE stripe_meters SET stripe_meter_id = 'mtr_evil'",
+        "DELETE FROM stripe_meters",
+        "TRUNCATE stripe_meters",
+        insert_price.as_str(),
+        "UPDATE stripe_prices SET stripe_price_id = 'price_evil'",
+        "DELETE FROM stripe_prices",
+        claim_customer.as_str(),
+        "UPDATE stripe_customers SET org_id = org_id",
+        "DELETE FROM stripe_customers",
+        "INSERT INTO stripe_events (event_id, event_type, stripe_created_at) \
+         VALUES ('evt_2', 'x', now())",
+        "DELETE FROM stripe_events",
+        "INSERT INTO stripe_sync_lease (name, token, until) \
+         VALUES ('sync', gen_random_uuid(), now())",
+    ] {
+        let mut tx = db.begin(OrgId::from(org)).await.unwrap();
+        let err = sqlx::query(stmt).execute(tx.conn()).await.expect_err(stmt);
+        assert!(
+            err.to_string().contains("permission denied"),
+            "{stmt}: {err}"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_card_status_vocabulary_is_closed(pool: PgPool) {
+    let org: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO orgs (slug, name) VALUES ('acme', 'Acme') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    for ok in ["none", "active", "failed", "detached"] {
+        sqlx::query(
+            "INSERT INTO subscriptions (org_id, payment_method_status) VALUES ($1, $2) \
+             ON CONFLICT (org_id) DO UPDATE SET payment_method_status = EXCLUDED.payment_method_status",
+        )
+        .bind(org)
+        .bind(ok)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let err = sqlx::query("UPDATE subscriptions SET payment_method_status = 'maybe'")
+        .execute(&pool)
+        .await
+        .expect_err("an unknown card status");
+    assert!(err.to_string().contains("check constraint"), "{err}");
 }

@@ -21,12 +21,14 @@
 //! server's own credential ([`api::CallingResourceServer`]), not a session
 //! cookie, and are outside `otto-web`'s CSRF guard, which only wraps its own
 //! router. Lifecycle webhooks are delivered by [`webhooks::run`], and
-//! notification email by [`email::run`] when SMTP is configured, background
-//! tasks the binary starts; `otto-platform-server resource ...` provisions
+//! notification email by [`email::run`] when SMTP is configured, and Stripe
+//! sync by [`stripe_cmd::run_loop`] when billing is enabled, background tasks
+//! the binary starts; `otto-platform-server resource ...` provisions
 //! resource servers ([`resource_cmd`]), `otto-platform-server client ...`
-//! registers first-party OAuth clients ([`client_cmd`]), and
+//! registers first-party OAuth clients ([`client_cmd`]),
 //! `otto-platform-server pricebook ...` sets what each value meter costs
-//! ([`pricebook_cmd`]). The console bundle is
+//! ([`pricebook_cmd`]), and `otto-platform-server stripe sync` makes Stripe
+//! match the price book ([`stripe_cmd`]). The console bundle is
 //! a separate piece in `web/`, served from here when `OTTO_STATIC_DIR` is set,
 //! which is how the hosted Fly deployment runs.
 //!
@@ -44,6 +46,7 @@ pub mod internal;
 pub mod introspect;
 pub mod pricebook_cmd;
 pub mod resource_cmd;
+pub mod stripe_cmd;
 pub mod webhooks;
 
 use std::convert::Infallible;
@@ -61,7 +64,7 @@ use tower_http::services::fs::ServeFileSystemResponseBody;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
-pub use config::{Config, EmailConfig, LogFormat};
+pub use config::{Config, EmailConfig, LogFormat, StripeConfig};
 
 /// The routes that need nothing but a database handle: health and the
 /// resource-server API.
@@ -461,7 +464,24 @@ fn web_state(db: Db, config: &Config) -> Result<otto_web::AppState> {
     let webauthn = otto_web::relying_party(&web_config)
         .context("could not build the WebAuthn relying party from OTTO_PUBLIC_URL")?;
 
-    Ok(otto_web::AppState::new(db, cipher, webauthn, web_config))
+    Ok(otto_web::AppState::new(db, cipher, webauthn, web_config).with_stripe(stripe(config)?))
+}
+
+/// Billing's Stripe client and webhook secret, or `None` when billing is
+/// disabled. Production Stripe: there is no setting for another base URL, and
+/// tests build their client against a local mock directly.
+pub fn stripe(config: &Config) -> Result<Option<otto_billing::billing::Stripe>> {
+    config
+        .stripe
+        .as_ref()
+        .map(|s| {
+            Ok(otto_billing::billing::Stripe {
+                client: otto_billing::stripe::Client::new(s.secret_key.clone())
+                    .context("could not build the Stripe client")?,
+                webhook_secret: s.webhook_secret.clone(),
+            })
+        })
+        .transpose()
 }
 
 /// Every setting `otto-web` takes from this deployment, in one place so it can
@@ -484,6 +504,15 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn billing_follows_the_stripe_secrets() {
+        let mut config = Config::for_test();
+        assert!(stripe(&config).unwrap().is_none());
+        config.stripe =
+            config::parse_stripe(Some("sk_test_x".into()), Some("whsec_x".into())).unwrap();
+        assert!(stripe(&config).unwrap().is_some());
+    }
 
     #[test]
     fn every_deployment_setting_reaches_otto_web() {

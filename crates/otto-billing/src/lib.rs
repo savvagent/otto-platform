@@ -6,6 +6,7 @@
 //! reference data that `otto_app` reads and never writes: the
 //! public catalog of tiers, what each service bills by, and what it costs.
 
+pub mod billing;
 pub mod meters;
 pub mod plans;
 pub mod pricebook;

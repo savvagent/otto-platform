@@ -112,6 +112,60 @@ pub struct Subscription {
     pub items: List<SubscriptionItem>,
     #[serde(default)]
     pub metadata: Metadata,
+    /// The `sub_sched_...` managing it, if any (never expanded).
+    #[serde(default)]
+    pub schedule: Option<String>,
+}
+
+/// A payment method, as `detach` returns it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PaymentMethod {
+    pub id: String,
+    pub customer: Option<String>,
+}
+
+/// The current phase's window of a subscription schedule, Unix seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct PhaseWindow {
+    pub start_date: i64,
+    pub end_date: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SchedulePhaseItem {
+    /// A `price_...` id (never expanded by this client).
+    pub price: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SchedulePhase {
+    pub start_date: i64,
+    pub end_date: Option<i64>,
+    #[serde(default)]
+    pub items: Vec<SchedulePhaseItem>,
+    pub proration_behavior: Option<String>,
+}
+
+/// A subscription schedule: the subscription's items phase by phase, each
+/// phase switching in at an exact time.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SubscriptionSchedule {
+    pub id: String,
+    /// `not_started`, `active`, `completed`, `released` or `canceled`.
+    pub status: String,
+    pub subscription: Option<String>,
+    pub current_phase: Option<PhaseWindow>,
+    #[serde(default)]
+    pub phases: Vec<SchedulePhase>,
+    pub end_behavior: Option<String>,
+}
+
+impl SubscriptionSchedule {
+    /// Whether the schedule still manages its subscription and can be
+    /// updated.
+    pub fn is_open(&self) -> bool {
+        matches!(self.status.as_str(), "not_started" | "active")
+    }
 }
 
 /// Stripe's acknowledgement of a meter event.
@@ -210,6 +264,26 @@ pub struct CreateSubscription {
     /// When the first full period starts. Proration is always off.
     pub billing_cycle_anchor: Option<DateTime<Utc>>,
     pub metadata: Metadata,
+}
+
+/// One phase of an [`UpdateSchedule`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulePhaseParams {
+    /// Only the first phase may name its start, and when updating a running
+    /// schedule it must be the current phase's start exactly. Later phases
+    /// start where the previous one ends.
+    pub start_date: Option<DateTime<Utc>>,
+    pub end_date: DateTime<Utc>,
+    /// One item per price (`price_...`); metered items take no quantity.
+    pub prices: Vec<String>,
+}
+
+/// The whole phase list of a schedule. Sent with `end_behavior=release` (the
+/// subscription carries on with the last phase's items after it) and
+/// `proration_behavior=none`, at the top level and on every phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateSchedule {
+    pub phases: Vec<SchedulePhaseParams>,
 }
 
 /// One usage report for a meter.
@@ -471,6 +545,184 @@ impl Client {
         self.post(
             &format!("/v1/subscription_items/{item}"),
             form,
+            idempotency_key,
+        )
+        .await
+    }
+
+    /// `GET /v1/subscriptions/{id}`
+    pub async fn retrieve_subscription(&self, id: &str) -> Result<Subscription, StripeError> {
+        check_id("subscription", id)?;
+        self.get(&format!("/v1/subscriptions/{id}")).await
+    }
+
+    /// `GET /v1/subscriptions?customer=...&status=all`: every subscription of
+    /// one customer, whatever its status (one page of up to 100).
+    pub async fn list_subscriptions(
+        &self,
+        customer: &str,
+    ) -> Result<List<Subscription>, StripeError> {
+        check_id("customer", customer)?;
+        self.get(&format!(
+            "/v1/subscriptions?customer={customer}&status=all&limit=100"
+        ))
+        .await
+    }
+
+    /// `GET /v1/subscription_items?subscription=...`: every item (Stripe
+    /// allows at most 20, so one page of 100 is all of them).
+    pub async fn list_subscription_items(
+        &self,
+        subscription: &str,
+    ) -> Result<List<SubscriptionItem>, StripeError> {
+        check_id("subscription", subscription)?;
+        self.get(&format!(
+            "/v1/subscription_items?subscription={subscription}&limit=100"
+        ))
+        .await
+    }
+
+    /// `GET /v1/customers/search` for `metadata['<key>']:'<value>'`.
+    ///
+    /// Stripe's search is eventually consistent (a customer created in the
+    /// last minute may be missing). `key` and `value` are restricted to
+    /// `[A-Za-z0-9_-]` so nothing can change the query's meaning.
+    pub async fn search_customers_by_metadata(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<List<Customer>, StripeError> {
+        let plain = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 100
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        };
+        if !plain(key) || !plain(value) {
+            return Err(invalid(
+                "metadata search terms must be 1 to 100 of [A-Za-z0-9_-]",
+            ));
+        }
+        let query =
+            serde_urlencoded::to_string([("query", format!("metadata['{key}']:'{value}'"))])
+                .map_err(|e| invalid(format!("query encoding: {e}")))?;
+        self.get(&format!("/v1/customers/search?{query}&limit=100"))
+            .await
+    }
+
+    /// `GET /v1/billing/meters?status=active`, one page of up to 100, after
+    /// `starting_after` (a `mtr_...`) when given.
+    pub async fn list_meters(
+        &self,
+        starting_after: Option<&str>,
+    ) -> Result<List<Meter>, StripeError> {
+        let mut path = "/v1/billing/meters?status=active&limit=100".to_owned();
+        if let Some(after) = starting_after {
+            check_id("meter", after)?;
+            path.push_str(&format!("&starting_after={after}"));
+        }
+        self.get(&path).await
+    }
+
+    /// `POST /v1/payment_methods/{id}/detach`
+    pub async fn detach_payment_method(
+        &self,
+        payment_method: &str,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<PaymentMethod, StripeError> {
+        check_id("payment method", payment_method)?;
+        self.post(
+            &format!("/v1/payment_methods/{payment_method}/detach"),
+            Form::default(),
+            idempotency_key,
+        )
+        .await
+    }
+
+    /// `POST /v1/subscription_schedules` with `from_subscription`: put an
+    /// existing subscription under a schedule whose one phase is what it has
+    /// now.
+    pub async fn create_schedule_from_subscription(
+        &self,
+        subscription: &str,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<SubscriptionSchedule, StripeError> {
+        check_id("subscription", subscription)?;
+        let mut form = Form::default();
+        form.push("from_subscription", subscription);
+        self.post("/v1/subscription_schedules", form, idempotency_key)
+            .await
+    }
+
+    /// `GET /v1/subscription_schedules/{id}`
+    pub async fn retrieve_schedule(&self, id: &str) -> Result<SubscriptionSchedule, StripeError> {
+        check_id("subscription schedule", id)?;
+        self.get(&format!("/v1/subscription_schedules/{id}")).await
+    }
+
+    /// `POST /v1/subscription_schedules/{id}`: replace the phase list. See
+    /// [`UpdateSchedule`].
+    pub async fn update_schedule(
+        &self,
+        id: &str,
+        params: &UpdateSchedule,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<SubscriptionSchedule, StripeError> {
+        check_id("subscription schedule", id)?;
+        if params.phases.is_empty() {
+            return Err(invalid("a schedule needs at least one phase"));
+        }
+        let mut form = Form::default();
+        form.push("end_behavior", "release");
+        form.push("proration_behavior", "none");
+        let mut previous_end: Option<DateTime<Utc>> = None;
+        for (i, phase) in params.phases.iter().enumerate() {
+            if i > 0 && phase.start_date.is_some() {
+                return Err(invalid("only the first phase may name its start"));
+            }
+            if phase.prices.is_empty() {
+                return Err(invalid("every phase needs at least one item"));
+            }
+            let start = phase.start_date.or(previous_end);
+            if start.is_some_and(|s| phase.end_date <= s) {
+                return Err(invalid("each phase must end after it starts"));
+            }
+            if let Some(start) = phase.start_date {
+                form.push(
+                    format!("phases[{i}][start_date]"),
+                    start.timestamp().to_string(),
+                );
+            }
+            form.push(
+                format!("phases[{i}][end_date]"),
+                phase.end_date.timestamp().to_string(),
+            );
+            form.push(format!("phases[{i}][proration_behavior]"), "none");
+            for (j, price) in phase.prices.iter().enumerate() {
+                check_id("price", price)?;
+                form.push(format!("phases[{i}][items][{j}][price]"), price.as_str());
+            }
+            previous_end = Some(phase.end_date);
+        }
+        self.post(
+            &format!("/v1/subscription_schedules/{id}"),
+            form,
+            idempotency_key,
+        )
+        .await
+    }
+
+    /// `POST /v1/subscription_schedules/{id}/release`: stop managing the
+    /// subscription, which keeps its current items.
+    pub async fn release_schedule(
+        &self,
+        id: &str,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<SubscriptionSchedule, StripeError> {
+        check_id("subscription schedule", id)?;
+        self.post(
+            &format!("/v1/subscription_schedules/{id}/release"),
+            Form::default(),
             idempotency_key,
         )
         .await

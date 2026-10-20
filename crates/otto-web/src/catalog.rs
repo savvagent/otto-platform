@@ -22,7 +22,7 @@
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post, put, MethodRouter};
 
-use crate::routes::{auth, orgs, plans, sso, teams, tokens, usage};
+use crate::routes::{auth, billing, orgs, plans, sso, stripe_webhook, teams, tokens, usage};
 use crate::state::AppState;
 use crate::{oauth, openapi};
 
@@ -63,6 +63,8 @@ pub enum Auth {
     OrgMember,
     /// A session, plus `owner` or `admin` of the org in the path.
     OrgAdmin,
+    /// A session, plus `owner` of the org in the path: billing.
+    OrgOwner,
 }
 
 impl Auth {
@@ -72,11 +74,12 @@ impl Auth {
             Auth::Session => "session",
             Auth::OrgMember => "org member",
             Auth::OrgAdmin => "org admin",
+            Auth::OrgOwner => "org owner",
         }
     }
 
     pub fn needs_org(self) -> bool {
-        matches!(self, Auth::OrgMember | Auth::OrgAdmin)
+        matches!(self, Auth::OrgMember | Auth::OrgAdmin | Auth::OrgOwner)
     }
 }
 
@@ -95,6 +98,10 @@ pub struct Endpoint {
     /// is not cosmetic — a generated client that expects `200` treats a real
     /// `201`/`204`/`303` success as an error.
     pub success: u16,
+    /// Failure statuses this endpoint answers beyond the ones every endpoint
+    /// of its kind can (`400`, `500`, and `401`/`403`/`404` behind a session),
+    /// e.g. `503` while a feature is switched off. See [`Endpoint::also_fails`].
+    pub extra_failures: &'static [u16],
     pub route: MethodRouter<AppState>,
 }
 
@@ -109,6 +116,7 @@ impl Endpoint {
             request: None,
             response: None,
             success: 200,
+            extra_failures: &[],
             route,
         }
     }
@@ -183,6 +191,13 @@ impl Endpoint {
     /// exactly what the handler actually sends.
     pub fn status(mut self, code: u16) -> Self {
         self.success = code;
+        self
+    }
+
+    /// Declare failure statuses beyond the common ones, so the document says
+    /// what a client must handle (`503 billing_disabled`, `413`, ...).
+    pub fn also_fails(mut self, statuses: &'static [u16]) -> Self {
+        self.extra_failures = statuses;
         self
     }
 
@@ -730,6 +745,52 @@ pub fn catalog() -> Vec<Endpoint> {
                  metered prices can still be shown. `features` lists only the \
                  capabilities chosen for advertising, not every key a plan carries. A \
                  `monthlyCents` of 0 on enterprise means negotiated, not free.",
+            ),
+        // ----------------------------------------------------------- billing
+        Endpoint::get("/api/orgs/{org}/billing", billing::get_billing)
+            .auth(Auth::OrgOwner)
+            .returns("BillingStatus")
+            .summary("Card on file and subscription status")
+            .describe(
+                "Owner-only. Whether billing is enabled on this deployment, whether the \
+                 org has a card on file (`none`, `active`, `failed` when Stripe could not \
+                 collect with it, `detached` when it was removed), and the Stripe \
+                 subscription's status, which invoices metered usage monthly in arrears. \
+                 With billing disabled this still answers, with `billingEnabled: false`.",
+            ),
+        Endpoint::post("/api/orgs/{org}/billing/setup", billing::start_setup)
+            .auth(Auth::OrgOwner)
+            .returns("BillingSetupSession")
+            .also_fails(&[409, 502, 503])
+            .summary("Start putting a card on file")
+            .describe(
+                "Owner-only and audited (`billing.setup.started`). Creates the org's \
+                 Stripe customer on first use and returns a Stripe Checkout URL in setup \
+                 mode, for cards only; send the owner there. Checkout returns them to the console's \
+                 billing page with `?setup=success` or `?setup=cancelled`, but the card is \
+                 on file only once Stripe confirms it on the webhook, after which the org \
+                 is subscribed with one metered item per priced meter. `503 \
+                 billing_disabled` when this deployment has no Stripe configuration; `502 \
+                 stripe_unavailable` when Stripe could not be reached; `409 billing_busy` \
+                 while another billing change for the org is in progress. Putting a card \
+                 on file again after the subscription was canceled resumes billing.",
+            ),
+        Endpoint::post("/api/stripe/webhook", stripe_webhook::receive)
+            .auth(Auth::Public)
+            .returns("StripeWebhookReceived")
+            .also_fails(&[413, 503])
+            .body_limit(stripe_webhook::MAX_WEBHOOK_PAYLOAD_BYTES)
+            .summary("Stripe's events (Stripe only)")
+            .describe(
+                "Called by Stripe, not by a client. Public, and authenticated only by \
+                 the `Stripe-Signature` header over the raw body (`400` when it does not \
+                 verify); the body is capped at 64 KiB (`413`). Idempotent by event id. \
+                 Acts on `checkout.session.completed` (setup mode), \
+                 `customer.subscription.updated`, `customer.subscription.deleted`, \
+                 `invoice.paid`, `invoice.payment_failed` and `payment_method.detached`, \
+                 and acknowledges \
+                 every other verified event with no action. `500` asks Stripe to retry; \
+                 `503 billing_disabled` when this deployment has no Stripe configuration.",
             ),
         // -------------------------------------------------- tokens & usage
         Endpoint::get("/api/orgs/{org}/tokens", tokens::list_tokens)

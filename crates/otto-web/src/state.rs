@@ -122,6 +122,11 @@ pub struct AppState {
     /// unauthenticated endpoint does not reach the database on every call.
     /// See [`crate::routes::plans`].
     pub plans: Arc<crate::routes::plans::PlansCache>,
+    /// Stripe, when billing is enabled (`STRIPE_SECRET_KEY` and
+    /// `STRIPE_WEBHOOK_SECRET` both set). `None` is billing disabled: the
+    /// billing routes say `billingEnabled: false` or answer `503
+    /// billing_disabled`. Set with [`AppState::with_stripe`].
+    pub stripe: Option<Arc<otto_billing::billing::Stripe>>,
 }
 
 impl AppState {
@@ -138,7 +143,14 @@ impl AppState {
             cipher: Arc::new(cipher),
             config: Arc::new(config),
             plans: Arc::default(),
+            stripe: None,
         }
+    }
+
+    /// Enable billing with this Stripe configuration (or disable it, `None`).
+    pub fn with_stripe(mut self, stripe: Option<otto_billing::billing::Stripe>) -> Self {
+        self.stripe = stripe.map(Arc::new);
+        self
     }
 }
 
@@ -147,6 +159,7 @@ impl std::fmt::Debug for AppState {
         // No cipher.
         f.debug_struct("AppState")
             .field("config", &self.config)
+            .field("billing_enabled", &self.stripe.is_some())
             .finish_non_exhaustive()
     }
 }

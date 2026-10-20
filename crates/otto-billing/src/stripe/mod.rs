@@ -33,8 +33,9 @@ mod tests;
 pub use api::{
     CheckoutSession, CreateCustomer, CreateMeter, CreateMeteredPrice, CreateSetupCheckoutSession,
     CreateSubscription, Customer, InvoiceSettings, List, Meter, MeterEvent, MeterEventRecord,
-    Price, PriceProduct, PriceTier, Recurring, SetupIntent, SetupPaymentMethods, Subscription,
-    SubscriptionItem, TierUpTo,
+    PaymentMethod, PhaseWindow, Price, PriceProduct, PriceTier, Recurring, SchedulePhase,
+    SchedulePhaseItem, SchedulePhaseParams, SetupIntent, SetupPaymentMethods, Subscription,
+    SubscriptionItem, SubscriptionSchedule, TierUpTo, UpdateSchedule,
 };
 pub use client::{Client, DEFAULT_BASE_URL, MAX_RESPONSE_BYTES, STRIPE_VERSION};
 pub use error::{ApiError, StripeError};

@@ -134,7 +134,10 @@ fn responses(endpoint: &Endpoint) -> Value {
     if endpoint.auth.needs_org() {
         // 404 rather than 403 for an org you are not in — see `OrgCtx`.
         responses["403"] = error.clone();
-        responses["404"] = error;
+        responses["404"] = error.clone();
+    }
+    for status in endpoint.extra_failures {
+        responses[status.to_string()] = error.clone();
     }
 
     responses
@@ -165,7 +168,12 @@ fn tag_for(path: &str) -> &'static str {
         "tokens"
     } else if path.contains("/invites") {
         "invites"
-    } else if path.contains("/usage") || path.contains("/audit") || path == "/api/plans" {
+    } else if path.contains("/usage")
+        || path.contains("/audit")
+        || path.contains("/billing")
+        || path.starts_with("/api/stripe")
+        || path == "/api/plans"
+    {
         "billing"
     } else {
         "orgs"
@@ -185,6 +193,7 @@ fn components() -> Value {
         entity_schemas(),
         sso_schemas(),
         plan_schemas(),
+        billing_schemas(),
         response_schemas(),
         request_schemas(),
     ] {
@@ -653,6 +662,79 @@ fn plan_schemas() -> Value {
                 },
             },
             "required": ["upTo", "unitAmountUcents"],
+        },
+    })
+}
+
+/// The org's billing: card on file, subscription, Stripe's webhook.
+fn billing_schemas() -> Value {
+    json!({
+        "BillingStatus": {
+            "type": "object",
+            "description":
+                "Where an org's billing stands. Owner-only. Metered usage is invoiced \
+                 monthly in arrears through the Stripe subscription.",
+            "properties": {
+                "billingEnabled": {
+                    "type": "boolean",
+                    "description":
+                        "Whether this deployment bills through Stripe. When false, no card \
+                         can be put on file and nothing is invoiced.",
+                },
+                "cardStatus": {
+                    "type": "string",
+                    "enum": ["none", "active", "failed", "detached"],
+                    "description":
+                        "`none`: never put on file. `active`: on file and the default. \
+                         `failed`: Stripe could not collect an invoice with it. \
+                         `detached`: removed. Put a new card on file to recover from the \
+                         last two.",
+                },
+                "subscriptionStatus": {
+                    "type": ["string", "null"],
+                    "description":
+                        "The Stripe subscription's status (`active`, `past_due`, \
+                         `canceled`, ...), or null when the org has none yet: a card is \
+                         needed, and at least one priced meter synced to Stripe.",
+                },
+                "billingStopped": {
+                    "type": "boolean",
+                    "description":
+                        "Stripe canceled the subscription. Nothing is invoiced and nothing \
+                         re-subscribes the org until an owner puts a card on file again.",
+                },
+                "subscriptionLive": {
+                    "type": "boolean",
+                    "description":
+                        "Whether usage is being invoiced through the subscription (status \
+                         `active`, `trialing`, `past_due` or `unpaid`).",
+                },
+            },
+            "required": [
+                "billingEnabled",
+                "cardStatus",
+                "subscriptionStatus",
+                "subscriptionLive",
+                "billingStopped",
+            ],
+        },
+        "BillingSetupSession": {
+            "type": "object",
+            "description": "A Stripe Checkout session in setup mode.",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "Stripe's hosted page. Send the owner here.",
+                },
+            },
+            "required": ["url"],
+        },
+        "StripeWebhookReceived": {
+            "type": "object",
+            "description": "Stripe's event was verified and is handled (or needs nothing).",
+            "properties": { "received": { "type": "boolean", "const": true } },
+            "required": ["received"],
         },
     })
 }
