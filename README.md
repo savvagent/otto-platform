@@ -136,6 +136,8 @@ Configuration is all `OTTO_*` (plus `DATABASE_URL` and `RUST_LOG`):
 | `OTTO_ENFORCE_QUOTAS` | `0` | Reporting only: whether resource servers enforce hard-stop plans, echoed as `enforced` by the usage endpoint. |
 | `OTTO_RUN_MIGRATIONS` | `1` | Apply migrations at startup. |
 | `OTTO_LOG_FORMAT` | `text` | `json` for structured logs. |
+| `OTTO_SMTP_URL` | unset | Secret. SMTP server for notification email, credentials in the URL: `smtps://user:pass@host:465` or `smtp://user:pass@host:587?tls=required` (plain `smtp://` only to a loopback host). Set together with `OTTO_EMAIL_FROM`; exactly one of the two refuses to start. With neither, email is disabled (logged at boot) and messages stay queued in `notification_outbox`. |
+| `OTTO_EMAIL_FROM` | unset | Secret. The `From:` mailbox for notification email, e.g. `otto <alerts@savvagent.com>`. Set together with `OTTO_SMTP_URL`. |
 
 On startup it will:
 

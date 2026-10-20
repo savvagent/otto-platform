@@ -20,8 +20,25 @@ the host of `OTTO_PUBLIC_URL`, so passkeys only work when the browser is on
 | `OTTO_STATIC_DIR`       | `/srv/console`               | Serve the console from this process. Prerendered pages answer as themselves (`/pricing` from `pricing.html` and `/` from `index.html`; `/pricing.html`, `/index.html` and a trailing slash are each a `308` to the one URL); any other extensionless path gets the SPA shell, `200.html`, with `X-Robots-Tag: noindex, nofollow`. The bundle must contain `200.html` (adapter-static `fallback: '200.html'`), or the server refuses to start. A missing asset stays a `404`; so does a path with a malformed escape or a `.`/`..` segment, as JSON. Unknown `/api`, `/oauth`, `/sso`, `/.well-known` and `/internal` paths answer a JSON `404`, never the shell. |
 | `OTTO_CLIENT_IP_HEADER` | `fly-client-ip`              | Fly's proxy overwrites it with the real client address, so per-IP throttles and the audit trail are sound with nothing else to lock down.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 
-Secrets (`DATABASE_URL` from `fly postgres attach`, `OTTO_ENCRYPTION_KEY`) are staged by
-hand; see the header of `fly.toml`.
+## Secrets
+
+Never in `fly.toml`. Staged with `fly secrets set -a otto-platform`; see also the header of
+`fly.toml`.
+
+| Secret                | Required                         | What                                                                                                                                                                                                                                                                                         |
+| --------------------- | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`        | yes                              | Staged by `fly postgres attach`.                                                                                                                                                                                                                                                             |
+| `OTTO_ENCRYPTION_KEY` | yes                              | 32 random bytes, base64 (`openssl rand -base64 32`). Encrypts secrets at rest; losing it makes them unreadable.                                                                                                                                                                              |
+| `OTTO_SMTP_URL`       | no; together with the next one   | Notification email's SMTP server, credentials in the URL: `smtps://user:pass@host:465` or `smtp://user:pass@host:587?tls=required`. Unset (with `OTTO_EMAIL_FROM` also unset), email is disabled: the boot log says so and budget-alert emails wait in `notification_outbox` until it is set. |
+| `OTTO_EMAIL_FROM`     | no; together with the one above  | The `From:` mailbox, e.g. `otto <alerts@savvagent.com>`. Setting exactly one of the two email secrets fails the deploy's health check by refusing to start.                                                                                                                                 |
+
+Set the two email secrets in one command so no release boots with only one of them:
+
+```bash
+fly secrets set -a otto-platform \
+  OTTO_SMTP_URL='smtps://USER:PASSWORD@smtp.example.com:465' \
+  OTTO_EMAIL_FROM='otto <alerts@savvagent.com>'
+```
 
 ## The hostname
 
