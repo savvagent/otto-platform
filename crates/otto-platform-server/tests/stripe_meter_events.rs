@@ -1,18 +1,20 @@
 //! Metered usage to Stripe meter events (#64), end to end against a real
-//! Postgres and the local Stripe stand-in: ingest queues exactly the metered
-//! events of orgs with a live subscription, never failing an event; the
-//! shipper sends each once, retries under the same identifier, records
-//! terminal failures visibly, reaches every org's rows under row-level
-//! security, and does not run with billing disabled.
+//! Postgres and the local Stripe stand-in: ingest adds exactly the metered
+//! events of orgs with a live subscription to one open row per org, meter,
+//! customer and hour, never failing an event; the shipper sends each row
+//! once, retries under the same identifier, records terminal failures
+//! visibly, reaches every org's rows under row-level security, and does not
+//! run with billing disabled.
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use otto_auth::resources::{self, ResourceServerSpec};
 use otto_billing::billing::mock::MockStripe;
 use otto_billing::billing::Stripe;
+use otto_billing::period::{self, Month};
 use otto_billing::stripe::WebhookSecret;
 use otto_billing::stripe_outbox::{self, OutboxStatus};
 use otto_core::orgs::OrgsExt;
@@ -89,20 +91,32 @@ async fn send(db: &Db, req: Request<Body>) -> (StatusCode, Value) {
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
 }
 
-fn event(org: OrgId, quantity: Option<u64>) -> Value {
+/// Ten minutes into the previous hour: an hour that has ended, so its row is
+/// due at once. Within the grace of the previous month if the current one has
+/// just started, so never re-dated.
+fn last_hour() -> DateTime<Utc> {
+    period::hour_bucket(Utc::now()) - Duration::minutes(50)
+}
+
+fn event_at(org: OrgId, quantity: Option<u64>, at: DateTime<Utc>) -> Value {
     let mut ev = json!({
         "event_id": Uuid::new_v4(),
         "org_id": org,
         "user_id": null,
         "tool": "flag.evaluate",
         "billable": true,
-        "occurred_at": Utc::now(),
+        "occurred_at": at,
     });
     if let Some(q) = quantity {
         ev["meter"] = json!(EVALS);
         ev["quantity"] = json!(q);
     }
     ev
+}
+
+/// A metered (or, with `None`, unmetered) event of the last hour.
+fn event(org: OrgId, quantity: Option<u64>) -> Value {
+    event_at(org, quantity, last_hour())
 }
 
 /// A Stripe subscription row for `org`, as setup and the webhooks leave it.
@@ -116,17 +130,30 @@ enum Billing<'a> {
     Subscribed(&'a str, &'a str),
 }
 
+/// SQL for the start of the UTC hour `n` hours ago, whatever the session's
+/// time zone.
+fn hours_ago(n: u32) -> String {
+    format!("to_timestamp(floor(extract(epoch FROM now()) / 3600) * 3600 - {n} * 3600)")
+}
+
 impl World {
     async fn org(&self, slug: &str, billing: Billing<'_>) -> OrgId {
         let org = self.db.create_org(slug, slug).await.unwrap().id;
+        self.bill(org, slug, billing).await;
+        org
+    }
+
+    async fn bill(&self, org: OrgId, slug: &str, billing: Billing<'_>) {
         let (customer, sub, status) = match billing {
-            Billing::None => return org,
+            Billing::None => return,
             Billing::CustomerOnly(c) => (Some(c), None, "active"),
             Billing::Subscribed(c, status) => (Some(c), Some(format!("sub_{slug}")), status),
         };
         sqlx::query(
             "INSERT INTO subscriptions (org_id, stripe_customer_id, stripe_subscription_id, status) \
-             VALUES ($1, $2, $3, $4)",
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (org_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, \
+               stripe_subscription_id = EXCLUDED.stripe_subscription_id, status = EXCLUDED.status",
         )
         .bind(org)
         .bind(customer)
@@ -135,7 +162,6 @@ impl World {
         .execute(&self.pool)
         .await
         .unwrap();
-        org
     }
 
     async fn ship(&self, events: Vec<Value>) -> Value {
@@ -160,21 +186,51 @@ impl World {
 
     async fn rows(&self) -> Vec<Row> {
         sqlx::query_as(
-            "SELECT org_id, identifier, event_name, stripe_customer_id, value, occurred_at, \
-                    status, attempts, last_error \
-             FROM stripe_meter_outbox ORDER BY created_at, identifier",
+            "SELECT id, org_id, identifier, event_name, stripe_customer_id, value, bucket_start, \
+                    next_attempt_at, status, attempts, last_error \
+             FROM stripe_meter_outbox ORDER BY created_at, value",
         )
         .fetch_all(&self.pool)
         .await
         .unwrap()
     }
 
-    async fn row(&self, identifier: &str) -> Row {
+    /// The only row there is.
+    async fn only_row(&self) -> Row {
+        let mut rows = self.rows().await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        rows.remove(0)
+    }
+
+    /// The row most recently created.
+    async fn newest(&self) -> Row {
+        self.rows().await.pop().expect("an outbox row")
+    }
+
+    async fn row(&self, id: Uuid) -> Row {
         self.rows()
             .await
             .into_iter()
-            .find(|r| r.identifier == identifier)
-            .expect("an outbox row")
+            .find(|r| r.id == id)
+            .expect("the outbox row")
+    }
+
+    /// A row written straight to the table (as the owner, past row-level
+    /// security), for shipper tests that need many: hour `hours_ago`.
+    async fn insert_row(&self, org: OrgId, customer: &str, value: i64, hours: u32) -> Uuid {
+        sqlx::query_scalar(&format!(
+            "INSERT INTO stripe_meter_outbox \
+               (org_id, event_name, stripe_customer_id, value, bucket_start) \
+             VALUES ($1, $2, $3, $4, {}) RETURNING id",
+            hours_ago(hours)
+        ))
+        .bind(org)
+        .bind(EVENT_NAME)
+        .bind(customer)
+        .bind(value)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
     }
 
     /// Give the meter its Stripe billing meter, as `stripe sync` does.
@@ -215,23 +271,27 @@ impl World {
         .await
         .unwrap()
     }
+
+    async fn ship_due(&self, mock: &MockStripe) -> stripe_shipper::PassReport {
+        stripe_shipper::ship_due(&self.db, &mock.client())
+            .await
+            .unwrap()
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct Row {
+    id: Uuid,
     org_id: Uuid,
     identifier: String,
     event_name: String,
     stripe_customer_id: String,
     value: i64,
-    occurred_at: DateTime<Utc>,
+    bucket_start: DateTime<Utc>,
+    next_attempt_at: DateTime<Utc>,
     status: String,
     attempts: i32,
     last_error: Option<String>,
-}
-
-fn identifier_of(ev: &Value) -> String {
-    format!("otto-flags:{}", ev["event_id"].as_str().unwrap())
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
@@ -274,69 +334,165 @@ async fn only_metered_events_of_orgs_with_a_live_subscription_are_queued(pool: P
         ],
         "only metered events of live subscriptions: {rows:?}"
     );
-    let row = w.row(&identifier_of(&metered)).await;
+    let row = rows.iter().find(|r| r.org_id == live.as_uuid()).unwrap();
     assert_eq!(row.event_name, EVENT_NAME);
     assert_eq!(row.status, "pending");
     assert_eq!(row.attempts, 0);
+    assert!(row.identifier.starts_with("agg:"), "{}", row.identifier);
     let sent_at: DateTime<Utc> = metered["occurred_at"].as_str().unwrap().parse().unwrap();
-    assert!((row.occurred_at - sent_at).num_milliseconds().abs() < 1);
+    assert_eq!(row.bucket_start, period::hour_bucket(sent_at));
+    assert_eq!(
+        row.next_attempt_at,
+        row.bucket_start + Duration::hours(1),
+        "due when its hour ends"
+    );
 
     // Every event still counted, billed through Stripe or not.
     for (org, q) in [(live, 7), (canceled, 3), (card_only, 4), (free, 5)] {
         assert_eq!(w.meter_quantity(org).await, q);
     }
 
-    // A replayed batch is a duplicate everywhere, the outbox included.
+    // A replayed batch is a duplicate everywhere: the ledger claim stops it
+    // before it can add to the outbox.
     let receipt = w.ship(events).await;
     assert_eq!(receipt["duplicates"], json!(6));
-    assert_eq!(w.rows().await.len(), 2);
+    let again = w.rows().await;
+    assert_eq!(
+        again.iter().map(|r| r.value).collect::<Vec<_>>(),
+        rows.iter().map(|r| r.value).collect::<Vec<_>>(),
+        "a replay adds nothing"
+    );
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
-async fn queueing_never_fails_an_event(pool: PgPool) {
-    let w = world(pool).await;
-    let live = w
-        .org("live", Billing::Subscribed("cus_live", "active"))
-        .await;
-    let other = w.org("other", Billing::Subscribed("cus_o", "active")).await;
-    // Another org's row already holds the identifier (a resource server that
-    // reused an event id): the event is counted, and nothing is queued twice.
-    let ev = event(live, Some(9));
-    sqlx::query(
-        "INSERT INTO stripe_meter_outbox \
-           (org_id, identifier, event_name, stripe_customer_id, value, occurred_at) \
-         VALUES ($1, $2, $3, 'cus_o', 1, now())",
-    )
-    .bind(other)
-    .bind(identifier_of(&ev))
-    .bind(EVENT_NAME)
-    .execute(&w.pool)
-    .await
-    .unwrap();
-    let receipt = w.ship(vec![ev]).await;
-    assert_eq!(receipt["accepted"], json!(1));
-    assert_eq!(w.meter_quantity(live).await, 9);
-    assert_eq!(w.rows().await.len(), 1);
-}
-
-#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
-async fn a_shipped_event_is_sent_once_and_marked_sent(pool: PgPool) {
+async fn an_hours_events_are_one_row_and_one_stripe_call(pool: PgPool) {
     let w = world(pool).await;
     let mock = MockStripe::start().await;
     let org = w
         .org("live", Billing::Subscribed("cus_live", "active"))
         .await;
-    let ev = event(org, Some(42));
-    w.ship(vec![ev.clone()]).await;
+    let hour = last_hour();
+    // Forty events in one hour, in two batches.
+    let events: Vec<_> = (1..=40u64)
+        .map(|q| event_at(org, Some(q), hour + Duration::seconds(q as i64)))
+        .collect();
+    w.ship(events[..25].to_vec()).await;
+    w.ship(events[25..].to_vec()).await;
+    let row = w.only_row().await;
+    assert_eq!(row.value, (1..=40).sum::<i64>());
+    assert_eq!(row.bucket_start, period::hour_bucket(hour));
 
+    let report = w.ship_due(&mock).await;
+    assert_eq!((report.claimed, report.sent), (1, 1));
+    let posts = mock.requests("POST", METER_EVENTS);
+    assert_eq!(posts.len(), 1, "one call for the hour");
+    assert_eq!(posts[0].field("payload[value]"), Some("820"));
     assert_eq!(
-        stripe_shipper::ship_due(&w.db, &mock.client())
-            .await
-            .unwrap()
-            .claimed,
-        1
+        posts[0].field("timestamp"),
+        Some(row.bucket_start.timestamp().to_string().as_str()),
+        "the hour's start"
     );
-    let row = w.row(&identifier_of(&ev)).await;
+    assert_eq!(w.meter_quantity(org).await, 820);
+
+    // Another hour is another row.
+    let earlier = hour - Duration::hours(1);
+    if Month::of(earlier) == Month::of(hour) {
+        w.ship(vec![event_at(org, Some(5), earlier)]).await;
+        let newest = w.newest().await;
+        assert_eq!(
+            (newest.value, newest.bucket_start),
+            (5, period::hour_bucket(earlier))
+        );
+    }
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_claimed_row_takes_no_more_usage(pool: PgPool) {
+    let w = world(pool).await;
+    let mock = MockStripe::start().await;
+    let org = w
+        .org("live", Billing::Subscribed("cus_live", "active"))
+        .await;
+    w.ship(vec![event(org, Some(3))]).await;
+    let first = stripe_outbox::claim_due(&w.db, 10).await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].value, 3);
+
+    // Same hour, after the claim: a new row with its own identifier.
+    w.ship(vec![event(org, Some(4))]).await;
+    let rows = w.rows().await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        w.row(first[0].id).await.value,
+        3,
+        "the claimed row is fixed"
+    );
+    let second = rows.iter().find(|r| r.id != first[0].id).unwrap();
+    assert_eq!(second.value, 4);
+    assert_eq!(second.bucket_start, first[0].bucket_start);
+    assert_ne!(second.identifier, first[0].identifier);
+
+    // A failed attempt keeps the row closed too.
+    stripe_outbox::mark_retry(&w.db, &first[0], "HTTP 429", false)
+        .await
+        .unwrap();
+    w.ship(vec![event(org, Some(5))]).await;
+    assert_eq!(w.row(first[0].id).await.value, 3);
+    assert_eq!(w.row(second.id).await.value, 9, "the open row took it");
+
+    w.make_due().await;
+    let report = w.ship_due(&mock).await;
+    assert_eq!(report.sent, 2);
+    let mut values: Vec<_> = mock
+        .requests("POST", METER_EVENTS)
+        .iter()
+        .map(|p| p.field("payload[value]").unwrap().to_owned())
+        .collect();
+    values.sort();
+    assert_eq!(values, ["3", "9"]);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_full_row_closes_and_queueing_never_fails_an_event(pool: PgPool) {
+    let w = world(pool).await;
+    let org = w
+        .org("live", Billing::Subscribed("cus_live", "active"))
+        .await;
+    w.ship(vec![event(org, Some(1))]).await;
+    let row = w.only_row().await;
+    // As full as an open row can be.
+    sqlx::query("UPDATE stripe_meter_outbox SET value = $1")
+        .bind(stripe_outbox::OPEN_ROW_MAX_VALUE)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let max = otto_resource::MAX_METER_QUANTITY;
+    let receipt = w.ship(vec![event(org, Some(max))]).await;
+    assert_eq!(receipt["accepted"], json!(1));
+    let full = stripe_outbox::OPEN_ROW_MAX_VALUE + max as i64;
+    assert_eq!(w.row(row.id).await.value, full);
+    // Past the open limit: the next event opens a new row.
+    let receipt = w.ship(vec![event(org, Some(max))]).await;
+    assert_eq!(receipt["accepted"], json!(1));
+    let rows = w.rows().await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(w.row(row.id).await.value, full);
+    assert!(full <= stripe_outbox::MAX_OUTBOX_VALUE);
+    assert_eq!(w.meter_quantity(org).await, 1 + 2 * max as i64);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_shipped_row_is_sent_once_and_marked_sent(pool: PgPool) {
+    let w = world(pool).await;
+    let mock = MockStripe::start().await;
+    let org = w
+        .org("live", Billing::Subscribed("cus_live", "active"))
+        .await;
+    w.ship(vec![event(org, Some(42))]).await;
+    let queued = w.only_row().await;
+
+    assert_eq!(w.ship_due(&mock).await.claimed, 1);
+    let row = w.row(queued.id).await;
     assert_eq!((row.status.as_str(), row.attempts), ("sent", 1));
     assert_eq!(row.last_error, None);
 
@@ -344,28 +500,35 @@ async fn a_shipped_event_is_sent_once_and_marked_sent(pool: PgPool) {
     assert_eq!(posts.len(), 1);
     let p = &posts[0];
     assert_eq!(p.field("event_name"), Some(EVENT_NAME));
-    assert_eq!(p.field("identifier"), Some(identifier_of(&ev).as_str()));
+    assert_eq!(p.field("identifier"), Some(row.identifier.as_str()));
     assert_eq!(p.field("payload[stripe_customer_id]"), Some("cus_live"));
     assert_eq!(p.field("payload[value]"), Some("42"));
     assert_eq!(
         p.field("timestamp"),
-        Some(row.occurred_at.timestamp().to_string().as_str())
+        Some(row.bucket_start.timestamp().to_string().as_str())
     );
     assert_eq!(
         p.idempotency_key.as_deref(),
-        Some(format!("otto-mev-{}-1", identifier_of(&ev)).as_str())
+        Some(format!("otto-mev-{}-1", row.identifier).as_str())
     );
 
     // Nothing is due any more.
     w.make_due().await;
-    assert_eq!(
-        stripe_shipper::ship_due(&w.db, &mock.client())
-            .await
-            .unwrap()
-            .claimed,
-        0
-    );
+    assert_eq!(w.ship_due(&mock).await.claimed, 0);
     assert_eq!(mock.meter_events().len(), 1);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_row_of_the_current_hour_waits_for_the_hour_to_end(pool: PgPool) {
+    let w = world(pool).await;
+    let mock = MockStripe::start().await;
+    let org = w
+        .org("live", Billing::Subscribed("cus_live", "active"))
+        .await;
+    w.ship(vec![event_at(org, Some(1), Utc::now())]).await;
+    assert_eq!(w.ship_due(&mock).await.claimed, 0);
+    w.make_due().await;
+    assert_eq!(w.ship_due(&mock).await.sent, 1);
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
@@ -375,17 +538,15 @@ async fn a_retry_reuses_the_identifier_and_lands_once(pool: PgPool) {
     let org = w
         .org("live", Billing::Subscribed("cus_live", "active"))
         .await;
-    let ev = event(org, Some(3));
-    let id = identifier_of(&ev);
-    w.ship(vec![ev]).await;
+    w.ship(vec![event(org, Some(3))]).await;
+    let queued = w.only_row().await;
+    let id = queued.identifier.clone();
 
     for status in [500, 429] {
         mock.fail(METER_EVENTS, status);
-        stripe_shipper::ship_due(&w.db, &mock.client())
-            .await
-            .unwrap();
+        w.ship_due(&mock).await;
         mock.clear_failures();
-        let row = w.row(&id).await;
+        let row = w.row(queued.id).await;
         assert_eq!(row.status, "pending", "{status} is retried");
         assert!(
             row.last_error
@@ -394,19 +555,11 @@ async fn a_retry_reuses_the_identifier_and_lands_once(pool: PgPool) {
             "{row:?}"
         );
         // Not due until the backoff has passed.
-        assert_eq!(
-            stripe_shipper::ship_due(&w.db, &mock.client())
-                .await
-                .unwrap()
-                .claimed,
-            0
-        );
+        assert_eq!(w.ship_due(&mock).await.claimed, 0);
         w.make_due().await;
     }
-    stripe_shipper::ship_due(&w.db, &mock.client())
-        .await
-        .unwrap();
-    let row = w.row(&id).await;
+    w.ship_due(&mock).await;
+    let row = w.row(queued.id).await;
     assert_eq!((row.status.as_str(), row.attempts), ("sent", 3));
 
     let posts = mock.requests("POST", METER_EVENTS);
@@ -434,38 +587,38 @@ async fn terminal_failures_are_recorded_and_never_retried(pool: PgPool) {
         .await;
 
     // A 4xx other than 429: rejected.
-    let refused = event(org, Some(1));
-    w.ship(vec![refused.clone()]).await;
+    w.ship(vec![event(org, Some(1))]).await;
+    let refused = w.newest().await;
     mock.fail(METER_EVENTS, 400);
-    stripe_shipper::ship_due(&w.db, &mock.client())
-        .await
-        .unwrap();
+    w.ship_due(&mock).await;
     mock.clear_failures();
-    let row = w.row(&identifier_of(&refused)).await;
+    let row = w.row(refused.id).await;
     assert_eq!((row.status.as_str(), row.attempts), ("rejected", 1));
     assert!(row.last_error.as_deref().is_some_and(|e| e.contains("400")));
 
-    // Older than Stripe accepts: expired without a call.
-    let old = event(org, Some(2));
-    w.ship(vec![old.clone()]).await;
-    sqlx::query(
-        "UPDATE stripe_meter_outbox SET occurred_at = now() - interval '40 days' \
-         WHERE identifier = $1",
-    )
-    .bind(identifier_of(&old))
+    // Older than Stripe accepts: expired without a call. (Moving its hour
+    // also moves it off the open row's key.)
+    w.ship(vec![event(org, Some(2))]).await;
+    let old = w.newest().await;
+    sqlx::query(&format!(
+        "UPDATE stripe_meter_outbox SET bucket_start = {} WHERE id = $1",
+        hours_ago(40 * 24)
+    ))
+    .bind(old.id)
     .execute(&w.pool)
     .await
     .unwrap();
 
     // Failing past its 12 h window: expired, not retried.
-    let late = event(org, Some(3));
-    w.ship(vec![late.clone()]).await;
+    w.ship(vec![event(org, Some(3))]).await;
+    let late = w.newest().await;
+    assert_ne!(late.id, old.id);
     sqlx::query(
         "UPDATE stripe_meter_outbox SET window_started_at = now() - interval '11 hours 59 minutes', \
            attempts = 20 \
-         WHERE identifier = $1",
+         WHERE id = $1",
     )
-    .bind(identifier_of(&late))
+    .bind(late.id)
     .execute(&w.pool)
     .await
     .unwrap();
@@ -473,9 +626,7 @@ async fn terminal_failures_are_recorded_and_never_retried(pool: PgPool) {
     let posts_before = mock.requests("POST", METER_EVENTS).len();
     mock.fail(METER_EVENTS, 503);
     w.make_due().await;
-    stripe_shipper::ship_due(&w.db, &mock.client())
-        .await
-        .unwrap();
+    w.ship_due(&mock).await;
     mock.clear_failures();
     assert_eq!(
         mock.requests("POST", METER_EVENTS).len(),
@@ -483,13 +634,13 @@ async fn terminal_failures_are_recorded_and_never_retried(pool: PgPool) {
         "only the late row was sent; the old one never was"
     );
 
-    let old_row = w.row(&identifier_of(&old)).await;
+    let old_row = w.row(old.id).await;
     assert_eq!((old_row.status.as_str(), old_row.attempts), ("expired", 0));
     assert!(old_row
         .last_error
         .as_deref()
         .is_some_and(|e| e.contains("older than") && !e.contains("may have been delivered")));
-    let late_row = w.row(&identifier_of(&late)).await;
+    let late_row = w.row(late.id).await;
     assert_eq!(late_row.status, "expired");
     assert!(late_row
         .last_error
@@ -500,13 +651,7 @@ async fn terminal_failures_are_recorded_and_never_retried(pool: PgPool) {
 
     // None of them is claimed again, and the lost ones are counted.
     w.make_due().await;
-    assert_eq!(
-        stripe_shipper::ship_due(&w.db, &mock.client())
-            .await
-            .unwrap()
-            .claimed,
-        0
-    );
+    assert_eq!(w.ship_due(&mock).await.claimed, 0);
     let mut out = Vec::new();
     stripe_shipper::write_counts(&w.db, &mut out).await.unwrap();
     let out = String::from_utf8(out).unwrap();
@@ -532,19 +677,16 @@ async fn a_row_whose_window_closed_unsent_expires_without_a_call(pool: PgPool) {
     let org = w
         .org("live", Billing::Subscribed("cus_live", "active"))
         .await;
-    let ev = event(org, Some(1));
-    w.ship(vec![ev.clone()]).await;
+    w.ship(vec![event(org, Some(1))]).await;
     // Claimed 13 h ago by a shipper that never recorded anything: its answer
     // was lost, so the window started then.
     sqlx::query("UPDATE stripe_meter_outbox SET sending_since = now() - interval '13 hours'")
         .execute(&w.pool)
         .await
         .unwrap();
-    stripe_shipper::ship_due(&w.db, &mock.client())
-        .await
-        .unwrap();
+    w.ship_due(&mock).await;
     assert!(mock.requests("POST", METER_EVENTS).is_empty());
-    let row = w.row(&identifier_of(&ev)).await;
+    let row = w.only_row().await;
     assert_eq!(row.status, "expired");
     assert!(row
         .last_error
@@ -553,16 +695,15 @@ async fn a_row_whose_window_closed_unsent_expires_without_a_call(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
-async fn sent_rows_are_swept_after_the_retention_period(pool: PgPool) {
+async fn sent_rows_are_swept_after_the_retention_period_in_batches(pool: PgPool) {
     let w = world(pool).await;
     let mock = MockStripe::start().await;
-    let org = w
-        .org("live", Billing::Subscribed("cus_live", "active"))
+    let a = w.org("acme", Billing::Subscribed("cus_a", "active")).await;
+    let b = w
+        .org("globex", Billing::Subscribed("cus_b", "active"))
         .await;
-    w.ship(vec![event(org, Some(1)), event(org, Some(2))]).await;
-    stripe_shipper::ship_due(&w.db, &mock.client())
-        .await
-        .unwrap();
+    w.ship(vec![event(a, Some(1)), event(b, Some(2))]).await;
+    w.ship_due(&mock).await;
     assert_eq!(stripe_outbox::sweep(&w.db, 35).await.unwrap(), 0);
     sqlx::query(
         "UPDATE stripe_meter_outbox SET finished_at = now() - interval '36 days' \
@@ -572,6 +713,25 @@ async fn sent_rows_are_swept_after_the_retention_period(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(stripe_outbox::sweep(&w.db, 35).await.unwrap(), 1);
+    assert_eq!(w.rows().await.len(), 1);
+
+    // More than one batch of old sent rows: all of them go, the rest stay.
+    let n = stripe_outbox::SWEEP_BATCH + 7;
+    sqlx::query(&format!(
+        "INSERT INTO stripe_meter_outbox \
+           (org_id, event_name, stripe_customer_id, value, bucket_start, status, attempts, \
+            finished_at) \
+         SELECT $1, $2, 'cus_a', 1, {}, 'sent', 1, now() - interval '40 days' \
+         FROM generate_series(1, $3)",
+        hours_ago(24 * 41)
+    ))
+    .bind(a)
+    .bind(EVENT_NAME)
+    .bind(n)
+    .execute(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(stripe_outbox::sweep(&w.db, 35).await.unwrap(), n as u64);
     assert_eq!(w.rows().await.len(), 1);
 }
 
@@ -626,6 +786,54 @@ async fn the_shipper_reaches_every_org_under_row_level_security(pool: PgPool) {
     assert_eq!(orgs, vec![acme.as_uuid()]);
     drop(tx);
 
+    // Ingest under otto_app adds to the open row through the tenant policy.
+    let mut tx = app.begin(acme).await.unwrap();
+    otto_billing::usage::lock_org_ingest(&mut tx).await.unwrap();
+    let mut budgets = otto_billing::budgets::PendingBudgets::default();
+    use otto_billing::usage::UsageExt;
+    tx.ingest_usage_deferred(
+        FLAGS,
+        &otto_billing::usage::ShippedUsage {
+            event_id: Uuid::new_v4(),
+            user: None,
+            tool: "t",
+            billable: true,
+            occurred_at: last_hour(),
+            service: Some("otto-flags"),
+            metered: Some(otto_billing::usage::Metered {
+                meter: EVALS,
+                quantity: 10,
+            }),
+        },
+        &mut budgets,
+    )
+    .await
+    .unwrap();
+    budgets.run(&mut tx).await.unwrap();
+    // Pinned, it reads its own org's pending usage.
+    let before = period::hour_bucket(Utc::now()) + Duration::hours(1);
+    assert!(stripe_outbox::has_pending_before(tx.conn(), acme, before)
+        .await
+        .unwrap());
+    // Asking about another org through this pin is refused, not a false "no".
+    assert!(stripe_outbox::has_pending_before(tx.conn(), globex, before)
+        .await
+        .is_err());
+    tx.commit().await.unwrap();
+    let mut values: Vec<i64> = sqlx::query_scalar("SELECT value FROM stripe_meter_outbox")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    values.sort();
+    assert_eq!(values, [2, 11]);
+
+    // An unpinned transaction that did not opt in is refused too.
+    let mut tx = app.begin_unpinned().await.unwrap();
+    assert!(stripe_outbox::has_pending_before(tx.conn(), acme, before)
+        .await
+        .is_err());
+    drop(tx);
+
     assert_eq!(
         stripe_shipper::ship_due(&app, &mock.client())
             .await
@@ -640,6 +848,13 @@ async fn the_shipper_reaches_every_org_under_row_level_security(pool: PgPool) {
     assert_eq!(statuses, ["sent", "sent"]);
     let summary = stripe_outbox::outbox_summary(&app).await.unwrap();
     assert_eq!(summary.count(OutboxStatus::Sent), 2, "{summary:?}");
+    let (deferred, _) = stripe_outbox::defer_unsynced(&app).await.unwrap();
+    assert_eq!(deferred, 0);
+    sqlx::query("UPDATE stripe_meter_outbox SET finished_at = now() - interval '40 days'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stripe_outbox::sweep(&app, 35).await.unwrap(), 2);
 
     // The delivery role can never create a row for any org.
     let mut tx = app.begin_unpinned().await.unwrap();
@@ -647,11 +862,12 @@ async fn the_shipper_reaches_every_org_under_row_level_security(pool: PgPool) {
         .execute(tx.conn())
         .await
         .unwrap();
-    let insert = sqlx::query(
+    let insert = sqlx::query(&format!(
         "INSERT INTO stripe_meter_outbox \
-           (org_id, identifier, event_name, stripe_customer_id, value, occurred_at) \
-         VALUES ($1, 'x:1', 'x__y', 'cus_a', 1, now())",
-    )
+           (org_id, event_name, stripe_customer_id, value, bucket_start) \
+         VALUES ($1, 'x__y', 'cus_a', 1, {})",
+        hours_ago(1)
+    ))
     .bind(acme)
     .execute(tx.conn())
     .await;
@@ -664,8 +880,8 @@ async fn the_shipper_runs_only_when_billing_is_enabled(pool: PgPool) {
     let org = w
         .org("live", Billing::Subscribed("cus_live", "active"))
         .await;
-    let ev = event(org, Some(5));
-    w.ship(vec![ev.clone()]).await;
+    w.ship(vec![event(org, Some(5))]).await;
+    let queued = w.only_row().await;
 
     let (stop, rx) = tokio::sync::watch::channel(false);
     assert!(
@@ -680,7 +896,7 @@ async fn the_shipper_runs_only_when_billing_is_enabled(pool: PgPool) {
     };
     let task = stripe_shipper::spawn(w.db.clone(), Some(&stripe), rx).expect("billing enabled");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while w.row(&identifier_of(&ev)).await.status != "sent" {
+    while w.row(queued.id).await.status != "sent" {
         assert!(tokio::time::Instant::now() < deadline, "never shipped");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -700,31 +916,30 @@ async fn a_row_waits_until_stripe_knows_its_meter(pool: PgPool) {
     let org = w
         .org("live", Billing::Subscribed("cus_live", "active"))
         .await;
-    let ev = event(org, Some(4));
-    let stale = event(org, Some(5));
-    w.ship(vec![ev.clone(), stale.clone()]).await;
-    sqlx::query(
-        "UPDATE stripe_meter_outbox SET occurred_at = now() - interval '40 days' \
-         WHERE identifier = $1",
-    )
-    .bind(identifier_of(&stale))
+    w.ship(vec![event(org, Some(5))]).await;
+    let stale = w.newest().await;
+    sqlx::query(&format!(
+        "UPDATE stripe_meter_outbox SET bucket_start = {} WHERE id = $1",
+        hours_ago(40 * 24)
+    ))
+    .bind(stale.id)
     .execute(&w.pool)
     .await
     .unwrap();
+    w.ship(vec![event(org, Some(4))]).await;
+    let ev = w.newest().await;
+    assert_ne!(ev.id, stale.id);
 
     // Not synced: nothing is claimed, and its window has not started.
-    let report = stripe_shipper::ship_due(&w.db, &mock.client())
-        .await
-        .unwrap();
+    let report = w.ship_due(&mock).await;
     assert_eq!(report.claimed, 0);
     assert!(mock.requests("POST", METER_EVENTS).is_empty());
-    let waiting: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT window_started_at FROM stripe_meter_outbox WHERE identifier = $1",
-    )
-    .bind(identifier_of(&ev))
-    .fetch_one(&w.pool)
-    .await
-    .unwrap();
+    let waiting: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT window_started_at FROM stripe_meter_outbox WHERE id = $1")
+            .bind(ev.id)
+            .fetch_one(&w.pool)
+            .await
+            .unwrap();
     assert_eq!(waiting, None);
 
     // Waiting rows are pushed back so they do not head the due index...
@@ -732,32 +947,47 @@ async fn a_row_waits_until_stripe_knows_its_meter(pool: PgPool) {
     assert_eq!(deferred, 2);
     assert!(oldest.is_some());
     assert_eq!(stripe_outbox::defer_unsynced(&w.db).await.unwrap().0, 0);
+    // ...stay open to the hour's usage...
+    w.ship(vec![event(org, Some(6))]).await;
+    assert_eq!(w.row(ev.id).await.value, 10);
     // ...and still expire by age.
     let expired = stripe_outbox::expire_stale(&w.db).await.unwrap();
-    assert_eq!(
-        expired
-            .iter()
-            .map(|r| r.identifier.clone())
-            .collect::<Vec<_>>(),
-        [identifier_of(&stale)]
-    );
-    assert_eq!(w.row(&identifier_of(&stale)).await.status, "expired");
+    assert_eq!(expired.iter().map(|r| r.id).collect::<Vec<_>>(), [stale.id]);
+    assert_eq!(w.row(stale.id).await.status, "expired");
 
     // Once sync has made the meter, it ships at its next recheck.
     w.sync_meter().await;
-    assert_eq!(
-        stripe_shipper::ship_due(&w.db, &mock.client())
-            .await
-            .unwrap()
-            .claimed,
-        0
-    );
+    assert_eq!(w.ship_due(&mock).await.claimed, 0);
     w.make_due().await;
-    let report = stripe_shipper::ship_due(&w.db, &mock.client())
-        .await
-        .unwrap();
+    let report = w.ship_due(&mock).await;
     assert_eq!((report.claimed, report.sent), (1, 1));
-    assert_eq!(w.row(&identifier_of(&ev)).await.status, "sent");
+    assert_eq!(w.row(ev.id).await.status, "sent");
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn deferring_unsynced_rows_is_bounded(pool: PgPool) {
+    let w = world(pool).await;
+    w.unsync_meter().await;
+    let org = w
+        .org("live", Billing::Subscribed("cus_live", "active"))
+        .await;
+    let n = stripe_outbox::DEFER_BATCH + 5;
+    sqlx::query(&format!(
+        "INSERT INTO stripe_meter_outbox \
+           (org_id, event_name, stripe_customer_id, value, bucket_start, attempts) \
+         SELECT $1, $2, 'cus_live', 1, {}, 1 FROM generate_series(1, $3)",
+        hours_ago(2)
+    ))
+    .bind(org)
+    .bind(EVENT_NAME)
+    .bind(n)
+    .execute(&w.pool)
+    .await
+    .unwrap();
+    let first = stripe_outbox::defer_unsynced(&w.db).await.unwrap().0;
+    assert_eq!(first, stripe_outbox::DEFER_BATCH);
+    assert_eq!(stripe_outbox::defer_unsynced(&w.db).await.unwrap().0, 5);
+    assert_eq!(stripe_outbox::defer_unsynced(&w.db).await.unwrap().0, 0);
 }
 
 /// An earlier attempt reached Stripe but its answer was lost (here: a send
@@ -771,9 +1001,9 @@ async fn lost_answer_then_duplicate(pool: PgPool, duplicate_is_error: bool) {
     let org = w
         .org("live", Billing::Subscribed("cus_live", "active"))
         .await;
-    let ev = event(org, Some(6));
-    let id = identifier_of(&ev);
-    w.ship(vec![ev]).await;
+    w.ship(vec![event(org, Some(6))]).await;
+    let queued = w.only_row().await;
+    let id = queued.identifier.clone();
 
     mock.delay(METER_EVENTS, std::time::Duration::from_millis(600));
     let report = stripe_shipper::ship_due_with_deadline(
@@ -784,7 +1014,7 @@ async fn lost_answer_then_duplicate(pool: PgPool, duplicate_is_error: bool) {
     .await
     .unwrap();
     assert_eq!((report.claimed, report.sent), (1, 0));
-    let row = w.row(&id).await;
+    let row = w.row(queued.id).await;
     assert_eq!(row.status, "pending");
     assert!(row
         .last_error
@@ -803,10 +1033,8 @@ async fn lost_answer_then_duplicate(pool: PgPool, duplicate_is_error: bool) {
     assert_eq!(mock.meter_events().len(), 1);
 
     w.make_due().await;
-    stripe_shipper::ship_due(&w.db, &mock.client())
-        .await
-        .unwrap();
-    let row = w.row(&id).await;
+    w.ship_due(&mock).await;
+    let row = w.row(queued.id).await;
     assert_eq!((row.status.as_str(), row.attempts), ("sent", 2));
     let keys: Vec<_> = mock
         .requests("POST", METER_EVENTS)
@@ -840,32 +1068,26 @@ async fn refusals_before_processing_do_not_start_the_retry_window(pool: PgPool) 
     let org = w
         .org("live", Billing::Subscribed("cus_live", "active"))
         .await;
-    let ev = event(org, Some(8));
-    let id = identifier_of(&ev);
-    w.ship(vec![ev]).await;
-    // Simulated clock: the event happened 13 h ago, and the key has been
-    // refused long enough for hour-long backoffs.
-    sqlx::query(
-        "UPDATE stripe_meter_outbox SET occurred_at = now() - interval '13 hours', \
-           attempts = 20",
-    )
+    w.ship(vec![event(org, Some(8))]).await;
+    let queued = w.only_row().await;
+    // Simulated clock: the usage is 13 h old, and the key has been refused
+    // long enough for hour-long backoffs.
+    sqlx::query(&format!(
+        "UPDATE stripe_meter_outbox SET bucket_start = {}, attempts = 20",
+        hours_ago(13)
+    ))
     .execute(&w.pool)
     .await
     .unwrap();
 
     for status in [401, 403, 429, 401, 401] {
         mock.fail(METER_EVENTS, status);
-        let report = stripe_shipper::ship_due(&w.db, &mock.client())
-            .await
-            .unwrap();
+        let report = w.ship_due(&mock).await;
         mock.clear_failures();
         assert_eq!(report.sent, 0);
         assert_eq!(report.claimed, 1, "{status}");
         // As if the backoff had passed, and the 13 h with it.
-        sqlx::query("UPDATE stripe_meter_outbox SET next_attempt_at = now()")
-            .execute(&w.pool)
-            .await
-            .unwrap();
+        w.make_due().await;
         let (status_now, window): (String, Option<DateTime<Utc>>) =
             sqlx::query_as("SELECT status, window_started_at FROM stripe_meter_outbox")
                 .fetch_one(&w.pool)
@@ -876,10 +1098,8 @@ async fn refusals_before_processing_do_not_start_the_retry_window(pool: PgPool) 
     }
 
     // The key is fixed: it ships.
-    stripe_shipper::ship_due(&w.db, &mock.client())
-        .await
-        .unwrap();
-    assert_eq!(w.row(&id).await.status, "sent");
+    w.ship_due(&mock).await;
+    assert_eq!(w.row(queued.id).await.status, "sent");
     assert_eq!(mock.meter_events().len(), 1);
 }
 
@@ -887,24 +1107,15 @@ async fn refusals_before_processing_do_not_start_the_retry_window(pool: PgPool) 
 async fn one_customer_and_meter_is_sent_one_at_a_time(pool: PgPool) {
     let w = world(pool).await;
     let mock = MockStripe::start().await;
-    let a = w.org("acme", Billing::Subscribed("cus_a", "active")).await;
-    let b = w
-        .org("globex", Billing::Subscribed("cus_b", "active"))
-        .await;
-    let c = w
-        .org("initech", Billing::Subscribed("cus_c", "active"))
-        .await;
-    let mut events = Vec::new();
-    for org in [a, b, c] {
-        for q in 1..=3 {
-            events.push(event(org, Some(q)));
+    for (slug, customer) in [("acme", "cus_a"), ("globex", "cus_b"), ("initech", "cus_c")] {
+        let org = w.org(slug, Billing::Subscribed(customer, "active")).await;
+        // Three closed hours each.
+        for hours in 2..=4 {
+            w.insert_row(org, customer, 1, hours).await;
         }
     }
-    w.ship(events).await;
     mock.delay(METER_EVENTS, std::time::Duration::from_millis(80));
-    let report = stripe_shipper::ship_due(&w.db, &mock.client())
-        .await
-        .unwrap();
+    let report = w.ship_due(&mock).await;
     assert_eq!((report.claimed, report.sent), (9, 9));
     let (per_customer, total) = mock.max_meter_events_in_flight();
     assert_eq!(
@@ -922,10 +1133,9 @@ async fn a_pass_without_progress_does_not_start_the_next_at_once(pool: PgPool) {
         .org("live", Billing::Subscribed("cus_live", "active"))
         .await;
     // More than a batch, every send failing.
-    let events: Vec<_> = (0..stripe_shipper::BATCH + 4)
-        .map(|_| event(org, Some(1)))
-        .collect();
-    w.ship(events).await;
+    for hours in 2..(2 + stripe_shipper::BATCH as u32 + 4) {
+        w.insert_row(org, "cus_live", 1, hours).await;
+    }
     mock.fail(METER_EVENTS, 500);
 
     let (stop, rx) = tokio::sync::watch::channel(false);
@@ -956,15 +1166,14 @@ async fn a_pass_without_progress_does_not_start_the_next_at_once(pool: PgPool) {
 }
 
 /// A shipper whose lease lapsed and was claimed again cannot record over the
-/// new claim: its writes are fenced by the claim's `sending_since`.
+/// new claim: all its writes are fenced by the claim's `sending_since`.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn a_stale_shipper_cannot_record_over_a_newer_claim(pool: PgPool) {
     let w = world(pool).await;
     let org = w
         .org("live", Billing::Subscribed("cus_live", "active"))
         .await;
-    let ev = event(org, Some(2));
-    w.ship(vec![ev]).await;
+    w.ship(vec![event(org, Some(2))]).await;
 
     let first = stripe_outbox::claim_due(&w.db, 10).await.unwrap().remove(0);
     // Its lease lapses; another shipper claims the row.
@@ -985,7 +1194,8 @@ async fn a_stale_shipper_cannot_record_over_a_newer_claim(pool: PgPool) {
         .await
         .unwrap()
     };
-    // The stale shipper's definite failure, and a terminal: no effect.
+    // The stale shipper's definite failure, a terminal, and a success: no
+    // effect.
     assert_eq!(
         stripe_outbox::mark_retry(&w.db, &first, "HTTP 401", false)
             .await
@@ -997,6 +1207,7 @@ async fn a_stale_shipper_cannot_record_over_a_newer_claim(pool: PgPool) {
             .await
             .unwrap()
     );
+    assert!(!stripe_outbox::mark_sent(&w.db, &first).await.unwrap());
     assert_eq!(
         state().await,
         ("pending".to_owned(), 0, Some(second.claimed_at)),
@@ -1011,4 +1222,190 @@ async fn a_stale_shipper_cannot_record_over_a_newer_claim(pool: PgPool) {
         Some(OutboxStatus::Pending)
     );
     assert_eq!(state().await, ("pending".to_owned(), 1, None));
+    w.make_due().await;
+    let third = stripe_outbox::claim_due(&w.db, 10).await.unwrap().remove(0);
+    assert!(stripe_outbox::mark_sent(&w.db, &third).await.unwrap());
+    assert_eq!(state().await, ("sent".to_owned(), 2, None));
+}
+
+/// Pending usage before an instant holds an invoice; sent and lost rows do
+/// not.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn pending_usage_before_an_instant_is_reported(pool: PgPool) {
+    let w = world(pool).await;
+    let mock = MockStripe::start().await;
+    let org = w
+        .org("live", Billing::Subscribed("cus_live", "active"))
+        .await;
+    let other = w.org("other", Billing::Subscribed("cus_o", "active")).await;
+    let pending = |before: DateTime<Utc>| {
+        let db = w.db.clone();
+        async move {
+            let mut tx = db.begin(org).await.unwrap();
+            stripe_outbox::has_pending_before(tx.conn(), org, before)
+                .await
+                .unwrap()
+        }
+    };
+    let hour = period::hour_bucket(last_hour());
+    assert!(!pending(hour + Duration::hours(1)).await, "nothing queued");
+
+    w.ship(vec![event(org, Some(1)), event(other, Some(1))])
+        .await;
+    assert!(pending(hour + Duration::hours(1)).await);
+    // An opted-in unpinned transaction may ask too.
+    let mut tx = w.db.begin_unpinned().await.unwrap();
+    sqlx::query("SELECT set_config('app.stripe_meter_delivery', 'on', true)")
+        .execute(tx.conn())
+        .await
+        .unwrap();
+    assert!(
+        stripe_outbox::has_pending_before(tx.conn(), other, hour + Duration::hours(1))
+            .await
+            .unwrap()
+    );
+    drop(tx);
+    assert!(
+        !pending(hour).await,
+        "the row's hour starts at, not before, `hour`"
+    );
+
+    // Claimed but unsent still holds.
+    let claimed = stripe_outbox::claim_due(&w.db, 10).await.unwrap();
+    assert_eq!(claimed.len(), 2);
+    assert!(pending(hour + Duration::hours(1)).await);
+    for row in &claimed {
+        let sent = row.org_id == org.as_uuid();
+        if sent {
+            stripe_outbox::mark_sent(&w.db, row).await.unwrap();
+        } else {
+            stripe_outbox::mark_retry(&w.db, row, "HTTP 500", true)
+                .await
+                .unwrap();
+        }
+    }
+    assert!(
+        !pending(hour + Duration::hours(1)).await,
+        "sent; the other org's pending row is not this org's"
+    );
+
+    // A lost row does not hold an invoice either.
+    w.ship(vec![event(org, Some(1))]).await;
+    mock.fail(METER_EVENTS, 400);
+    w.make_due().await;
+    w.ship_due(&mock).await;
+    assert!(!pending(hour + Duration::hours(1)).await);
+    let lost: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM stripe_meter_outbox WHERE org_id = $1 AND status = 'rejected'",
+    )
+    .bind(org)
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(lost, 1);
+}
+
+/// Usage counted before an org's subscription went live is queued once,
+/// however often the backfill runs, and never on top of what ingest queued.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_backfill_queues_unqueued_usage_once(pool: PgPool) {
+    let w = world(pool).await;
+    let org = w.org("acme", Billing::CustomerOnly("cus_a")).await;
+    let now = Utc::now();
+    let month = Month::of(now);
+    // Counted for the current month, but no live subscription: not queued.
+    let at = |minutes| now - Duration::minutes(minutes);
+    w.ship(vec![
+        event_at(org, Some(5), at(1)),
+        event_at(org, Some(7), at(2)),
+    ])
+    .await;
+    assert!(w.rows().await.is_empty());
+
+    let backfill = |month: Month| {
+        let db = w.db.clone();
+        async move {
+            let mut tx = db.begin(org).await.unwrap();
+            let r = stripe_outbox::backfill_period(&mut tx, month).await;
+            tx.commit().await.unwrap();
+            r
+        }
+    };
+    // Still no live subscription: nothing to bill.
+    assert_eq!(backfill(month).await.unwrap(), 0);
+
+    w.bill(org, "acme", Billing::Subscribed("cus_a", "active"))
+        .await;
+    assert_eq!(backfill(month).await.unwrap(), 12);
+    let row = w.only_row().await;
+    assert_eq!((row.value, row.stripe_customer_id.as_str()), (12, "cus_a"));
+    assert_eq!(row.bucket_start, period::hour_bucket(Utc::now()));
+    assert_eq!(Month::of(row.bucket_start), month);
+    // Idempotent.
+    assert_eq!(backfill(month).await.unwrap(), 0);
+
+    // Ingest after the subscription queues its own events, and a later
+    // backfill adds nothing on top.
+    w.ship(vec![event_at(org, Some(3), Utc::now())]).await;
+    let total: i64 = w.rows().await.iter().map(|r| r.value).sum();
+    assert_eq!(total, 15);
+    assert_eq!(w.meter_quantity(org).await, 15);
+    assert_eq!(backfill(month).await.unwrap(), 0);
+
+    // Rows already sent (or lost) count as queued.
+    sqlx::query(
+        "UPDATE stripe_meter_outbox SET status = 'sent', finished_at = now(), attempts = 1",
+    )
+    .execute(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(backfill(month).await.unwrap(), 0);
+
+    // A month that has not started is refused; a closed one too.
+    let next = month.offset(1).unwrap();
+    assert!(backfill(next).await.is_err());
+    assert!(backfill(month.offset(-3).unwrap()).await.is_err());
+    let previous = month.offset(-1).unwrap();
+    assert_eq!(
+        backfill(previous).await.is_err(),
+        period::period_closed(previous, Utc::now()),
+        "the previous month only during its grace"
+    );
+}
+
+/// A late event is still accepted, and billed (counters, budget period and
+/// outbox alike) in the period it arrived in, once its own has closed.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_late_event_is_billed_in_the_current_period(pool: PgPool) {
+    let w = world(pool).await;
+    let org = w
+        .org("live", Billing::Subscribed("cus_live", "active"))
+        .await;
+    let now = Utc::now();
+    let current = Month::of(now);
+    let previous = current.offset(-1).unwrap();
+    let late_at = period::starts_at(current) - Duration::minutes(30);
+    let receipt = w.ship(vec![event_at(org, Some(9), late_at)]).await;
+    assert_eq!(receipt["accepted"], json!(1), "a late event is accepted");
+
+    let periods: Vec<chrono::NaiveDate> =
+        sqlx::query_scalar("SELECT period_start FROM org_meter_period_usage WHERE org_id = $1")
+            .bind(org)
+            .fetch_all(&w.pool)
+            .await
+            .unwrap();
+    let row = w.only_row().await;
+    if period::period_closed(previous, Utc::now()) {
+        assert_eq!(
+            periods,
+            [current.first_day()],
+            "counted in the current period"
+        );
+        assert_eq!(Month::of(row.bucket_start), current);
+        assert!(row.bucket_start >= period::hour_bucket(now));
+    } else {
+        // Inside the grace (the first two hours of a month): still on time.
+        assert_eq!(periods, [previous.first_day()]);
+        assert_eq!(row.bucket_start, period::hour_bucket(late_at));
+    }
 }

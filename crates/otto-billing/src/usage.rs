@@ -19,8 +19,9 @@
 //!
 //! A shipped event may name one of the shipping service's declared meters
 //! (`meters`, see [`crate::meters`]) and a quantity. [`check_metering`] decides,
-//! without a query, whether the event is acceptable; [`UsageExt::ingest_usage`]
-//! then counts it in three places, all in the ingest transaction:
+//! without a query, whether the event is acceptable;
+//! [`UsageExt::ingest_usage_deferred`] then counts it in three places, all in
+//! the ingest transaction:
 //!
 //! - `org_period_usage`, the legacy family-wide bucket, exactly as before
 //!   (its `billable` flag included), for the console usage page;
@@ -41,10 +42,34 @@
 //! emails any budget threshold the service has newly reached. It never
 //! rejects or fails an event.
 //!
-//! A metered event of an org with a live Stripe subscription is also queued
-//! for Stripe (`stripe_meter_outbox`, see [`crate::stripe_outbox`]) by the
+//! A metered event of an org with a live Stripe subscription is also added
+//! to the org's open Stripe meter outbox row for its meter and hour
+//! (`stripe_meter_outbox`, aggregated, see [`crate::stripe_outbox`]) by the
 //! same statement that counts it, at no extra round trip. An org without one
 //! is not billed through Stripe, and queues nothing.
+//!
+//! # Which period an event is billed in
+//!
+//! An event is billed at the instant it happened (`occurred_at`, never later
+//! than its arrival), so an event that sat in a resource server's outbox
+//! across midnight on the 1st still counts in the month it was earned in,
+//! **until that month's period closes**: [`PERIOD_CLOSE_GRACE`](crate::period::PERIOD_CLOSE_GRACE) (2 hours)
+//! into the next month ([`crate::period`]). An event that arrives after its
+//! month has closed is **late**: it is still accepted and counted, but billed
+//! at the moment it arrives ([`crate::period::billed_at`]), in the current
+//! period, for its counters, its budget and its Stripe meter event alike. So
+//! the platform and Stripe always agree on the period of every event, and a
+//! period's invoice, once its period has closed, never grows. The ingest
+//! receipt does not distinguish a late event: it is `accepted` like any other.
+//! The ledger (`usage_events.created_at`) records the billed instant.
+//!
+//! # Concurrency
+//!
+//! One batch of one org runs in one transaction, which takes the org's
+//! ingest lock first ([`lock_org_ingest`]), so two batches of one org never
+//! interleave: whatever order their events touch counter rows in, they cannot
+//! deadlock. Within a statement the counter rows are taken in a fixed order
+//! (see `ingest_usage_deferred`).
 //!
 //! Meter declarations are add-only ([`crate::meters`] never removes one), so
 //! an event accepted once stays acceptable: a replay of it reaches the ledger
@@ -66,7 +91,7 @@ use uuid::Uuid;
 
 use crate::billing::LIVE_STATUSES;
 use crate::budgets::PendingBudgets;
-use crate::pricebook::Month;
+use crate::period::{self, Month};
 use crate::stripe_outbox;
 
 /// The first day of the current UTC billing month, as SQL.
@@ -340,7 +365,33 @@ pub fn earliest_occurred_at(now: DateTime<Utc>) -> DateTime<Utc> {
     prev.and_time(NaiveTime::MIN).and_utc()
 }
 
-/// What [`UsageExt::ingest_usage`] did with an event.
+/// The first key of the transaction-scoped advisory lock
+/// [`lock_org_ingest`] takes (`pg_advisory_xact_lock(INGEST_LOCK_NAMESPACE,
+/// hashtext(org_id::text))`). The two-key form lives in its own key space,
+/// apart from the one-`bigint` advisory locks elsewhere (the auth rate
+/// limiter's, sqlx's migration lock); any other two-key advisory lock must
+/// use a different first key.
+pub const INGEST_LOCK_NAMESPACE: i32 = 0x0055_1001;
+
+/// Take the org's ingest lock for the rest of `tx`, waiting for any other
+/// transaction that holds it (another ingest batch of the org, or
+/// [`crate::stripe_outbox::backfill_period`]) to end.
+///
+/// Call it first, right after `begin`: it serializes whole batches of one
+/// org, so their counter row locks cannot deadlock whatever order the events
+/// arrive in, and so a backfill sees no batch half-way. Two orgs whose ids
+/// hash alike only wait for each other, which is harmless.
+pub async fn lock_org_ingest(tx: &mut Tx<'_>) -> std::result::Result<(), sqlx::Error> {
+    let org = tx.org();
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::uuid::text))")
+        .bind(INGEST_LOCK_NAMESPACE)
+        .bind(org)
+        .execute(tx.conn())
+        .await?;
+    Ok(())
+}
+
+/// What [`UsageExt::ingest_usage_deferred`] did with an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestOutcome {
     /// New: recorded and counted.
@@ -363,23 +414,29 @@ pub trait UsageExt {
     ) -> impl std::future::Future<Output = Result<PeriodUsage>> + Send;
 
     /// Record a usage event shipped from a resource server's outbox,
-    /// idempotently, and run its budget step at once. See [`IngestOutcome`].
-    /// A batch should use [`ingest_usage_deferred`](Self::ingest_usage_deferred)
-    /// instead, which runs the budget step once per service and period.
-    fn ingest_usage(
-        &mut self,
-        resource_uri: &str,
-        event: &ShippedUsage<'_>,
-    ) -> impl std::future::Future<Output = Result<IngestOutcome>> + Send;
-
-    /// [`ingest_usage`](Self::ingest_usage), with the budget step noted in
-    /// `budgets` rather than run: call [`PendingBudgets::run`] on this
-    /// transaction once the batch's events are counted, before committing.
+    /// idempotently (see [`IngestOutcome`]), with its budget step noted in
+    /// `budgets`: call [`PendingBudgets::run`] on this transaction once the
+    /// batch's events are counted, before committing. Take
+    /// [`lock_org_ingest`] first, and feed a batch's events in billed order
+    /// (period, then `occurred_at`).
     fn ingest_usage_deferred(
         &mut self,
         resource_uri: &str,
         event: &ShippedUsage<'_>,
         budgets: &mut PendingBudgets,
+    ) -> impl std::future::Future<Output = Result<IngestOutcome>> + Send;
+
+    /// [`ingest_usage_deferred`](Self::ingest_usage_deferred) as if the
+    /// platform's clock read `now`, which decides the accepted window and
+    /// whether the event's period has closed. For tests of period boundaries
+    /// only; production ingest uses the real clock.
+    #[doc(hidden)]
+    fn ingest_usage_deferred_at(
+        &mut self,
+        resource_uri: &str,
+        event: &ShippedUsage<'_>,
+        budgets: &mut PendingBudgets,
+        now: DateTime<Utc>,
     ) -> impl std::future::Future<Output = Result<IngestOutcome>> + Send;
 
     fn current_usage(&mut self) -> impl std::future::Future<Output = Result<PeriodUsage>> + Send;
@@ -445,27 +502,24 @@ impl UsageExt for Tx<'_> {
     /// lands with it, or says `duplicate` and nothing happens. It resolves in
     /// the database rather than in a read-then-write because two concurrent
     /// shippers of the same batch must not race.
-    async fn ingest_usage(
-        &mut self,
-        resource_uri: &str,
-        event: &ShippedUsage<'_>,
-    ) -> Result<IngestOutcome> {
-        let mut budgets = PendingBudgets::default();
-        let outcome = self
-            .ingest_usage_deferred(resource_uri, event, &mut budgets)
-            .await?;
-        budgets.run(self).await?;
-        Ok(outcome)
-    }
-
     async fn ingest_usage_deferred(
         &mut self,
         resource_uri: &str,
         event: &ShippedUsage<'_>,
         budgets: &mut PendingBudgets,
     ) -> Result<IngestOutcome> {
+        self.ingest_usage_deferred_at(resource_uri, event, budgets, Utc::now())
+            .await
+    }
+
+    async fn ingest_usage_deferred_at(
+        &mut self,
+        resource_uri: &str,
+        event: &ShippedUsage<'_>,
+        budgets: &mut PendingBudgets,
+        now: DateTime<Utc>,
+    ) -> Result<IngestOutcome> {
         let org = self.org();
-        let now = Utc::now();
         // Checked before the claim so a rejected event leaves no trace and can
         // be corrected and resent under the same id.
         if event.occurred_at < earliest_occurred_at(now) {
@@ -500,51 +554,64 @@ impl UsageExt for Tx<'_> {
         // since the event was written leaves it NULL instead of failing the
         // foreign key (the same trade `record_usage` documents).
         //
-        // LOCK ORDER. The three counter upserts each lock one row, and every
-        // ingest takes them in the same order so two concurrent ingests can
-        // never deadlock: the legacy `org_period_usage` row first, then the
-        // service's `org_service_period_usage` row, then the meter's
-        // `org_meter_period_usage` row. Data-modifying CTEs run in no
-        // guaranteed order on their own, so the order is forced by data
-        // dependencies: `service` selects from `legacy`'s RETURNING, and
-        // `meter` cannot produce its row until it has read both `legacy` and
-        // the completed `service`. Whoever retires the legacy bucket must keep
-        // `service` ahead of `meter` the same way (have `meter` read
-        // `service`), not just delete the `legacy` CTE.
+        // LOCK ORDER, within this statement. The three counter upserts and
+        // the outbox upsert each lock one row, always in the same order: the
+        // legacy `org_period_usage` row first, then the service's
+        // `org_service_period_usage` row, then the meter's
+        // `org_meter_period_usage` row, then the open `stripe_meter_outbox`
+        // row. Data-modifying CTEs run in no guaranteed order on their own, so
+        // the order is forced by data dependencies: `service` selects from
+        // `legacy`'s RETURNING, `meter` cannot produce its row until it has
+        // read both `legacy` and the completed `service`, and `stripe` waits
+        // for the completed `meter`. Whoever retires the legacy bucket must
+        // keep that chain (have `meter` read `service`), not just delete the
+        // `legacy` CTE.
+        //
+        // This alone does NOT stop two transactions from deadlocking: the
+        // rows are per period (and per service and meter), so two batches
+        // holding events of different periods or meters lock different rows
+        // in whatever order their events come. What prevents that is the
+        // org's ingest lock ([`lock_org_ingest`]), which serializes batches
+        // of one org; the caller also feeds events in billed order. A caller
+        // that skips the lock (a single event in its own transaction) only
+        // ever waits on another's rows, which is safe for one statement.
         //
         // `service` and `meter` insert nothing when $9 / $7 is NULL: an event
         // from a server with no slug counts only in the legacy bucket, and an
         // unmetered one adds to no meter. A metered event's quantity counts
         // whatever `billable` says (module docs).
         //
-        // `stripe` queues the event for Stripe (`stripe_meter_outbox`) when it
+        // `stripe` adds the event to the org's open Stripe meter outbox row
+        // for its event name, customer and hour ($11), or opens one, when it
         // is metered ($10 is its Stripe event name, NULL otherwise) and the
         // org has a live subscription: a customer, and a subscription whose
         // status is one of $12, as `billing::live_subscription` reads it. An
         // org with none inserts nothing, and the read costs no round trip.
         // It cannot fail the event: the values satisfy the table's checks by
-        // construction (`stripe_outbox::enqueue_fields`), the row is new (the
-        // claim above just said so; a replayed identifier does nothing), it
-        // reads `subscriptions` without locking it, and it locks no row any
-        // other ingest takes, so the lock order above is unchanged. The
-        // timestamp is the event's, as counted ($5).
+        // construction (`stripe_outbox::enqueue_event_name`, an hour bucket,
+        // a quantity far below `stripe_outbox::MAX_ADDITION` added to a row
+        // at most `OPEN_ROW_MAX_VALUE`), and it reads `subscriptions` without
+        // locking it. The event is new (the claim above just said so), so it
+        // is added exactly once. A new row is first due when its hour ends.
         //
         // The final SELECT reads the service's budget for a metered event
         // (no row otherwise, or with no budget), and the highest threshold
         // already fired for the event's period, so the budget step costs
         // nothing for the common case and nothing once 100% has fired. It
         // reads, it does not lock.
-        let at = event.occurred_at.min(now);
+        // The instant it is billed at: when it happened, or now for an event
+        // of a closed period (module docs).
+        let at = period::billed_at(event.occurred_at, now);
+        let bucket = period::hour_bucket(at);
         let (meter, quantity) = match event.metered {
             Some(m) => (Some(m.meter), Some(m.quantity)),
             None => (None, None),
         };
-        // An event already too old for Stripe is not queued (see
+        // An hour already too old for Stripe is not queued (see
         // `stripe_outbox`): it would only expire.
-        let (event_name, identifier) =
-            stripe_outbox::enqueue_fields(event.service, event.metered, event.event_id, at, now)
-                .unzip();
-        let budget: Option<crate::budgets::IngestBudget> = sqlx::query_as(
+        let event_name =
+            stripe_outbox::enqueue_event_name(event.service, event.metered, bucket, now);
+        let budget: Option<crate::budgets::IngestBudget> = sqlx::query_as(&format!(
             "WITH event AS ( \
                INSERT INTO usage_events \
                  (org_id, user_id, tool, billable, created_at, resource_uri, meter, quantity) \
@@ -579,16 +646,19 @@ impl UsageExt for Tx<'_> {
                ON CONFLICT (org_id, meter, period_start) DO UPDATE \
                  SET quantity = org_meter_period_usage.quantity + EXCLUDED.quantity, \
                      updated_at = now() \
+               RETURNING 1 \
              ), stripe AS ( \
                INSERT INTO stripe_meter_outbox \
-                 (org_id, identifier, event_name, stripe_customer_id, value, occurred_at) \
-               SELECT $1, $11::text, $10::text, s.stripe_customer_id, $8::bigint, $5 \
-               FROM subscriptions s \
+                 (org_id, event_name, stripe_customer_id, value, bucket_start, \
+                  next_attempt_at) \
+               SELECT $1, $10::text, s.stripe_customer_id, $8::bigint, $11::timestamptz, \
+                      $11::timestamptz + interval '1 hour' \
+               FROM subscriptions s CROSS JOIN (SELECT count(*) FROM meter) AS meter_done \
                WHERE $10::text IS NOT NULL AND s.org_id = $1 \
                  AND s.stripe_customer_id IS NOT NULL \
                  AND s.stripe_subscription_id IS NOT NULL \
                  AND s.status = ANY($12::text[]) \
-               ON CONFLICT (identifier) DO NOTHING \
+               {add_to_open_row} \
              ) \
              SELECT b.monthly_budget_cents, b.hard_stop, \
                     (SELECT max(a.threshold) FROM budget_alerts a \
@@ -598,7 +668,8 @@ impl UsageExt for Tx<'_> {
                       AS max_fired \
              FROM service_budgets b \
              WHERE $7::text IS NOT NULL AND b.org_id = $1 AND b.service = $9::text",
-        )
+            add_to_open_row = stripe_outbox::add_to_open_row(),
+        ))
         .bind(org)
         .bind(event.user)
         .bind(event.tool)
@@ -609,7 +680,7 @@ impl UsageExt for Tx<'_> {
         .bind(quantity)
         .bind(event.service)
         .bind(event_name)
-        .bind(identifier)
+        .bind(bucket)
         .bind(&LIVE_STATUSES[..])
         .fetch_optional(self.conn())
         .await?;

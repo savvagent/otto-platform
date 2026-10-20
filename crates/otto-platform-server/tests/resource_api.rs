@@ -1256,13 +1256,27 @@ fn usage_status_blocking_rules() {
         service: None,
         meters: Vec::new(),
         budget: None,
+        blocked_reason: None,
     };
     assert!(!s.is_blocked());
     assert!(!s.budget_exceeded(), "no budget never blocks");
+    assert!(!s.billable_blocked());
     s.billable_count = 500;
     assert!(s.is_blocked());
+    assert!(
+        !s.billable_blocked(),
+        "the legacy bucket is not a reason to refuse"
+    );
     s.hard_stop = false;
     assert!(!s.is_blocked() && s.over_limit());
+    s.blocked_reason = Some(otto_resource::PAYMENT_REQUIRED.into());
+    assert!(s.billable_blocked() && !s.budget_exceeded());
+    // Absent from the wire when unset, for older clients.
+    s.blocked_reason = None;
+    assert!(serde_json::to_value(&s)
+        .unwrap()
+        .get("blocked_reason")
+        .is_none());
 }
 
 #[test]
@@ -1426,14 +1440,17 @@ async fn usage_outside_the_accepted_window_is_rejected_not_counted(pool: PgPool)
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
-async fn a_late_event_is_counted_in_the_month_it_happened(pool: PgPool) {
+async fn a_late_event_is_accepted_and_counted_in_an_open_month(pool: PgPool) {
+    use otto_billing::period::{self, Month};
+
     let w = world(pool).await;
     let when = otto_billing::usage::earliest_occurred_at(Utc::now()) + chrono::Duration::hours(1);
     let mut ev = usage_event(w.org, None, Uuid::new_v4(), true);
     ev["occurred_at"] = json!(when);
     assert_eq!(
         post_usage(&w.db, &w.factory_basic(), vec![ev]).await.1["accepted"],
-        1
+        1,
+        "a late event is accepted whatever its month"
     );
 
     let periods: Vec<(chrono::NaiveDate, i64)> =
@@ -1441,7 +1458,15 @@ async fn a_late_event_is_counted_in_the_month_it_happened(pool: PgPool) {
             .fetch_all(w.db.pool())
             .await
             .unwrap();
-    assert_eq!(periods, [(when.date_naive().with_day_one(), 1)]);
+    // The month it happened in, while that month is open (the first two
+    // hours of the next); after that, the month it arrived in.
+    let now = Utc::now();
+    let expected = if period::period_closed(Month::of(when), now) {
+        now.date_naive().with_day_one()
+    } else {
+        when.date_naive().with_day_one()
+    };
+    assert_eq!(periods, [(expected, 1)]);
 }
 
 trait WithDayOne {

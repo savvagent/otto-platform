@@ -8,10 +8,13 @@
 //! identity data of its own. [`plans`], [`meters`] and [`pricebook`] are global
 //! reference data that `otto_app` reads and never writes: the
 //! public catalog of tiers, what each service bills by, and what it costs.
+//! [`period`] says when a billing month closes, for metering and invoicing
+//! alike.
 
 pub mod billing;
 pub mod budgets;
 pub mod meters;
+pub mod period;
 pub mod plans;
 pub mod pricebook;
 pub mod stripe;

@@ -207,6 +207,21 @@ impl World {
         tx.commit().await.unwrap();
     }
 
+    /// Give the org a live Stripe subscription, as setup and the webhooks
+    /// leave it.
+    async fn subscribe(&self) {
+        sqlx::query(
+            "INSERT INTO subscriptions (org_id, stripe_customer_id, stripe_subscription_id, status) \
+             VALUES ($1, 'cus_acme', 'sub_acme', 'active') \
+             ON CONFLICT (org_id) DO UPDATE SET stripe_customer_id = 'cus_acme', \
+               stripe_subscription_id = 'sub_acme', status = 'active'",
+        )
+        .bind(self.org)
+        .execute(self.db.pool())
+        .await
+        .unwrap();
+    }
+
     async fn add(&self, email: &str, role: Role) -> UserId {
         let user = self.db.upsert_user(email, None).await.unwrap();
         self.db.add_member(self.org, user.id, role).await.unwrap();
@@ -243,6 +258,10 @@ fn the_wire_and_the_platform_agree_on_the_reason() {
     assert_eq!(
         otto_resource::BUDGET_EXCEEDED,
         otto_billing::budgets::BUDGET_EXCEEDED
+    );
+    assert_eq!(
+        otto_resource::PAYMENT_REQUIRED,
+        otto_billing::budgets::PAYMENT_REQUIRED
     );
 }
 
@@ -434,16 +453,19 @@ async fn a_hard_stop_on_one_service_leaves_another_unblocked(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
-async fn with_no_budget_nothing_is_ever_blocked(pool: PgPool) {
+async fn with_no_budget_and_a_subscription_nothing_is_ever_blocked(pool: PgPool) {
     let w = world(pool).await;
+    w.subscribe().await;
     w.evals(1_000_000_000).await;
     w.evals(1_000_000_000).await;
 
     for auth in [&w.flags, &w.factory] {
         let status = w.status(auth).await;
         assert!(status.get("budget").is_none(), "{status}");
+        assert!(status.get("blocked_reason").is_none(), "{status}");
         let parsed: otto_resource::UsageStatus = serde_json::from_value(status).unwrap();
         assert!(!parsed.budget_exceeded());
+        assert!(!parsed.billable_blocked());
     }
     assert!(w.alerts().await.is_empty());
     assert!(w.emails().await.is_empty());
@@ -477,13 +499,16 @@ async fn unmetered_events_never_move_spend(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
-async fn a_late_event_is_rated_and_alerted_in_its_own_month(pool: PgPool) {
+async fn a_late_event_is_rated_and_alerted_in_the_period_it_is_billed_in(pool: PgPool) {
+    use otto_billing::period::{self, Month};
+
     let w = world(pool).await;
     // Last month evaluations cost ten cents each.
     price(&w.db, EVALS, -1, &[(None, 10 * CENT)]).await;
     w.set_budget("otto-flags", 1_000, false).await;
 
-    let last_month = otto_billing::usage::earliest_occurred_at(Utc::now());
+    let now = Utc::now();
+    let last_month = otto_billing::usage::earliest_occurred_at(now);
     let mut late = event(w.org, Some(EVALS), Some(85));
     late["occurred_at"] = json!(last_month + chrono::Duration::hours(1));
     w.ship(&w.flags, vec![late]).await;
@@ -493,15 +518,276 @@ async fn a_late_event_is_rated_and_alerted_in_its_own_month(pool: PgPool) {
             .fetch_all(w.db.pool())
             .await
             .unwrap();
-    assert_eq!(
-        fired,
-        [(last_month.date_naive(), 50), (last_month.date_naive(), 80)],
-        "850 cents at last month's price"
-    );
-    // This month is untouched.
     let status = w.status(&w.flags).await;
-    assert_eq!(status["budget"]["spend_cents"], 0);
-    assert_eq!(status["budget"]["thresholds_reached"], json!([]));
+    if period::period_closed(Month::of(last_month), Utc::now()) {
+        // Last month has closed: the event is billed now, at this month's
+        // price (a cent), so 85 cents of a $10 budget fires nothing.
+        assert!(fired.is_empty(), "{fired:?}");
+        assert_eq!(status["budget"]["spend_cents"], 85);
+    } else {
+        // Inside the grace: still last month's, at last month's price.
+        assert_eq!(
+            fired,
+            [(last_month.date_naive(), 50), (last_month.date_naive(), 80)],
+            "850 cents at last month's price"
+        );
+        assert_eq!(status["budget"]["spend_cents"], 0);
+        assert_eq!(status["budget"]["thresholds_reached"], json!([]));
+    }
+}
+
+/// An event inside its month's grace is billed in its own month; one after
+/// it, in the month it arrived in. With the clock fixed, both cases run.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_period_close_decides_the_month_an_event_counts_in(pool: PgPool) {
+    use chrono::TimeZone;
+    use otto_billing::budgets::PendingBudgets;
+    use otto_billing::usage::{IngestOutcome, Metered, ShippedUsage, UsageExt};
+
+    let w = world(pool).await;
+    let at = |d, h, m| {
+        Utc.with_ymd_and_hms(2026, if d > 1 { 10 } else { 11 }, d, h, m, 0)
+            .unwrap()
+    };
+    let ingest = |occurred_at, now| {
+        let db = w.db.clone();
+        let org = w.org;
+        async move {
+            let mut tx = db.begin(org).await.unwrap();
+            otto_billing::usage::lock_org_ingest(&mut tx).await.unwrap();
+            let mut budgets = PendingBudgets::default();
+            let out = tx
+                .ingest_usage_deferred_at(
+                    FLAGS,
+                    &ShippedUsage {
+                        event_id: Uuid::new_v4(),
+                        user: None,
+                        tool: "t",
+                        billable: true,
+                        occurred_at,
+                        service: Some("otto-flags"),
+                        metered: Some(Metered {
+                            meter: EVALS,
+                            quantity: 1,
+                        }),
+                    },
+                    &mut budgets,
+                    now,
+                )
+                .await
+                .unwrap();
+            budgets.run(&mut tx).await.unwrap();
+            tx.commit().await.unwrap();
+            out
+        }
+    };
+    // 23:30 on 31 October, arriving at 01:59 and at 02:00 on 1 November.
+    let late = at(31, 23, 30);
+    assert_eq!(ingest(late, at(1, 1, 59)).await, IngestOutcome::Counted);
+    assert_eq!(ingest(late, at(1, 2, 0)).await, IngestOutcome::Counted);
+    let periods: Vec<(chrono::NaiveDate, i64)> = sqlx::query_as(
+        "SELECT period_start, quantity FROM org_meter_period_usage          WHERE org_id = $1 ORDER BY period_start",
+    )
+    .bind(w.org)
+    .fetch_all(w.db.pool())
+    .await
+    .unwrap();
+    let day = |m, d| chrono::NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+    assert_eq!(periods, [(day(10, 1), 1), (day(11, 1), 1)]);
+    let billed: Vec<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT created_at FROM usage_events ORDER BY created_at")
+            .fetch_all(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        billed,
+        [late, at(1, 2, 0)],
+        "the ledger keeps the billed instant"
+    );
+}
+
+/// Two batches for one org, each straddling a month boundary, in opposite
+/// orders, at once: without the org's ingest lock their counter rows would
+/// be locked in opposite orders and deadlock. Both commit.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn concurrent_batches_straddling_a_month_boundary_both_commit(pool: PgPool) {
+    use chrono::TimeZone;
+    use otto_billing::budgets::PendingBudgets;
+    use otto_billing::usage::{IngestOutcome, Metered, ShippedUsage, UsageExt};
+
+    let w = world(pool).await;
+    let now = Utc.with_ymd_and_hms(2026, 11, 1, 1, 0, 0).unwrap();
+    let october = Utc.with_ymd_and_hms(2026, 10, 31, 23, 30, 0).unwrap();
+    let november = Utc.with_ymd_and_hms(2026, 11, 1, 0, 30, 0).unwrap();
+    let batch = |order: [chrono::DateTime<Utc>; 2], hold: std::time::Duration| {
+        let db = w.db.clone();
+        let org = w.org;
+        async move {
+            let mut tx = db.begin(org).await.unwrap();
+            otto_billing::usage::lock_org_ingest(&mut tx).await.unwrap();
+            let mut budgets = PendingBudgets::default();
+            for (i, occurred_at) in order.into_iter().enumerate() {
+                let out = tx
+                    .ingest_usage_deferred_at(
+                        FLAGS,
+                        &ShippedUsage {
+                            event_id: Uuid::new_v4(),
+                            user: None,
+                            tool: "t",
+                            billable: true,
+                            occurred_at,
+                            service: Some("otto-flags"),
+                            metered: Some(Metered {
+                                meter: EVALS,
+                                quantity: 1,
+                            }),
+                        },
+                        &mut budgets,
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(out, IngestOutcome::Counted);
+                if i == 0 {
+                    // Give the other batch time to take its first row.
+                    tokio::time::sleep(hold).await;
+                }
+            }
+            budgets.run(&mut tx).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+    };
+    let hold = std::time::Duration::from_millis(300);
+    let a = tokio::spawn(batch([october, november], hold));
+    let b = tokio::spawn(batch([november, october], hold));
+    let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        (a.await, b.await)
+    })
+    .await
+    .expect("neither batch hangs");
+    a.expect("the first batch commits");
+    b.expect("the second batch commits");
+
+    let periods: Vec<(chrono::NaiveDate, i64)> = sqlx::query_as(
+        "SELECT period_start, quantity FROM org_meter_period_usage          WHERE org_id = $1 ORDER BY period_start",
+    )
+    .bind(w.org)
+    .fetch_all(w.db.pool())
+    .await
+    .unwrap();
+    let day = |m, d| chrono::NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+    assert_eq!(periods, [(day(10, 1), 2), (day(11, 1), 2)]);
+}
+
+/// The same, through `POST /internal/usage`: two concurrent batches for one
+/// org whose events come in opposite orders both succeed.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn concurrent_http_batches_for_one_org_both_succeed(pool: PgPool) {
+    let w = world(pool).await;
+    let now = Utc::now();
+    let events: Vec<Value> = (0..50)
+        .map(|i| {
+            let mut ev = event(w.org, Some(EVALS), Some(1));
+            ev["occurred_at"] = json!(now - chrono::Duration::seconds(i));
+            ev
+        })
+        .collect();
+    let mut reversed = events
+        .iter()
+        .map(|ev| {
+            let mut ev = ev.clone();
+            ev["event_id"] = json!(Uuid::new_v4());
+            ev
+        })
+        .collect::<Vec<_>>();
+    reversed.reverse();
+    let (a, b) = tokio::join!(w.ship(&w.flags, events), w.ship(&w.flags, reversed));
+    assert_eq!(
+        (a["accepted"].clone(), b["accepted"].clone()),
+        (json!(50), json!(50))
+    );
+    assert_eq!(w.status(&w.flags).await["meters"][0]["quantity"], 100);
+}
+
+/// An org with no live subscription must add a card before billable use of a
+/// service past its free tiers; only that service is blocked, a budget's hard
+/// stop wins, and a live subscription lifts it.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn billable_use_past_free_tiers_needs_a_payment_method(pool: PgPool) {
+    let w = world(pool).await;
+    // Ten jobs a month free, then a cent each.
+    price(&w.db, JOBS, 0, &[(Some(10), 0), (None, CENT)]).await;
+    let reason = |status: &Value| status.get("blocked_reason").cloned();
+
+    // Nothing used: nothing blocked.
+    for auth in [&w.flags, &w.factory] {
+        assert_eq!(reason(&w.status(auth).await), None);
+    }
+    // Within the free tier: spend 0, not blocked.
+    w.ship(&w.factory, vec![event(w.org, Some(JOBS), Some(10))])
+        .await;
+    let factory = w.status(&w.factory).await;
+    assert_eq!(reason(&factory), None, "{factory}");
+    assert!(factory.get("budget").is_none());
+    // Past it: payment required, for the factory only.
+    w.ship(&w.factory, vec![event(w.org, Some(JOBS), Some(1))])
+        .await;
+    let factory = w.status(&w.factory).await;
+    assert_eq!(reason(&factory), Some(json!("payment_required")));
+    assert!(factory.get("budget").is_none(), "no budget is set");
+    let parsed: otto_resource::UsageStatus = serde_json::from_value(factory).unwrap();
+    assert!(parsed.billable_blocked() && !parsed.budget_exceeded());
+    assert_eq!(
+        reason(&w.status(&w.flags).await),
+        None,
+        "another service is unaffected"
+    );
+
+    // A hard stop and no card: the budget wins.
+    w.set_budget("otto-flags", 3, true).await;
+    w.evals(5).await;
+    let flags = w.status(&w.flags).await;
+    assert_eq!(reason(&flags), Some(json!("budget_exceeded")));
+    assert_eq!(flags["budget"]["blocked"], true);
+
+    // A live subscription lifts payment_required, not the hard stop.
+    w.subscribe().await;
+    assert_eq!(reason(&w.status(&w.factory).await), None);
+    assert_eq!(
+        reason(&w.status(&w.flags).await),
+        Some(json!("budget_exceeded"))
+    );
+    // A past-due subscription is still live.
+    sqlx::query("UPDATE subscriptions SET status = 'past_due'")
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(reason(&w.status(&w.factory).await), None);
+    // A canceled one is not.
+    sqlx::query("UPDATE subscriptions SET status = 'canceled'")
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        reason(&w.status(&w.factory).await),
+        Some(json!("payment_required"))
+    );
+}
+
+/// With a live subscription and no budget, usage-status does not rate spend
+/// at all, so a price the rater refuses cannot fail or degrade it.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn spend_is_not_rated_when_no_answer_needs_it(pool: PgPool) {
+    let w = world(pool).await;
+    w.subscribe().await;
+    // A bounded last tier: the rater refuses it.
+    price(&w.db, JOBS, 0, &[(Some(10), CENT)]).await;
+    w.ship(&w.factory, vec![event(w.org, Some(JOBS), Some(500))])
+        .await;
+    let status = w.status(&w.factory).await;
+    assert!(status.get("budget").is_none(), "{status}");
+    assert!(status.get("blocked_reason").is_none(), "{status}");
+    assert_eq!(status["meters"][0]["quantity"], 500);
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
@@ -696,6 +982,7 @@ async fn the_budget_step_runs_once_per_service_and_period_per_batch(pool: PgPool
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn two_concurrent_ingests_crossing_a_threshold_fire_it_once(pool: PgPool) {
+    use otto_billing::budgets::PendingBudgets;
     use otto_billing::usage::{Metered, ShippedUsage, UsageExt};
 
     let w = world(pool).await;
@@ -704,7 +991,8 @@ async fn two_concurrent_ingests_crossing_a_threshold_fire_it_once(pool: PgPool) 
 
     let ingest = |db: Db, org: OrgId| async move {
         let mut tx = db.begin(org).await.unwrap();
-        tx.ingest_usage(
+        let mut budgets = PendingBudgets::default();
+        tx.ingest_usage_deferred(
             FLAGS,
             &ShippedUsage {
                 event_id: Uuid::new_v4(),
@@ -718,9 +1006,11 @@ async fn two_concurrent_ingests_crossing_a_threshold_fire_it_once(pool: PgPool) 
                     quantity: 1,
                 }),
             },
+            &mut budgets,
         )
         .await
         .unwrap();
+        budgets.run(&mut tx).await.unwrap();
         tx
     };
     // The first holds its transaction open across the threshold; the second

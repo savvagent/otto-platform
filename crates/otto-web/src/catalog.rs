@@ -869,9 +869,11 @@ pub fn catalog() -> Vec<Endpoint> {
             .summary("This period's usage against the plan")
             .describe(
                 "Free to read, and readable by an org that has run out. The legacy \
-                 family-wide bucket, plus `services`: each service with declared meters, \
-                 with its meters' quantities, its spend in US cents and its budget \
-                 (null when none is set).",
+                 family-wide bucket (its `hardStop` deprecated and always false), plus \
+                 `services`: each service with declared meters, with its meters' \
+                 quantities, its spend in US cents, its budget (null when none is set), \
+                 and `paymentRequired`, true when the service refuses billable calls \
+                 until the org adds a payment method.",
             ),
         Endpoint::get("/api/orgs/{org}/audit", usage::get_audit)
             .auth(Auth::OrgAdmin)

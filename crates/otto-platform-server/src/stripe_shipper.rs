@@ -1,8 +1,9 @@
 //! Shipping metered usage to Stripe meter events
 //! (savvagent/otto-platform#64, epic #55) from `stripe_meter_outbox`
-//! (migration 0023), which usage ingest fills for every metered event of an
-//! org with a live Stripe subscription. See `otto_billing::stripe_outbox` for
-//! what is queued and why every event reaches Stripe exactly once.
+//! (migration 0023), which usage ingest fills with the metered usage of orgs
+//! with a live Stripe subscription, one row per org, meter, customer and hour
+//! (a row is first due when its hour ends). See `otto_billing::stripe_outbox`
+//! for what is queued and why every row reaches Stripe exactly once.
 //!
 //! [`run`] is a polling loop shaped like [`crate::email::run`]: claim due rows
 //! across every org (a leased claim with `SKIP LOCKED`, so every machine can
@@ -336,7 +337,16 @@ async fn ship_one(
             Verdict::Sent => {
                 CREDENTIAL_FAULT_REPORTED.store(false, Ordering::Relaxed);
                 tally.sent.fetch_add(1, Ordering::Relaxed);
-                stripe_outbox::mark_sent(db, row).await
+                if !stripe_outbox::mark_sent(db, row).await? {
+                    // Its lease lapsed and another claim holds it: that claim
+                    // sends the same identifier, which Stripe drops as a
+                    // duplicate, and records the row as sent.
+                    tracing::info!(
+                        outbox_id = %row.id,
+                        "stripe meter event sent after its claim lapsed; the newer claim records it"
+                    );
+                }
+                Ok(())
             }
             Verdict::Retry {
                 error,
