@@ -103,7 +103,7 @@ fn basic(uri: &str, secret: &str) -> String {
 }
 
 async fn send(db: &Db, req: Request<Body>) -> (StatusCode, Value) {
-    let res = otto_platform_server::router(db.clone())
+    let res = otto_platform_server::router(db.clone(), otto_platform_server::Billing::Enabled)
         .oneshot(req)
         .await
         .unwrap();
@@ -453,7 +453,9 @@ async fn usage_status_reports_the_plan_and_its_features_and_oversized_batches_ar
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["plan"], "free");
     assert_eq!(body["included_ops"], 500);
-    assert_eq!(body["hard_stop"], true);
+    // The free plan's legacy hard stop is never served (#59): a family-wide
+    // bucket would let one service's usage stop another's work.
+    assert_eq!(body["hard_stop"], false);
     assert_eq!(body["billable_count"], 0);
     // The free plan unlocks nothing.
     assert_eq!(body["features"], serde_json::json!({}));
@@ -965,7 +967,7 @@ async fn webhook_config_is_validated_and_clearable(pool: PgPool) {
 async fn serve(db: &Db) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let app = otto_platform_server::router(db.clone());
+    let app = otto_platform_server::router(db.clone(), otto_platform_server::Billing::Enabled);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     base
 }
@@ -1060,6 +1062,9 @@ async fn the_client_ships_usage_and_reads_status_lookups(pool: PgPool) {
             tool: "queue.enqueue".into(),
             billable: i != 0,
             occurred_at: Utc::now(),
+            service: None,
+            meter: None,
+            quantity: None,
         })
         .collect();
     let receipt = client.ship_usage(&events).await.unwrap();
@@ -1248,12 +1253,30 @@ fn usage_status_blocking_rules() {
         included_ops: 500,
         hard_stop: true,
         features: Default::default(),
+        service: None,
+        meters: Vec::new(),
+        budget: None,
+        blocked_reason: None,
     };
     assert!(!s.is_blocked());
+    assert!(!s.budget_exceeded(), "no budget never blocks");
+    assert!(!s.billable_blocked());
     s.billable_count = 500;
     assert!(s.is_blocked());
+    assert!(
+        !s.billable_blocked(),
+        "the legacy bucket is not a reason to refuse"
+    );
     s.hard_stop = false;
     assert!(!s.is_blocked() && s.over_limit());
+    s.blocked_reason = Some(otto_resource::PAYMENT_REQUIRED.into());
+    assert!(s.billable_blocked() && !s.budget_exceeded());
+    // Absent from the wire when unset, for older clients.
+    s.blocked_reason = None;
+    assert!(serde_json::to_value(&s)
+        .unwrap()
+        .get("blocked_reason")
+        .is_none());
 }
 
 #[test]
@@ -1417,14 +1440,17 @@ async fn usage_outside_the_accepted_window_is_rejected_not_counted(pool: PgPool)
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
-async fn a_late_event_is_counted_in_the_month_it_happened(pool: PgPool) {
+async fn a_late_event_is_accepted_and_counted_in_an_open_month(pool: PgPool) {
+    use otto_billing::period::{self, Month};
+
     let w = world(pool).await;
     let when = otto_billing::usage::earliest_occurred_at(Utc::now()) + chrono::Duration::hours(1);
     let mut ev = usage_event(w.org, None, Uuid::new_v4(), true);
     ev["occurred_at"] = json!(when);
     assert_eq!(
         post_usage(&w.db, &w.factory_basic(), vec![ev]).await.1["accepted"],
-        1
+        1,
+        "a late event is accepted whatever its month"
     );
 
     let periods: Vec<(chrono::NaiveDate, i64)> =
@@ -1432,7 +1458,15 @@ async fn a_late_event_is_counted_in_the_month_it_happened(pool: PgPool) {
             .fetch_all(w.db.pool())
             .await
             .unwrap();
-    assert_eq!(periods, [(when.date_naive().with_day_one(), 1)]);
+    // The month it happened in, while that month is open (the first two
+    // hours of the next); after that, the month it arrived in.
+    let now = Utc::now();
+    let expected = if period::period_closed(Month::of(when), now) {
+        now.date_naive().with_day_one()
+    } else {
+        when.date_naive().with_day_one()
+    };
+    assert_eq!(periods, [(expected, 1)]);
 }
 
 trait WithDayOne {
@@ -1553,6 +1587,8 @@ async fn resource_server_calls_are_not_subject_to_the_browser_csrf_guard(pool: P
         static_dir: None,
         run_migrations: true,
         log_format: otto_platform_server::LogFormat::Text,
+        email: None,
+        stripe: None,
     };
     let app = || otto_platform_server::app(w.db.clone(), &config).unwrap();
     let token = w.oauth_token(FACTORY, &["jobs:read"]).await;
@@ -1602,4 +1638,887 @@ async fn resource_server_calls_are_not_subject_to_the_browser_csrf_guard(pool: P
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+// ------------------------------------------------------------------ meters
+
+async fn put_meters(db: &Db, auth: &str, meters: Value) -> (StatusCode, Value) {
+    send(
+        db,
+        Request::put("/internal/meters")
+            .header("authorization", auth)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "meters": meters }).to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+async fn stored_meters(db: &Db, service: &str) -> Vec<otto_billing::meters::Meter> {
+    let mut tx = db.begin_unpinned().await.unwrap();
+    otto_billing::meters::list_meters(&mut tx, service)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn meters_can_only_be_declared_under_the_callers_own_service(pool: PgPool) {
+    let w = world(pool).await;
+    resources::set_service(&w.db, FLAGS, "otto-flags")
+        .await
+        .unwrap();
+    resources::set_service(&w.db, FACTORY, "otto-factory")
+        .await
+        .unwrap();
+    let flags = basic(FLAGS, &w.flags_secret);
+
+    let (status, body) = put_meters(
+        &w.db,
+        &flags,
+        json!([
+            {"key": "otto-flags/evaluations", "display_name": "Flag evaluations", "unit": "evaluation"},
+            {"key": "otto-factory/jobs", "display_name": "Jobs", "unit": "job"},
+            {"key": "otto-flags-x/evaluations", "display_name": "X", "unit": "x"},
+            {"key": "evaluations", "display_name": "X", "unit": "x"},
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["declared"], json!(["otto-flags/evaluations"]));
+    let rejected: Vec<&str> = body["rejected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        rejected,
+        [
+            "otto-factory/jobs",
+            "otto-flags-x/evaluations",
+            "evaluations"
+        ]
+    );
+    for r in body["rejected"].as_array().unwrap() {
+        assert!(
+            r["reason"].as_str().unwrap().contains("otto-flags/<meter>"),
+            "{r}"
+        );
+    }
+
+    // Nothing was written into another service's namespace.
+    assert!(stored_meters(&w.db, "otto-factory").await.is_empty());
+    let mine = stored_meters(&w.db, "otto-flags").await;
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].meter, "evaluations");
+    assert_eq!(mine[0].display_name, "Flag evaluations");
+    assert_eq!(mine[0].unit, "evaluation");
+
+    // The declaring route takes the same credential as every /internal route.
+    let (status, _) = put_meters(&w.db, "Bearer otto_rs_nope", json!([])).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn redeclaring_meters_is_idempotent_and_updates_what_changed(pool: PgPool) {
+    let w = world(pool).await;
+    resources::set_service(&w.db, FLAGS, "otto-flags")
+        .await
+        .unwrap();
+    let flags = basic(FLAGS, &w.flags_secret);
+    let decl = json!([
+        {"key": "otto-flags/evaluations", "display_name": "Flag evaluations", "unit": "evaluation"},
+        {"key": "otto-flags/rollbacks", "display_name": "Auto-rollbacks", "unit": "rollback"},
+    ]);
+
+    let (status, first) = put_meters(&w.db, &flags, decl.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let before = stored_meters(&w.db, "otto-flags").await;
+
+    let (status, again) = put_meters(&w.db, &flags, decl).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first, again);
+    assert_eq!(again["rejected"], json!([]));
+    assert_eq!(
+        stored_meters(&w.db, "otto-flags").await,
+        before,
+        "an unchanged declaration changes nothing, timestamps included"
+    );
+
+    // A changed unit replaces the stored one; a meter left out stays.
+    let (status, body) = put_meters(
+        &w.db,
+        &flags,
+        json!([{"key": "otto-flags/evaluations", "display_name": " Evaluations ", "unit": "1k evaluations"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["declared"], json!(["otto-flags/evaluations"]));
+    let after = stored_meters(&w.db, "otto-flags").await;
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0].key, "otto-flags/evaluations");
+    assert_eq!(after[0].display_name, "Evaluations");
+    assert_eq!(after[0].unit, "1k evaluations");
+    assert_eq!(after[0].created_at, before[0].created_at);
+    assert!(after[0].updated_at >= before[0].updated_at);
+    assert_eq!(after[1], before[1]);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn malformed_meters_are_rejected_one_by_one(pool: PgPool) {
+    let w = world(pool).await;
+    resources::set_service(&w.db, FLAGS, "otto-flags")
+        .await
+        .unwrap();
+    let flags = basic(FLAGS, &w.flags_secret);
+    let long_key = format!("otto-flags/{}", "a".repeat(5000));
+
+    let (status, body) = put_meters(
+        &w.db,
+        &flags,
+        json!([
+            {"key": "otto-flags/Evaluations", "display_name": "X", "unit": "x"},
+            {"key": "otto-flags/1st", "display_name": "X", "unit": "x"},
+            {"key": "otto-flags/ok", "display_name": "", "unit": "x"},
+            {"key": "otto-flags/ok", "display_name": "x".repeat(81), "unit": "x"},
+            {"key": "otto-flags/ok", "display_name": "X", "unit": "u".repeat(33)},
+            {"key": "otto-flags/ok", "display_name": "two\nlines", "unit": "x"},
+            {"key": long_key, "display_name": "X", "unit": "x"},
+            {"key": "otto-flags/good", "display_name": "Good", "unit": "x"},
+            {"key": "otto-flags/good", "display_name": "Twice", "unit": "x"},
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["declared"], json!(["otto-flags/good"]));
+    let rejected = body["rejected"].as_array().unwrap();
+    assert_eq!(rejected.len(), 8, "{body}");
+    // An absurd key is not echoed back whole.
+    assert!(rejected[6]["key"].as_str().unwrap().len() <= 128);
+    assert!(rejected[8 - 1]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("more than once"));
+    let stored = stored_meters(&w.db, "otto-flags").await;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].display_name, "Good");
+
+    // More than the cap is refused whole.
+    let many: Vec<Value> = (0..=otto_resource::MAX_METER_DECLARATIONS)
+        .map(|i| json!({"key": format!("otto-flags/m{i}"), "display_name": "M", "unit": "x"}))
+        .collect();
+    let (status, body) = put_meters(&w.db, &flags, json!(many)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(stored_meters(&w.db, "otto-flags").await.len(), 1);
+
+    // And so is a body far larger than any valid declaration.
+    let huge = json!([{"key": "otto-flags/big", "display_name": "x".repeat(100_000), "unit": "x"}]);
+    let (status, _) = put_meters(&w.db, &flags, huge).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_resource_server_without_a_service_cannot_declare_meters(pool: PgPool) {
+    let w = world(pool).await;
+    let (status, body) = put_meters(
+        &w.db,
+        &w.factory_basic(),
+        json!([{"key": "otto-factory/jobs", "display_name": "Jobs", "unit": "job"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "service_not_set");
+    assert!(stored_meters(&w.db, "otto-factory").await.is_empty());
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_client_declares_meters(pool: PgPool) {
+    use otto_resource::{Error, MeterDeclaration};
+
+    let w = world(pool).await;
+    let base = serve(&w.db).await;
+    let client = PlatformClient::new(ClientConfig::new(&base, FLAGS, &w.flags_secret)).unwrap();
+    let decls: Vec<MeterDeclaration> = (0..otto_resource::MAX_METER_DECLARATIONS + 3)
+        .map(|i| MeterDeclaration::new(format!("otto-flags/m{i}"), format!("M {i}"), "x"))
+        .chain([MeterDeclaration::new(
+            "otto-cxp/tickets",
+            "Tickets",
+            "ticket",
+        )])
+        .collect();
+
+    // Before an operator assigns a service: 409, not retriable.
+    let err = client.declare_meters(&decls).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Status { status: 409, body } if body.contains("service_not_set")),
+        "{err:?}"
+    );
+    assert!(!err.is_retriable());
+
+    resources::set_service(&w.db, FLAGS, "otto-flags")
+        .await
+        .unwrap();
+    // More than one request's worth: the client splits and merges.
+    let receipt = client.declare_meters(&decls).await.unwrap();
+    assert_eq!(
+        receipt.declared.len(),
+        otto_resource::MAX_METER_DECLARATIONS + 3
+    );
+    assert_eq!(receipt.rejected.len(), 1);
+    assert_eq!(receipt.rejected[0].key, "otto-cxp/tickets");
+    assert!(!receipt.is_complete());
+    assert_eq!(
+        stored_meters(&w.db, "otto-flags").await.len(),
+        otto_resource::MAX_METER_DECLARATIONS + 3
+    );
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_operator_cli_assigns_service_slugs(pool: PgPool) {
+    use otto_platform_server::resource_cmd::{execute, parse};
+
+    let db = Db::from_pool(pool);
+    let run = |line: &str| {
+        let args: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+        let cmd = parse(&args).unwrap();
+        let db = db.clone();
+        async move {
+            let mut out = Vec::new();
+            execute(&db, None, cmd, &mut out)
+                .await
+                .map(|()| String::from_utf8(out).unwrap())
+        }
+    };
+
+    // register --service, and list shows it.
+    let out = run(&format!(
+        "register {FLAGS} --name otto-flags --scopes flags:read --service otto-flags"
+    ))
+    .await
+    .unwrap();
+    assert!(out.contains("service=otto-flags"), "{out}");
+    run(&format!(
+        "register {FACTORY} --name otto-factory --scopes jobs:read"
+    ))
+    .await
+    .unwrap();
+    let list = run("list").await.unwrap();
+    let line = |uri: &str| {
+        list.lines()
+            .find(|l| l.starts_with(uri))
+            .unwrap_or_else(|| panic!("{uri} not in {list:?}"))
+            .to_owned()
+    };
+    assert!(line(FLAGS).ends_with("\tservice=otto-flags"), "{list}");
+    assert!(line(FACTORY).ends_with("\tservice=-"), "{list}");
+
+    // Re-registering without --service keeps it.
+    run(&format!(
+        "register {FLAGS} --name otto-flags --scopes flags:read,flags:write"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        resources::get(&db, FLAGS)
+            .await
+            .unwrap()
+            .unwrap()
+            .service
+            .as_deref(),
+        Some("otto-flags")
+    );
+
+    // set-service assigns one; describe shows it.
+    let out = run(&format!("set-service {FACTORY} otto-factory"))
+        .await
+        .unwrap();
+    assert!(out.contains("service=otto-factory"), "{out}");
+    let out = run(&format!("describe {FACTORY} --clear")).await.unwrap();
+    assert!(out.contains("service=otto-factory"), "{out}");
+
+    // Malformed slugs are refused while parsing, before anything is written.
+    for bad in ["Otto", "otto_factory"] {
+        let args: Vec<String> = format!("set-service {FACTORY} {bad}")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        assert!(parse(&args).is_err(), "{bad}");
+    }
+    // Slugs are unique, and the URI must be registered.
+    for bad in [
+        format!("set-service {FACTORY} otto-flags"),
+        "set-service https://nope.example/mcp otto-nope".to_owned(),
+    ] {
+        let err = run(&bad).await.expect_err(&bad);
+        assert!(!err.to_string().contains("duplicate key"), "{bad}: {err}");
+    }
+    let err = run(&format!("set-service {FACTORY} otto-flags"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already assigned"), "{err}");
+
+    // Renaming is fine until the service has declared meters, then refused.
+    run(&format!("set-service {FACTORY} otto-factory-2"))
+        .await
+        .unwrap();
+    run(&format!("set-service {FACTORY} otto-factory"))
+        .await
+        .unwrap();
+    let mut tx = db.begin_unpinned().await.unwrap();
+    otto_billing::meters::upsert_meters(
+        &mut tx,
+        &[otto_billing::meters::check_declaration(
+            "otto-factory",
+            &otto_billing::meters::MeterSpec {
+                key: "otto-factory/jobs",
+                display_name: "Jobs",
+                unit: "job",
+            },
+        )
+        .unwrap()],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    // Setting the same slug again is still fine.
+    run(&format!("set-service {FACTORY} otto-factory"))
+        .await
+        .unwrap();
+    let err = run(&format!("set-service {FACTORY} otto-jobs"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("declared meters"), "{err}");
+    assert_eq!(
+        resources::get(&db, FACTORY)
+            .await
+            .unwrap()
+            .unwrap()
+            .service
+            .as_deref(),
+        Some("otto-factory")
+    );
+}
+
+// ---------------------------------------------------------- metered usage
+
+const EVALS: &str = "otto-flags/evaluations";
+const JOBS: &str = "otto-factory/jobs";
+
+/// `world()` with service slugs assigned and one meter declared per service:
+/// otto-flags declares `evaluations`, otto-factory declares `jobs`.
+async fn metered_world(pool: PgPool) -> World {
+    let w = world(pool).await;
+    for (uri, service, secret, key, name, unit) in [
+        (
+            FLAGS,
+            "otto-flags",
+            &w.flags_secret,
+            EVALS,
+            "Flag evaluations",
+            "evaluation",
+        ),
+        (
+            FACTORY,
+            "otto-factory",
+            &w.factory_secret,
+            JOBS,
+            "Jobs completed",
+            "job",
+        ),
+    ] {
+        resources::set_service(&w.db, uri, service).await.unwrap();
+        let (status, body) = put_meters(
+            &w.db,
+            &basic(uri, secret),
+            json!([{"key": key, "display_name": name, "unit": unit}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["declared"], json!([key]));
+    }
+    w
+}
+
+impl World {
+    fn flags_basic(&self) -> String {
+        basic(FLAGS, &self.flags_secret)
+    }
+
+    async fn status(&self, auth: &str) -> Value {
+        let (status, body) = get(
+            &self.db,
+            auth,
+            &format!("/internal/orgs/{}/usage-status", self.org),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+}
+
+fn metered(org: OrgId, meter: &str, quantity: Option<u64>) -> Value {
+    let mut ev = usage_event(org, None, Uuid::new_v4(), true);
+    ev["meter"] = json!(meter);
+    if let Some(q) = quantity {
+        ev["quantity"] = json!(q);
+    }
+    ev
+}
+
+/// The reason codes of a receipt's rejections, in order.
+fn rejection_codes(receipt: &Value) -> Vec<String> {
+    receipt["rejected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let reason = r["reason"].as_str().unwrap();
+            reason.split(':').next().unwrap().to_owned()
+        })
+        .collect()
+}
+
+async fn meter_quantity(db: &Db, meter: &str) -> Option<i64> {
+    sqlx::query_scalar("SELECT quantity FROM org_meter_period_usage WHERE meter = $1")
+        .bind(meter)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap()
+}
+
+async fn service_pool(db: &Db, service: &str) -> Option<(i64, i64)> {
+    sqlx::query_as(
+        "SELECT billable_count, total_count FROM org_service_period_usage WHERE service = $1",
+    )
+    .bind(service)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_undeclared_meter_is_rejected_per_event_and_the_rest_counted(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let auth = w.flags_basic();
+    let undeclared = metered(w.org, "otto-flags/clicks", Some(3));
+    let undeclared_id = undeclared["event_id"].clone();
+    let mut free = usage_event(w.org, None, Uuid::new_v4(), false);
+    free["service"] = json!("otto-flags");
+    let batch = vec![
+        metered(w.org, EVALS, Some(5)),
+        undeclared,
+        free,
+        // Another service's declared meter is not this caller's.
+        metered(w.org, JOBS, Some(1)),
+        // A meter with no quantity counts one.
+        metered(w.org, EVALS, None),
+    ];
+
+    let (status, receipt) = post_usage(&w.db, &auth, batch.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["accepted"], 3, "{receipt}");
+    assert_eq!(
+        rejection_codes(&receipt),
+        ["unknown_meter", "unknown_meter"]
+    );
+    assert_eq!(receipt["rejected"][0]["event_id"], undeclared_id);
+    assert!(receipt["rejected"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("otto-flags/clicks"));
+
+    assert_eq!(meter_quantity(&w.db, EVALS).await, Some(6));
+    assert_eq!(meter_quantity(&w.db, JOBS).await, None);
+    assert_eq!(meter_quantity(&w.db, "otto-flags/clicks").await, None);
+    // Every accepted event counts in the shipper's pool, metered or not.
+    assert_eq!(service_pool(&w.db, "otto-flags").await, Some((2, 3)));
+    assert_eq!(service_pool(&w.db, "otto-factory").await, None);
+    // And in the legacy family-wide bucket, exactly as before.
+    let legacy: (i64, i64) =
+        sqlx::query_as("SELECT billable_count, total_count FROM org_period_usage")
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(legacy, (2, 3));
+
+    // The event rows carry who shipped them and what they metered.
+    let rows: Vec<(Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT resource_uri, meter, quantity FROM usage_events ORDER BY quantity NULLS FIRST",
+    )
+    .fetch_all(w.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (Some(FLAGS.to_owned()), None, None),
+            (Some(FLAGS.to_owned()), Some(EVALS.to_owned()), Some(1)),
+            (Some(FLAGS.to_owned()), Some(EVALS.to_owned()), Some(5)),
+        ]
+    );
+
+    // A replay counts nothing twice, meters included; the rejected events are
+    // still rejected, not duplicates.
+    let (_, again) = post_usage(&w.db, &auth, batch).await;
+    assert_eq!(
+        (again["accepted"].clone(), again["duplicates"].clone()),
+        (json!(0), json!(3))
+    );
+    assert_eq!(rejection_codes(&again), ["unknown_meter", "unknown_meter"]);
+    assert_eq!(meter_quantity(&w.db, EVALS).await, Some(6));
+    assert_eq!(service_pool(&w.db, "otto-flags").await, Some((2, 3)));
+
+    // A rejected event left no trace, so it can be corrected and resent under
+    // the same id.
+    let mut fixed = metered(w.org, EVALS, Some(3));
+    fixed["event_id"] = undeclared_id;
+    assert_eq!(post_usage(&w.db, &auth, vec![fixed]).await.1["accepted"], 1);
+    assert_eq!(meter_quantity(&w.db, EVALS).await, Some(9));
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_service_other_than_the_callers_is_a_mismatch(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let mut theirs = metered(w.org, EVALS, Some(1));
+    theirs["service"] = json!("otto-factory");
+    let mut unmetered_theirs = usage_event(w.org, None, Uuid::new_v4(), true);
+    unmetered_theirs["service"] = json!("otto-factory");
+    let mut mine = metered(w.org, EVALS, Some(2));
+    mine["service"] = json!("otto-flags");
+
+    let (_, receipt) = post_usage(
+        &w.db,
+        &w.flags_basic(),
+        vec![theirs, unmetered_theirs, mine],
+    )
+    .await;
+    assert_eq!(receipt["accepted"], 1, "{receipt}");
+    assert_eq!(
+        rejection_codes(&receipt),
+        ["service_mismatch", "service_mismatch"]
+    );
+    assert_eq!(meter_quantity(&w.db, EVALS).await, Some(2));
+    assert_eq!(service_pool(&w.db, "otto-factory").await, None);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_caller_without_a_service_ships_only_unmetered_usage(pool: PgPool) {
+    let w = world(pool).await;
+    let auth = w.factory_basic();
+    let mut named = usage_event(w.org, None, Uuid::new_v4(), true);
+    named["service"] = json!("otto-factory");
+    let (_, receipt) = post_usage(
+        &w.db,
+        &auth,
+        vec![
+            usage_event(w.org, None, Uuid::new_v4(), true),
+            metered(w.org, JOBS, Some(1)),
+            named,
+        ],
+    )
+    .await;
+    assert_eq!(receipt["accepted"], 1, "{receipt}");
+    assert_eq!(
+        rejection_codes(&receipt),
+        ["unknown_meter", "service_mismatch"]
+    );
+    // No pool to count in: only the legacy bucket moved.
+    let pools: i64 = sqlx::query_scalar("SELECT count(*) FROM org_service_period_usage")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(pools, 0);
+
+    let status = w.status(&auth).await;
+    assert_eq!(status["total_count"], 1);
+    assert!(status.get("service").is_none(), "{status}");
+    assert_eq!(status["meters"], json!([]));
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn quantities_are_bounded_per_event(pool: PgPool) {
+    let w = metered_world(pool).await;
+    assert_eq!(
+        otto_resource::MAX_METER_QUANTITY,
+        otto_billing::usage::MAX_METER_QUANTITY
+    );
+    let mut quantity_without_meter = usage_event(w.org, None, Uuid::new_v4(), true);
+    quantity_without_meter["quantity"] = json!(4);
+    let mut negative = metered(w.org, EVALS, None);
+    negative["quantity"] = json!(-1);
+
+    let (status, receipt) = post_usage(
+        &w.db,
+        &w.flags_basic(),
+        vec![
+            metered(w.org, EVALS, Some(0)),
+            metered(w.org, EVALS, Some(1_000_000_001)),
+            quantity_without_meter,
+            metered(w.org, EVALS, Some(1)),
+            metered(w.org, EVALS, Some(1_000_000_000)),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt["accepted"], 2, "{receipt}");
+    assert_eq!(
+        rejection_codes(&receipt),
+        ["invalid_quantity", "invalid_quantity", "invalid_quantity"]
+    );
+    assert_eq!(meter_quantity(&w.db, EVALS).await, Some(1_000_000_001));
+
+    // A quantity that is not a u64 at all is a malformed body, like any other
+    // type error, and counts nothing.
+    let (status, _) = post_usage(&w.db, &w.flags_basic(), vec![negative]).await;
+    assert!(status.is_client_error(), "{status}");
+    assert_eq!(meter_quantity(&w.db, EVALS).await, Some(1_000_000_001));
+}
+
+/// `UsageEvent` exactly as `otto-resource` shipped it before value meters.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OldUsageEvent {
+    event_id: Uuid,
+    org_id: Uuid,
+    user_id: Option<Uuid>,
+    tool: String,
+    billable: bool,
+    occurred_at: chrono::DateTime<Utc>,
+}
+
+/// `UsageStatus` exactly as a resource server pinned before value meters
+/// parses it, with its blocking rule.
+#[derive(serde::Deserialize)]
+struct OldUsageStatus {
+    #[allow(dead_code)]
+    org_id: Uuid,
+    #[allow(dead_code)]
+    plan: String,
+    #[allow(dead_code)]
+    period_start: chrono::NaiveDate,
+    billable_count: i64,
+    #[allow(dead_code)]
+    total_count: i64,
+    included_ops: i64,
+    hard_stop: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    features: std::collections::BTreeMap<String, Value>,
+}
+
+impl OldUsageStatus {
+    fn is_blocked(&self) -> bool {
+        self.hard_stop && self.billable_count >= self.included_ops
+    }
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn old_and_new_shapes_round_trip(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let base = serve(&w.db).await;
+    let auth = w.flags_basic();
+
+    // An old client's event, serialized by the old type, ingests as unmetered.
+    let old = OldUsageEvent {
+        event_id: Uuid::new_v4(),
+        org_id: w.org.as_uuid(),
+        user_id: Some(w.user.as_uuid()),
+        tool: "flag.set".into(),
+        billable: true,
+        occurred_at: Utc::now(),
+    };
+    let old_json = serde_json::to_value(&old).unwrap();
+    let parsed: UsageEvent = serde_json::from_value(old_json.clone()).unwrap();
+    assert_eq!(
+        (parsed.service, parsed.meter, parsed.quantity),
+        (None, None, None)
+    );
+    let (_, receipt) = post_usage(&w.db, &auth, vec![old_json]).await;
+    assert_eq!(receipt["accepted"], 1, "{receipt}");
+
+    // A new unmetered event is byte-for-byte the old shape on the wire, and a
+    // new metered one still parses as the old type.
+    let new_unmetered = UsageEvent {
+        event_id: old.event_id,
+        org_id: old.org_id,
+        user_id: old.user_id,
+        tool: old.tool.clone(),
+        billable: old.billable,
+        occurred_at: old.occurred_at,
+        service: None,
+        meter: None,
+        quantity: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&new_unmetered).unwrap(),
+        serde_json::to_value(&old).unwrap()
+    );
+    let new_metered = UsageEvent {
+        service: Some("otto-flags".into()),
+        meter: Some(EVALS.into()),
+        quantity: Some(12),
+        event_id: Uuid::new_v4(),
+        ..new_unmetered
+    };
+    let wire = serde_json::to_value(&new_metered).unwrap();
+    assert_eq!(wire["meter"], EVALS);
+    serde_json::from_value::<OldUsageEvent>(wire).unwrap();
+
+    // Shipped through the client, the metered event counts in its meter.
+    let client = PlatformClient::new(ClientConfig::new(&base, FLAGS, &w.flags_secret)).unwrap();
+    let receipt = client.ship_usage(&[new_metered]).await.unwrap();
+    assert_eq!(receipt.accepted, 1);
+
+    // The new status body parses as the old shape, and as the new one.
+    let body = w.status(&auth).await;
+    let old_status: OldUsageStatus = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(old_status.billable_count, 2);
+    assert!(!old_status.hard_stop);
+    let status = client.usage_status(w.org.as_uuid()).await.unwrap();
+    assert_eq!(status.service.as_deref(), Some("otto-flags"));
+    assert_eq!(
+        status.meters,
+        [otto_resource::MeterUsage {
+            meter: EVALS.into(),
+            display_name: "Flag evaluations".into(),
+            unit: "evaluation".into(),
+            quantity: 12,
+        }]
+    );
+    assert_eq!(status.meter(EVALS).unwrap().quantity, 12);
+
+    // And an old platform's body (no `service`, no `meters`, no `features`)
+    // still parses as the new type.
+    let older = json!({
+        "org_id": w.org,
+        "plan": "free",
+        "period_start": "2026-10-01",
+        "billable_count": 1,
+        "total_count": 1,
+        "included_ops": 500,
+        "hard_stop": true,
+    });
+    let s: otto_resource::UsageStatus = serde_json::from_value(older).unwrap();
+    assert!(s.service.is_none() && s.meters.is_empty());
+    // A new status re-serialized is readable by the old type too.
+    serde_json::from_value::<OldUsageStatus>(serde_json::to_value(&status).unwrap()).unwrap();
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn heavy_usage_never_blocks_an_old_client(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let base = serve(&w.db).await;
+    let auth = w.flags_basic();
+
+    // Well past the free plan's 500-operation bucket, which hard-stops.
+    for _ in 0..2 {
+        let batch: Vec<Value> = (0..400)
+            .map(|i| {
+                if i % 2 == 0 {
+                    metered(w.org, EVALS, Some(1000))
+                } else {
+                    usage_event(w.org, None, Uuid::new_v4(), true)
+                }
+            })
+            .collect();
+        assert_eq!(post_usage(&w.db, &auth, batch).await.1["accepted"], 400);
+    }
+    let plan_hard_stop: bool =
+        sqlx::query_scalar("SELECT hard_stop FROM plans WHERE plan = 'free'")
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert!(
+        plan_hard_stop,
+        "the free plan still hard-stops in the plan table"
+    );
+
+    let old: OldUsageStatus = serde_json::from_value(w.status(&auth).await).unwrap();
+    assert!(old.billable_count >= old.included_ops);
+    assert!(!old.hard_stop);
+    assert!(!old.is_blocked());
+
+    let client = PlatformClient::new(ClientConfig::new(&base, FLAGS, &w.flags_secret)).unwrap();
+    let status = client.usage_status(w.org.as_uuid()).await.unwrap();
+    assert!(status.over_limit() && !status.is_blocked());
+    assert_eq!(status.meter(EVALS).unwrap().quantity, 400_000);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn usage_from_one_service_never_changes_anothers_status(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let flags = w.flags_basic();
+    let factory = w.factory_basic();
+
+    // The service-scoped part of a status, and the old client's verdict.
+    let scoped = |body: &Value| {
+        let old: OldUsageStatus = serde_json::from_value(body.clone()).unwrap();
+        (
+            body["service"].clone(),
+            body["meters"].clone(),
+            body["hard_stop"].clone(),
+            old.is_blocked(),
+        )
+    };
+
+    let factory_before = w.status(&factory).await;
+    assert_eq!(factory_before["service"], "otto-factory");
+    assert_eq!(
+        factory_before["meters"],
+        json!([{"meter": JOBS, "display_name": "Jobs completed", "unit": "job", "quantity": 0}])
+    );
+
+    for _ in 0..2 {
+        let batch: Vec<Value> = (0..300)
+            .map(|_| metered(w.org, EVALS, Some(1_000)))
+            .collect();
+        assert_eq!(post_usage(&w.db, &flags, batch).await.1["accepted"], 300);
+    }
+
+    let factory_after = w.status(&factory).await;
+    assert_eq!(scoped(&factory_after), scoped(&factory_before));
+    assert_eq!(service_pool(&w.db, "otto-factory").await, None);
+
+    // The shipper sees its own usage, and only its own meters.
+    let flags_status = w.status(&flags).await;
+    assert_eq!(flags_status["service"], "otto-flags");
+    assert_eq!(
+        flags_status["meters"],
+        json!([{
+            "meter": EVALS,
+            "display_name": "Flag evaluations",
+            "unit": "evaluation",
+            "quantity": 600_000,
+        }])
+    );
+    assert_eq!(service_pool(&w.db, "otto-flags").await, Some((600, 600)));
+
+    // And the other way round.
+    let (_, r) = post_usage(&w.db, &factory, vec![metered(w.org, JOBS, Some(7))]).await;
+    assert_eq!(r["accepted"], 1);
+    assert_eq!(scoped(&w.status(&flags).await), scoped(&flags_status));
+    assert_eq!(w.status(&factory).await["meters"][0]["quantity"], 7);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn meter_usage_is_counted_per_org(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let other = w.db.create_org("globex", "Globex").await.unwrap();
+    let (_, r) = post_usage(
+        &w.db,
+        &w.flags_basic(),
+        vec![
+            metered(w.org, EVALS, Some(5)),
+            metered(other.id, EVALS, Some(11)),
+        ],
+    )
+    .await;
+    assert_eq!(r["accepted"], 2, "{r}");
+    assert_eq!(w.status(&w.flags_basic()).await["meters"][0]["quantity"], 5);
+    let (_, theirs) = get(
+        &w.db,
+        &w.flags_basic(),
+        &format!("/internal/orgs/{}/usage-status", other.id),
+    )
+    .await;
+    assert_eq!(theirs["meters"][0]["quantity"], 11);
 }

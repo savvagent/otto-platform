@@ -11,8 +11,9 @@ use uuid::Uuid;
 use crate::cache::TtlCache;
 use crate::error::{Error, Result};
 use crate::types::{
-    looks_like_token, IntrospectionResponse, MemberInfo, MemberTeams, TeamInfo, TokenClaims,
-    UsageBatch, UsageEvent, UsageReceipt, UsageStatus, MAX_USAGE_BATCH,
+    looks_like_token, IntrospectionResponse, MemberInfo, MemberTeams, MeterDeclaration,
+    MeterDeclarationBatch, MeterDeclarationReceipt, TeamInfo, TokenClaims, UsageBatch, UsageEvent,
+    UsageReceipt, UsageStatus, MAX_METER_DECLARATIONS, MAX_USAGE_BATCH,
 };
 
 /// How long a positive introspection result is trusted, and so the longest a
@@ -261,9 +262,13 @@ impl PlatformClient {
 
     // ------------------------------------------------------------------ usage
 
-    /// The org's usage this month against its plan, cached for
-    /// [`USAGE_STATUS_TTL`]. Check [`UsageStatus::is_blocked`] before doing
-    /// billable work.
+    /// The org's usage this month, cached for [`USAGE_STATUS_TTL`]: this
+    /// service's own meters ([`UsageStatus::meters`]) and the plan's features.
+    ///
+    /// The legacy family-wide fields are deprecated, and
+    /// [`UsageStatus::is_blocked`] is always false against a current platform,
+    /// so do not gate work on it. Per-service budget enforcement arrives with
+    /// the status's budget field (savvagent/otto-platform#63).
     pub async fn usage_status(&self, org_id: Uuid) -> Result<UsageStatus> {
         if let Some(hit) = self.usage.get(&org_id) {
             return Ok(hit);
@@ -288,6 +293,58 @@ impl PlatformClient {
                 .request(Method::POST, self.url(&["internal", "usage"]))
                 .json(&UsageBatch {
                     events: chunk.to_vec(),
+                });
+            receipt.merge(self.send(req).await?.json().await.map_err(decode)?);
+        }
+        Ok(receipt)
+    }
+
+    // ----------------------------------------------------------------- meters
+
+    /// Declare the value meters this resource server bills by. Call it at
+    /// startup, **before** starting the usage shipper: the platform rejects a
+    /// usage event for a meter that has not been declared, and the shipper
+    /// drops rejected events.
+    ///
+    /// Idempotent, so declare the full set on every start. A changed display
+    /// name or unit replaces the stored one; a meter left out is not removed.
+    /// Splits into requests of [`MAX_METER_DECLARATIONS`] and returns the
+    /// merged receipt. A declaration the platform refuses (a key outside this
+    /// server's service, a malformed field) is reported in
+    /// [`MeterDeclarationReceipt::rejected`], not as an error: log it, and
+    /// treat it as the deploy bug it is.
+    ///
+    /// Fails with [`Error::Status`] `409` (`service_not_set`) when no operator
+    /// has assigned this resource server a service slug yet
+    /// (`otto-platform-server resource set-service`).
+    ///
+    /// ```no_run
+    /// # async fn demo(platform: &otto_resource::PlatformClient) -> otto_resource::Result<()> {
+    /// use otto_resource::MeterDeclaration;
+    ///
+    /// let receipt = platform
+    ///     .declare_meters(&[MeterDeclaration::new(
+    ///         "otto-flags/evaluations",
+    ///         "Flag evaluations",
+    ///         "evaluation",
+    ///     )])
+    ///     .await?;
+    /// for r in &receipt.rejected {
+    ///     eprintln!("meter {} refused: {}", r.key, r.reason);
+    /// }
+    /// // ... now start the usage shipper.
+    /// # Ok(()) }
+    /// ```
+    pub async fn declare_meters(
+        &self,
+        meters: &[MeterDeclaration],
+    ) -> Result<MeterDeclarationReceipt> {
+        let mut receipt = MeterDeclarationReceipt::default();
+        for chunk in meters.chunks(MAX_METER_DECLARATIONS) {
+            let req = self
+                .request(Method::PUT, self.url(&["internal", "meters"]))
+                .json(&MeterDeclarationBatch {
+                    meters: chunk.to_vec(),
                 });
             receipt.merge(self.send(req).await?.json().await.map_err(decode)?);
         }
@@ -374,8 +431,9 @@ impl PlatformClient {
     // ---------------------------------------------------------------- console
 
     /// The platform console's usage page for an org, `/o/{org_slug}/usage`
-    /// under the platform origin: where to send a user whose org is over its
-    /// plan ([`UsageStatus::is_blocked`]). Takes the org's slug
+    /// under the platform origin: where to send a user to review the org's
+    /// usage and billing (and, once per-service budgets land with
+    /// savvagent/otto-platform#63, a user whose budget is exhausted). Takes the org's slug
     /// ([`crate::OrgInfo::slug`]), not its id; the slug is percent-encoded.
     ///
     /// ```

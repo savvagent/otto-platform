@@ -24,6 +24,8 @@
 
 import type {
   AuditEvent,
+  BillingStatus,
+  BudgetsResponse,
   BrowserSession,
   ClaimedDomain,
   IdpConnection,
@@ -41,7 +43,10 @@ import type {
   OrgMember,
   PlansResponse,
   Role,
+  ServiceBudget,
   SessionOpened,
+  SetBudgetRequest,
+  SetupSession,
   SsoStartResponse,
   Team,
   TeamMember,
@@ -319,5 +324,24 @@ export const api = {
   // ---------------------------------------------------------- usage & audit
   usage: (org: string) => get<UsageStatus>(`/api/orgs/${seg(org)}/usage`),
   audit: (org: string, limit = 100) =>
-    get<AuditEvent[]>(`/api/orgs/${seg(org)}/audit${query({ limit })}`)
+    get<AuditEvent[]>(`/api/orgs/${seg(org)}/audit${query({ limit })}`),
+
+  // -------------------------------------------------------------- budgets
+  /** Every metered service's budget and spend. Any member may read. */
+  budgets: (org: string) => get<BudgetsResponse>(`/api/orgs/${seg(org)}/budgets`),
+  /** Owner or admin; `403` for a member. Answers the service's new row. */
+  setBudget: (org: string, service: string, body: SetBudgetRequest) =>
+    put<ServiceBudget>(`/api/orgs/${seg(org)}/budgets/${seg(service)}`, body),
+  /** Owner or admin. `204` whether or not a budget was set. */
+  clearBudget: (org: string, service: string) =>
+    del<void>(`/api/orgs/${seg(org)}/budgets/${seg(service)}`),
+
+  // -------------------------------------------------------------- billing
+  /** Owner only, reads included. */
+  billing: (org: string) => get<BillingStatus>(`/api/orgs/${seg(org)}/billing`),
+  /**
+   * Start putting a card on file: answers a Stripe Checkout URL to send the
+   * owner to. `409 billing_busy`, `503 billing_disabled`, `502 stripe_unavailable`.
+   */
+  startBillingSetup: (org: string) => post<SetupSession>(`/api/orgs/${seg(org)}/billing/setup`)
 };

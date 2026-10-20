@@ -23,13 +23,10 @@ async fn every_plan_is_listed_in_tier_order(pool: PgPool) {
     );
 
     let free = &plans[0];
-    assert!(free.hard_stop, "free stops dead at its bucket");
     assert_eq!(free.monthly_cents, 0);
 
     let team = &plans[1];
     assert_eq!(team.display_name, "Team");
     assert_eq!(team.monthly_cents, 2900);
-    assert_eq!(team.included_ops, 10_000);
-    assert!(!team.hard_stop);
     assert_eq!(team.features["auto_rollback"], serde_json::json!(true));
 }

@@ -1,9 +1,11 @@
 //! The usage meter, read-only.
 //!
 //! The same numbers the resource servers' own `usage` reports are built from
-//! (`otto_billing::usage`), so the figure in the console and the figure an agent
-//! sees cannot disagree: one plan and one usage bucket, family-wide, whichever
-//! otto-* service the calls were made against.
+//! (`otto_billing::usage`, `otto_billing::budgets`), so the figure in the
+//! console and the figure an agent sees cannot disagree. Two generations
+//! share the body: the legacy family-wide bucket (one plan, one count across
+//! every otto-* service), and `services`, each metered service's own meters,
+//! spend and budget.
 //!
 //! **Reading your own bill is free.** Nothing here records usage, and nothing
 //! here refuses anything — enforcement belongs to the resource servers, which
@@ -13,11 +15,15 @@
 //! *why* it has run out.
 
 use axum::extract::{Json, State};
-use otto_billing::usage::{PeriodUsage, PlanLimits, UsageExt};
+use otto_billing::billing::gate::{self, Billing};
+use otto_billing::budgets::{self, PAYMENT_REQUIRED};
+use otto_billing::pricebook::Month;
+use otto_billing::usage::{MeterPeriodUsage, PeriodUsage, PlanLimits, UsageExt};
 use otto_tenant::audit::AuditEvent;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
+use crate::routes::budgets::{from_budgets, spend_error, BudgetView};
 use crate::session::OrgCtx;
 use crate::state::AppState;
 
@@ -42,12 +48,65 @@ pub struct UsageStatus {
     /// True once the org has used four fifths of its bucket. Worth surfacing to
     /// a human.
     pub warning: bool,
-    /// Whether exceeding the bucket stops billable work rather than metering
-    /// overage.
+    /// **Deprecated**, always `false`, as `/internal/.../usage-status` serves
+    /// it: the family-wide bucket never stops work. A service's own budget
+    /// hard stop is `services[].budget.hardStop`.
     pub hard_stop: bool,
     /// Whether the resource servers are currently refusing calls over the
     /// bucket at all. See [`crate::state::Config::enforce_quotas`].
     pub enforced: bool,
+    /// Each service with declared meters, by slug: its meters' usage, its
+    /// spend and its budget this month. Added alongside the legacy fields
+    /// above, which keep their meaning.
+    pub services: Vec<ServiceUsage>,
+}
+
+/// One metered service's usage this month.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceUsage {
+    pub service: String,
+    /// Every meter the service has declared, by key, zero when unused.
+    pub meters: Vec<MeterUsageView>,
+    /// What the meters have cost this month, in US cents. `None` when it
+    /// cannot be computed; [`spend_error`](Self::spend_error) says so.
+    pub spend_cents: Option<i64>,
+    /// `pricing_unavailable` when [`spend_cents`](Self::spend_cents) is
+    /// `None`, otherwise `None`.
+    pub spend_error: Option<&'static str>,
+    /// `None` when no budget is set.
+    pub budget: Option<BudgetView>,
+    /// Whether the service is refusing billable calls until the org adds a
+    /// working payment method: exactly when the platform's
+    /// `/internal/.../usage-status` answers `blocked_reason:
+    /// "payment_required"` for it ([`gate::blocked_reason`], one function for
+    /// both). So it is false while the service's budget hard stop is what
+    /// blocks it (`budget.blocked`): the console never asks for a card when
+    /// the platform says `budget_exceeded`. Never with unknown spend, and
+    /// never with billing disabled.
+    pub payment_required: bool,
+}
+
+/// One meter's quantity this month.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MeterUsageView {
+    /// `<service>/<meter>`.
+    pub meter: String,
+    pub display_name: String,
+    pub unit: String,
+    pub quantity: i64,
+}
+
+impl From<MeterPeriodUsage> for MeterUsageView {
+    fn from(m: MeterPeriodUsage) -> Self {
+        Self {
+            meter: m.meter,
+            display_name: m.display_name,
+            unit: m.unit,
+            quantity: m.quantity,
+        }
+    }
 }
 
 /// Fraction of the bucket at which an org is warned. Matches what the resource
@@ -55,7 +114,12 @@ pub struct UsageStatus {
 const WARN_AT: f64 = 0.8;
 
 impl UsageStatus {
-    fn new(usage: PeriodUsage, limits: PlanLimits, enforced: bool) -> Self {
+    fn new(
+        usage: PeriodUsage,
+        limits: PlanLimits,
+        enforced: bool,
+        services: Vec<ServiceUsage>,
+    ) -> Self {
         let warning = if limits.included_ops <= 0 {
             // A bucket of zero is exhausted from the first call, not a division
             // by zero.
@@ -63,6 +127,8 @@ impl UsageStatus {
         } else {
             usage.billable_count as f64 >= limits.included_ops as f64 * WARN_AT
         };
+        // `limits.hard_stop` (the plan's flag) is deliberately not served:
+        // see the field.
         Self {
             plan: limits.display_name,
             included_ops: limits.included_ops,
@@ -74,8 +140,9 @@ impl UsageStatus {
             total_calls: usage.total_count,
             period_start: usage.period_start,
             warning,
-            hard_stop: limits.hard_stop,
+            hard_stop: false,
             enforced,
+            services,
         }
     }
 }
@@ -85,11 +152,35 @@ pub async fn get_usage(State(state): State<AppState>, ctx: OrgCtx) -> ApiResult<
     let mut tx = state.db.begin(ctx.org.id).await?;
     let usage = tx.current_usage().await?;
     let limits = tx.plan_limits().await?;
+    // `now()` is fixed for the transaction, so this is the month
+    // `current_usage` just read.
+    let period = Month::containing(usage.period_start);
+    let statuses = budgets::org_status(&mut tx, period)
+        .await
+        .map_err(|e| from_budgets("read service usage", e))?;
+    // With no Stripe configured nobody can put a card on file, so nobody is
+    // asked to (`gate::standing` answers good standing without a query).
+    let standing = gate::standing(&mut tx, Billing::enabled_if(state.stripe.is_some()))
+        .await
+        .map_err(|e| ApiError::internal("read the org's billing standing", e))?;
+    let mut services = Vec::with_capacity(statuses.len());
+    for status in statuses {
+        let meters = tx.service_meter_usage(&status.service).await?;
+        services.push(ServiceUsage {
+            payment_required: gate::blocked_reason(&status, standing) == Some(PAYMENT_REQUIRED),
+            budget: BudgetView::of(&status),
+            spend_error: spend_error(&status),
+            meters: meters.into_iter().map(Into::into).collect(),
+            spend_cents: status.spend_cents,
+            service: status.service,
+        });
+    }
     tx.commit().await?;
     Ok(Json(UsageStatus::new(
         usage,
         limits,
         state.config.enforce_quotas,
+        services,
     )))
 }
 
@@ -143,6 +234,7 @@ mod tests {
                 features: serde_json::json!({}),
             },
             false,
+            Vec::new(),
         )
     }
 
@@ -163,6 +255,11 @@ mod tests {
     fn the_warning_starts_at_four_fifths() {
         assert!(!status(399, 500).warning);
         assert!(status(400, 500).warning);
+    }
+
+    #[test]
+    fn the_legacy_hard_stop_is_never_served() {
+        assert!(!status(900, 500).hard_stop, "the plan's own flag is true");
     }
 
     #[test]

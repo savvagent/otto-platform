@@ -11,8 +11,9 @@
 //!
 //! A service registers itself with [`register`], an idempotent upsert of its
 //! name and scopes that it can run at every startup. Disabling a resource
-//! server and issuing its introspection credential are operator actions and
-//! are never touched by `register`.
+//! server, issuing its introspection credential, and assigning its service
+//! slug ([`set_service`]) are operator actions and are never touched by
+//! `register`.
 
 use std::collections::BTreeMap;
 
@@ -65,12 +66,30 @@ pub struct ResourceServer {
     /// Where lifecycle webhooks are delivered, if configured. The signing
     /// secret is never part of this struct; see [`set_webhook`].
     pub webhook_url: Option<String>,
+    /// The service slug its value meters, usage pools and budgets are keyed
+    /// by (`<service>/<meter>`), assigned by an operator with [`set_service`].
+    /// `None` until then, and a server without one cannot declare meters.
+    pub service: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 const COLS: &str = "resource_uri, name, scopes, default_scopes, scope_descriptions, disabled, \
-                    webhook_url, created_at, updated_at";
+                    webhook_url, service, created_at, updated_at";
+
+/// Longest service slug accepted, matching the `resource_servers_service_slug`
+/// CHECK (migration 0017).
+pub const MAX_SERVICE_SLUG_LEN: usize = 63;
+
+/// Whether `slug` is a valid service slug: `^[a-z][a-z0-9-]{0,62}$`, the same
+/// rule as the CHECK constraint, so a bad one is refused with a readable
+/// message before it reaches the database.
+pub fn is_service_slug(slug: &str) -> bool {
+    let mut bytes = slug.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z'))
+        && slug.len() <= MAX_SERVICE_SLUG_LEN
+        && bytes.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+}
 
 impl ResourceServer {
     /// The registered description of `scope`, if it has one.
@@ -204,6 +223,46 @@ pub async fn set_scope_descriptions(
     .fetch_one(db.pool())
     .await?;
     Ok(row)
+}
+
+/// Assign a resource server's service slug: the name its value meters are
+/// declared under (`<service>/<meter>`) and its usage pools and budgets are
+/// keyed by. An operator action, never part of [`register`], so a service
+/// cannot pick (or take over) a name for itself.
+///
+/// Setting the slug it already has is a no-op. A slug held by another resource
+/// server is refused, and so is renaming a service that has declared meters:
+/// everything keyed by the old name would be stranded.
+pub async fn set_service(db: &Db, resource_uri: &str, service: &str) -> Result<ResourceServer> {
+    if !is_service_slug(service) {
+        return Err(AuthError::InvalidRequest(format!(
+            "service {service:?} must be a lower-case slug: a letter, then up to 62 \
+             letters, digits or hyphens"
+        )));
+    }
+    let row = sqlx::query_as(&format!(
+        "UPDATE resource_servers SET service = $2, updated_at = now() \
+         WHERE resource_uri = $1 RETURNING {COLS}"
+    ))
+    .bind(resource_uri)
+    .bind(service)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| match &e {
+        sqlx::Error::Database(d) if d.is_unique_violation() => AuthError::InvalidRequest(format!(
+            "service {service:?} is already assigned to another resource server"
+        )),
+        sqlx::Error::Database(d) if d.is_foreign_key_violation() => {
+            AuthError::InvalidRequest(format!(
+                "{resource_uri:?} has declared meters under its current service; \
+                 it cannot be renamed to {service:?}"
+            ))
+        }
+        _ => AuthError::Db(e),
+    })?;
+    row.ok_or_else(|| {
+        AuthError::InvalidTarget(format!("{resource_uri:?} is not a registered resource"))
+    })
 }
 
 /// Look up a resource server that may currently be issued tokens.
@@ -523,6 +582,7 @@ mod tests {
             scope_descriptions: Default::default(),
             disabled: false,
             webhook_url: None,
+            service: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -607,6 +667,28 @@ mod tests {
                 ),
                 "{bad:?}"
             );
+        }
+    }
+
+    #[test]
+    fn service_slug_rules() {
+        let longest = format!("a{}", "b".repeat(MAX_SERVICE_SLUG_LEN - 1));
+        for ok in ["otto-flags", "a", "cxp2", "a-b-c", longest.as_str()] {
+            assert!(is_service_slug(ok), "{ok:?} should be accepted");
+        }
+        let too_long = format!("{longest}c");
+        for bad in [
+            "",
+            "Otto",
+            "1otto",
+            "-otto",
+            "otto_flags",
+            "otto/flags",
+            "otto flags",
+            "ottö",
+            too_long.as_str(),
+        ] {
+            assert!(!is_service_slug(bad), "{bad:?} should be refused");
         }
     }
 

@@ -9,6 +9,11 @@
 //! what one org is entitled to (after its negotiated override), the catalog is
 //! what anyone is offered.
 //!
+//! **Plans buy features, not usage** (epic savvagent/otto-platform#55). The
+//! offer is a tier's name, list price and capabilities; usage is priced per
+//! meter by the price book ([`crate::pricebook`]). The `included_ops` and
+//! `hard_stop` columns are still in `plans` but are not part of the offer.
+//!
 //! Read-only by construction: `otto_app` has no write grant on `plans`
 //! (migration 0016), and operators change tiers as the migrating role.
 
@@ -25,13 +30,6 @@ use sqlx::FromRow;
 pub struct PlanOffer {
     pub plan: Plan,
     pub display_name: String,
-    /// Billable operations included each month, as listed. A subscription's
-    /// `included_ops_override` is deliberately not applied: the catalog is the
-    /// public offer, not anyone's contract.
-    pub included_ops: i64,
-    /// Whether exceeding the bucket stops billable work rather than metering
-    /// overage.
-    pub hard_stop: bool,
     /// The list price, in US cents. `0` on enterprise means negotiated, not
     /// free; the column has no way to say "call us", and the only reader that
     /// needs to tell the two apart is a pricing page, which knows the tier.
@@ -47,8 +45,7 @@ pub struct PlanOffer {
 /// reads tiers in and the one a new tier is slotted into by its migration.
 pub async fn list_plans(tx: &mut Unpinned) -> Result<Vec<PlanOffer>> {
     let plans = sqlx::query_as(
-        "SELECT plan, display_name, included_ops, hard_stop, monthly_cents, features \
-         FROM plans ORDER BY plan",
+        "SELECT plan, display_name, monthly_cents, features FROM plans ORDER BY plan",
     )
     .fetch_all(tx.conn())
     .await?;

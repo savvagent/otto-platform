@@ -19,9 +19,9 @@
    * renders.
    *
    * The family's claims are each one sentence of fact the platform enforces
-   * — OIDC SSO (there is no SAML), one plan and one usage bucket per org,
-   * audience-bound tokens — so a translation can be checked against the code
-   * rather than against a slogan.
+   * — OIDC SSO (there is no SAML), usage metered and billed per service
+   * with the plan buying features, audience-bound tokens — so a translation
+   * can be checked against the code rather than against a slogan.
    *
    * Lists drawn without bullets carry `role="list"`: Safari drops list
    * semantics from a `<ul>`/`<ol>` whose markers are removed by CSS, and

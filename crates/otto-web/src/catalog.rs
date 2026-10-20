@@ -22,7 +22,9 @@
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post, put, MethodRouter};
 
-use crate::routes::{auth, orgs, plans, sso, teams, tokens, usage};
+use crate::routes::{
+    auth, billing, budgets, orgs, plans, sso, stripe_webhook, teams, tokens, usage,
+};
 use crate::state::AppState;
 use crate::{oauth, openapi};
 
@@ -63,6 +65,8 @@ pub enum Auth {
     OrgMember,
     /// A session, plus `owner` or `admin` of the org in the path.
     OrgAdmin,
+    /// A session, plus `owner` of the org in the path: billing.
+    OrgOwner,
 }
 
 impl Auth {
@@ -72,11 +76,12 @@ impl Auth {
             Auth::Session => "session",
             Auth::OrgMember => "org member",
             Auth::OrgAdmin => "org admin",
+            Auth::OrgOwner => "org owner",
         }
     }
 
     pub fn needs_org(self) -> bool {
-        matches!(self, Auth::OrgMember | Auth::OrgAdmin)
+        matches!(self, Auth::OrgMember | Auth::OrgAdmin | Auth::OrgOwner)
     }
 }
 
@@ -95,6 +100,10 @@ pub struct Endpoint {
     /// is not cosmetic — a generated client that expects `200` treats a real
     /// `201`/`204`/`303` success as an error.
     pub success: u16,
+    /// Failure statuses this endpoint answers beyond the ones every endpoint
+    /// of its kind can (`400`, `500`, and `401`/`403`/`404` behind a session),
+    /// e.g. `503` while a feature is switched off. See [`Endpoint::also_fails`].
+    pub extra_failures: &'static [u16],
     pub route: MethodRouter<AppState>,
 }
 
@@ -109,6 +118,7 @@ impl Endpoint {
             request: None,
             response: None,
             success: 200,
+            extra_failures: &[],
             route,
         }
     }
@@ -183,6 +193,13 @@ impl Endpoint {
     /// exactly what the handler actually sends.
     pub fn status(mut self, code: u16) -> Self {
         self.success = code;
+        self
+    }
+
+    /// Declare failure statuses beyond the common ones, so the document says
+    /// what a client must handle (`503 billing_disabled`, `413`, ...).
+    pub fn also_fails(mut self, statuses: &'static [u16]) -> Self {
+        self.extra_failures = statuses;
         self
     }
 
@@ -715,18 +732,110 @@ pub fn catalog() -> Vec<Endpoint> {
             .returns("PlansResponse")
             .summary("Public plan catalog")
             .describe(
-                "Every plan on offer, cheapest tier first: what a pricing page reads. \
-                 Public because plans are operator-maintained reference data, not tenant \
-                 data — they belong to no org, and a visitor deciding whether to sign up \
-                 has no credential to present. Read live from the `plans` table, so the \
-                 prices shown are the ones billed against; each instance reuses what it \
-                 read for a minute, and the response is cacheable for five more \
-                 (`Cache-Control: public, max-age=300`). `features` lists only the \
-                 capabilities chosen for advertising, not every key a plan carries. \
-                 A `monthlyCents` of 0 on \
-                 enterprise means negotiated, not free. Lists the published bucket, not \
-                 any org's negotiated override; an org's own figure is \
-                 /api/orgs/{org}/usage.",
+                "Every plan on offer, cheapest tier first, and the metered prices in \
+                 effect this month: what a pricing page reads. Plans buy features, not \
+                 usage: each plan is a name, a list price and the capabilities it \
+                 unlocks, and usage is priced per value meter, the same on every plan, by \
+                 the price book (`meters`, graduated tiers in millionths of a cent). \
+                 Public because plans and prices are operator-maintained reference data, \
+                 not tenant data — they belong to no org, and a visitor deciding whether \
+                 to sign up has no credential to present. Read live from the database, \
+                 so the prices shown are the ones billed against; each instance reuses \
+                 what it read for a minute, and the response is cacheable for five more \
+                 (`Cache-Control: public, max-age=300`), so for up to about six minutes \
+                 after a month begins (00:00 UTC on the first) the previous month's \
+                 metered prices can still be shown. `features` lists only the \
+                 capabilities chosen for advertising, not every key a plan carries. A \
+                 `monthlyCents` of 0 on enterprise means negotiated, not free.",
+            ),
+        // ----------------------------------------------------------- billing
+        Endpoint::get("/api/orgs/{org}/billing", billing::get_billing)
+            .auth(Auth::OrgOwner)
+            .returns("BillingStatus")
+            .summary("Card on file and subscription status")
+            .describe(
+                "Owner-only. Whether billing is enabled on this deployment, whether the \
+                 org has a card on file (`none`, `active`, `failed` when Stripe could not \
+                 collect with it, `detached` when it was removed), and the Stripe \
+                 subscription's status, which invoices metered usage monthly in arrears. \
+                 With billing disabled this still answers, with `billingEnabled: false`.",
+            ),
+        Endpoint::post("/api/orgs/{org}/billing/setup", billing::start_setup)
+            .auth(Auth::OrgOwner)
+            .returns("BillingSetupSession")
+            .also_fails(&[409, 502, 503])
+            .summary("Start putting a card on file")
+            .describe(
+                "Owner-only and audited (`billing.setup.started`). Creates the org's \
+                 Stripe customer on first use and returns a Stripe Checkout URL in setup \
+                 mode, for cards only; send the owner there. Checkout returns them to the console's \
+                 billing page with `?setup=success` or `?setup=cancelled`, but the card is \
+                 on file only once Stripe confirms it on the webhook, after which the org \
+                 is subscribed with one metered item per priced meter. `503 \
+                 billing_disabled` when this deployment has no Stripe configuration; `502 \
+                 stripe_unavailable` when Stripe could not be reached; `409 billing_busy` \
+                 while another billing change for the org is in progress. Putting a card \
+                 on file again after the subscription was canceled resumes billing.",
+            ),
+        Endpoint::post("/api/stripe/webhook", stripe_webhook::receive)
+            .auth(Auth::Public)
+            .returns("StripeWebhookReceived")
+            .also_fails(&[413, 503])
+            .body_limit(stripe_webhook::MAX_WEBHOOK_PAYLOAD_BYTES)
+            .summary("Stripe's events (Stripe only)")
+            .describe(
+                "Called by Stripe, not by a client. Public, and authenticated only by \
+                 the `Stripe-Signature` header over the raw body (`400` when it does not \
+                 verify); the body is capped at 64 KiB (`413`). Idempotent by event id. \
+                 Acts on `checkout.session.completed` (setup mode), \
+                 `customer.subscription.updated`, `customer.subscription.deleted`, \
+                 `invoice.paid`, `invoice.payment_failed` and `payment_method.detached`, \
+                 and acknowledges \
+                 every other verified event with no action. `500` asks Stripe to retry; \
+                 `503 billing_disabled` when this deployment has no Stripe configuration.",
+            ),
+        // ----------------------------------------------------------- budgets
+        Endpoint::get("/api/orgs/{org}/budgets", budgets::list_budgets)
+            .auth(Auth::OrgMember)
+            .returns("BudgetsResponse")
+            .summary("Every metered service's budget and spend")
+            .describe(
+                "Any member. One entry per service with declared meters, budgeted or not: \
+                 this month's spend in US cents (each meter's quantity rated against the \
+                 prices in effect for the month, unpriced meters adding nothing), the \
+                 alert thresholds (50, 80, 100 percent) that have fired this month, and \
+                 the budget, or null when none is set. A service whose spend cannot be \
+                 computed (a pricing fault) reports `spendCents: null` and `spendError: \
+                 \"pricing_unavailable\"` without affecting the others. Free to read, and \
+                 readable by an org that is over budget.",
+            ),
+        Endpoint::put("/api/orgs/{org}/budgets/{service}", budgets::set_budget)
+            .auth(Auth::OrgAdmin)
+            .takes("SetBudgetRequest")
+            .returns("ServiceBudget")
+            .summary("Set a service's monthly budget")
+            .describe(
+                "Owner or admin, with the console session only: a bearer token or personal \
+                 access token never reaches this API, so agents can read budgets but not \
+                 change them. Audited (`billing.budget.set`). Sets or replaces the \
+                 service's budget for every month from now on, in US cents (1 to \
+                 1000000000). Alerts fire by email to owners and admins when spend first \
+                 reaches 50, 80 and 100 percent in a month, once each. `hardStop` (off by \
+                 default) makes the service refuse billable calls once spend reaches the \
+                 budget; free calls and every other service keep working. Alerts that \
+                 already fired this month do not fire again after the budget is raised or \
+                 lowered; only thresholds not yet reached this month can. `404` for a \
+                 service with no declared meters.",
+            ),
+        Endpoint::delete("/api/orgs/{org}/budgets/{service}", budgets::clear_budget)
+            .auth(Auth::OrgAdmin)
+            .status(204)
+            .summary("Remove a service's monthly budget")
+            .describe(
+                "Owner or admin, with the console session only. Removes the budget and with \
+                 it any hard stop; `204` whether or not one was set, audited \
+                 (`billing.budget.cleared`) when one was. Alerts that already fired this \
+                 month stay fired. `404` for a service with no declared meters.",
             ),
         // -------------------------------------------------- tokens & usage
         Endpoint::get("/api/orgs/{org}/tokens", tokens::list_tokens)
@@ -758,7 +867,14 @@ pub fn catalog() -> Vec<Endpoint> {
             .auth(Auth::OrgMember)
             .returns("UsageStatus")
             .summary("This period's usage against the plan")
-            .describe("Free to read, and readable by an org that has run out."),
+            .describe(
+                "Free to read, and readable by an org that has run out. The legacy \
+                 family-wide bucket (its `hardStop` deprecated and always false), plus \
+                 `services`: each service with declared meters, with its meters' \
+                 quantities, its spend in US cents, its budget (null when none is set), \
+                 and `paymentRequired`, true when the service refuses billable calls \
+                 until the org adds a payment method.",
+            ),
         Endpoint::get("/api/orgs/{org}/audit", usage::get_audit)
             .auth(Auth::OrgAdmin)
             .returns("AuditEventList")

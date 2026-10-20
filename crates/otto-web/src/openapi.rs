@@ -134,7 +134,10 @@ fn responses(endpoint: &Endpoint) -> Value {
     if endpoint.auth.needs_org() {
         // 404 rather than 403 for an org you are not in — see `OrgCtx`.
         responses["403"] = error.clone();
-        responses["404"] = error;
+        responses["404"] = error.clone();
+    }
+    for status in endpoint.extra_failures {
+        responses[status.to_string()] = error.clone();
     }
 
     responses
@@ -146,6 +149,7 @@ fn param_description(name: &str) -> &'static str {
         "team" => "Team slug.",
         "user" => "User id (UUID).",
         "id" => "Resource id (UUID).",
+        "service" => "Service slug, e.g. `otto-flags`.",
         _ => "",
     }
 }
@@ -165,7 +169,13 @@ fn tag_for(path: &str) -> &'static str {
         "tokens"
     } else if path.contains("/invites") {
         "invites"
-    } else if path.contains("/usage") || path.contains("/audit") || path == "/api/plans" {
+    } else if path.contains("/usage")
+        || path.contains("/budgets")
+        || path.contains("/audit")
+        || path.contains("/billing")
+        || path.starts_with("/api/stripe")
+        || path == "/api/plans"
+    {
         "billing"
     } else {
         "orgs"
@@ -185,6 +195,8 @@ fn components() -> Value {
         entity_schemas(),
         sso_schemas(),
         plan_schemas(),
+        billing_schemas(),
+        budget_schemas(),
         response_schemas(),
         request_schemas(),
     ] {
@@ -528,10 +540,23 @@ fn entity_schemas() -> Value {
                 "totalCalls": { "type": "integer" },
                 "periodStart": { "type": "string", "format": "date" },
                 "warning": { "type": "boolean" },
-                "hardStop": { "type": "boolean" },
+                "hardStop": {
+                    "type": "boolean",
+                    "deprecated": true,
+                    "description":
+                        "Always false: the family-wide bucket never stops work. A \
+                         service's own hard stop is `services[].budget.hardStop`.",
+                },
                 "enforced": { "type": "boolean" },
+                "services": {
+                    "type": "array",
+                    "items": reference("ServiceUsage"),
+                    "description":
+                        "Each service with declared meters, by slug: its own meters, \
+                         spend and budget this month.",
+                },
             },
-            "required": ["plan", "includedOps", "billableUsed", "remaining"],
+            "required": ["plan", "includedOps", "billableUsed", "remaining", "services"],
         },
         "AuditEvent": {
             "type": "object",
@@ -561,33 +586,34 @@ fn plan_schemas() -> Value {
     json!({
         "PlansResponse": {
             "type": "object",
-            "description": "Every plan on offer, cheapest tier first.",
+            "description":
+                "Every plan on offer, cheapest tier first, and the metered prices in \
+                 effect this month. Plans buy features; usage is priced per meter, the \
+                 same on every plan.",
             "properties": {
                 "plans": { "type": "array", "items": reference("PublicPlan") },
+                "meters": {
+                    "type": "array",
+                    "items": reference("PublicMeter"),
+                    "description":
+                        "Every meter with a price in effect this month, by service and \
+                         meter. A meter with no price is not listed.",
+                },
             },
-            "required": ["plans"],
+            "required": ["plans", "meters"],
         },
         "PublicPlan": {
             "type": "object",
             "description":
-                "One tier as offered, before any org's negotiated override. Live from the \
-                 `plans` table.",
+                "One tier as offered: its name, list price and the capabilities it \
+                 unlocks. Live from the `plans` table. Usage is priced by `meters`, \
+                 not by the plan.",
             "properties": {
                 "plan": {
                     "type": "string",
                     "enum": ["free", "team", "business", "enterprise"],
                 },
                 "displayName": { "type": "string" },
-                "includedOps": {
-                    "type": "integer",
-                    "description": "Billable operations included each month.",
-                },
-                "hardStop": {
-                    "type": "boolean",
-                    "description":
-                        "Whether exceeding the bucket stops billable work rather than \
-                         metering overage.",
-                },
                 "monthlyCents": {
                     "type": "integer",
                     "description":
@@ -604,9 +630,268 @@ fn plan_schemas() -> Value {
                          advertised.",
                 },
             },
+            "required": ["plan", "displayName", "monthlyCents", "features"],
+        },
+        "PublicMeter": {
+            "type": "object",
+            "description":
+                "One value meter's price, from the price book in effect this month.",
+            "properties": {
+                "service": { "type": "string", "description": "The service slug, e.g. `otto-flags`." },
+                "meter": {
+                    "type": "string",
+                    "description": "The meter's name within its service, e.g. `evaluations`.",
+                },
+                "displayName": { "type": "string" },
+                "unit": { "type": "string", "description": "What one unit is, e.g. `evaluation`." },
+                "tiers": {
+                    "type": "array",
+                    "items": reference("PublicTier"),
+                    "minItems": 1,
+                    "description":
+                        "Graduated tiers, in order. Units up to the first tier's `upTo` in \
+                         a month are charged at its unit amount, the units above that up to \
+                         the next `upTo` at the next one's, and so on; the last tier is \
+                         unbounded. A free allowance is a first tier priced at 0.",
+                },
+            },
+            "required": ["service", "meter", "displayName", "unit", "tiers"],
+        },
+        "PublicTier": {
+            "type": "object",
+            "description": "One graduated tier of a meter's price.",
+            "properties": {
+                "upTo": {
+                    "type": ["integer", "null"],
+                    "format": "int64",
+                    "description":
+                        "The last unit of the month this tier prices; null on the last, \
+                         unbounded tier.",
+                },
+                "unitAmountUcents": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 0,
+                    "description":
+                        "Price per unit in millionths of a US cent (1000000 is one cent). \
+                         A meter's monthly amount is rounded to whole cents once, half up.",
+                },
+            },
+            "required": ["upTo", "unitAmountUcents"],
+        },
+    })
+}
+
+/// The org's billing: card on file, subscription, Stripe's webhook.
+fn billing_schemas() -> Value {
+    json!({
+        "BillingStatus": {
+            "type": "object",
+            "description":
+                "Where an org's billing stands. Owner-only. Metered usage is invoiced \
+                 monthly in arrears through the Stripe subscription.",
+            "properties": {
+                "billingEnabled": {
+                    "type": "boolean",
+                    "description":
+                        "Whether this deployment bills through Stripe. When false, no card \
+                         can be put on file and nothing is invoiced.",
+                },
+                "cardStatus": {
+                    "type": "string",
+                    "enum": ["none", "active", "failed", "detached"],
+                    "description":
+                        "`none`: never put on file. `active`: on file and the default. \
+                         `failed`: Stripe could not collect an invoice with it. \
+                         `detached`: removed. Put a new card on file to recover from the \
+                         last two.",
+                },
+                "subscriptionStatus": {
+                    "type": ["string", "null"],
+                    "description":
+                        "The Stripe subscription's status (`active`, `past_due`, \
+                         `canceled`, ...), or null when the org has none yet: a card is \
+                         needed, and at least one priced meter synced to Stripe.",
+                },
+                "billingStopped": {
+                    "type": "boolean",
+                    "description":
+                        "Stripe canceled the subscription. Nothing is invoiced and nothing \
+                         re-subscribes the org until an owner puts a card on file again.",
+                },
+                "subscriptionLive": {
+                    "type": "boolean",
+                    "description":
+                        "Whether usage is being invoiced through the subscription (status \
+                         `active`, `trialing`, `past_due` or `unpaid`).",
+                },
+            },
             "required": [
-                "plan", "displayName", "includedOps", "hardStop", "monthlyCents", "features",
+                "billingEnabled",
+                "cardStatus",
+                "subscriptionStatus",
+                "subscriptionLive",
+                "billingStopped",
             ],
+        },
+        "BillingSetupSession": {
+            "type": "object",
+            "description": "A Stripe Checkout session in setup mode.",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "Stripe's hosted page. Send the owner here.",
+                },
+            },
+            "required": ["url"],
+        },
+        "StripeWebhookReceived": {
+            "type": "object",
+            "description": "Stripe's event was verified and is handled (or needs nothing).",
+            "properties": { "received": { "type": "boolean", "const": true } },
+            "required": ["received"],
+        },
+    })
+}
+
+/// Per-service budgets, and the per-service part of the usage page.
+fn budget_schemas() -> Value {
+    json!({
+        "BudgetsResponse": {
+            "type": "object",
+            "properties": {
+                "periodStart": {
+                    "type": "string",
+                    "format": "date",
+                    "description": "First day of the UTC billing month the spend is for.",
+                },
+                "services": {
+                    "type": "array",
+                    "items": reference("ServiceBudget"),
+                    "description": "Every service with declared meters, by slug.",
+                },
+            },
+            "required": ["periodStart", "services"],
+        },
+        "ServiceBudget": {
+            "type": "object",
+            "description": "One service's budget and spend this month.",
+            "properties": {
+                "service": { "type": "string", "description": "The service slug." },
+                "spendCents": {
+                    "type": ["integer", "null"],
+                    "format": "int64",
+                    "description":
+                        "What the service's meters have cost this month, in US cents, at \
+                         the prices in effect. Unpriced meters and free calls add nothing. \
+                         Null when it cannot be computed (see `spendError`).",
+                },
+                "spendError": {
+                    "type": ["string", "null"],
+                    "enum": ["pricing_unavailable", null],
+                    "description":
+                        "`pricing_unavailable` when this service's spend could not be \
+                         computed (a pricing fault on the platform's side); null otherwise. \
+                         Other services are unaffected, and nothing is blocked on it.",
+                },
+                "thresholdsReached": {
+                    "type": "array",
+                    "items": { "type": "integer", "enum": [50, 80, 100] },
+                    "description":
+                        "The alert thresholds (percent) that have fired this month, \
+                         ascending. Each fires once a month.",
+                },
+                "budget": {
+                    "oneOf": [reference("Budget"), { "type": "null" }],
+                    "description": "Null when no budget is set.",
+                },
+            },
+            "required": ["service", "spendCents", "spendError", "thresholdsReached", "budget"],
+        },
+        "Budget": {
+            "type": "object",
+            "description": "A service's monthly budget, and where spend stands against it.",
+            "properties": {
+                "monthlyBudgetCents": { "type": "integer", "format": "int64" },
+                "hardStop": {
+                    "type": "boolean",
+                    "description":
+                        "Refuse billable calls to this service once spend reaches the budget.",
+                },
+                "percentUsed": {
+                    "type": ["integer", "null"],
+                    "description":
+                        "Whole percent spent, rounded down. Can exceed 100. Null when spend \
+                         is unknown.",
+                },
+                "blocked": {
+                    "type": "boolean",
+                    "description":
+                        "Whether the service is refusing billable calls now: hard stop on \
+                         and spend at or past the budget.",
+                },
+                "updatedAt": { "type": "string", "format": "date-time" },
+            },
+            "required": ["monthlyBudgetCents", "hardStop", "percentUsed", "blocked", "updatedAt"],
+        },
+        "SetBudgetRequest": {
+            "type": "object",
+            "properties": {
+                "monthlyBudgetCents": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 1,
+                    "maximum": 1_000_000_000,
+                    "description": "The budget for one UTC calendar month, in US cents.",
+                },
+                "hardStop": { "type": "boolean", "default": false },
+            },
+            "required": ["monthlyBudgetCents"],
+            "additionalProperties": false,
+        },
+        "ServiceUsage": {
+            "type": "object",
+            "description": "One metered service's usage this month.",
+            "properties": {
+                "service": { "type": "string" },
+                "meters": { "type": "array", "items": reference("MeterUsage") },
+                "spendCents": {
+                    "type": ["integer", "null"],
+                    "format": "int64",
+                    "description": "Null when it cannot be computed (see `spendError`).",
+                },
+                "spendError": {
+                    "type": ["string", "null"],
+                    "enum": ["pricing_unavailable", null],
+                },
+                "budget": {
+                    "oneOf": [reference("Budget"), { "type": "null" }],
+                    "description": "Null when no budget is set.",
+                },
+                "paymentRequired": {
+                    "type": "boolean",
+                    "description":
+                        "Whether the service refuses billable calls until the org adds a \
+                         payment method: the org has no live subscription and the \
+                         service's spend this month is above zero (past its free tiers). \
+                         Free calls keep working.",
+                },
+            },
+            "required": [
+                "service", "meters", "spendCents", "spendError", "budget", "paymentRequired",
+            ],
+        },
+        "MeterUsage": {
+            "type": "object",
+            "description": "One declared meter's quantity this month, zero when unused.",
+            "properties": {
+                "meter": { "type": "string", "description": "`<service>/<meter>`." },
+                "displayName": { "type": "string" },
+                "unit": { "type": "string" },
+                "quantity": { "type": "integer", "format": "int64" },
+            },
+            "required": ["meter", "displayName", "unit", "quantity"],
         },
     })
 }

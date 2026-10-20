@@ -179,17 +179,126 @@ export interface TeamMember {
   joinedAt: string;
 }
 
+/**
+ * `GET /api/orgs/{org}/usage`: this month's metered usage and spend, per
+ * service.
+ *
+ * **Only part of the body is declared, on purpose.** The server still sends
+ * the retired family-wide bucket beside `services` (`includedOps`,
+ * `billableUsed`, `remaining`, `totalCalls`, `warning`, `hardStop`,
+ * `enforced`). Usage is now priced per service, by value meter, so the
+ * console no longer presents any of those, and leaving them undeclared makes
+ * `npm run check` fail on a page that starts reading them again.
+ */
 export interface UsageStatus {
   plan: string;
-  includedOps: number;
-  billableUsed: number;
-  remaining: number;
-  totalCalls: number;
+  /** First day of the UTC billing month, `YYYY-MM-DD`. */
   periodStart: string;
-  warning: boolean;
+  /** Each service with declared meters, by slug. */
+  services: ServiceUsage[];
+}
+
+/** One meter's quantity this month (`MeterUsageView`). */
+export interface MeterUsage {
+  /** `<service>/<meter>`, e.g. `otto-flags/evaluations`. */
+  meter: string;
+  /** Written by the service, in English; shown as given. */
+  displayName: string;
+  /** What one unit is, e.g. `evaluation`. Also the service's English. */
+  unit: string;
+  quantity: number;
+}
+
+/**
+ * Why a service's spend is `null`. The one value today: the price could not
+ * be read. Spend that is unknown is shown as unknown, never as `$0`.
+ */
+export type SpendError = 'pricing_unavailable';
+
+/** An alert threshold, in percent of the monthly budget. */
+export type BudgetThreshold = 50 | 80 | 100;
+
+/** A service's budget, and where spend stands against it (`BudgetView`). */
+export interface BudgetView {
+  /** 1 to `MAX_MONTHLY_BUDGET_CENTS`, in US cents. */
+  monthlyBudgetCents: number;
   hardStop: boolean;
-  /** Whether the server is currently refusing billable calls over the bucket. */
-  enforced: boolean;
+  /** Whole percent spent, rounded down; can exceed 100. `null` when spend is unknown. */
+  percentUsed: number | null;
+  /** Hard stop on and spend at or past the budget: billable calls are refused. */
+  blocked: boolean;
+  updatedAt: string;
+}
+
+/** One metered service's usage this month (`ServiceUsage`). */
+export interface ServiceUsage {
+  /** The service slug, e.g. `otto-flags`. */
+  service: string;
+  meters: MeterUsage[];
+  /** US cents, or `null` when it cannot be computed; `spendError` says why. */
+  spendCents: number | null;
+  spendError: SpendError | null;
+  /** `null` when no budget is set. */
+  budget: BudgetView | null;
+  /**
+   * The org has no live subscription and this service's spend this month is
+   * past its free allowance, so the resource servers refuse its billable
+   * calls (`payment_required`) until a card is on file. Its free calls keep
+   * working. Never `true` while spend is unknown.
+   *
+   * This, not the deprecated, always-`false` top-level `hardStop`, is how
+   * the console learns that work is being refused for want of payment.
+   */
+  paymentRequired: boolean;
+}
+
+/** One service's budget and spend this month (`ServiceBudgetView`). */
+export interface ServiceBudget {
+  service: string;
+  spendCents: number | null;
+  spendError: SpendError | null;
+  /**
+   * The thresholds whose alerts have fired this month, ascending. Kept when
+   * the budget changes, so it can name a threshold the current budget is not
+   * at: an alert already sent is not sent again.
+   */
+  thresholdsReached: BudgetThreshold[];
+  budget: BudgetView | null;
+}
+
+/** `GET /api/orgs/{org}/budgets` (`BudgetsView`). */
+export interface BudgetsResponse {
+  /** First day of the UTC billing month the spend is for, `YYYY-MM-DD`. */
+  periodStart: string;
+  /** Every service with declared meters, budgeted or not. */
+  services: ServiceBudget[];
+}
+
+/** The body of `PUT /api/orgs/{org}/budgets/{service}`. */
+export interface SetBudgetRequest {
+  monthlyBudgetCents: number;
+  hardStop: boolean;
+}
+
+/** Whether the org has a usable card on file (`PaymentMethodStatus`). */
+export type CardStatus = 'none' | 'active' | 'failed' | 'detached';
+
+/** `GET /api/orgs/{org}/billing` (`BillingStatusView`). Owner only. */
+export interface BillingStatus {
+  /** Whether this deployment bills through Stripe at all. */
+  billingEnabled: boolean;
+  cardStatus: CardStatus;
+  /** Stripe's subscription status (`active`, `past_due`, ...), or `null` with none. */
+  subscriptionStatus: string | null;
+  /** Whether usage is invoiced through the subscription. */
+  subscriptionLive: boolean;
+  /** Stripe canceled the subscription; resumes once a card is put on file again. */
+  billingStopped: boolean;
+}
+
+/** `POST /api/orgs/{org}/billing/setup`: Stripe Checkout, in setup mode. */
+export interface SetupSession {
+  url: string;
 }
 
 /** The tiers, cheapest first — the order `GET /api/plans` lists them in. */
@@ -198,6 +307,10 @@ export type PlanTier = 'free' | 'team' | 'business' | 'enterprise';
 /**
  * One tier as offered (`PublicPlan`): the list price, before any org's
  * negotiated override, read live from the `plans` table.
+ *
+ * **A plan buys features, not usage.** It carries no allowance and no overage
+ * rule: usage is priced per service, by value meter, the same on every plan
+ * (see `PricedMeter`).
  *
  * `monthlyCents` is US cents, and `0` means two different things: free on
  * `free`, *negotiated* on `enterprise`. Read it through `$lib/pricing`'s
@@ -213,17 +326,52 @@ export interface Plan {
   plan: PlanTier;
   /** A name, so it is shown as given and never translated. */
   displayName: string;
-  /** Billable operations included each month. */
-  includedOps: number;
-  /** Whether going over the bucket stops billable work rather than metering overage. */
-  hardStop: boolean;
   monthlyCents: number;
   features: Record<string, boolean>;
 }
 
-/** `GET /api/plans`: every plan on offer, cheapest tier first. Public, no session. */
+/**
+ * One graduated tier of a meter's price (`PublicTier`).
+ *
+ * Units up to `upTo` in a month are charged `unitAmountUcents` each; the next
+ * tier starts at the unit after. `null` only on the last, unbounded tier. A
+ * first tier priced at `0` is a free allowance.
+ */
+export interface PriceTier {
+  upTo: number | null;
+  /**
+   * Price per unit in **millionths of a US cent** (`1_000_000` is one cent).
+   * Never divide it as a float; `$lib/pricing`'s `unitPrice` formats it
+   * exactly.
+   */
+  unitAmountUcents: number;
+}
+
+/**
+ * One value meter with a price in effect this month (`PublicMeter`). A meter
+ * with no price is not listed at all, so a service with no entries here has
+ * no published usage price yet.
+ */
+export interface PricedMeter {
+  /** The service slug, e.g. `otto-flags`. */
+  service: string;
+  /** The meter's name within the service, e.g. `evaluations`. */
+  meter: string;
+  /** Written by the service, in English; shown as given, like a plan's name. */
+  displayName: string;
+  /** What one unit is, e.g. `evaluation`. Also the service's English. */
+  unit: string;
+  /** Graduated, in order; the last is unbounded. */
+  tiers: PriceTier[];
+}
+
+/**
+ * `GET /api/plans`: every plan on offer, cheapest tier first, and every
+ * metered price in effect this month. Public, no session.
+ */
 export interface PlansResponse {
   plans: Plan[];
+  meters: PricedMeter[];
 }
 
 export interface BrowserSession {

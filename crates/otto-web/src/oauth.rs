@@ -1441,6 +1441,7 @@ mod tests {
             ),
             disabled: false,
             webhook_url: None,
+            service: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -1631,6 +1632,7 @@ mod tests {
                 scope_descriptions: Default::default(),
                 disabled: false,
                 webhook_url: None,
+                service: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             },

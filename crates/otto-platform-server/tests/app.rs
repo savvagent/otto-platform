@@ -18,6 +18,8 @@ fn config() -> Config {
         static_dir: None,
         run_migrations: true,
         log_format: otto_platform_server::LogFormat::Text,
+        email: None,
+        stripe: None,
     }
 }
 
@@ -120,4 +122,25 @@ async fn the_console_served_directly_keeps_csrf_and_json_404s(pool: PgPool) {
     let (status, _) = call(Request::get("/readyz").body(Body::empty()).unwrap()).await;
     assert_eq!(status, StatusCode::OK);
     let _ = std::fs::remove_dir_all(cfg.static_dir.as_ref().expect("set above"));
+}
+
+/// With no Stripe secrets the whole application still boots and serves, and
+/// the Stripe webhook, mounted in the assembled router, says billing is off
+/// rather than 404ing or failing.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn without_stripe_secrets_billing_is_reported_disabled(pool: PgPool) {
+    let router = app(Db::from_pool(pool), &config()).expect("app boots without Stripe");
+    let res = router
+        .oneshot(
+            Request::post("/api/stripe/webhook")
+                .header("stripe-signature", "t=1,v1=00")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "billing_disabled");
 }

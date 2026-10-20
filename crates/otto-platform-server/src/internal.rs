@@ -7,7 +7,8 @@
 //!
 //! ```text
 //!   POST /internal/usage                                     batch usage ingest
-//!   GET  /internal/orgs/{org}/usage-status                   period usage vs plan, plan features
+//!   PUT  /internal/meters                                    declare the caller's value meters
+//!   GET  /internal/orgs/{org}/usage-status                   the caller's meters, budget, plan features
 //!   GET  /internal/orgs/{org}/members/{user}                 whoami: user + org + role
 //!   GET  /internal/orgs/{org}/members/by-email?email=        member lookup
 //!   GET  /internal/orgs/{org}/members/{user}/teams           the member's teams in the org
@@ -26,20 +27,32 @@
 //! unguessable UUIDs, which is the whole of the defence; see the PR for the
 //! open question.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
-use axum::extract::{Path, Query, State};
-use axum::routing::{get, post};
+use axum::extract::{DefaultBodyLimit, FromRef, Path, Query, State};
+use axum::http::header::CACHE_CONTROL;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use otto_billing::usage::{IngestOutcome, ShippedUsage, UsageExt};
+use otto_billing::billing::gate::{self, Standing};
+use otto_billing::budgets::{
+    self, PendingBudgets, ServiceBudgetStatus, BUDGET_EXCEEDED, SPEND_UNAVAILABLE,
+};
+use otto_billing::meters::{self, MeterSpec};
+use otto_billing::period::{self, Month};
+use otto_billing::usage::{
+    self, IngestOutcome, Metered, MeteringFields, ShippedUsage, Shipper, UsageExt,
+};
 use otto_core::orgs::{Org, OrgsExt};
 use otto_core::teams::{Team, TeamsExt};
 use otto_resource::{
-    MemberInfo, MemberTeams, OrgInfo, RejectedEvent, TeamInfo, UsageBatch, UsageReceipt,
-    UsageStatus, UserInfo, MAX_USAGE_BATCH,
+    BudgetStatus, MemberInfo, MemberTeams, MeterDeclarationBatch, MeterDeclarationReceipt,
+    MeterUsage, OrgInfo, RejectedEvent, RejectedMeter, TeamInfo, UsageBatch, UsageReceipt,
+    UsageStatus, UserInfo, MAX_METER_DECLARATIONS, MAX_USAGE_BATCH,
 };
 use otto_tenant::ids::{OrgId, TeamId, UserId};
-use otto_tenant::Db;
+use otto_tenant::{Db, Tx};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -49,9 +62,53 @@ use crate::api::{wire_role, ApiError, CallingResourceServer};
 /// kilobyte of one is a bug in the shipper.
 const MAX_TOOL_LEN: usize = 128;
 
-pub fn router(db: Db) -> Router {
+/// The largest `PUT /internal/meters` body read. Fifty well-formed meters fit
+/// in well under a quarter of this.
+const MAX_METERS_BODY: usize = 64 * 1024;
+
+/// How much of a refused meter key is echoed back. A valid key is at most
+/// 63 + 1 + 63 bytes.
+const MAX_ECHOED_KEY: usize = 128;
+
+/// Whether this deployment bills through Stripe ([`gate::Billing`]): decides
+/// whether usage-status may ever answer `payment_required`.
+pub use otto_billing::billing::gate::Billing;
+
+/// Billing as `config` sets it up: enabled when both Stripe secrets are set
+/// ([`crate::Config::stripe`]).
+pub fn billing_of(config: &crate::Config) -> Billing {
+    Billing::enabled_if(config.stripe.is_some())
+}
+
+/// What the `/internal` routes share. A route takes the parts it needs
+/// (`State<Db>`, `State<Billing>`) through [`FromRef`], so one that needs
+/// the billing mode cannot be mounted without it: the router does not
+/// compile unless its state provides every handler's.
+#[derive(Debug, Clone)]
+pub struct InternalState {
+    pub db: Db,
+    pub billing: Billing,
+}
+
+impl FromRef<InternalState> for Db {
+    fn from_ref(state: &InternalState) -> Self {
+        state.db.clone()
+    }
+}
+
+impl FromRef<InternalState> for Billing {
+    fn from_ref(state: &InternalState) -> Self {
+        state.billing
+    }
+}
+
+pub fn router(db: Db, billing: Billing) -> Router {
     Router::new()
         .route("/internal/usage", post(ingest_usage))
+        .route(
+            "/internal/meters",
+            put(declare_meters).layer(DefaultBodyLimit::max(MAX_METERS_BODY)),
+        )
         .route("/internal/orgs/{org}/usage-status", get(usage_status))
         .route(
             "/internal/orgs/{org}/members/by-email",
@@ -67,7 +124,7 @@ pub fn router(db: Db) -> Router {
             get(team_by_slug),
         )
         .route("/internal/orgs/{org}/teams/{team}", get(team))
-        .with_state(db)
+        .with_state(InternalState { db, billing })
 }
 
 /// An org that exists and has not been deleted, or 404.
@@ -91,8 +148,22 @@ async fn live_org(db: &Db, org: Uuid) -> Result<Org, ApiError> {
 /// An event the platform can never accept is reported in `rejected` instead
 /// of failing the batch, so one poison event cannot wedge the shipper's
 /// outbox. That covers an unknown or deleted org, a bad tool name, an
-/// `occurred_at` outside the accepted window (see `otto_billing::usage`), and
-/// an `event_id` already used for a different org.
+/// `occurred_at` outside the accepted window (see `otto_billing::usage`), an
+/// `event_id` already used for a different org, and the metering refusals of
+/// [`usage::check_metering`] (`unknown_meter`, `service_mismatch`,
+/// `invalid_quantity`), whose reason starts with that code.
+///
+/// Every event counts in the caller's own per-service pool, keyed by the
+/// caller's service slug and never by anything the event says. The caller's
+/// declared meters are read once per request, not once per event.
+///
+/// An event whose billing month has already closed (see
+/// `otto_billing::period`) is accepted and billed in the current period.
+///
+/// Each org's transaction first takes the org's ingest lock
+/// ([`usage::lock_org_ingest`]), so concurrent batches for one org run one
+/// after the other instead of deadlocking on each other's counter rows, and
+/// counts the org's events in billed order (period, then `occurred_at`).
 async fn ingest_usage(
     State(db): State<Db>,
     CallingResourceServer(rs): CallingResourceServer,
@@ -104,8 +175,16 @@ async fn ingest_usage(
         )));
     }
 
+    let service = rs.service.as_deref();
+    let declared = declared_meters(&db, service, &batch.events).await?;
+    let shipper = Shipper {
+        service,
+        declared: &declared,
+    };
+
     let mut receipt = UsageReceipt::default();
-    let mut by_org: BTreeMap<Uuid, Vec<&otto_resource::UsageEvent>> = BTreeMap::new();
+    let mut by_org: BTreeMap<Uuid, Vec<(&otto_resource::UsageEvent, Option<Metered<'_>>)>> =
+        BTreeMap::new();
     for ev in &batch.events {
         let tool = ev.tool.trim();
         if tool.is_empty() || tool.len() > MAX_TOOL_LEN {
@@ -113,16 +192,30 @@ async fn ingest_usage(
                 event_id: ev.event_id,
                 reason: format!("`tool` must be 1 to {MAX_TOOL_LEN} characters"),
             });
-        } else {
-            by_org.entry(ev.org_id).or_default().push(ev);
+            continue;
+        }
+        match usage::check_metering(
+            &shipper,
+            MeteringFields {
+                service: ev.service.as_deref(),
+                meter: ev.meter.as_deref(),
+                quantity: ev.quantity,
+            },
+        ) {
+            Ok(metered) => by_org.entry(ev.org_id).or_default().push((ev, metered)),
+            Err(refused) => receipt.rejected.push(RejectedEvent {
+                event_id: ev.event_id,
+                reason: refused.to_string(),
+            }),
         }
     }
 
-    for (org, events) in by_org {
+    let now = chrono::Utc::now();
+    for (org, mut events) in by_org {
         if db.get_active_org(OrgId::from(org)).await?.is_none() {
             receipt
                 .rejected
-                .extend(events.iter().map(|ev| RejectedEvent {
+                .extend(events.iter().map(|(ev, _)| RejectedEvent {
                     event_id: ev.event_id,
                     reason: format!("org {org} does not exist"),
                 }));
@@ -130,12 +223,19 @@ async fn ingest_usage(
         }
 
         let mut tx = db.begin(OrgId::from(org)).await?;
+        usage::lock_org_ingest(&mut tx).await?;
+        // Stable, so events of one instant keep the batch's order.
+        events.sort_by_key(|(ev, _)| {
+            let at = period::billed_at(ev.occurred_at, now);
+            (Month::of(at), ev.occurred_at)
+        });
+        let mut budgets = PendingBudgets::default();
         let mut accepted = 0;
         let mut duplicates = 0;
         let mut rejected = Vec::new();
-        for ev in events {
+        for (ev, metered) in events {
             let outcome = tx
-                .ingest_usage(
+                .ingest_usage_deferred(
                     &rs.resource_uri,
                     &ShippedUsage {
                         event_id: ev.event_id,
@@ -143,7 +243,10 @@ async fn ingest_usage(
                         tool: ev.tool.trim(),
                         billable: ev.billable,
                         occurred_at: ev.occurred_at,
+                        service,
+                        metered,
                     },
+                    &mut budgets,
                 )
                 .await?;
             match outcome {
@@ -155,6 +258,9 @@ async fn ingest_usage(
                 }),
             }
         }
+        // Budget alerts, once per service and period this batch touched. It
+        // never fails the events (see `PendingBudgets::run`).
+        budgets.run(&mut tx).await?;
         tx.commit().await?;
         receipt.accepted += accepted;
         receipt.duplicates += duplicates;
@@ -164,11 +270,138 @@ async fn ingest_usage(
     Ok(Json(receipt))
 }
 
-/// The org's usage this month against its plan. Resource servers cache this
-/// for 60 s, so it is a cheap read and may be slightly behind the counters.
+/// The meter keys `service` has declared, read only when the batch names a
+/// meter at all: an unmetered batch, or a caller with no service (which can
+/// have declared nothing), costs no query.
+async fn declared_meters(
+    db: &Db,
+    service: Option<&str>,
+    events: &[otto_resource::UsageEvent],
+) -> Result<HashSet<String>, ApiError> {
+    let Some(service) = service else {
+        return Ok(HashSet::new());
+    };
+    if events.iter().all(|ev| ev.meter.is_none()) {
+        return Ok(HashSet::new());
+    }
+    let mut tx = db.begin_unpinned().await?;
+    let declared = meters::list_meters(&mut tx, service).await?;
+    tx.rollback().await?;
+    Ok(declared.into_iter().map(|m| m.key).collect())
+}
+
+// ------------------------------------------------------------------ meters
+
+/// Declare the calling resource server's value meters, idempotently.
+///
+/// Each meter's key must be `<service>/<meter>` under the caller's own
+/// `service` (assigned by an operator with `resource set-service`); a key in
+/// another namespace, a malformed field, or a key repeated in the request is
+/// refused per meter in the receipt, and the rest are still declared. A caller
+/// with no service yet gets 409 `service_not_set`: it has no namespace to
+/// declare into, and retrying will not help until an operator assigns one.
+async fn declare_meters(
+    State(db): State<Db>,
+    CallingResourceServer(rs): CallingResourceServer,
+    Json(batch): Json<MeterDeclarationBatch>,
+) -> Result<Response, ApiError> {
+    let Some(service) = rs.service.as_deref() else {
+        let mut res = (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "service_not_set",
+                "error_description": "this resource server has no service slug yet; \
+                    an operator assigns one with `otto-platform-server resource set-service`",
+            })),
+        )
+            .into_response();
+        res.headers_mut()
+            .insert(CACHE_CONTROL, "no-store".parse().expect("static header"));
+        return Ok(res);
+    };
+    if batch.meters.len() > MAX_METER_DECLARATIONS {
+        return Err(ApiError::TooLarge(format!(
+            "a declaration holds at most {MAX_METER_DECLARATIONS} meters"
+        )));
+    }
+
+    let mut receipt = MeterDeclarationReceipt::default();
+    let mut valid = Vec::with_capacity(batch.meters.len());
+    for m in &batch.meters {
+        let checked = meters::check_declaration(
+            service,
+            &MeterSpec {
+                key: &m.key,
+                display_name: &m.display_name,
+                unit: &m.unit,
+            },
+        )
+        .and_then(|v| {
+            if valid
+                .iter()
+                .any(|seen: &meters::ValidMeter| seen.key == v.key)
+            {
+                Err("`key` is declared more than once in this request".to_owned())
+            } else {
+                Ok(v)
+            }
+        });
+        match checked {
+            Ok(v) => valid.push(v),
+            Err(reason) => receipt.rejected.push(RejectedMeter {
+                key: truncate(&m.key, MAX_ECHOED_KEY),
+                reason,
+            }),
+        }
+    }
+
+    let mut tx = db.begin_unpinned().await?;
+    meters::upsert_meters(&mut tx, &valid).await?;
+    tx.commit().await?;
+    receipt.declared = valid.into_iter().map(|v| v.key).collect();
+    Ok(Json(receipt).into_response())
+}
+
+/// At most `max` bytes of `s`, cut on a character boundary.
+fn truncate(s: &str, max: usize) -> String {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
+}
+
+/// The org's usage this month. Resource servers cache this for 60 s, so it is
+/// a cheap read and may be slightly behind the counters. Reading it is free
+/// and works however much has been used.
+///
+/// `service`, `meters`, `budget` and `blocked_reason` are the calling
+/// resource server's own only: another service's usage or budget never shows
+/// here, so a hard stop on one service never blocks another. `budget` is
+/// absent when the org has set none for the caller's service.
+///
+/// `blocked_reason` says why the caller must refuse billable calls, as
+/// [`gate::blocked_reason`] decides (the same function the console's usage
+/// page uses): `budget_exceeded` (its budget's hard stop) or
+/// `payment_required` (billing is enabled, the org is not in good standing
+/// to pay — no subscription, `unpaid`, or a failed payment past its grace —
+/// and the service's spend this month is above zero, past its free tiers);
+/// the budget wins when both apply. With billing disabled
+/// ([`Billing::Disabled`]) there is no way to put a card on file, so
+/// `payment_required` is never answered. The platform only reports it;
+/// resource servers enforce it, and fail open. Spend is computed only when an
+/// answer needs it ([`gate::needs_spend`]): with a budget, or when payment
+/// is required. An org in good standing with no budget never waits on (or
+/// fails with) the price book.
+///
+/// The legacy family-wide fields are all still served for clients pinned to
+/// an older `otto-resource`, but `hard_stop` is always `false`: an older
+/// client blocks on `hard_stop && billable_count >= included_ops`, and with a
+/// family-wide count that would let one service's usage stop work in another.
 async fn usage_status(
     State(db): State<Db>,
-    CallingResourceServer(_rs): CallingResourceServer,
+    State(billing): State<Billing>,
+    CallingResourceServer(rs): CallingResourceServer,
     Path(org): Path<Uuid>,
 ) -> Result<Json<UsageStatus>, ApiError> {
     live_org(&db, org).await?;
@@ -176,7 +409,30 @@ async fn usage_status(
     let mut tx = db.begin(OrgId::from(org)).await?;
     let usage = tx.current_usage().await?;
     let limits = tx.plan_limits().await?;
+    let (meters, gate) = match rs.service.as_deref() {
+        Some(service) => {
+            let meters = tx.service_meter_usage(service).await?;
+            let period = Month::containing(usage.period_start);
+            (
+                meters,
+                service_gate(&mut tx, service, period, billing).await?,
+            )
+        }
+        None => (Vec::new(), Gate::default()),
+    };
     tx.rollback().await?;
+
+    let meters = meters
+        .into_iter()
+        .map(|m| {
+            Ok(MeterUsage {
+                quantity: u64::try_from(m.quantity).map_err(ApiError::internal)?,
+                meter: m.meter,
+                display_name: m.display_name,
+                unit: m.unit,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
 
     Ok(Json(UsageStatus {
         org_id: org,
@@ -185,12 +441,82 @@ async fn usage_status(
         billable_count: usage.billable_count,
         total_count: usage.total_count,
         included_ops: limits.included_ops,
-        hard_stop: limits.hard_stop,
+        // Never the plan's flag; see above.
+        hard_stop: false,
         features: match limits.features {
             serde_json::Value::Object(map) => map.into_iter().collect(),
             _ => Default::default(),
         },
+        service: rs.service,
+        meters,
+        budget: gate.budget,
+        blocked_reason: gate.blocked_reason.map(str::to_owned),
     }))
+}
+
+/// What usage-status says about the caller's spend this period.
+#[derive(Debug, Default)]
+struct Gate {
+    /// `None` when the org has set no budget for the service.
+    budget: Option<BudgetStatus>,
+    /// [`BUDGET_EXCEEDED`], [`budgets::PAYMENT_REQUIRED`], or `None`.
+    blocked_reason: Option<&'static str>,
+}
+
+/// The caller's budget this period and whether it must refuse billable
+/// calls, rating its spend only when the answer depends on it
+/// ([`gate::needs_spend`]).
+///
+/// A budget whose spend cannot be computed (a malformed price version, an
+/// overflow) is still reported, with `spend_cents` and `percent_used` null,
+/// `blocked` false and reason `spend_unavailable`; unknown spend never
+/// requires payment either: enforcement fails open, visibly. A database
+/// error fails the request.
+async fn service_gate(
+    tx: &mut Tx<'_>,
+    service: &str,
+    period: Month,
+    billing_mode: Billing,
+) -> Result<Gate, ApiError> {
+    let has_budget = budgets::get_budget(tx, service)
+        .await
+        .map_err(ApiError::internal)?
+        .is_some();
+    // With billing off every org is in good standing, without a query.
+    let standing: Standing = gate::standing(tx, billing_mode)
+        .await
+        .map_err(ApiError::internal)?;
+    if !gate::needs_spend(has_budget, standing) {
+        return Ok(Gate::default());
+    }
+    let status = budgets::service_status(tx, service, period)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Gate {
+        budget: wire_budget(&status),
+        blocked_reason: gate::blocked_reason(&status, standing),
+    })
+}
+
+fn wire_budget(status: &ServiceBudgetStatus) -> Option<BudgetStatus> {
+    let budget = status.budget.as_ref()?;
+    let blocked = status.blocked();
+    let reason = if blocked {
+        Some(BUDGET_EXCEEDED)
+    } else if status.spend_cents.is_none() {
+        Some(SPEND_UNAVAILABLE)
+    } else {
+        None
+    };
+    Some(BudgetStatus {
+        monthly_budget_cents: budget.monthly_budget_cents,
+        spend_cents: status.spend_cents,
+        percent_used: status.percent_used(),
+        thresholds_reached: status.thresholds_reached.clone(),
+        hard_stop: budget.hard_stop,
+        blocked,
+        reason: reason.map(str::to_owned),
+    })
 }
 
 // ---------------------------------------------------------------- identity

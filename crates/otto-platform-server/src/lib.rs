@@ -20,10 +20,16 @@
 //! The resource-server-facing endpoints authenticate with the resource
 //! server's own credential ([`api::CallingResourceServer`]), not a session
 //! cookie, and are outside `otto-web`'s CSRF guard, which only wraps its own
-//! router. Lifecycle webhooks are delivered by [`webhooks::run`], a background
-//! task the binary starts; `otto-platform-server resource ...` provisions
-//! resource servers ([`resource_cmd`]) and `otto-platform-server client ...`
-//! registers first-party OAuth clients ([`client_cmd`]). The console bundle is
+//! router. Lifecycle webhooks are delivered by [`webhooks::run`], and
+//! notification email by [`email::run`] when SMTP is configured, and Stripe
+//! sync by [`stripe_cmd::run_loop`] and metered usage to Stripe meter events
+//! by [`stripe_shipper::run`] when billing is enabled, background tasks the
+//! binary starts; `otto-platform-server resource ...` provisions
+//! resource servers ([`resource_cmd`]), `otto-platform-server client ...`
+//! registers first-party OAuth clients ([`client_cmd`]),
+//! `otto-platform-server pricebook ...` sets what each value meter costs
+//! ([`pricebook_cmd`]), and `otto-platform-server stripe sync` makes Stripe
+//! match the price book ([`stripe_cmd`]). The console bundle is
 //! a separate piece in `web/`, served from here when `OTTO_STATIC_DIR` is set,
 //! which is how the hosted Fly deployment runs.
 //!
@@ -35,10 +41,14 @@
 pub mod api;
 pub mod client_cmd;
 pub mod config;
+pub mod email;
 pub mod health;
 pub mod internal;
 pub mod introspect;
+pub mod pricebook_cmd;
 pub mod resource_cmd;
+pub mod stripe_cmd;
+pub mod stripe_shipper;
 pub mod webhooks;
 
 use std::convert::Infallible;
@@ -56,14 +66,15 @@ use tower_http::services::fs::ServeFileSystemResponseBody;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
-pub use config::{Config, LogFormat};
+pub use config::{Config, EmailConfig, LogFormat, StripeConfig};
+pub use internal::Billing;
 
-/// The routes that need nothing but a database handle: health and the
-/// resource-server API.
-pub fn router(db: Db) -> Router {
+/// The routes that need only a database handle and whether billing is
+/// enabled: health and the resource-server API.
+pub fn router(db: Db, billing: Billing) -> Router {
     health::router(db.clone())
         .merge(introspect::router(db.clone()))
-        .merge(internal::router(db))
+        .merge(internal::router(db, billing))
 }
 
 /// Build the whole application: health, the resource-server API, and the
@@ -76,7 +87,7 @@ pub fn router(db: Db) -> Router {
 pub fn app(db: Db, config: &Config) -> Result<Router> {
     let web = otto_web::router(web_state(db.clone(), config)?);
 
-    let app = router(db).merge(web);
+    let app = router(db, internal::billing_of(config)).merge(web);
     // Either way an unmatched API-shaped or undecodable path answers JSON: a
     // client that guessed a route needs something it can parse. The exception
     // is a miss under the bundle that is not a page route, such as a missing
@@ -456,7 +467,39 @@ fn web_state(db: Db, config: &Config) -> Result<otto_web::AppState> {
     let webauthn = otto_web::relying_party(&web_config)
         .context("could not build the WebAuthn relying party from OTTO_PUBLIC_URL")?;
 
-    Ok(otto_web::AppState::new(db, cipher, webauthn, web_config))
+    Ok(otto_web::AppState::new(db, cipher, webauthn, web_config).with_stripe(stripe(config)?))
+}
+
+/// Billing's Stripe client and webhook secret, or `None` when billing is
+/// disabled. Production Stripe: there is no setting for another base URL, and
+/// tests build their client against a local mock directly.
+pub fn stripe(config: &Config) -> Result<Option<otto_billing::billing::Stripe>> {
+    config
+        .stripe
+        .as_ref()
+        .map(|s| {
+            Ok(otto_billing::billing::Stripe {
+                client: otto_billing::stripe::Client::new(s.secret_key.clone())
+                    .context("could not build the Stripe client")?,
+                webhook_secret: s.webhook_secret.clone(),
+            })
+        })
+        .transpose()
+}
+
+/// Refuse a Stripe key whose mode (live or test) differs from the one this
+/// database's Stripe objects were made in, recording the mode the first time
+/// ([`otto_billing::billing::check_key_mode`]). Nothing to check with billing
+/// disabled. Called at boot, before anything talks to Stripe.
+pub async fn verify_stripe_mode(db: &Db, config: &Config) -> Result<()> {
+    let Some(stripe) = &config.stripe else {
+        return Ok(());
+    };
+    let mode = otto_billing::billing::check_key_mode(db, &stripe.secret_key)
+        .await
+        .context("refusing to start: the Stripe key does not fit this database")?;
+    tracing::info!(stripe_mode = %mode, "Stripe key mode matches this database");
+    Ok(())
 }
 
 /// Every setting `otto-web` takes from this deployment, in one place so it can
@@ -479,6 +522,45 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn billing_follows_the_stripe_secrets() {
+        let mut config = Config::for_test();
+        assert!(stripe(&config).unwrap().is_none());
+        config.stripe =
+            config::parse_stripe(Some("sk_test_x".into()), Some("whsec_x".into())).unwrap();
+        assert!(stripe(&config).unwrap().is_some());
+    }
+
+    #[test]
+    fn billing_mode_follows_the_stripe_secrets() {
+        let mut config = Config::for_test();
+        assert_eq!(internal::billing_of(&config), Billing::Disabled);
+        config.stripe =
+            config::parse_stripe(Some("sk_test_x".into()), Some("whsec_x".into())).unwrap();
+        assert_eq!(internal::billing_of(&config), Billing::Enabled);
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn a_stripe_key_of_the_other_mode_is_refused_at_boot(pool: sqlx::PgPool) {
+        let db = Db::from_pool(pool);
+        let mut config = Config::for_test();
+        // Billing off: nothing to check, nothing recorded.
+        verify_stripe_mode(&db, &config).await.unwrap();
+        config.stripe =
+            config::parse_stripe(Some("sk_test_supersecret".into()), Some("whsec_x".into()))
+                .unwrap();
+        verify_stripe_mode(&db, &config).await.unwrap();
+        verify_stripe_mode(&db, &config).await.unwrap();
+        config.stripe =
+            config::parse_stripe(Some("rk_live_supersecret".into()), Some("whsec_x".into()))
+                .unwrap();
+        let err = format!("{:#}", verify_stripe_mode(&db, &config).await.unwrap_err());
+        assert!(err.contains("refusing to start"), "{err}");
+        assert!(err.contains("live-mode key"), "{err}");
+        assert!(err.contains("test mode"), "{err}");
+        assert!(!err.contains("supersecret"), "{err}");
+    }
 
     #[test]
     fn every_deployment_setting_reaches_otto_web() {

@@ -21,6 +21,7 @@ uuid.workspace = true
 base64.workspace = true
 futures.workspace = true
 reqwest.workspace = true
+lettre.workspace = true
 percent-encoding = "2"
 tokio.workspace = true
 tracing.workspace = true
@@ -33,6 +34,9 @@ http.workspace = true
 tower-http = { workspace = true, features = ["trace", "fs"] }
 
 [dev-dependencies]
+# test-support compiles `otto_billing::billing::mock`, the local Stripe
+# stand-in `stripe_cmd`'s tests sync against.
+otto-billing = { workspace = true, features = ["test-support"] }
 base64.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["full"] }
