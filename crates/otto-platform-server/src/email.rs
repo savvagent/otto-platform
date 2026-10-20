@@ -44,7 +44,7 @@ use futures::StreamExt;
 use lettre::message::header::ContentType;
 use lettre::message::Mailbox;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-use otto_core::notifications::{self, DueEmail};
+use otto_core::notifications::{self, DueEmail, FailureRecorded};
 use otto_tenant::Db;
 use percent_encoding::percent_decode_str;
 use tokio::sync::watch;
@@ -190,8 +190,10 @@ impl SmtpMailer {
         self
     }
 
-    fn classify(&self, e: &lettre::transport::smtp::Error) -> SendError {
-        let message = self.redact(&format!("smtp: {e}"));
+    /// `recipient` is scrubbed from the message too: servers often echo it
+    /// (`5.1.1 <owner@acme.example>: user unknown`), and this message is logged.
+    fn classify(&self, e: &lettre::transport::smtp::Error, recipient: &str) -> SendError {
+        let message = scrub_recipient(&self.redact(&format!("smtp: {e}")), recipient);
         let basic = e.status().map(|c| c.to_string());
         let detail = std::error::Error::source(e).map(|s| s.to_string());
         match verdict(basic.as_deref(), e.is_permanent(), detail.as_deref()) {
@@ -234,7 +236,7 @@ impl Mailer for SmtpMailer {
                 self.config_fault_reported.store(false, Ordering::Relaxed);
                 Ok(())
             }
-            Ok(Err(e)) => Err(self.classify(&e)),
+            Ok(Err(e)) => Err(self.classify(&e, &email.to)),
             Err(_) => Err(SendError::transient(format!(
                 "smtp: no complete reply within {} s",
                 self.deadline.as_secs_f32()
@@ -327,6 +329,32 @@ fn redact(text: &str, secrets: &[String]) -> String {
     text
 }
 
+/// `text` with every occurrence of `recipient` (compared ignoring ASCII case,
+/// as servers may echo it lower-cased) replaced by `<recipient>`. An address
+/// is a person's, and errors are logged; the row id and org identify the
+/// message instead.
+fn scrub_recipient(text: &str, recipient: &str) -> String {
+    if recipient.is_empty() {
+        return text.to_string();
+    }
+    // ASCII lower-casing keeps every byte offset, so a match found in the
+    // lowered copies is at the same offsets in the original.
+    let hay = text.to_ascii_lowercase();
+    let needle = recipient.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = 0;
+    for (at, _) in hay.match_indices(needle.as_str()) {
+        if at < rest {
+            continue;
+        }
+        out.push_str(&text[rest..at]);
+        out.push_str("<recipient>");
+        rest = at + needle.len();
+    }
+    out.push_str(&text[rest..]);
+    out
+}
+
 /// Run until `shutdown` flips to `true`.
 pub async fn run<M: Mailer>(db: Db, mailer: M, mut shutdown: watch::Receiver<bool>) {
     tracing::info!("email delivery task started");
@@ -377,20 +405,32 @@ pub async fn deliver_due<M: Mailer>(db: &Db, mailer: &M) -> otto_core::Result<us
 }
 
 async fn deliver_one<M: Mailer>(db: &Db, mailer: &M, d: &DueEmail) {
-    // The recipient is a person's address: logged by row id and org, not by
-    // address.
+    // The recipient is a person's address: logged by row id and org, never by
+    // address, and scrubbed from any error text a mailer hands back.
     let recorded = match mailer.send(&OutgoingEmail::from(d)).await {
-        Ok(()) => notifications::mark_sent(db, d.id).await,
+        Ok(()) => match notifications::mark_sent(db, d).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                tracing::info!(
+                    email_id = %d.id,
+                    org_id = %d.org_id,
+                    "notification email was already finished; a lapsed claim sent it again"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
         Err(e) => {
+            let error = scrub_recipient(&e.message, &d.recipient);
             tracing::warn!(
                 email_id = %d.id,
                 org_id = %d.org_id,
                 attempt = d.attempts + 1,
-                error = %e,
+                error = %error,
                 "notification email failed"
             );
-            match notifications::mark_attempt_failed(db, d, &e.message, e.permanent).await {
-                Ok(true) => {
+            match notifications::mark_attempt_failed(db, d, &error, e.permanent).await {
+                Ok(FailureRecorded::GaveUp) => {
                     tracing::error!(
                         email_id = %d.id,
                         org_id = %d.org_id,
@@ -398,7 +438,16 @@ async fn deliver_one<M: Mailer>(db: &Db, mailer: &M, d: &DueEmail) {
                     );
                     Ok(())
                 }
-                Ok(false) => Ok(()),
+                Ok(FailureRecorded::Retrying) => Ok(()),
+                Ok(FailureRecorded::Superseded) => {
+                    tracing::warn!(
+                        email_id = %d.id,
+                        org_id = %d.org_id,
+                        "notification email failure not recorded: the claim lapsed and \
+                         another delivery task holds the row"
+                    );
+                    Ok(())
+                }
                 Err(e) => Err(e),
             }
         }
@@ -478,6 +527,23 @@ mod tests {
                 "{basic:?} {detail:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_recipient_is_scrubbed_in_any_ascii_case() {
+        assert_eq!(
+            scrub_recipient(
+                "smtp: 550 5.1.1 <Owner@Acme.Example>: user unknown; owner@acme.example",
+                "owner@acme.example"
+            ),
+            "smtp: 550 5.1.1 <<recipient>>: user unknown; <recipient>"
+        );
+        assert_eq!(
+            scrub_recipient("josé@x.de bounced", "josé@x.de"),
+            "<recipient> bounced"
+        );
+        assert_eq!(scrub_recipient("nothing here", "a@b.c"), "nothing here");
+        assert_eq!(scrub_recipient("unchanged", ""), "unchanged");
     }
 
     #[test]
