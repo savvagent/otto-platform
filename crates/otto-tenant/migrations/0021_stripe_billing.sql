@@ -7,6 +7,12 @@
 -- Additive only: new columns on `subscriptions` (0003) and five new global
 -- tables.
 
+-- Fail fast rather than queue: a migration waiting for a lock on a busy table
+-- makes every later query on that table wait behind it. Failing the boot lets
+-- the next boot retry. SET LOCAL ends with this migration's transaction (sqlx
+-- runs each migration in one).
+SET LOCAL lock_timeout = '5s';
+
 -- ------------------------------------------------------------ subscriptions
 --
 -- 0003 already holds `stripe_customer_id`, `stripe_subscription_id` and

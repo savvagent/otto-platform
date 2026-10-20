@@ -13,6 +13,12 @@
 -- `claim_usage_event` ledger claim (0009), so a replayed event can never count
 -- twice in any of these totals.
 
+-- Fail fast rather than queue: a migration waiting for a lock on a busy table
+-- makes every later query on that table wait behind it. Failing the boot lets
+-- the next boot retry. SET LOCAL ends with this migration's transaction (sqlx
+-- runs each migration in one).
+SET LOCAL lock_timeout = '5s';
+
 -- Additive and nullable: every existing row predates them, and an unmetered
 -- event leaves `meter` and `quantity` NULL. Adding a nullable column with no
 -- default is a catalog-only change.
@@ -51,7 +57,7 @@ CREATE TABLE org_meter_period_usage (
   quantity     bigint      NOT NULL DEFAULT 0 CHECK (quantity >= 0),
   updated_at   timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (org_id, meter, period_start)
-);
+) WITH (fillfactor = 70);
 
 -- Each service's calls per org and UTC billing month, metered or not: the
 -- per-service counterpart of `org_period_usage`.
@@ -64,7 +70,16 @@ CREATE TABLE org_service_period_usage (
   total_count    bigint      NOT NULL DEFAULT 0 CHECK (total_count >= 0),
   updated_at     timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (org_id, service, period_start)
-);
+) WITH (fillfactor = 70);
+
+-- The three per-period counters are each updated in place hundreds of times
+-- per ingest batch. Leaving 30% of every page free lets those updates stay
+-- heap-only (HOT) on the same page instead of bloating the table and its
+-- primary key. The two new tables are created that way above; the legacy
+-- `org_period_usage` (0003) is altered here. Changing fillfactor rewrites
+-- nothing: it takes a brief SHARE UPDATE EXCLUSIVE lock, and only pages
+-- filled from now on (and after a future VACUUM FULL) honour it.
+ALTER TABLE org_period_usage SET (fillfactor = 70);
 
 -- Tenant tables: the standard isolation policy (0004), which is also how
 -- `Db::verify_tenant_isolation` and the rls_registry test discover them.

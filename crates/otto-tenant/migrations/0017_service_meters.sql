@@ -1,6 +1,12 @@
 -- Service slugs and value-meter declarations (savvagent/otto-platform#56,
 -- epic #55: bill each otto-* service by its own value meters).
---
+
+-- Fail fast rather than queue: a migration waiting for a lock on a busy table
+-- makes every later query on that table wait behind it. Failing the boot lets
+-- the next boot retry. SET LOCAL ends with this migration's transaction (sqlx
+-- runs each migration in one).
+SET LOCAL lock_timeout = '5s';
+
 -- A resource server's `service` is the short name its meters, usage pools and
 -- budgets are keyed by (`otto-flags`, `otto-cxp`). An operator assigns it
 -- (`otto-platform-server resource set-service`); a service never names
