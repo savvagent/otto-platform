@@ -106,6 +106,10 @@ CREATE TABLE stripe_events (
   CONSTRAINT stripe_events_type_len CHECK (char_length(event_type) BETWEEN 1 AND 255)
 );
 
+-- What `otto_billing::billing::sweep_events` deletes by: ledger rows older than
+-- the retention window, oldest first, a bounded batch at a time.
+CREATE INDEX stripe_events_processed_at ON stripe_events (processed_at);
+
 -- The Stripe billing meter (and the Stripe product its prices hang off) for
 -- each platform meter, written by `stripe sync`.
 CREATE TABLE stripe_meters (

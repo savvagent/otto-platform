@@ -198,6 +198,73 @@ async fn record_event(db: &Db, event: &WebhookEvent, created: DateTime<Utc>) -> 
     Ok(())
 }
 
+/// How long [`sweep_events`] should keep a handled event in the ledger. Stripe
+/// redelivers an event for at most three days, and an operator can resend one
+/// from the dashboard for 30, so 90 leaves a wide margin.
+pub const EVENT_RETENTION_DAYS: i32 = 90;
+
+/// The shortest retention [`sweep_events`] accepts: Stripe's automatic
+/// redelivery window (three days) with margin. Forgetting an event inside it
+/// would let a redelivery be handled twice.
+pub const MIN_EVENT_RETENTION_DAYS: i32 = 7;
+
+/// Rows deleted per statement (and per transaction) by [`sweep_events`].
+const SWEEP_BATCH: i64 = 1_000;
+
+/// Batches one [`sweep_events`] call runs at most, so one call is bounded
+/// (`SWEEP_BATCH * SWEEP_MAX_BATCHES` rows) however large a backlog it
+/// meets; the next call carries on.
+const SWEEP_MAX_BATCHES: u32 = 100;
+
+/// Delete `stripe_events` ledger rows processed more than `older_than_days`
+/// ago, oldest first, in batches of a thousand, each in its own short
+/// transaction, so no lock is held long and the webhook handler never waits on
+/// it. One call deletes at most a hundred thousand rows; a larger backlog is
+/// finished by later calls. Returns how many rows were deleted.
+///
+/// Meant to run periodically (say once an hour) with [`EVENT_RETENTION_DAYS`].
+/// A ledger row only has to outlive Stripe's redeliveries of its event; after
+/// that it is dead weight on the primary key every webhook checks.
+///
+/// # Errors
+///
+/// [`otto_tenant::Error::Invalid`] (as [`Error::Tenant`]) when
+/// `older_than_days` is under [`MIN_EVENT_RETENTION_DAYS`]; nothing is
+/// deleted. Otherwise only a database error, after which the batches already
+/// committed stay deleted.
+pub async fn sweep_events(db: &Db, older_than_days: i32) -> Result<u64> {
+    if older_than_days < MIN_EVENT_RETENTION_DAYS {
+        return Err(otto_tenant::Error::Invalid(format!(
+            "Stripe events must be kept at least {MIN_EVENT_RETENTION_DAYS} days, \
+             past Stripe's redelivery window; asked to keep {older_than_days}"
+        ))
+        .into());
+    }
+    let mut total = 0;
+    for _ in 0..SWEEP_MAX_BATCHES {
+        let mut tx = db.begin_unpinned().await?;
+        let n = sqlx::query(
+            "DELETE FROM stripe_events WHERE event_id IN ( \
+               SELECT event_id FROM stripe_events \
+                WHERE processed_at < now() - make_interval(days => $1) \
+                ORDER BY processed_at \
+                LIMIT $2 \
+                FOR UPDATE SKIP LOCKED)",
+        )
+        .bind(older_than_days)
+        .bind(SWEEP_BATCH)
+        .execute(tx.conn())
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        total += n;
+        if n < SWEEP_BATCH as u64 {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 /// `checkout.session.completed` in setup mode: make the collected card the
 /// customer's default, mark it on file (clearing a stop), detach the card it
 /// replaces, and subscribe the org.
@@ -533,6 +600,64 @@ mod tests {
         assert_eq!(invoice_subscription(&basil), Some("sub_1"));
         assert_eq!(invoice_subscription(&older), Some("sub_2"));
         assert_eq!(invoice_subscription(&json!({"parent": null})), None);
+    }
+
+    async fn ledger_rows(pool: &sqlx::PgPool, n: i64, processed_days_ago: i32) {
+        sqlx::query(
+            "INSERT INTO stripe_events (event_id, event_type, stripe_created_at, processed_at) \
+             SELECT 'evt_' || $2 || '_' || g, 'invoice.paid', now(), \
+                    now() - make_interval(days => $2) \
+               FROM generate_series(1, $1) g",
+        )
+        .bind(n)
+        .bind(processed_days_ago)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn ledger_ages(pool: &sqlx::PgPool) -> Vec<(i32, i64)> {
+        sqlx::query_as(
+            "SELECT extract(day FROM now() - processed_at)::int4 AS d, count(*) \
+               FROM stripe_events GROUP BY d ORDER BY d",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn the_sweep_forgets_only_events_past_retention(pool: sqlx::PgPool) {
+        let db = Db::from_pool(pool.clone());
+        // More than one batch past retention, some inside it.
+        ledger_rows(&pool, SWEEP_BATCH + 7, 120).await;
+        ledger_rows(&pool, 3, 91).await;
+        ledger_rows(&pool, 5, 89).await;
+        ledger_rows(&pool, 4, 1).await;
+
+        assert_eq!(
+            sweep_events(&db, EVENT_RETENTION_DAYS).await.unwrap(),
+            SWEEP_BATCH as u64 + 10
+        );
+        assert_eq!(ledger_ages(&pool).await, vec![(1, 4), (89, 5)]);
+        // Nothing left to do.
+        assert_eq!(sweep_events(&db, EVENT_RETENTION_DAYS).await.unwrap(), 0);
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn the_sweep_refuses_to_forget_redeliverable_events(pool: sqlx::PgPool) {
+        let db = Db::from_pool(pool.clone());
+        ledger_rows(&pool, 2, 5).await;
+        for days in [MIN_EVENT_RETENTION_DAYS - 1, 0, -1] {
+            assert!(
+                matches!(
+                    sweep_events(&db, days).await,
+                    Err(Error::Tenant(otto_tenant::Error::Invalid(_)))
+                ),
+                "{days}"
+            );
+        }
+        assert_eq!(ledger_ages(&pool).await, vec![(5, 2)]);
     }
 
     #[test]
