@@ -9,7 +9,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Role } from '$lib/types';
 import Harness from '../RoleHarness.svelte';
-import { BUDGETS, USAGE, failure, json, requests, serve } from '../test-fixtures';
+import {
+  BUDGETS,
+  USAGE,
+  USAGE_PAYMENT_REQUIRED,
+  failure,
+  json,
+  requests,
+  serve
+} from '../test-fixtures';
 import Page from './+page.svelte';
 
 let container: HTMLElement;
@@ -142,4 +150,92 @@ describe('the usage page', () => {
 
     unmount(instance);
   });
+});
+
+describe('the usage page when a service needs a card', () => {
+  const routes = (usage: unknown, budgetsHealthy = true) =>
+    serve({
+      'GET /api/orgs/acme/usage': () => json(usage),
+      'GET /api/orgs/acme/budgets': () => (budgetsHealthy ? json(BUDGETS) : failure(502, 'unknown'))
+    });
+
+  const notices = () => container.querySelector('section[aria-label="Payment needed"]');
+  const flagsCard = () =>
+    Array.from(container.querySelectorAll('section')).find(
+      (s) => s.querySelector('h2')?.textContent === 'Otto Flags'
+    )!;
+  const cxpCard = () =>
+    Array.from(container.querySelectorAll('section')).find(
+      (s) => s.querySelector('h2')?.textContent === 'Otto CXP'
+    )!;
+
+  it('tells an owner paid usage is paused, links to billing, and marks the meter', async () => {
+    vi.stubGlobal('fetch', routes(USAGE_PAYMENT_REQUIRED));
+    const instance = render('owner');
+
+    await vi.waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(2));
+    const status = notices()?.querySelector('[role="status"]');
+    expect(status?.textContent).toContain(
+      'Otto Flags is past its free allowance this month, so its paid usage is paused until a card is on file. Its free calls keep working.'
+    );
+    expect(status?.textContent).not.toContain('Otto CXP');
+    const link = status!.querySelector('a')!;
+    expect(link.getAttribute('href')).toBe('/o/acme/billing');
+    expect(link.textContent?.trim()).toBe('Add a card');
+    // State on load is a polite status, never an interrupting alert.
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+
+    expect(flagsCard().textContent).toContain('Paid usage paused');
+    expect(cxpCard().textContent).not.toContain('Paid usage paused');
+
+    const text = container.textContent ?? '';
+    expect(text).not.toMatch(/operation|bucket|included|remaining/i);
+
+    unmount(instance);
+  });
+
+  it.each<Role>(['admin', 'member'])(
+    'tells an %s an owner must add a card, with no link',
+    async (role) => {
+      vi.stubGlobal('fetch', routes(USAGE_PAYMENT_REQUIRED));
+      const instance = render(role);
+
+      await vi.waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(2));
+      const status = notices()?.querySelector('[role="status"]');
+      expect(status?.textContent).toContain(
+        'Otto Flags is past its free allowance this month, so its paid usage is paused until an owner of this organization adds a card. Its free calls keep working.'
+      );
+      expect(status?.querySelector('a')).toBeNull();
+      expect(container.querySelector('a[href="/o/acme/billing"]')).toBeNull();
+      expect(flagsCard().textContent).toContain('Paid usage paused');
+
+      unmount(instance);
+    }
+  );
+
+  it('still shows the notice when the budgets read fails', async () => {
+    vi.stubGlobal('fetch', routes(USAGE_PAYMENT_REQUIRED, false));
+    const instance = render('owner');
+
+    await vi.waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(2));
+    expect(container.textContent).toContain('Budget alerts could not be read just now.');
+    expect(notices()?.querySelector('a[href="/o/acme/billing"]')).not.toBeNull();
+
+    unmount(instance);
+  });
+
+  it.each<Role>(['owner', 'admin', 'member'])(
+    'says nothing about payment to a %s when no service needs a card',
+    async (role) => {
+      vi.stubGlobal('fetch', routes(USAGE));
+      const instance = render(role);
+
+      await vi.waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(2));
+      expect(notices()).toBeNull();
+      expect(container.textContent).not.toContain('Paid usage paused');
+      expect(container.textContent).not.toContain('free allowance');
+
+      unmount(instance);
+    }
+  );
 });

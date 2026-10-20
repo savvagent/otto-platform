@@ -13,12 +13,15 @@
   import Empty from '$lib/components/Empty.svelte';
   import Loading from '$lib/components/Loading.svelte';
   import Meter from '$lib/components/Meter.svelte';
+  import PaymentRequiredNotices from '$lib/components/PaymentRequiredNotices.svelte';
   import ServiceLink from '$lib/components/ServiceLink.svelte';
 
   /**
    * The organization overview: who is in it, what plan it is on, what each
    * metered service has cost this month against any budget (with any budget
-   * alerts this month has fired), and where to go to use the services it has.
+   * alerts this month has fired, and a notice for any service whose paid usage
+   * is paused until a card is on file), and where to go to use the services it
+   * has.
    *
    * It owns identity and billing only. What an org *does* with a service (queues,
    * repositories, trackers) lives in that service's own console, or, for a
@@ -104,6 +107,12 @@
   {:else if !overview}
     <Loading what={m.overview_loading()} />
   {:else}
+    <PaymentRequiredNotices
+      services={overview.usage.services}
+      owner={org.isOwner}
+      billingHref="/o/{org.slug}/billing"
+    />
+
     {#if overview.budgets}
       <BudgetAlerts services={overview.budgets.services} />
     {:else}

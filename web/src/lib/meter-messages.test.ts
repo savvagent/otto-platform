@@ -86,6 +86,16 @@ describe('console usage copy', () => {
           ['Svc', 'P80']
         ],
         ['budget_alert_blocked', m.budget_alert_blocked({ service: 'Svc' }, { locale }), ['Svc']],
+        [
+          'payment_required_owner',
+          m.payment_required_owner({ service: 'Svc' }, { locale }),
+          ['Svc']
+        ],
+        [
+          'payment_required_member',
+          m.payment_required_member({ service: 'Svc' }, { locale }),
+          ['Svc']
+        ],
         ['budget_saved', m.budget_saved({ service: 'Svc' }, { locale }), ['Svc']],
         ['budget_cleared', m.budget_cleared({ service: 'Svc' }, { locale }), ['Svc']],
         ['budget_amount_hint', m.budget_amount_hint({ max: 'M$9' }, { locale }), ['M$9']],

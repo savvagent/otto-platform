@@ -240,6 +240,16 @@ export interface ServiceUsage {
   spendError: SpendError | null;
   /** `null` when no budget is set. */
   budget: BudgetView | null;
+  /**
+   * The org has no live subscription and this service's spend this month is
+   * past its free allowance, so the resource servers refuse its billable
+   * calls (`payment_required`) until a card is on file. Its free calls keep
+   * working. Never `true` while spend is unknown.
+   *
+   * This, not the deprecated, always-`false` top-level `hardStop`, is how
+   * the console learns that work is being refused for want of payment.
+   */
+  paymentRequired: boolean;
 }
 
 /** One service's budget and spend this month (`ServiceBudgetView`). */

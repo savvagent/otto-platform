@@ -13,6 +13,7 @@
   import Empty from '$lib/components/Empty.svelte';
   import Loading from '$lib/components/Loading.svelte';
   import Meter from '$lib/components/Meter.svelte';
+  import PaymentRequiredNotices from '$lib/components/PaymentRequiredNotices.svelte';
 
   /**
    * Usage, per service: each meter's quantity this month, and what it has
@@ -27,6 +28,11 @@
    * here as well as on the budgets page. It is optional: if it fails, the
    * usage still shows, with a quiet note that alerts could not be read,
    * rather than a page blanked over a secondary read.
+   *
+   * A service whose paid usage is paused for want of a card
+   * (`paymentRequired`) gets a notice above, and says so beside its meter.
+   * That comes from the usage read itself, so it shows even when the budgets
+   * read fails.
    */
 
   const org = useOrg();
@@ -82,6 +88,12 @@
   {:else if !report}
     <Loading what={m.usage_reading_meter()} />
   {:else}
+    <PaymentRequiredNotices
+      services={report.usage.services}
+      owner={org.isOwner}
+      billingHref="/o/{org.slug}/billing"
+    />
+
     {#if report.budgets}
       <BudgetAlerts services={report.budgets.services} />
     {:else}

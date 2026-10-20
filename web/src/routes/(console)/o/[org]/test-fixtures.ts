@@ -43,7 +43,8 @@ export const USAGE = {
       ],
       spendCents: 8_250,
       spendError: null,
-      budget: FLAGS_BUDGET
+      budget: FLAGS_BUDGET,
+      paymentRequired: false
     },
     {
       service: 'otto-cxp',
@@ -57,9 +58,23 @@ export const USAGE = {
       ],
       spendCents: null,
       spendError: 'pricing_unavailable',
-      budget: null
+      budget: null,
+      paymentRequired: false
     }
   ]
+} satisfies UsageStatus & Record<string, unknown>;
+
+/**
+ * `USAGE` for an org with no live subscription whose Otto Flags spend is past
+ * its free allowance: the server refuses Flags' billable calls with
+ * `payment_required` until a card is on file. CXP's spend is unknown, so it
+ * is never flagged.
+ */
+export const USAGE_PAYMENT_REQUIRED = {
+  ...USAGE,
+  services: USAGE.services.map((s) =>
+    s.service === 'otto-flags' ? { ...s, paymentRequired: true } : s
+  )
 } satisfies UsageStatus & Record<string, unknown>;
 
 export const FLAGS_ROW: ServiceBudget = {
