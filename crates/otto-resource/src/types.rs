@@ -295,3 +295,83 @@ pub struct TeamInfo {
 pub struct MemberTeams {
     pub teams: Vec<TeamInfo>,
 }
+
+/// One value meter a resource server bills by, declared with
+/// [`crate::PlatformClient::declare_meters`].
+///
+/// `key` is `<service>/<meter>`, where `<service>` is the service slug an
+/// operator assigned this resource server (`otto-platform-server resource
+/// set-service`) and `<meter>` matches `^[a-z][a-z0-9_]{0,62}$`.
+/// `display_name` (at most 80 characters) is what usage pages and invoices
+/// show; `unit` (at most 32) is what one unit of quantity is.
+///
+/// ```
+/// use otto_resource::MeterDeclaration;
+///
+/// let m = MeterDeclaration::new("otto-flags/evaluations", "Flag evaluations", "evaluation");
+/// assert_eq!(m.key, "otto-flags/evaluations");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeterDeclaration {
+    pub key: String,
+    pub display_name: String,
+    pub unit: String,
+}
+
+impl MeterDeclaration {
+    pub fn new(
+        key: impl Into<String>,
+        display_name: impl Into<String>,
+        unit: impl Into<String>,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            display_name: display_name.into(),
+            unit: unit.into(),
+        }
+    }
+}
+
+/// The most meters one `PUT /internal/meters` accepts.
+/// [`crate::PlatformClient::declare_meters`] splits larger sets.
+pub const MAX_METER_DECLARATIONS: usize = 50;
+
+/// The body of `PUT /internal/meters`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeterDeclarationBatch {
+    pub meters: Vec<MeterDeclaration>,
+}
+
+/// A declaration the platform refused: a key outside this resource server's
+/// service, a malformed field, or a key repeated in one request. Fix the
+/// declaration and declare again; usage for a meter that was never declared
+/// is rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedMeter {
+    /// The key as sent, truncated if it was absurdly long.
+    pub key: String,
+    pub reason: String,
+}
+
+/// The platform's answer to a meter declaration. Every meter sent is in
+/// exactly one of `declared` and `rejected`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeterDeclarationReceipt {
+    /// Keys now declared as sent, whether new, updated, or unchanged.
+    #[serde(default)]
+    pub declared: Vec<String>,
+    #[serde(default)]
+    pub rejected: Vec<RejectedMeter>,
+}
+
+impl MeterDeclarationReceipt {
+    /// Whether every meter was accepted.
+    pub fn is_complete(&self) -> bool {
+        self.rejected.is_empty()
+    }
+
+    pub(crate) fn merge(&mut self, other: MeterDeclarationReceipt) {
+        self.declared.extend(other.declared);
+        self.rejected.extend(other.rejected);
+    }
+}

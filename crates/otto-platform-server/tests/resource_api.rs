@@ -1603,3 +1603,356 @@ async fn resource_server_calls_are_not_subject_to_the_browser_csrf_guard(pool: P
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 }
+
+// ------------------------------------------------------------------ meters
+
+async fn put_meters(db: &Db, auth: &str, meters: Value) -> (StatusCode, Value) {
+    send(
+        db,
+        Request::put("/internal/meters")
+            .header("authorization", auth)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "meters": meters }).to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+async fn stored_meters(db: &Db, service: &str) -> Vec<otto_billing::meters::Meter> {
+    let mut tx = db.begin_unpinned().await.unwrap();
+    otto_billing::meters::list_meters(&mut tx, service)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn meters_can_only_be_declared_under_the_callers_own_service(pool: PgPool) {
+    let w = world(pool).await;
+    resources::set_service(&w.db, FLAGS, "otto-flags")
+        .await
+        .unwrap();
+    resources::set_service(&w.db, FACTORY, "otto-factory")
+        .await
+        .unwrap();
+    let flags = basic(FLAGS, &w.flags_secret);
+
+    let (status, body) = put_meters(
+        &w.db,
+        &flags,
+        json!([
+            {"key": "otto-flags/evaluations", "display_name": "Flag evaluations", "unit": "evaluation"},
+            {"key": "otto-factory/jobs", "display_name": "Jobs", "unit": "job"},
+            {"key": "otto-flags-x/evaluations", "display_name": "X", "unit": "x"},
+            {"key": "evaluations", "display_name": "X", "unit": "x"},
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["declared"], json!(["otto-flags/evaluations"]));
+    let rejected: Vec<&str> = body["rejected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        rejected,
+        [
+            "otto-factory/jobs",
+            "otto-flags-x/evaluations",
+            "evaluations"
+        ]
+    );
+    for r in body["rejected"].as_array().unwrap() {
+        assert!(
+            r["reason"].as_str().unwrap().contains("otto-flags/<meter>"),
+            "{r}"
+        );
+    }
+
+    // Nothing was written into another service's namespace.
+    assert!(stored_meters(&w.db, "otto-factory").await.is_empty());
+    let mine = stored_meters(&w.db, "otto-flags").await;
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].meter, "evaluations");
+    assert_eq!(mine[0].display_name, "Flag evaluations");
+    assert_eq!(mine[0].unit, "evaluation");
+
+    // The declaring route takes the same credential as every /internal route.
+    let (status, _) = put_meters(&w.db, "Bearer otto_rs_nope", json!([])).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn redeclaring_meters_is_idempotent_and_updates_what_changed(pool: PgPool) {
+    let w = world(pool).await;
+    resources::set_service(&w.db, FLAGS, "otto-flags")
+        .await
+        .unwrap();
+    let flags = basic(FLAGS, &w.flags_secret);
+    let decl = json!([
+        {"key": "otto-flags/evaluations", "display_name": "Flag evaluations", "unit": "evaluation"},
+        {"key": "otto-flags/rollbacks", "display_name": "Auto-rollbacks", "unit": "rollback"},
+    ]);
+
+    let (status, first) = put_meters(&w.db, &flags, decl.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let before = stored_meters(&w.db, "otto-flags").await;
+
+    let (status, again) = put_meters(&w.db, &flags, decl).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first, again);
+    assert_eq!(again["rejected"], json!([]));
+    assert_eq!(
+        stored_meters(&w.db, "otto-flags").await,
+        before,
+        "an unchanged declaration changes nothing, timestamps included"
+    );
+
+    // A changed unit replaces the stored one; a meter left out stays.
+    let (status, body) = put_meters(
+        &w.db,
+        &flags,
+        json!([{"key": "otto-flags/evaluations", "display_name": " Evaluations ", "unit": "1k evaluations"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["declared"], json!(["otto-flags/evaluations"]));
+    let after = stored_meters(&w.db, "otto-flags").await;
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0].key, "otto-flags/evaluations");
+    assert_eq!(after[0].display_name, "Evaluations");
+    assert_eq!(after[0].unit, "1k evaluations");
+    assert_eq!(after[0].created_at, before[0].created_at);
+    assert!(after[0].updated_at >= before[0].updated_at);
+    assert_eq!(after[1], before[1]);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn malformed_meters_are_rejected_one_by_one(pool: PgPool) {
+    let w = world(pool).await;
+    resources::set_service(&w.db, FLAGS, "otto-flags")
+        .await
+        .unwrap();
+    let flags = basic(FLAGS, &w.flags_secret);
+    let long_key = format!("otto-flags/{}", "a".repeat(5000));
+
+    let (status, body) = put_meters(
+        &w.db,
+        &flags,
+        json!([
+            {"key": "otto-flags/Evaluations", "display_name": "X", "unit": "x"},
+            {"key": "otto-flags/1st", "display_name": "X", "unit": "x"},
+            {"key": "otto-flags/ok", "display_name": "", "unit": "x"},
+            {"key": "otto-flags/ok", "display_name": "x".repeat(81), "unit": "x"},
+            {"key": "otto-flags/ok", "display_name": "X", "unit": "u".repeat(33)},
+            {"key": "otto-flags/ok", "display_name": "two\nlines", "unit": "x"},
+            {"key": long_key, "display_name": "X", "unit": "x"},
+            {"key": "otto-flags/good", "display_name": "Good", "unit": "x"},
+            {"key": "otto-flags/good", "display_name": "Twice", "unit": "x"},
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["declared"], json!(["otto-flags/good"]));
+    let rejected = body["rejected"].as_array().unwrap();
+    assert_eq!(rejected.len(), 8, "{body}");
+    // An absurd key is not echoed back whole.
+    assert!(rejected[6]["key"].as_str().unwrap().len() <= 128);
+    assert!(rejected[8 - 1]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("more than once"));
+    let stored = stored_meters(&w.db, "otto-flags").await;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].display_name, "Good");
+
+    // More than the cap is refused whole.
+    let many: Vec<Value> = (0..=otto_resource::MAX_METER_DECLARATIONS)
+        .map(|i| json!({"key": format!("otto-flags/m{i}"), "display_name": "M", "unit": "x"}))
+        .collect();
+    let (status, body) = put_meters(&w.db, &flags, json!(many)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(stored_meters(&w.db, "otto-flags").await.len(), 1);
+
+    // And so is a body far larger than any valid declaration.
+    let huge = json!([{"key": "otto-flags/big", "display_name": "x".repeat(100_000), "unit": "x"}]);
+    let (status, _) = put_meters(&w.db, &flags, huge).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_resource_server_without_a_service_cannot_declare_meters(pool: PgPool) {
+    let w = world(pool).await;
+    let (status, body) = put_meters(
+        &w.db,
+        &w.factory_basic(),
+        json!([{"key": "otto-factory/jobs", "display_name": "Jobs", "unit": "job"}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "service_not_set");
+    assert!(stored_meters(&w.db, "otto-factory").await.is_empty());
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_client_declares_meters(pool: PgPool) {
+    use otto_resource::{Error, MeterDeclaration};
+
+    let w = world(pool).await;
+    let base = serve(&w.db).await;
+    let client = PlatformClient::new(ClientConfig::new(&base, FLAGS, &w.flags_secret)).unwrap();
+    let decls: Vec<MeterDeclaration> = (0..otto_resource::MAX_METER_DECLARATIONS + 3)
+        .map(|i| MeterDeclaration::new(format!("otto-flags/m{i}"), format!("M {i}"), "x"))
+        .chain([MeterDeclaration::new(
+            "otto-cxp/tickets",
+            "Tickets",
+            "ticket",
+        )])
+        .collect();
+
+    // Before an operator assigns a service: 409, not retriable.
+    let err = client.declare_meters(&decls).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Status { status: 409, body } if body.contains("service_not_set")),
+        "{err:?}"
+    );
+    assert!(!err.is_retriable());
+
+    resources::set_service(&w.db, FLAGS, "otto-flags")
+        .await
+        .unwrap();
+    // More than one request's worth: the client splits and merges.
+    let receipt = client.declare_meters(&decls).await.unwrap();
+    assert_eq!(
+        receipt.declared.len(),
+        otto_resource::MAX_METER_DECLARATIONS + 3
+    );
+    assert_eq!(receipt.rejected.len(), 1);
+    assert_eq!(receipt.rejected[0].key, "otto-cxp/tickets");
+    assert!(!receipt.is_complete());
+    assert_eq!(
+        stored_meters(&w.db, "otto-flags").await.len(),
+        otto_resource::MAX_METER_DECLARATIONS + 3
+    );
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_operator_cli_assigns_service_slugs(pool: PgPool) {
+    use otto_platform_server::resource_cmd::{execute, parse};
+
+    let db = Db::from_pool(pool);
+    let run = |line: &str| {
+        let args: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+        let cmd = parse(&args).unwrap();
+        let db = db.clone();
+        async move {
+            let mut out = Vec::new();
+            execute(&db, None, cmd, &mut out)
+                .await
+                .map(|()| String::from_utf8(out).unwrap())
+        }
+    };
+
+    // register --service, and list shows it.
+    let out = run(&format!(
+        "register {FLAGS} --name otto-flags --scopes flags:read --service otto-flags"
+    ))
+    .await
+    .unwrap();
+    assert!(out.contains("service=otto-flags"), "{out}");
+    run(&format!(
+        "register {FACTORY} --name otto-factory --scopes jobs:read"
+    ))
+    .await
+    .unwrap();
+    let list = run("list").await.unwrap();
+    let line = |uri: &str| {
+        list.lines()
+            .find(|l| l.starts_with(uri))
+            .unwrap_or_else(|| panic!("{uri} not in {list:?}"))
+            .to_owned()
+    };
+    assert!(line(FLAGS).ends_with("\tservice=otto-flags"), "{list}");
+    assert!(line(FACTORY).ends_with("\tservice=-"), "{list}");
+
+    // Re-registering without --service keeps it.
+    run(&format!(
+        "register {FLAGS} --name otto-flags --scopes flags:read,flags:write"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        resources::get(&db, FLAGS)
+            .await
+            .unwrap()
+            .unwrap()
+            .service
+            .as_deref(),
+        Some("otto-flags")
+    );
+
+    // set-service assigns one; describe shows it.
+    let out = run(&format!("set-service {FACTORY} otto-factory"))
+        .await
+        .unwrap();
+    assert!(out.contains("service=otto-factory"), "{out}");
+    let out = run(&format!("describe {FACTORY} --clear")).await.unwrap();
+    assert!(out.contains("service=otto-factory"), "{out}");
+
+    // Slugs are validated, unique, and the URI must be registered.
+    for bad in [
+        format!("set-service {FACTORY} Otto"),
+        format!("set-service {FACTORY} otto_factory"),
+        format!("set-service {FACTORY} otto-flags"),
+        "set-service https://nope.example/mcp otto-nope".to_owned(),
+    ] {
+        let err = run(&bad).await.expect_err(&bad);
+        assert!(!err.to_string().contains("duplicate key"), "{bad}: {err}");
+    }
+    let err = run(&format!("set-service {FACTORY} otto-flags"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already assigned"), "{err}");
+
+    // Renaming is fine until the service has declared meters, then refused.
+    run(&format!("set-service {FACTORY} otto-factory-2"))
+        .await
+        .unwrap();
+    run(&format!("set-service {FACTORY} otto-factory"))
+        .await
+        .unwrap();
+    let mut tx = db.begin_unpinned().await.unwrap();
+    otto_billing::meters::upsert_meters(
+        &mut tx,
+        &[otto_billing::meters::check_declaration(
+            "otto-factory",
+            &otto_billing::meters::MeterSpec {
+                key: "otto-factory/jobs",
+                display_name: "Jobs",
+                unit: "job",
+            },
+        )
+        .unwrap()],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    // Setting the same slug again is still fine.
+    run(&format!("set-service {FACTORY} otto-factory"))
+        .await
+        .unwrap();
+    let err = run(&format!("set-service {FACTORY} otto-jobs"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("declared meters"), "{err}");
+    assert_eq!(
+        resources::get(&db, FACTORY)
+            .await
+            .unwrap()
+            .unwrap()
+            .service
+            .as_deref(),
+        Some("otto-factory")
+    );
+}

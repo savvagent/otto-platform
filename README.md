@@ -188,6 +188,40 @@ refused. Unchecking everything refuses the request with `access_denied`.
 read scopes `<thing>:read`: any other name is treated as one that can change
 something.
 
+### Service slugs and value meters
+
+A resource server bills by value meters it declares itself, each keyed
+`<service>/<meter>` (for example `otto-flags/evaluations`). The `<service>`
+part is the resource server's **service slug**, which only an operator
+assigns, so one service can never declare or ship meters under another's
+name:
+
+```sh
+otto-platform-server resource set-service https://otto-flags.example/mcp otto-flags
+
+# Or at registration time:
+otto-platform-server resource register https://otto-flags.example/mcp \
+  --name otto-flags --scopes flags:read,flags:write --service otto-flags
+```
+
+A slug matches `^[a-z][a-z0-9-]{0,62}$` and is unique. Re-registering without
+`--service` keeps it, and it cannot be changed once the service has declared
+meters under it. `resource list` and `resource describe` show it
+(`service=-` when none is set).
+
+At startup the service declares its meters with
+`otto_resource::PlatformClient::declare_meters` (`PUT /internal/meters`, at
+most 50 per request, upserted idempotently), and only then starts its usage
+shipper. A meter outside its own namespace, or a malformed one (meter name
+`^[a-z][a-z0-9_]{0,62}$`, display name up to 80 characters, unit up to 32), is
+refused per meter in the receipt. A resource server with no slug gets
+`409 service_not_set`.
+
+**Operator ordering:** run `set-service` in production *before* each service
+releases a version that declares meters. Otherwise its declarations are
+refused, its metered events are rejected as unknown meters, and the shipper
+drops them: that usage is lost, not delayed.
+
 ### Running just the migrations
 
 Any tool that runs `sqlx::migrate!` against `crates/otto-tenant/migrations/`

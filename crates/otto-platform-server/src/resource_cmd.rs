@@ -4,7 +4,9 @@
 //!
 //! ```text
 //! otto-platform-server resource register <resource-uri> --name <name> \
-//!     --scopes a,b,c [--default-scopes a] [--scope-description a=text]...
+//!     --scopes a,b,c [--default-scopes a] [--scope-description a=text]... \
+//!     [--service <slug>]
+//! otto-platform-server resource set-service <resource-uri> <slug>
 //! otto-platform-server resource describe <resource-uri> \
 //!     [--scope-description a=text]... [--clear]
 //! otto-platform-server resource rotate-secret <resource-uri>
@@ -21,6 +23,14 @@
 //! without them re-registering keeps what is there. `describe` always
 //! replaces the whole set, so it is also how one is removed: repeat the
 //! descriptions you want to keep, or pass `--clear` for none.
+//!
+//! `--service <slug>` on `register`, or `set-service`, assigns the service slug
+//! the resource server's value meters are declared under (`<slug>/<meter>`).
+//! Run it before a service that declares meters is released: until then its
+//! declarations are refused (409 `service_not_set`) and its metered usage is
+//! rejected as unknown. A slug is unique, and cannot be changed once the
+//! service has declared meters under it. Re-registering without `--service`
+//! leaves the slug alone.
 //!
 //! Secrets are printed once, on stdout, and cannot be read back: the
 //! introspection secret is stored hashed, the webhook secret sealed. Losing
@@ -39,7 +49,8 @@ usage: otto-platform-server resource <command>
 
 commands:
   register <resource-uri> --name <name> --scopes a,b [--default-scopes a]
-           [--scope-description a=text]...
+           [--scope-description a=text]... [--service <slug>]
+  set-service <resource-uri> <slug>   assign the service slug its value meters are keyed by
   describe <resource-uri> [--scope-description a=text]... [--clear]
                                       replace the scope descriptions shown on the consent screen
   rotate-secret <resource-uri>        issue a new introspection credential
@@ -59,6 +70,12 @@ pub enum Command {
         default_scopes: Vec<String>,
         /// `(scope, text)`; empty leaves existing descriptions alone.
         scope_descriptions: Vec<(String, String)>,
+        /// `None` leaves the service slug alone.
+        service: Option<String>,
+    },
+    SetService {
+        resource_uri: String,
+        service: String,
     },
     /// Replace all scope descriptions; empty clears them.
     Describe {
@@ -88,7 +105,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut it = rest.iter().map(String::as_str);
     while let Some(a) = it.next() {
         match a {
-            "--name" | "--scopes" | "--default-scopes" | "--scope-description" => {
+            "--name" | "--scopes" | "--default-scopes" | "--scope-description" | "--service" => {
                 let v = it.next().ok_or_else(|| format!("{a} needs a value"))?;
                 flags.push((a, Some(v)));
             }
@@ -138,7 +155,15 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 .map(list)
                 .unwrap_or_default(),
             scope_descriptions: descriptions()?,
+            service: flag("--service").flatten().map(str::to_owned),
         }),
+        "set-service" => match positional.as_slice() {
+            [uri, service] => Ok(Command::SetService {
+                resource_uri: (*uri).to_owned(),
+                service: (*service).to_owned(),
+            }),
+            _ => Err("expected <resource-uri> <slug>".into()),
+        },
         "describe" => {
             let scope_descriptions = descriptions()?;
             let clear = flag("--clear").is_some();
@@ -190,6 +215,7 @@ pub async fn execute(
             scopes,
             default_scopes,
             scope_descriptions,
+            service,
         } => {
             let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
             let defaults: Vec<&str> = default_scopes.iter().map(String::as_str).collect();
@@ -212,6 +238,10 @@ pub async fn execute(
                     rs.scope_descriptions.len()
                 )?;
             }
+            if let Some(service) = service {
+                let rs = resources::set_service(db, &resource_uri, &service).await?;
+                writeln!(out, "service={}", rs.service.as_deref().unwrap_or("-"))?;
+            }
             writeln!(
                 out,
                 "next: `resource rotate-secret` for its credential, `resource set-webhook` for lifecycle events"
@@ -226,6 +256,22 @@ pub async fn execute(
                 out,
                 "{resource_uri} now has {} scope description(s)",
                 rs.scope_descriptions.len()
+            )?;
+            writeln!(out, "service={}", rs.service.as_deref().unwrap_or("-"))?;
+        }
+        Command::SetService {
+            resource_uri,
+            service,
+        } => {
+            let rs = resources::set_service(db, &resource_uri, &service).await?;
+            writeln!(
+                out,
+                "{resource_uri} service={}",
+                rs.service.as_deref().unwrap_or("-")
+            )?;
+            writeln!(
+                out,
+                "its meters are declared as {service}/<meter> (PUT /internal/meters)"
             )?;
         }
         Command::RotateSecret { resource_uri } => {
@@ -269,11 +315,12 @@ pub async fn execute(
             for rs in resources::list(db).await? {
                 writeln!(
                     out,
-                    "{}\t{}\t{}\twebhook={}",
+                    "{}\t{}\t{}\twebhook={}\tservice={}",
                     rs.resource_uri,
                     rs.name,
                     if rs.disabled { "disabled" } else { "enabled" },
                     rs.webhook_url.as_deref().unwrap_or("-"),
+                    rs.service.as_deref().unwrap_or("-"),
                 )?;
             }
         }
@@ -314,6 +361,7 @@ mod tests {
                 scopes: vec!["a".into(), "b".into()],
                 default_scopes: vec!["a".into()],
                 scope_descriptions: vec![],
+                service: None,
             }
         );
         assert_eq!(
@@ -327,9 +375,41 @@ mod tests {
                 scopes: vec!["a".into()],
                 default_scopes: vec![],
                 scope_descriptions: vec![("a".into(), "x=y".into())],
+                service: None,
             }
         );
         assert!(parse(&args("register https://x.example/mcp --name X")).is_err());
+        assert_eq!(
+            parse(&args(
+                "register https://x.example/mcp --name X --scopes a --service otto-x"
+            ))
+            .unwrap(),
+            Command::Register {
+                resource_uri: "https://x.example/mcp".into(),
+                name: "X".into(),
+                scopes: vec!["a".into()],
+                default_scopes: vec![],
+                scope_descriptions: vec![],
+                service: Some("otto-x".into()),
+            }
+        );
+        assert!(parse(&args(
+            "register https://x.example/mcp --name X --scopes a --service"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn parses_set_service() {
+        assert_eq!(
+            parse(&args("set-service https://x.example/mcp otto-x")).unwrap(),
+            Command::SetService {
+                resource_uri: "https://x.example/mcp".into(),
+                service: "otto-x".into(),
+            }
+        );
+        assert!(parse(&args("set-service https://x.example/mcp")).is_err());
+        assert!(parse(&args("set-service https://x.example/mcp a b")).is_err());
     }
 
     #[test]

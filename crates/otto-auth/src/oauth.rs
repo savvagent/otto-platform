@@ -932,6 +932,7 @@ mod tests {
                 scope_descriptions: Default::default(),
                 disabled: false,
                 webhook_url: None,
+                service: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },

@@ -7,6 +7,7 @@
 //!
 //! ```text
 //!   POST /internal/usage                                     batch usage ingest
+//!   PUT  /internal/meters                                    declare the caller's value meters
 //!   GET  /internal/orgs/{org}/usage-status                   period usage vs plan, plan features
 //!   GET  /internal/orgs/{org}/members/{user}                 whoami: user + org + role
 //!   GET  /internal/orgs/{org}/members/by-email?email=        member lookup
@@ -28,15 +29,20 @@
 
 use std::collections::BTreeMap;
 
-use axum::extract::{Path, Query, State};
-use axum::routing::{get, post};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::header::CACHE_CONTROL;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use otto_billing::meters::{self, MeterSpec};
 use otto_billing::usage::{IngestOutcome, ShippedUsage, UsageExt};
 use otto_core::orgs::{Org, OrgsExt};
 use otto_core::teams::{Team, TeamsExt};
 use otto_resource::{
-    MemberInfo, MemberTeams, OrgInfo, RejectedEvent, TeamInfo, UsageBatch, UsageReceipt,
-    UsageStatus, UserInfo, MAX_USAGE_BATCH,
+    MemberInfo, MemberTeams, MeterDeclarationBatch, MeterDeclarationReceipt, OrgInfo,
+    RejectedEvent, RejectedMeter, TeamInfo, UsageBatch, UsageReceipt, UsageStatus, UserInfo,
+    MAX_METER_DECLARATIONS, MAX_USAGE_BATCH,
 };
 use otto_tenant::ids::{OrgId, TeamId, UserId};
 use otto_tenant::Db;
@@ -49,9 +55,21 @@ use crate::api::{wire_role, ApiError, CallingResourceServer};
 /// kilobyte of one is a bug in the shipper.
 const MAX_TOOL_LEN: usize = 128;
 
+/// The largest `PUT /internal/meters` body read. Fifty well-formed meters fit
+/// in well under a quarter of this.
+const MAX_METERS_BODY: usize = 64 * 1024;
+
+/// How much of a refused meter key is echoed back. A valid key is at most
+/// 63 + 1 + 63 bytes.
+const MAX_ECHOED_KEY: usize = 128;
+
 pub fn router(db: Db) -> Router {
     Router::new()
         .route("/internal/usage", post(ingest_usage))
+        .route(
+            "/internal/meters",
+            put(declare_meters).layer(DefaultBodyLimit::max(MAX_METERS_BODY)),
+        )
         .route("/internal/orgs/{org}/usage-status", get(usage_status))
         .route(
             "/internal/orgs/{org}/members/by-email",
@@ -162,6 +180,87 @@ async fn ingest_usage(
     }
 
     Ok(Json(receipt))
+}
+
+// ------------------------------------------------------------------ meters
+
+/// Declare the calling resource server's value meters, idempotently.
+///
+/// Each meter's key must be `<service>/<meter>` under the caller's own
+/// `service` (assigned by an operator with `resource set-service`); a key in
+/// another namespace, a malformed field, or a key repeated in the request is
+/// refused per meter in the receipt, and the rest are still declared. A caller
+/// with no service yet gets 409 `service_not_set`: it has no namespace to
+/// declare into, and retrying will not help until an operator assigns one.
+async fn declare_meters(
+    State(db): State<Db>,
+    CallingResourceServer(rs): CallingResourceServer,
+    Json(batch): Json<MeterDeclarationBatch>,
+) -> Result<Response, ApiError> {
+    let Some(service) = rs.service.as_deref() else {
+        let mut res = (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "service_not_set",
+                "error_description": "this resource server has no service slug yet; \
+                    an operator assigns one with `otto-platform-server resource set-service`",
+            })),
+        )
+            .into_response();
+        res.headers_mut()
+            .insert(CACHE_CONTROL, "no-store".parse().expect("static header"));
+        return Ok(res);
+    };
+    if batch.meters.len() > MAX_METER_DECLARATIONS {
+        return Err(ApiError::TooLarge(format!(
+            "a declaration holds at most {MAX_METER_DECLARATIONS} meters"
+        )));
+    }
+
+    let mut receipt = MeterDeclarationReceipt::default();
+    let mut valid = Vec::with_capacity(batch.meters.len());
+    for m in &batch.meters {
+        let checked = meters::check_declaration(
+            service,
+            &MeterSpec {
+                key: &m.key,
+                display_name: &m.display_name,
+                unit: &m.unit,
+            },
+        )
+        .and_then(|v| {
+            if valid
+                .iter()
+                .any(|seen: &meters::ValidMeter| seen.key == v.key)
+            {
+                Err("`key` is declared more than once in this request".to_owned())
+            } else {
+                Ok(v)
+            }
+        });
+        match checked {
+            Ok(v) => valid.push(v),
+            Err(reason) => receipt.rejected.push(RejectedMeter {
+                key: truncate(&m.key, MAX_ECHOED_KEY),
+                reason,
+            }),
+        }
+    }
+
+    let mut tx = db.begin_unpinned().await?;
+    meters::upsert_meters(&mut tx, &valid).await?;
+    tx.commit().await?;
+    receipt.declared = valid.into_iter().map(|v| v.key).collect();
+    Ok(Json(receipt).into_response())
+}
+
+/// At most `max` bytes of `s`, cut on a character boundary.
+fn truncate(s: &str, max: usize) -> String {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
 }
 
 /// The org's usage this month against its plan. Resource servers cache this

@@ -5,5 +5,6 @@
 //! identity data of its own. [`plans`] is the one unpinned read: the public
 //! catalog of tiers, which belongs to no org.
 
+pub mod meters;
 pub mod plans;
 pub mod usage;
