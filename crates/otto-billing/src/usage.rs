@@ -539,8 +539,11 @@ impl UsageExt for Tx<'_> {
             Some(m) => (Some(m.meter), Some(m.quantity)),
             None => (None, None),
         };
+        // An event already too old for Stripe is not queued (see
+        // `stripe_outbox`): it would only expire.
         let (event_name, identifier) =
-            stripe_outbox::enqueue_fields(event.service, event.metered, event.event_id).unzip();
+            stripe_outbox::enqueue_fields(event.service, event.metered, event.event_id, at, now)
+                .unzip();
         let budget: Option<crate::budgets::IngestBudget> = sqlx::query_as(
             "WITH event AS ( \
                INSERT INTO usage_events \

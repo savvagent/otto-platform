@@ -29,8 +29,15 @@
 --             4xx other than 429. Never retried.
 --   expired   not sent in time: older than Stripe accepts (35 days), or still
 --             failing when its retry window closed (12 h after the first
---             attempt, well inside Stripe's 24 h identifier dedupe window, so
---             no retry can ever be counted twice). Never retried.
+--             attempt Stripe may have received, well inside Stripe's 24 h
+--             identifier dedupe window, so no retry can ever be counted
+--             twice). Never retried.
+-- `sent` means Stripe accepted the event for processing; Stripe validates
+-- meter events asynchronously and reports failures as separate events.
+--
+-- A row is only sent once its `event_name` has a Stripe meter (`stripe_meters`,
+-- written by `stripe sync`); until then it waits, and expires by age only.
+-- Deleting an org deletes its rows, shipped or not.
 -- `rejected` and `expired` rows are revenue that did not reach Stripe. They
 -- are kept with `last_error` for an operator, never swept, and logged at
 -- error level when they happen.
@@ -57,8 +64,15 @@ CREATE TABLE stripe_meter_outbox (
   -- Next time the shipper may pick this row up. Also the claim lease: claiming
   -- pushes it forward, so two machines never send the same row at once.
   next_attempt_at    timestamptz NOT NULL DEFAULT now(),
-  -- Set by the first claim. The retry window is measured from it.
-  first_attempt_at   timestamptz,
+  -- When the first attempt Stripe may have received started (a timeout, a
+  -- 5xx, or an answer that was never recorded). The retry window is measured
+  -- from it. Definite refusals before processing (401, 403, 429) leave it
+  -- unset, so they are bounded by the event's age alone.
+  window_started_at  timestamptz,
+  -- Set by a claim, cleared when the attempt's result is recorded. A claim
+  -- that finds it still set knows the previous attempt's answer was lost, and
+  -- starts the window from it.
+  sending_since      timestamptz,
   created_at         timestamptz NOT NULL DEFAULT now(),
   -- When it became sent, rejected or expired.
   finished_at        timestamptz,

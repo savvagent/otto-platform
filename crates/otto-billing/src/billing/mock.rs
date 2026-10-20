@@ -21,8 +21,12 @@
 //!   start.
 //! - **Meter events** ([`MockStripe::meter_events`]): a timestamp more than
 //!   35 days old or more than 5 minutes ahead is `400`, and an `identifier`
-//!   already received is accepted but not counted again (Stripe dedupes on
-//!   it for at least 24 hours).
+//!   already received is not counted again (Stripe dedupes on it for at least
+//!   24 hours). It is answered `200` by default, or `400
+//!   resource_already_exists` after [`MockStripe::answer_duplicates_with_error`],
+//!   so callers can be tested against either. [`MockStripe::delay`] slows a
+//!   path down, and [`MockStripe::max_meter_events_in_flight`] reports how
+//!   many meter-event calls overlapped.
 //!
 //! Schedules do not run on their own: [`MockStripe::advance_to`] plays them to
 //! a given time, switching each subscription's items as its phases begin.
@@ -111,6 +115,18 @@ struct Inner {
     detached: Vec<String>,
     /// Meter events Stripe counted, in arrival order, one per identifier.
     meter_events: Vec<Value>,
+    /// Answer a duplicate meter-event identifier with a `400` rather than
+    /// a `200`.
+    duplicate_is_error: bool,
+    /// Path prefix -> how long every matching request waits before it is
+    /// handled.
+    delays: Vec<(String, std::time::Duration)>,
+    /// Meter-event calls in flight now, by customer and in total, and the
+    /// most there have ever been.
+    in_flight: HashMap<String, usize>,
+    in_flight_total: usize,
+    max_in_flight_per_customer: usize,
+    max_in_flight_total: usize,
     /// Path prefix -> the status every matching request fails with.
     failures: Vec<(String, u16)>,
 }
@@ -375,6 +391,30 @@ impl MockStripe {
         self.lock().meter_events.clone()
     }
 
+    /// Answer a meter event whose identifier was already received with `400
+    /// resource_already_exists` (`true`) or `200` (`false`, the default).
+    pub fn answer_duplicates_with_error(&self, error: bool) {
+        self.lock().duplicate_is_error = error;
+    }
+
+    /// Every request whose path starts with `prefix` waits `delay` before it
+    /// is handled.
+    pub fn delay(&self, prefix: &str, delay: std::time::Duration) {
+        self.lock().delays.push((prefix.to_owned(), delay));
+    }
+
+    /// Stop every [`Self::delay`].
+    pub fn clear_delays(&self) {
+        self.lock().delays.clear();
+    }
+
+    /// The most meter-event calls ever in flight at once for one customer,
+    /// and in total.
+    pub fn max_meter_events_in_flight(&self) -> (usize, usize) {
+        let inner = self.lock();
+        (inner.max_in_flight_per_customer, inner.max_in_flight_total)
+    }
+
     /// A customer as Stripe holds it.
     pub fn customer(&self, id: &str) -> Option<Value> {
         self.lock().customers.get(id).cloned()
@@ -471,7 +511,54 @@ async fn handle(
         body: String::from_utf8_lossy(&body).into_owned(),
     };
 
-    let mut inner = inner.lock().unwrap_or_else(PoisonError::into_inner);
+    // Handled in a task of its own, so a caller that gives up (a client
+    // timeout) does not stop the request being processed, as with Stripe.
+    let task = tokio::spawn(async move {
+        let lock = || inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let meter_event = seen.path == "/v1/billing/meter_events";
+        let customer = seen
+            .field("payload[stripe_customer_id]")
+            .unwrap_or_default()
+            .to_owned();
+        let delay = {
+            let mut inner = lock();
+            if meter_event {
+                let n = inner.in_flight.entry(customer.clone()).or_default();
+                *n += 1;
+                let n = *n;
+                inner.in_flight_total += 1;
+                inner.max_in_flight_per_customer = inner.max_in_flight_per_customer.max(n);
+                inner.max_in_flight_total = inner.max_in_flight_total.max(inner.in_flight_total);
+            }
+            inner
+                .delays
+                .iter()
+                .find(|(prefix, _)| seen.path.starts_with(prefix.as_str()))
+                .map(|(_, d)| *d)
+        };
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
+        }
+        let mut inner = lock();
+        let (status, axum::Json(value)) = respond(&mut inner, seen);
+        if meter_event {
+            if let Some(n) = inner.in_flight.get_mut(&customer) {
+                *n -= 1;
+            }
+            inner.in_flight_total -= 1;
+        }
+        (status, value)
+    });
+    match task.await {
+        Ok((status, value)) => (status, axum::Json(value)),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({ "error": { "type": "api_error", "message": "mock panicked" } })),
+        ),
+    }
+}
+
+fn respond(inner: &mut Inner, seen: Seen) -> (StatusCode, axum::Json<Value>) {
     inner.seen.push(seen.clone());
 
     if let Some(key) = seen.idempotency_key.as_ref() {
@@ -500,7 +587,7 @@ async fn handle(
             "api_error",
             "the mock was told to fail this path",
         ),
-        None => route(&mut inner, &seen),
+        None => route(inner, &seen),
     };
     if let Some(key) = seen.idempotency_key {
         inner.replies.insert(
@@ -892,11 +979,24 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
                     "value": f("payload[value]"),
                 },
             });
-            if !inner
+            if inner
                 .meter_events
                 .iter()
                 .any(|e| e["identifier"] == json!(identifier))
             {
+                if inner.duplicate_is_error {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": {
+                            "type": "invalid_request_error",
+                            "code": "resource_already_exists",
+                            "message": format!(
+                                "A meter event with identifier {identifier} already exists."
+                            ),
+                        } }),
+                    );
+                }
+            } else {
                 inner.meter_events.push(record.clone());
             }
             (StatusCode::OK, record)
