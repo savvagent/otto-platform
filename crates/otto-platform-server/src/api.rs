@@ -2,7 +2,7 @@
 //! share: the error envelope and authentication of the calling resource
 //! server.
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRef, FromRequestParts};
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, WWW_AUTHENTICATE};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
@@ -101,10 +101,15 @@ impl IntoResponse for ApiError {
 /// which resource servers exist.
 pub struct CallingResourceServer(pub ResourceServer);
 
-impl FromRequestParts<Db> for CallingResourceServer {
+impl<S> FromRequestParts<S> for CallingResourceServer
+where
+    Db: FromRef<S>,
+    S: Send + Sync,
+{
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, db: &Db) -> Result<Self, ApiError> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        let db = &Db::from_ref(state);
         let header = parts
             .headers
             .get(AUTHORIZATION)

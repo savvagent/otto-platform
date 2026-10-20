@@ -15,8 +15,8 @@
 //! *why* it has run out.
 
 use axum::extract::{Json, State};
-use otto_billing::billing;
-use otto_billing::budgets;
+use otto_billing::billing::gate::{self, Billing};
+use otto_billing::budgets::{self, PAYMENT_REQUIRED};
 use otto_billing::pricebook::Month;
 use otto_billing::usage::{MeterPeriodUsage, PeriodUsage, PlanLimits, UsageExt};
 use otto_tenant::audit::AuditEvent;
@@ -77,9 +77,13 @@ pub struct ServiceUsage {
     /// `None` when no budget is set.
     pub budget: Option<BudgetView>,
     /// Whether the service is refusing billable calls until the org adds a
-    /// payment method: the org has no live subscription, and the service's
-    /// spend this month is above zero (past its free tiers). Never with
-    /// unknown spend.
+    /// working payment method: exactly when the platform's
+    /// `/internal/.../usage-status` answers `blocked_reason:
+    /// "payment_required"` for it ([`gate::blocked_reason`], one function for
+    /// both). So it is false while the service's budget hard stop is what
+    /// blocks it (`budget.blocked`): the console never asks for a card when
+    /// the platform says `budget_exceeded`. Never with unknown spend, and
+    /// never with billing disabled.
     pub payment_required: bool,
 }
 
@@ -154,17 +158,16 @@ pub async fn get_usage(State(state): State<AppState>, ctx: OrgCtx) -> ApiResult<
     let statuses = budgets::org_status(&mut tx, period)
         .await
         .map_err(|e| from_budgets("read service usage", e))?;
-    let live = billing::live_subscription(&mut tx)
+    // With no Stripe configured nobody can put a card on file, so nobody is
+    // asked to (`gate::standing` answers good standing without a query).
+    let standing = gate::standing(&mut tx, Billing::enabled_if(state.stripe.is_some()))
         .await
-        .map_err(|e| ApiError::internal("read the org's subscription", e))?
-        .is_some();
+        .map_err(|e| ApiError::internal("read the org's billing standing", e))?;
     let mut services = Vec::with_capacity(statuses.len());
     for status in statuses {
         let meters = tx.service_meter_usage(&status.service).await?;
         services.push(ServiceUsage {
-            // Only with billing on: with no Stripe configured nobody can put a
-            // card on file, so asking for one would lock every org out.
-            payment_required: state.stripe.is_some() && status.payment_required(live),
+            payment_required: gate::blocked_reason(&status, standing) == Some(PAYMENT_REQUIRED),
             budget: BudgetView::of(&status),
             spend_error: spend_error(&status),
             meters: meters.into_iter().map(Into::into).collect(),

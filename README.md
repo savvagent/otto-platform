@@ -277,7 +277,11 @@ month and the month's usage so far is queued for it, so the whole month is
 billed through one set of tiers. Each month's invoice is held as a draft
 (`invoice.created`) until the month's usage has reached Stripe, then finalized
 by sync (72 hours at most). A canceled subscription stops billing until the
-owner puts a card on file again. With billing disabled, usage-status never
+owner puts a card on file again. A failed payment keeps billable use going for
+a 7-day grace (`past_due`, or a failed or removed card), after which, and at
+once when Stripe marks the subscription `unpaid`, usage-status answers
+`payment_required` past the free tiers; the usage is still queued, so it is
+invoiced if the card recovers. With billing disabled, usage-status never
 answers `payment_required`.
 
 `stripe sync` makes Stripe match the price book. With billing enabled the

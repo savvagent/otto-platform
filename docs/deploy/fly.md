@@ -169,8 +169,11 @@ matches):
   choose **cancel the subscription**. The platform treats a canceled subscription as
   billing stopped: the org's billable use past its free tiers answers `payment_required`
   until its owner puts a card on file again, which starts a new subscription. "Mark as
-  unpaid" or "leave past due" keep the subscription live here, so usage keeps being
-  billed onto invoices nobody pays and nothing blocks it.
+  unpaid" or "leave past due" keep the subscription live here: its usage keeps being
+  queued for Stripe (so it is invoiced if the card recovers), but billable use past the
+  free tiers answers `payment_required` as soon as it is `unpaid`, and 7 days after it
+  became `past_due` (`otto_billing::billing::gate::PAYMENT_GRACE`). A card marked
+  `failed` or `detached` gets the same 7 days.
 - **Invoice finalization**: leave Stripe's automatic finalization of subscription
   invoices on. Stripe makes each month's invoice as a draft at 00:00 UTC on the first and
   would finalize it about an hour later (it waits for a successful answer to the
@@ -210,10 +213,18 @@ re-subscription after a cancellation is backdated only past the earlier subscrip
 (see `otto_billing::billing`, "The first month").
 
 **Invoices wait for their usage.** See *Invoice finalization* above. A held invoice is
-finalized once the month has closed and two sync runs at least 10 minutes apart have seen
-none of the org's usage from before the month's end waiting to be sent. One still waiting
-after 72 hours is finalized anyway, logged at error ("finalized a Stripe invoice at its
-maximum hold") and shown by `stripe sync` as `finalized_late`: that usage is not on it.
+finalized once the month has closed, two sync runs at least 10 minutes apart have seen
+none of the usage that can be on it waiting to be sent, and the last of that usage was
+sent at least 10 minutes earlier (Stripe applies meter events asynchronously). "Usage
+that can be on it" is the org's usage billed in that month, for the invoice's customer,
+of meters Stripe knows: a row stuck in an older month, a previous subscription's
+customer's row, or a row of a meter `stripe sync` has not made yet never holds it (the
+last is logged at warn, "waiting for a meter Stripe does not know yet": run `stripe
+sync`). One still waiting after 72 hours is finalized anyway, logged at error
+("finalized a Stripe invoice at its maximum hold") and shown by `stripe sync` as
+`finalized_late`: that usage is not on it. A draft that had already advanced when the
+webhook came to hold it is left to Stripe (`not_draft`); if it is open its automatic
+collection is turned back on, and a paid, void or uncollectible one is not touched.
 
 ### When a new price takes effect
 
@@ -256,11 +267,27 @@ Notes:
 - With billing disabled, `GET /api/orgs/{org}/billing` says so, nothing is invoiced, and
   usage-status never answers `payment_required` (nobody can put a card on file); usage is
   still metered and kept, and budgets still apply.
-- Deleting an org does not yet cancel its Stripe subscription. Cancel it in the dashboard.
+- Deleting an org does not yet cancel its Stripe subscription, or release its held
+  invoices (#73); see [Deleting an org with a subscription](#deleting-an-org-with-a-subscription).
 - Deleting an org deletes its queued meter events with it: usage it had not yet shipped
   to Stripe is not invoiced.
 - The webhook ledger (`stripe_events`) is swept about once an hour of events handled more
   than 90 days ago.
+
+### Deleting an org with a subscription
+
+Until #73, deleting an org leaves its Stripe side as it was, and deletes the platform's
+record of it (the customer map, the subscription row, the held invoices, the queued meter
+events). Sync never touches that customer again. So, in the dashboard, for the org's
+customer:
+
+1. **Cancel its subscription**, or Stripe keeps invoicing it every month.
+2. **Finalize or void its held draft invoices** (Invoices → Drafts, filtered to the
+   customer; automatic collection shows as off). The platform turned their automatic
+   advance off and would have finalized them; with the org deleted nothing will, and a
+   draft with automatic collection off stays a draft forever. Finalize one that should
+   be collected (turn automatic collection back on, or collect it by hand); void one
+   that should not.
 
 ### Monitoring
 
@@ -334,7 +361,26 @@ going live and after any change to billing.
    first. Stripe makes the closing month's invoice; the `invoice.created` webhook holds
    it (Dashboard: draft, automatic collection off). The closing month's usage is rated at
    the old price and the new month's at the new one.
-6. **Release of the held invoice.** The platform releases a held invoice by the real
+6. **Late usage reaches the held invoice (go-live gate).** This is the test that
+   invoice holding works at all: that usage Stripe receives after it made a month's
+   invoice, timestamped inside that month, still lands on it. With step 5's draft held
+   (the clock past 00:00 UTC on the first, the draft's automatic collection off):
+
+   1. Advance the clock **3 more hours** (past the month's 02:00 UTC close, as late usage
+      arrives in production).
+   2. Send a meter event **by hand** for the test-clock customer (`POST
+      /v1/billing/meter_events` from the Stripe CLI, or the meter's page in the
+      dashboard): the meter's event name, `stripe_customer_id` set to that customer, a
+      `value` you will recognize (say 7), a fresh `identifier`, and a **timestamp inside
+      the closed month** (say 23:30 UTC on its last day).
+   3. Release the invoice as in step 7, and open the finalized invoice.
+
+   It must include that usage (the meter's line quantity grew by 7). Record the result
+   here. **If it does not, invoice holding does not protect late usage, and going live
+   must wait** for a different design: adding late usage to the held draft as invoice
+   items, or closing the month (and shipping its last hour) before Stripe makes the
+   invoice. Owner: Rob.
+7. **Release of the held invoice.** The platform releases a held invoice by the real
    clock, so an invoice for a month that has not ended in real time waits for its
    72-hour maximum. To release it in the test, move its hold back and run sync:
 
@@ -346,7 +392,7 @@ going live and after any change to billing.
    `stripe sync` then prints an `invoice` line for it ending `finalized_late` (and logs
    the expected error); the invoice is open with automatic collection on, and the test card
    is charged.
-7. **Mid-period item change.** Simulate a missed switch: write a version for the
+8. **Mid-period item change.** Simulate a missed switch: write a version for the
    current month straight into the database (`pricebook set` refuses it), as the
    superuser, then run `stripe sync`. It moves the item in the middle of the month and
    prints a `changed price in the middle of` warning (logged at error). Advance the clock
@@ -377,7 +423,7 @@ DELETE FROM stripe_customers;
 UPDATE subscriptions
    SET stripe_customer_id = NULL, stripe_subscription_id = NULL, status = 'active',
        payment_method_status = 'none', stripe_payment_method_id = NULL,
-       payment_method_event_at = NULL, subscription_event_at = NULL,
+       payment_method_event_at = NULL, subscription_event_at = NULL, past_due_since = NULL,
        billing_stopped_at = NULL, stripe_schedule_id = NULL, stripe_plan = NULL,
        lease_until = NULL, lease_token = NULL;
 COMMIT;
@@ -436,7 +482,9 @@ always one the previous release can run against, and the migrator is built for i
 ignores applied migrations it does not know (`otto_tenant::db::MIGRATOR`), instead of
 refusing to boot. **To roll back, deploy the previous release's image** (for example
 `fly deploy -a otto-platform --image <previous image>`; `fly releases -a otto-platform
---image` lists them). It boots against the newer schema and serves. Do not touch
+--image` lists them). It boots against the newer schema and serves. (A release from
+before the epic #55 release does not ignore unknown migrations; rolling back to one needs
+`OTTO_RUN_MIGRATIONS=0` on that deploy, see the [release notes](#release-notes).) Do not touch
 `_sqlx_migrations`. When the rolled-forward release ships again, it finds its migrations
 already applied. Every migration a release does know is still checked against its applied
 checksum, so an edited migration is still refused.
@@ -462,8 +510,19 @@ still serving.
   nothing backfills them. The gap is the length of the rollout, usually minutes. The same
   applies after a rollback: events ingested while the previous release serves count only
   toward the legacy totals.
-- **Rollback is safe.** The previous release boots against the new schema (see
-  [Migrations and rolling back](#migrations-and-rolling-back)). From this release on, the
-  migrator ignores applied migrations it does not know. A release from *before* this one
-  does not; it refuses to boot against a database with migrations it lacks. So roll back
-  no further than this release once its migrations have been applied.
+- **Rolling back from this release needs `OTTO_RUN_MIGRATIONS=0`.** The release in
+  production before this epic (v0.9.2) predates the migrator's tolerance of unknown
+  migrations (`set_ignore_missing`, added in this release): booting with migrations on,
+  it finds 0017 to 0023 applied but unknown to it and refuses to start. It does support
+  `OTTO_RUN_MIGRATIONS`, and with it off it skips the migrator and serves against the
+  newer schema (the migrations are additive). So deploy it with that variable set:
+
+  ```bash
+  fly deploy -a otto-platform --image <v0.9.2 image> --env OTTO_RUN_MIGRATIONS=0
+  ```
+
+  `--env` applies to that deploy only; the next deploy (rolling forward again) runs
+  with migrations on, as normal, and finds them already applied. Do not touch
+  `_sqlx_migrations`. Rolling back from a later release to this one, or to any release
+  after it, needs nothing special: they ignore unknown migrations (see
+  [Migrations and rolling back](#migrations-and-rolling-back)).

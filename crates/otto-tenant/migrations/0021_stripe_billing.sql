@@ -41,6 +41,13 @@ ALTER TABLE subscriptions
   ADD COLUMN stripe_payment_method_id text,
   ADD COLUMN payment_method_event_at  timestamptz,
   ADD COLUMN subscription_event_at    timestamptz,
+  -- When the subscription last became `past_due`: the `created` time of the
+  -- event (or the moment sync read it from Stripe) that moved `status` to
+  -- `past_due` from anything else. Kept while it stays `past_due`, cleared on
+  -- any other status. Billable use is allowed for
+  -- `otto_billing::billing::gate::PAYMENT_GRACE` from it, then refused
+  -- (`payment_required`) until the subscription recovers.
+  ADD COLUMN past_due_since           timestamptz,
   -- Set when Stripe reports the subscription deleted (canceled in the
   -- dashboard, or by dunning). A stopped org is never re-subscribed by sync;
   -- only the owner putting a card on file again clears it.
@@ -170,8 +177,9 @@ CREATE TABLE stripe_account_mode (
 -- finalized is never invoiced. So the `invoice.created` webhook turns
 -- `auto_advance` off for each subscription-cycle invoice of an org's recorded
 -- subscription and records it here, and `stripe sync` finalizes it (turning
--- `auto_advance` back on, so Stripe collects it) once M has closed and none of
--- the org's usage before the end of M is still waiting to be sent, or after a
+-- `auto_advance` back on, so Stripe collects it) once M has closed, none of
+-- the invoice customer's usage billed in M for a meter Stripe knows is still
+-- waiting to be sent, and the last of it was sent a while ago; or after a
 -- maximum hold. See `otto_billing::billing` ("Invoices wait for their usage").
 --
 -- TENANT-scoped, with the standard policy: the webhook and sync write it in
@@ -181,6 +189,9 @@ CREATE TABLE stripe_held_invoices (
   stripe_invoice_id      text        PRIMARY KEY,
   org_id                 uuid        NOT NULL REFERENCES orgs (id) ON DELETE CASCADE,
   stripe_subscription_id text        NOT NULL,
+  -- The invoice's customer (`cus_...`). Only the outbox rows of this customer
+  -- can be on this invoice, so only they hold it.
+  stripe_customer_id     text        NOT NULL,
   -- The first day of the month the invoice bills.
   period_month           date        NOT NULL,
   held_at                timestamptz NOT NULL DEFAULT now(),
@@ -199,6 +210,8 @@ CREATE TABLE stripe_held_invoices (
     CHECK (char_length(stripe_invoice_id) BETWEEN 1 AND 255),
   CONSTRAINT stripe_held_invoices_sub_len
     CHECK (char_length(stripe_subscription_id) BETWEEN 1 AND 255),
+  CONSTRAINT stripe_held_invoices_customer_len
+    CHECK (char_length(stripe_customer_id) BETWEEN 1 AND 255),
   CONSTRAINT stripe_held_invoices_month CHECK (extract(day FROM period_month) = 1),
   CONSTRAINT stripe_held_invoices_outcome
     CHECK (outcome IN ('finalized', 'finalized_late', 'not_draft')),

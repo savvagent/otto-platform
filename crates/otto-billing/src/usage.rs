@@ -79,6 +79,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::LazyLock;
 
 use chrono::{DateTime, Datelike, Duration, Months, NaiveTime, Utc};
 use otto_core::error::{Error, Result};
@@ -402,6 +403,72 @@ pub enum IngestOutcome {
     Rejected(&'static str),
 }
 
+/// The statement that counts one usage event (see
+/// [`UsageExt::ingest_usage_deferred`] for what each part does), built once:
+/// only the open outbox row's conflict clause is spliced in, and it never
+/// changes.
+static INGEST_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "WITH event AS ( \
+           INSERT INTO usage_events \
+             (org_id, user_id, tool, billable, created_at, resource_uri, meter, quantity) \
+           VALUES ($1, (SELECT id FROM users WHERE id = $2), $3, $4, $5, $6, \
+                   $7::text, $8::bigint) \
+         ), legacy AS ( \
+           INSERT INTO org_period_usage (org_id, period_start, billable_count, total_count) \
+           VALUES ($1, date_trunc('month', $5::timestamptz AT TIME ZONE 'utc')::date, \
+                   $4::boolean::int, 1) \
+           ON CONFLICT (org_id, period_start) DO UPDATE \
+             SET billable_count = org_period_usage.billable_count + EXCLUDED.billable_count, \
+                 total_count = org_period_usage.total_count + 1, \
+                 updated_at = now() \
+           RETURNING period_start \
+         ), service AS ( \
+           INSERT INTO org_service_period_usage \
+             (org_id, service, period_start, billable_count, total_count) \
+           SELECT $1, $9::text, legacy.period_start, $4::boolean::int, 1 \
+           FROM legacy \
+           WHERE $9::text IS NOT NULL \
+           ON CONFLICT (org_id, service, period_start) DO UPDATE \
+             SET billable_count = org_service_period_usage.billable_count \
+                                  + EXCLUDED.billable_count, \
+                 total_count = org_service_period_usage.total_count + 1, \
+                 updated_at = now() \
+           RETURNING 1 \
+         ), meter AS ( \
+           INSERT INTO org_meter_period_usage (org_id, meter, period_start, quantity) \
+           SELECT $1, $7::text, legacy.period_start, $8::bigint \
+           FROM legacy CROSS JOIN (SELECT count(*) FROM service) AS service_done \
+           WHERE $7::text IS NOT NULL \
+           ON CONFLICT (org_id, meter, period_start) DO UPDATE \
+             SET quantity = org_meter_period_usage.quantity + EXCLUDED.quantity, \
+                 updated_at = now() \
+           RETURNING 1 \
+         ), stripe AS ( \
+           INSERT INTO stripe_meter_outbox \
+             (org_id, event_name, stripe_customer_id, value, bucket_start, \
+              next_attempt_at) \
+           SELECT $1, $10::text, s.stripe_customer_id, $8::bigint, $11::timestamptz, \
+                  $11::timestamptz + interval '1 hour' \
+           FROM subscriptions s CROSS JOIN (SELECT count(*) FROM meter) AS meter_done \
+           WHERE $10::text IS NOT NULL AND s.org_id = $1 \
+             AND s.stripe_customer_id IS NOT NULL \
+             AND s.stripe_subscription_id IS NOT NULL \
+             AND s.status = ANY($12::text[]) \
+           {add_to_open_row} \
+         ) \
+         SELECT b.monthly_budget_cents, b.hard_stop, \
+                (SELECT max(a.threshold) FROM budget_alerts a \
+                 WHERE a.org_id = $1 AND a.service = $9::text \
+                   AND a.period_start = \
+                       date_trunc('month', $5::timestamptz AT TIME ZONE 'utc')::date) \
+                  AS max_fired \
+         FROM service_budgets b \
+         WHERE $7::text IS NOT NULL AND b.org_id = $1 AND b.service = $9::text",
+        add_to_open_row = stripe_outbox::add_to_open_row(),
+    )
+});
+
 /// Extension methods on [`otto_tenant::Tx`] for metering and plan limits. See
 /// `otto-core`'s crate docs for why these are an extension trait rather than
 /// inherent methods.
@@ -611,79 +678,21 @@ impl UsageExt for Tx<'_> {
         // `stripe_outbox`): it would only expire.
         let event_name =
             stripe_outbox::enqueue_event_name(event.service, event.metered, bucket, now);
-        let budget: Option<crate::budgets::IngestBudget> = sqlx::query_as(&format!(
-            "WITH event AS ( \
-               INSERT INTO usage_events \
-                 (org_id, user_id, tool, billable, created_at, resource_uri, meter, quantity) \
-               VALUES ($1, (SELECT id FROM users WHERE id = $2), $3, $4, $5, $6, \
-                       $7::text, $8::bigint) \
-             ), legacy AS ( \
-               INSERT INTO org_period_usage (org_id, period_start, billable_count, total_count) \
-               VALUES ($1, date_trunc('month', $5::timestamptz AT TIME ZONE 'utc')::date, \
-                       $4::boolean::int, 1) \
-               ON CONFLICT (org_id, period_start) DO UPDATE \
-                 SET billable_count = org_period_usage.billable_count + EXCLUDED.billable_count, \
-                     total_count = org_period_usage.total_count + 1, \
-                     updated_at = now() \
-               RETURNING period_start \
-             ), service AS ( \
-               INSERT INTO org_service_period_usage \
-                 (org_id, service, period_start, billable_count, total_count) \
-               SELECT $1, $9::text, legacy.period_start, $4::boolean::int, 1 \
-               FROM legacy \
-               WHERE $9::text IS NOT NULL \
-               ON CONFLICT (org_id, service, period_start) DO UPDATE \
-                 SET billable_count = org_service_period_usage.billable_count \
-                                      + EXCLUDED.billable_count, \
-                     total_count = org_service_period_usage.total_count + 1, \
-                     updated_at = now() \
-               RETURNING 1 \
-             ), meter AS ( \
-               INSERT INTO org_meter_period_usage (org_id, meter, period_start, quantity) \
-               SELECT $1, $7::text, legacy.period_start, $8::bigint \
-               FROM legacy CROSS JOIN (SELECT count(*) FROM service) AS service_done \
-               WHERE $7::text IS NOT NULL \
-               ON CONFLICT (org_id, meter, period_start) DO UPDATE \
-                 SET quantity = org_meter_period_usage.quantity + EXCLUDED.quantity, \
-                     updated_at = now() \
-               RETURNING 1 \
-             ), stripe AS ( \
-               INSERT INTO stripe_meter_outbox \
-                 (org_id, event_name, stripe_customer_id, value, bucket_start, \
-                  next_attempt_at) \
-               SELECT $1, $10::text, s.stripe_customer_id, $8::bigint, $11::timestamptz, \
-                      $11::timestamptz + interval '1 hour' \
-               FROM subscriptions s CROSS JOIN (SELECT count(*) FROM meter) AS meter_done \
-               WHERE $10::text IS NOT NULL AND s.org_id = $1 \
-                 AND s.stripe_customer_id IS NOT NULL \
-                 AND s.stripe_subscription_id IS NOT NULL \
-                 AND s.status = ANY($12::text[]) \
-               {add_to_open_row} \
-             ) \
-             SELECT b.monthly_budget_cents, b.hard_stop, \
-                    (SELECT max(a.threshold) FROM budget_alerts a \
-                     WHERE a.org_id = $1 AND a.service = $9::text \
-                       AND a.period_start = \
-                           date_trunc('month', $5::timestamptz AT TIME ZONE 'utc')::date) \
-                      AS max_fired \
-             FROM service_budgets b \
-             WHERE $7::text IS NOT NULL AND b.org_id = $1 AND b.service = $9::text",
-            add_to_open_row = stripe_outbox::add_to_open_row(),
-        ))
-        .bind(org)
-        .bind(event.user)
-        .bind(event.tool)
-        .bind(event.billable)
-        .bind(at)
-        .bind(resource_uri)
-        .bind(meter)
-        .bind(quantity)
-        .bind(event.service)
-        .bind(event_name)
-        .bind(bucket)
-        .bind(&LIVE_STATUSES[..])
-        .fetch_optional(self.conn())
-        .await?;
+        let budget: Option<crate::budgets::IngestBudget> = sqlx::query_as(&INGEST_SQL)
+            .bind(org)
+            .bind(event.user)
+            .bind(event.tool)
+            .bind(event.billable)
+            .bind(at)
+            .bind(resource_uri)
+            .bind(meter)
+            .bind(quantity)
+            .bind(event.service)
+            .bind(event_name)
+            .bind(bucket)
+            .bind(&LIVE_STATUSES[..])
+            .fetch_optional(self.conn())
+            .await?;
 
         // After the counters, in this same transaction: steps that read what
         // the event just counted. Each must leave a valid event counted

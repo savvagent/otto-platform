@@ -236,6 +236,31 @@ impl World {
         .unwrap();
     }
 
+    /// Set the subscription's status and the card's, each with how long ago
+    /// it became so (`None`: unknown), as the webhooks record them.
+    async fn billing_state(
+        &self,
+        status: &str,
+        past_due_for: Option<chrono::Duration>,
+        card: &str,
+        card_for: Option<chrono::Duration>,
+    ) {
+        let ago = |d: Option<chrono::Duration>| d.map(|d| Utc::now() - d);
+        sqlx::query(
+            "UPDATE subscriptions SET status = $2, past_due_since = $3, \
+               payment_method_status = $4, payment_method_event_at = $5 \
+             WHERE org_id = $1",
+        )
+        .bind(self.org)
+        .bind(status)
+        .bind(ago(past_due_for))
+        .bind(card)
+        .bind(ago(card_for))
+        .execute(self.db.pool())
+        .await
+        .unwrap();
+    }
+
     async fn add(&self, email: &str, role: Role) -> UserId {
         let user = self.db.upsert_user(email, None).await.unwrap();
         self.db.add_member(self.org, user.id, role).await.unwrap();
@@ -771,20 +796,85 @@ async fn billable_use_past_free_tiers_needs_a_payment_method(pool: PgPool) {
         reason(&w.status(&w.flags).await),
         Some(json!("budget_exceeded"))
     );
-    // A past-due subscription is still live.
-    sqlx::query("UPDATE subscriptions SET status = 'past_due'")
-        .execute(w.db.pool())
-        .await
-        .unwrap();
-    assert_eq!(reason(&w.status(&w.factory).await), None);
-    // A canceled one is not.
-    sqlx::query("UPDATE subscriptions SET status = 'canceled'")
-        .execute(w.db.pool())
-        .await
-        .unwrap();
+    // A canceled one does not.
+    w.billing_state("canceled", None, "active", None).await;
     assert_eq!(
         reason(&w.status(&w.factory).await),
         Some(json!("payment_required"))
+    );
+}
+
+/// A failed payment keeps billable use going for the grace only: past due
+/// (or a failed or detached card) for less than `PAYMENT_GRACE` is allowed,
+/// past it, or `unpaid` at all, needs a working card. The budget's hard stop
+/// still wins, and with billing disabled nothing is required.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_failed_payment_is_allowed_only_within_the_grace(pool: PgPool) {
+    use otto_billing::billing::gate::PAYMENT_GRACE;
+    use otto_platform_server::Billing;
+    let w = world(pool).await;
+    price(&w.db, JOBS, 0, &[(Some(10), 0), (None, CENT)]).await;
+    let reason = |status: &Value| status.get("blocked_reason").cloned();
+    let required = Some(json!("payment_required"));
+    w.ship(&w.factory, vec![event(w.org, Some(JOBS), Some(50))])
+        .await;
+    let inside = Some(PAYMENT_GRACE - chrono::Duration::hours(1));
+    let beyond = Some(PAYMENT_GRACE + chrono::Duration::minutes(1));
+
+    w.subscribe().await;
+    w.billing_state("active", None, "active", None).await;
+    assert_eq!(reason(&w.status(&w.factory).await), None, "active");
+    w.billing_state("trialing", None, "active", None).await;
+    assert_eq!(reason(&w.status(&w.factory).await), None, "trialing");
+
+    w.billing_state("past_due", inside, "failed", inside).await;
+    assert_eq!(
+        reason(&w.status(&w.factory).await),
+        None,
+        "past due in grace"
+    );
+    w.billing_state("past_due", beyond, "failed", inside).await;
+    assert_eq!(reason(&w.status(&w.factory).await), required, "past due");
+    w.billing_state("unpaid", inside, "failed", inside).await;
+    assert_eq!(reason(&w.status(&w.factory).await), required, "unpaid");
+
+    // A failed or detached card past the grace, even on an active
+    // subscription.
+    for card in ["failed", "detached"] {
+        w.billing_state("active", None, card, inside).await;
+        assert_eq!(reason(&w.status(&w.factory).await), None, "{card} in grace");
+        w.billing_state("active", None, card, beyond).await;
+        assert_eq!(reason(&w.status(&w.factory).await), required, "{card}");
+    }
+
+    // Still queued for Stripe while past due or unpaid: the usage is
+    // invoiced if the card recovers.
+    let queued_before: i64 =
+        sqlx::query_scalar("SELECT COALESCE(sum(value), 0)::bigint FROM stripe_meter_outbox")
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    w.billing_state("unpaid", None, "failed", beyond).await;
+    w.ship(&w.factory, vec![event(w.org, Some(JOBS), Some(4))])
+        .await;
+    let queued_after: i64 =
+        sqlx::query_scalar("SELECT COALESCE(sum(value), 0)::bigint FROM stripe_meter_outbox")
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(queued_after - queued_before, 4);
+
+    // The budget's hard stop wins; with billing disabled only it blocks.
+    w.set_budget("otto-factory", 1, true).await;
+    assert_eq!(
+        reason(&w.status(&w.factory).await),
+        Some(json!("budget_exceeded"))
+    );
+    w.set_budget("otto-factory", 1_000_000, false).await;
+    assert_eq!(reason(&w.status(&w.factory).await), required);
+    assert_eq!(
+        reason(&w.status_with(&w.factory, Billing::Disabled).await),
+        None
     );
 }
 

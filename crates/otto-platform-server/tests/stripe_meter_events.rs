@@ -452,6 +452,54 @@ async fn a_claimed_row_takes_no_more_usage(pool: PgPool) {
     assert_eq!(values, ["3", "9"]);
 }
 
+/// Adding an event to an open row changes no indexed column (`value` is in
+/// no index, and `is_full` stays false), so Postgres updates the row in place
+/// (HOT) and writes no index entries: ingest's cost per event does not grow
+/// with the table's indexes (migration 0023).
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn adding_to_an_open_row_is_a_hot_update(pool: PgPool) {
+    use otto_billing::usage::UsageExt;
+    let w = world(pool).await;
+    let org = w
+        .org("live", Billing::Subscribed("cus_live", "active"))
+        .await;
+    let mut tx = w.db.begin(org).await.unwrap();
+    otto_billing::usage::lock_org_ingest(&mut tx).await.unwrap();
+    let mut budgets = otto_billing::budgets::PendingBudgets::default();
+    for _ in 0..5 {
+        tx.ingest_usage_deferred(
+            FLAGS,
+            &otto_billing::usage::ShippedUsage {
+                event_id: Uuid::new_v4(),
+                user: None,
+                tool: "t",
+                billable: true,
+                occurred_at: last_hour(),
+                service: Some("otto-flags"),
+                metered: Some(otto_billing::usage::Metered {
+                    meter: EVALS,
+                    quantity: 1,
+                }),
+            },
+            &mut budgets,
+        )
+        .await
+        .unwrap();
+    }
+    // This transaction's own counts: one insert, then four additions, every
+    // one of them HOT.
+    let (inserted, updated, hot): (i64, i64, i64) = sqlx::query_as(
+        "SELECT n_tup_ins, n_tup_upd, n_tup_hot_upd FROM pg_stat_xact_user_tables \
+          WHERE relname = 'stripe_meter_outbox'",
+    )
+    .fetch_one(tx.conn())
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!((inserted, updated, hot), (1, 4, 4));
+    assert_eq!(w.only_row().await.value, 5);
+}
+
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn a_full_row_closes_and_queueing_never_fails_an_event(pool: PgPool) {
     let w = world(pool).await;
@@ -810,15 +858,19 @@ async fn the_shipper_reaches_every_org_under_row_level_security(pool: PgPool) {
     .await
     .unwrap();
     budgets.run(&mut tx).await.unwrap();
-    // Pinned, it reads its own org's pending usage.
-    let before = period::hour_bucket(Utc::now()) + Duration::hours(1);
-    assert!(stripe_outbox::has_pending_before(tx.conn(), acme, before)
+    // Pinned, it reads its own org's pending usage (and, under otto_app,
+    // which meters Stripe knows).
+    let month = Month::of(last_hour());
+    let shipping = stripe_outbox::invoice_shipping(tx.conn(), acme, "cus_a", month)
         .await
-        .unwrap());
+        .unwrap();
+    assert!(shipping.pending && shipping.unsynced == 0, "{shipping:?}");
     // Asking about another org through this pin is refused, not a false "no".
-    assert!(stripe_outbox::has_pending_before(tx.conn(), globex, before)
-        .await
-        .is_err());
+    assert!(
+        stripe_outbox::invoice_shipping(tx.conn(), globex, "cus_g", month)
+            .await
+            .is_err()
+    );
     tx.commit().await.unwrap();
     let mut values: Vec<i64> = sqlx::query_scalar("SELECT value FROM stripe_meter_outbox")
         .fetch_all(&pool)
@@ -829,9 +881,11 @@ async fn the_shipper_reaches_every_org_under_row_level_security(pool: PgPool) {
 
     // An unpinned transaction that did not opt in is refused too.
     let mut tx = app.begin_unpinned().await.unwrap();
-    assert!(stripe_outbox::has_pending_before(tx.conn(), acme, before)
-        .await
-        .is_err());
+    assert!(
+        stripe_outbox::invoice_shipping(tx.conn(), acme, "cus_a", month)
+            .await
+            .is_err()
+    );
     drop(tx);
 
     assert_eq!(
@@ -1230,29 +1284,39 @@ async fn a_stale_shipper_cannot_record_over_a_newer_claim(pool: PgPool) {
 
 /// Pending usage before an instant holds an invoice; sent and lost rows do
 /// not.
+/// Only the usage that can be on a held invoice holds it: its own month, its
+/// own customer, meters Stripe knows, and only while pending.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
-async fn pending_usage_before_an_instant_is_reported(pool: PgPool) {
+async fn only_an_invoices_own_pending_usage_holds_it(pool: PgPool) {
     let w = world(pool).await;
     let mock = MockStripe::start().await;
     let org = w
         .org("live", Billing::Subscribed("cus_live", "active"))
         .await;
     let other = w.org("other", Billing::Subscribed("cus_o", "active")).await;
-    let pending = |before: DateTime<Utc>| {
+    let month = Month::of(last_hour());
+    let shipping = |customer: &'static str, month: Month| {
         let db = w.db.clone();
         async move {
             let mut tx = db.begin(org).await.unwrap();
-            stripe_outbox::has_pending_before(tx.conn(), org, before)
+            stripe_outbox::invoice_shipping(tx.conn(), org, customer, month)
                 .await
                 .unwrap()
         }
     };
-    let hour = period::hour_bucket(last_hour());
-    assert!(!pending(hour + Duration::hours(1)).await, "nothing queued");
+    let pending = |month: Month| {
+        let ship = shipping("cus_live", month);
+        async move { ship.await.pending }
+    };
+    assert_eq!(
+        shipping("cus_live", month).await,
+        stripe_outbox::InvoiceShipping::default(),
+        "nothing queued"
+    );
 
     w.ship(vec![event(org, Some(1)), event(other, Some(1))])
         .await;
-    assert!(pending(hour + Duration::hours(1)).await);
+    assert!(pending(month).await);
     // An opted-in unpinned transaction may ask too.
     let mut tx = w.db.begin_unpinned().await.unwrap();
     sqlx::query("SELECT set_config('app.stripe_meter_delivery', 'on', true)")
@@ -1260,20 +1324,21 @@ async fn pending_usage_before_an_instant_is_reported(pool: PgPool) {
         .await
         .unwrap();
     assert!(
-        stripe_outbox::has_pending_before(tx.conn(), other, hour + Duration::hours(1))
+        stripe_outbox::invoice_shipping(tx.conn(), other, "cus_o", month)
             .await
             .unwrap()
+            .pending
     );
     drop(tx);
-    assert!(
-        !pending(hour).await,
-        "the row's hour starts at, not before, `hour`"
-    );
+    // Another month's invoice, or another customer's, is not held by it.
+    assert!(!pending(month.offset(1).unwrap()).await);
+    assert!(!pending(month.offset(-1).unwrap()).await);
+    assert!(!shipping("cus_previous", month).await.pending);
 
     // Claimed but unsent still holds.
     let claimed = stripe_outbox::claim_due(&w.db, 10).await.unwrap();
     assert_eq!(claimed.len(), 2);
-    assert!(pending(hour + Duration::hours(1)).await);
+    assert!(pending(month).await);
     for row in &claimed {
         let sent = row.org_id == org.as_uuid();
         if sent {
@@ -1284,9 +1349,22 @@ async fn pending_usage_before_an_instant_is_reported(pool: PgPool) {
                 .unwrap();
         }
     }
+    let after_send = shipping("cus_live", month).await;
     assert!(
-        !pending(hour + Duration::hours(1)).await,
+        !after_send.pending,
         "sent; the other org's pending row is not this org's"
+    );
+    let sent_at: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT finished_at FROM stripe_meter_outbox WHERE org_id = $1 AND status = 'sent'",
+    )
+    .bind(org)
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after_send.last_sent_at,
+        Some(sent_at),
+        "the last send is reported"
     );
 
     // A lost row does not hold an invoice either.
@@ -1294,7 +1372,8 @@ async fn pending_usage_before_an_instant_is_reported(pool: PgPool) {
     mock.fail(METER_EVENTS, 400);
     w.make_due().await;
     w.ship_due(&mock).await;
-    assert!(!pending(hour + Duration::hours(1)).await);
+    mock.clear_failures();
+    assert!(!pending(month).await);
     let lost: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM stripe_meter_outbox WHERE org_id = $1 AND status = 'rejected'",
     )
@@ -1303,6 +1382,44 @@ async fn pending_usage_before_an_instant_is_reported(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(lost, 1);
+
+    // A row stuck pending in an older month, and a previous customer's row
+    // of this month, hold nothing.
+    let older = month.offset(-2).unwrap();
+    for (customer, at) in [
+        ("cus_live", period::starts_at(older) + Duration::hours(5)),
+        ("cus_previous", period::hour_bucket(last_hour())),
+    ] {
+        sqlx::query(
+            "INSERT INTO stripe_meter_outbox \
+               (org_id, event_name, stripe_customer_id, value, bucket_start, sending_since) \
+             VALUES ($1, $2, $3, 1, $4, now())",
+        )
+        .bind(org)
+        .bind(EVENT_NAME)
+        .bind(customer)
+        .bind(at)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    }
+    assert!(!pending(month).await);
+    assert!(pending(older).await, "it holds its own month's invoice");
+    assert!(shipping("cus_previous", month).await.pending);
+
+    // A row of a meter Stripe does not know is reported, and holds nothing.
+    sqlx::query(
+        "INSERT INTO stripe_meter_outbox \
+           (org_id, event_name, stripe_customer_id, value, bucket_start) \
+         VALUES ($1, 'otto_flags__unsynced', 'cus_live', 1, $2)",
+    )
+    .bind(org)
+    .bind(period::hour_bucket(last_hour()))
+    .execute(&w.pool)
+    .await
+    .unwrap();
+    let s = shipping("cus_live", month).await;
+    assert_eq!((s.pending, s.unsynced), (false, 1), "{s:?}");
 }
 
 /// Usage counted before an org's subscription went live is queued once,

@@ -464,8 +464,9 @@ async fn held_invoices_are_seen_and_written_only_by_their_own_org(pool: PgPool) 
     let mut tx = db.begin(acme).await.unwrap();
     sqlx::query(
         "INSERT INTO stripe_held_invoices \
-           (stripe_invoice_id, org_id, stripe_subscription_id, period_month) \
-         VALUES ('in_acme', $1, 'sub_1', '2026-10-01')",
+           (stripe_invoice_id, org_id, stripe_subscription_id, stripe_customer_id, \
+            period_month) \
+         VALUES ('in_acme', $1, 'sub_1', 'cus_1', '2026-10-01')",
     )
     .bind(acme)
     .execute(tx.conn())
@@ -489,8 +490,9 @@ async fn held_invoices_are_seen_and_written_only_by_their_own_org(pool: PgPool) 
     assert_eq!(n, 0);
     let err = sqlx::query(
         "INSERT INTO stripe_held_invoices \
-           (stripe_invoice_id, org_id, stripe_subscription_id, period_month) \
-         VALUES ('in_forged', $1, 'sub_1', '2026-10-01')",
+           (stripe_invoice_id, org_id, stripe_subscription_id, stripe_customer_id, \
+            period_month) \
+         VALUES ('in_forged', $1, 'sub_1', 'cus_1', '2026-10-01')",
     )
     .bind(acme)
     .execute(tx.conn())
@@ -504,6 +506,7 @@ async fn held_invoices_are_seen_and_written_only_by_their_own_org(pool: PgPool) 
         "UPDATE stripe_held_invoices SET outcome = 'paid', released_at = now()",
         "UPDATE stripe_held_invoices SET released_at = now()",
         "UPDATE stripe_held_invoices SET period_month = '2026-10-02'",
+        "UPDATE stripe_held_invoices SET stripe_customer_id = ''",
     ] {
         let mut tx = db.begin(acme).await.unwrap();
         let err = sqlx::query(stmt).execute(tx.conn()).await.expect_err(stmt);

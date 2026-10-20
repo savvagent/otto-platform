@@ -17,16 +17,23 @@
 //!    the invoice can advance.)
 //! 2. **Release.** Every [`super::sync`] run looks at each org's held
 //!    invoices ([`release_held`]). One is finalized, with `auto_advance`
-//!    back on so Stripe collects it, once its month has closed and none of
-//!    the org's usage billed before the end of the month has been waiting to
-//!    reach Stripe for [`INVOICE_SETTLE`] (two sync runs in a row see none,
-//!    which also gives Stripe time to apply the last meter events it
-//!    accepted). An invoice held [`MAX_INVOICE_HOLD`] is finalized anyway and
-//!    logged at error: invoices never sit forever, and the usage still
-//!    waiting is not on it.
+//!    back on so Stripe collects it, once its month has closed, none of the
+//!    usage that can be on it has been waiting to reach Stripe for
+//!    [`INVOICE_SETTLE`] (two sync runs in a row see none), and the last of
+//!    it was sent at least [`INVOICE_SETTLE`] ago (time for Stripe to apply
+//!    the last meter events it accepted). "Usage that can be on it" is
+//!    [`stripe_outbox::invoice_shipping`]'s: the invoice's own month and
+//!    customer, for meters Stripe knows. A stuck row of an older month,
+//!    another customer's row, or a row of a meter Stripe does not know yet
+//!    never holds it (the last is logged at warn). An invoice held
+//!    [`MAX_INVOICE_HOLD`] is finalized anyway and logged at error: invoices
+//!    never sit forever, and the usage still waiting is not on it.
 //! 3. **Someone else moved it.** An invoice that is no longer a draft when
 //!    sync comes to release it (finalized or voided in the dashboard) is left
-//!    alone and recorded as `not_draft`.
+//!    alone and recorded as `not_draft`. So is one that had already advanced
+//!    when the webhook came to hold it: if it is `open`, `auto_advance` is
+//!    turned back on so Stripe collects it; a `paid`, `void` or
+//!    `uncollectible` one is not touched at all.
 //!
 //! Both halves run under the org's billing lease, like every other billing
 //! change: no transaction is open during a Stripe call, and every write after
@@ -96,14 +103,20 @@ pub(super) enum Decision {
 }
 
 /// `clear_since`: since when sync has seen none of the month's usage waiting
-/// (`None`: some is waiting).
+/// (`None`: some is waiting). `last_sent_at`: when the last of it was sent
+/// (`None`: none was).
 pub(super) fn decide(
     month: Month,
     held_at: DateTime<Utc>,
     clear_since: Option<DateTime<Utc>>,
+    last_sent_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Decision {
-    if period::period_closed(month, now) && clear_since.is_some_and(|c| now - c >= INVOICE_SETTLE) {
+    let settled = |at: DateTime<Utc>| now - at >= INVOICE_SETTLE;
+    if period::period_closed(month, now)
+        && clear_since.is_some_and(settled)
+        && last_sent_at.is_none_or(settled)
+    {
         Decision::Finalize
     } else if now - held_at >= MAX_INVOICE_HOLD {
         Decision::FinalizeLate
@@ -144,6 +157,10 @@ pub(super) async fn invoice_created(
     let Some(month) = billed_month(invoice, created) else {
         return Ok(ignored("the invoice's period is out of range"));
     };
+    // `handle_event` found the org by this very field.
+    let Some(customer) = id_field(invoice, "customer") else {
+        return Ok(ignored("the invoice names no customer"));
+    };
 
     // Recorded before the hold is sent: an invoice held in Stripe is always
     // one sync will release.
@@ -164,12 +181,14 @@ pub(super) async fn invoice_created(
         None => {
             sqlx::query(
                 "INSERT INTO stripe_held_invoices \
-                   (stripe_invoice_id, org_id, stripe_subscription_id, period_month) \
-                 VALUES ($1, $2, $3, $4)",
+                   (stripe_invoice_id, org_id, stripe_subscription_id, stripe_customer_id, \
+                    period_month) \
+                 VALUES ($1, $2, $3, $4, $5)",
             )
             .bind(id)
             .bind(org)
             .bind(subscription)
+            .bind(customer)
             .bind(month.first_day())
             .execute(tx.conn())
             .await?;
@@ -189,18 +208,40 @@ pub(super) async fn invoice_created(
     tx.commit().await?;
 
     lease.renew(db).await?;
-    let held = client
+    let status = match client
         .set_invoice_auto_advance(id, false, &idem("invoice-hold", &id)?)
-        .await?;
-    if held.status.as_deref() != Some("draft") {
+        .await
+    {
+        Ok(held) => held.status,
+        // Stripe may refuse to update an invoice that is no longer a draft
+        // or open (paid, void). Look before failing the event, which Stripe
+        // would redeliver for days.
+        Err(e) if e.api().is_some_and(|a| a.status == 400) => {
+            lease.renew(db).await?;
+            let now = client.retrieve_invoice(id).await?;
+            if now.status.as_deref() == Some("draft") {
+                return Err(e.into());
+            }
+            now.status
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if status.as_deref() != Some("draft") {
         // It advanced before the hold reached it (Stripe had stopped waiting
-        // for this webhook). Give collection back to Stripe and let it be.
-        lease.renew(db).await?;
-        client
-            .set_invoice_auto_advance(id, true, &idem("invoice-unhold", &id)?)
-            .await?;
+        // for this webhook). An open invoice gets collection back (the hold
+        // just turned it off); a paid, void or uncollectible one is done
+        // with and is not touched again.
+        if status.as_deref() == Some("open") {
+            lease.renew(db).await?;
+            client
+                .set_invoice_auto_advance(id, true, &idem("invoice-unhold", &id)?)
+                .await?;
+        }
         record_release(db, lease, org, id, month, outcomes::NOT_DRAFT, STRIPE_ACTOR).await?;
-        return Ok(ignored("the invoice had already advanced; left to Stripe"));
+        return Ok(ignored(format!(
+            "the invoice had already advanced ({}); left to Stripe",
+            status.as_deref().unwrap_or("gone")
+        )));
     }
     Ok(EventOutcome::Handled)
 }
@@ -247,6 +288,7 @@ async fn record_release(
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct Held {
     stripe_invoice_id: String,
+    stripe_customer_id: String,
     period_month: chrono::NaiveDate,
     held_at: DateTime<Utc>,
 }
@@ -278,7 +320,8 @@ pub(super) async fn release_held(
         }
         let mut tx = db.begin(org).await?;
         let held: Vec<Held> = sqlx::query_as(
-            "SELECT stripe_invoice_id, period_month, held_at FROM stripe_held_invoices \
+            "SELECT stripe_invoice_id, stripe_customer_id, period_month, held_at \
+               FROM stripe_held_invoices \
              WHERE released_at IS NULL ORDER BY held_at, stripe_invoice_id",
         )
         .fetch_all(tx.conn())
@@ -332,15 +375,14 @@ async fn release_one(
 ) -> Result<()> {
     let id = held.stripe_invoice_id.as_str();
     let month = held.month();
-    let period_end = month
-        .offset(1)
-        .map(period::starts_at)
-        .ok_or_else(|| Error::Unexpected(format!("no month after {month}")))?;
 
-    // Is any of the month's usage still on its way? Asked in the org's own
-    // pinned transaction, as `has_pending_before` requires, under the lease.
+    // Is any of the usage that can be on this invoice still on its way?
+    // Asked in the org's own pinned transaction, as `invoice_shipping`
+    // requires, under the lease.
     let mut tx = lease.begin(db).await?;
-    let pending = stripe_outbox::has_pending_before(tx.conn(), org, period_end).await?;
+    let shipping =
+        stripe_outbox::invoice_shipping(tx.conn(), org, &held.stripe_customer_id, month).await?;
+    let pending = shipping.pending;
     let clear_since: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(
         "UPDATE stripe_held_invoices \
             SET clear_since = CASE WHEN $2 THEN NULL ELSE COALESCE(clear_since, now()) END \
@@ -357,7 +399,30 @@ async fn release_one(
         return Ok(());
     };
 
-    let decision = decide(month, held.held_at, clear_since, Utc::now());
+    if shipping.unsynced > 0 {
+        tracing::warn!(
+            %org,
+            invoice = %id,
+            period = %month,
+            rows = shipping.unsynced,
+            "usage of a held invoice's period is waiting for a meter Stripe does not know \
+             yet; it does not hold the invoice and will not be on it. Run `otto-platform-server \
+             stripe sync`"
+        );
+        report.warnings.push(format!(
+            "org {org}: held invoice {id} for {month}: {} outbox rows wait for a meter Stripe \
+             does not know yet and will not be on it",
+            shipping.unsynced
+        ));
+    }
+
+    let decision = decide(
+        month,
+        held.held_at,
+        clear_since,
+        shipping.last_sent_at,
+        Utc::now(),
+    );
     if decision == Decision::Wait {
         return Ok(());
     }
@@ -439,34 +504,53 @@ mod tests {
         let close = utc(2026, 11, 1, 2, 0);
         // Open period: wait, however clear.
         assert_eq!(
-            decide(oct, held, Some(held), close - Duration::seconds(1)),
+            decide(oct, held, Some(held), None, close - Duration::seconds(1)),
             Decision::Wait
         );
         // Closed, but usage seen waiting, or seen clear only just now.
-        assert_eq!(decide(oct, held, None, close), Decision::Wait);
+        assert_eq!(decide(oct, held, None, None, close), Decision::Wait);
         let seen = close + Duration::minutes(1);
         assert_eq!(
             decide(
                 oct,
                 held,
                 Some(seen),
+                None,
                 seen + INVOICE_SETTLE - Duration::seconds(1)
             ),
             Decision::Wait
         );
         assert_eq!(
-            decide(oct, held, Some(seen), seen + INVOICE_SETTLE),
+            decide(oct, held, Some(seen), None, seen + INVOICE_SETTLE),
+            Decision::Finalize
+        );
+        // Clear, but the last of its usage was sent only just now: Stripe
+        // may not have applied it yet.
+        let ready = seen + INVOICE_SETTLE;
+        assert_eq!(
+            decide(
+                oct,
+                held,
+                Some(seen),
+                Some(ready - INVOICE_SETTLE + Duration::seconds(1)),
+                ready
+            ),
+            Decision::Wait
+        );
+        assert_eq!(
+            decide(oct, held, Some(seen), Some(ready - INVOICE_SETTLE), ready),
             Decision::Finalize
         );
         // Held too long: finalized whatever is waiting.
         assert_eq!(
-            decide(oct, held, None, held + MAX_INVOICE_HOLD),
+            decide(oct, held, None, None, held + MAX_INVOICE_HOLD),
             Decision::FinalizeLate
         );
         assert_eq!(
             decide(
                 oct,
                 held,
+                None,
                 None,
                 held + MAX_INVOICE_HOLD - Duration::seconds(1)
             ),

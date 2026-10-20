@@ -1,5 +1,6 @@
 //! Reading an org's billing state.
 
+use chrono::{DateTime, Utc};
 use otto_tenant::Tx;
 use serde::Serialize;
 
@@ -67,7 +68,13 @@ impl SubscriptionState {
 pub struct BillingStatus {
     pub stripe_customer_id: Option<String>,
     pub payment_method: PaymentMethodStatus,
+    /// When `payment_method` became what it is (the Stripe event that set
+    /// it); `None` before any card.
+    pub payment_method_since: Option<DateTime<Utc>>,
     pub subscription: Option<SubscriptionState>,
+    /// When the subscription became `past_due`, while it is; `None`
+    /// otherwise.
+    pub past_due_since: Option<DateTime<Utc>>,
     /// Stripe deleted the subscription; nothing re-subscribes the org until
     /// its owner puts a card on file again.
     pub stopped: bool,
@@ -89,13 +96,19 @@ pub async fn status(tx: &mut Tx<'_>) -> Result<BillingStatus> {
         Some(row) => BillingStatus {
             stripe_customer_id: row.stripe_customer_id.clone(),
             payment_method: row.card()?,
+            payment_method_since: row.payment_method_event_at,
             subscription: row.subscription(),
+            past_due_since: row
+                .past_due_since
+                .filter(|_| row.status == "past_due" && row.stripe_subscription_id.is_some()),
             stopped: row.billing_stopped_at.is_some(),
         },
         None => BillingStatus {
             stripe_customer_id: None,
             payment_method: PaymentMethodStatus::None,
+            payment_method_since: None,
             subscription: None,
+            past_due_since: None,
             stopped: false,
         },
     })
