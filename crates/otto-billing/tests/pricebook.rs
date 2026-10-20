@@ -253,7 +253,7 @@ async fn an_unknown_meter_cannot_be_priced(pool: PgPool) {
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn a_concurrent_set_is_reported_as_such(pool: PgPool) {
     seed_meters(&pool).await;
-    let db = Db::from_pool(pool);
+    let db = Db::from_pool(pool.clone());
     let next = now_month(&db).await.offset(1).unwrap();
 
     let mut first = db.begin_unpinned().await.unwrap();
@@ -269,7 +269,27 @@ async fn a_concurrent_set_is_reported_as_such(pool: PgPool) {
             .await
             .map(|_| ())
     });
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait until the second run is actually blocked on `first`'s row lock, so
+    // the test exercises the race rather than whichever run happens to start
+    // first on a slow machine.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second run never blocked on the first"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     first.commit().await.unwrap();
 
     let err = second.await.unwrap().unwrap_err();
