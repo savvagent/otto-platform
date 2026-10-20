@@ -21,6 +21,7 @@ pub const DEFAULT_BASE_URL: &str = "https://api.stripe.com";
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A Stripe API client.
 ///
@@ -63,6 +64,7 @@ impl Client {
         }
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             // An API client has no reason to follow a redirect, and following
             // one could carry the Authorization header somewhere else.
             .redirect(reqwest::redirect::Policy::none())

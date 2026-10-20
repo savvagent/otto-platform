@@ -42,6 +42,17 @@
 //! unique, so distinct keys give distinct names. [`parse_meter_event_name`]
 //! is that decoder; the tests check it inverts [`meter_event_name`] over every
 //! key up to length 4 on a small alphabet, and that no two of them collide.
+//!
+//! # Length
+//!
+//! Stripe caps a meter's `event_name` at [`MAX_EVENT_NAME_LEN`] (100)
+//! characters, and [`meter_event_name`] refuses a key whose name would be
+//! longer ([`EventNameError::TooLong`]) rather than truncating it, which
+//! would break injectivity. Refusing part of the domain cannot create a
+//! collision. In practice: a plain key fits when
+//! `len(service) + len(meter) <= 98`; an escaped key counts every separator
+//! twice and needs `len(service) + len(meter) + separators <= 97`. Meter
+//! declarations should be held to that when they are registered.
 
 /// A meter key part that does not match its pattern.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -50,6 +61,21 @@ pub enum EventNameError {
     InvalidService,
     #[error("meter name must match ^[a-z][a-z0-9_]{{0,62}}$")]
     InvalidMeter,
+    #[error("meter key maps to a Stripe event name longer than {MAX_EVENT_NAME_LEN} characters")]
+    TooLong,
+}
+
+/// The longest `event_name` Stripe accepts for a billing meter.
+pub const MAX_EVENT_NAME_LEN: usize = 100;
+
+/// Whether `name` could be a Stripe meter event name this module produces:
+/// 1 to [`MAX_EVENT_NAME_LEN`] of `[a-z0-9_]`. A raw `service/meter` key fails.
+pub(super) fn is_event_name_shaped(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_EVENT_NAME_LEN
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
 }
 
 const MAX_PART: usize = 63;
@@ -96,15 +122,19 @@ pub fn meter_event_name(service: &str, meter: &str) -> Result<String, EventNameE
     if !valid_meter(meter) {
         return Err(EventNameError::InvalidMeter);
     }
-    if is_plain(service, meter) {
-        Ok(format!("{}__{meter}", service.replace('-', "_")))
+    let name = if is_plain(service, meter) {
+        format!("{}__{meter}", service.replace('-', "_"))
     } else {
-        Ok(format!(
+        format!(
             "{}___{}",
             service.replace('-', "_h"),
             meter.replace('_', "_u")
-        ))
+        )
+    };
+    if name.len() > MAX_EVENT_NAME_LEN {
+        return Err(EventNameError::TooLong);
     }
+    Ok(name)
 }
 
 /// The inverse of [`meter_event_name`]: `(service, meter)` for a name it
@@ -245,11 +275,48 @@ mod tests {
     }
 
     #[test]
-    fn max_length_parts() {
+    fn length_cap_plain() {
+        // 49 + "__" + 49 = 100: accepted, and it round-trips.
+        let (s, m) = ("a".repeat(49), "b".repeat(49));
+        let name = meter_event_name(&s, &m).unwrap();
+        assert_eq!(name.len(), 100);
+        assert_eq!(parse_meter_event_name(&name), Some((s.clone(), m)));
+        // One more character: 101, refused.
+        assert_eq!(
+            meter_event_name(&s, &"b".repeat(50)),
+            Err(EventNameError::TooLong)
+        );
+    }
+
+    #[test]
+    fn length_cap_escaped() {
+        // 33 'a' + trailing '-' -> 35 escaped, + "___" + 62 = 100.
+        let s = format!("{}-", "a".repeat(33));
+        let m = "b".repeat(62);
+        let name = meter_event_name(&s, &m).unwrap();
+        assert_eq!(name.len(), 100);
+        assert_eq!(parse_meter_event_name(&name), Some((s.clone(), m)));
+        assert_eq!(
+            meter_event_name(&s, &"b".repeat(63)),
+            Err(EventNameError::TooLong)
+        );
+        // Valid parts at their maximum length are refused, not truncated.
         let s = format!("a{}", "-".repeat(62));
         let m = format!("a{}", "_".repeat(62));
-        let name = meter_event_name(&s, &m).unwrap();
-        assert_eq!(parse_meter_event_name(&name), Some((s, m)));
+        assert_eq!(meter_event_name(&s, &m), Err(EventNameError::TooLong));
+        // An over-long name never parses either.
+        let long = format!("{}__{}", "a".repeat(49), "b".repeat(50));
+        assert_eq!(parse_meter_event_name(&long), None);
+    }
+
+    #[test]
+    fn event_name_shape() {
+        assert!(is_event_name_shaped("otto_factory__jobs_completed"));
+        assert!(is_event_name_shaped(&"a".repeat(100)));
+        assert!(!is_event_name_shaped(&"a".repeat(101)));
+        assert!(!is_event_name_shaped(""));
+        assert!(!is_event_name_shaped("otto-factory/jobs_completed"));
+        assert!(!is_event_name_shaped("Jobs"));
     }
 
     #[test]

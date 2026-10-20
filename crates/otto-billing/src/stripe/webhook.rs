@@ -44,6 +44,12 @@ pub const MAX_SIGNATURES: usize = 8;
 /// The longest `Stripe-Signature` header accepted.
 pub const MAX_SIGNATURE_HEADER_BYTES: usize = 4096;
 
+/// The largest payload [`verify_webhook_at`] will HMAC or parse. Checked
+/// first, before any other work. This bounds the work done here only: the
+/// HTTP layer receiving the webhook must also cap the request body (at this
+/// size or less), or it buffers an unbounded body before this check runs.
+pub const MAX_WEBHOOK_PAYLOAD_BYTES: usize = 64 * 1024;
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// A verified Stripe event. `data.object` is left as JSON: its shape depends
@@ -75,6 +81,8 @@ pub enum WebhookError {
     Stale { age_secs: i64 },
     #[error("webhook payload is not a Stripe event: {0}")]
     InvalidPayload(String),
+    #[error("webhook payload exceeds {MAX_WEBHOOK_PAYLOAD_BYTES} bytes")]
+    PayloadTooLarge,
 }
 
 /// An HMAC over `"{t}.{payload}"`, not yet finalized.
@@ -108,13 +116,18 @@ pub fn verify_webhook(
 /// As [`verify_webhook`], with an explicit clock (Unix seconds).
 ///
 /// The MAC is checked before the timestamp, so an unauthenticated caller
-/// learns nothing about the clock. Comparison is constant-time.
+/// learns nothing about the clock. Comparison is constant-time. A payload over
+/// [`MAX_WEBHOOK_PAYLOAD_BYTES`] is refused before anything else; the HTTP
+/// layer must cap the request body as well.
 pub fn verify_webhook_at(
     secret: &WebhookSecret,
     header: &str,
     payload: &[u8],
     now: i64,
 ) -> Result<WebhookEvent, WebhookError> {
+    if payload.len() > MAX_WEBHOOK_PAYLOAD_BYTES {
+        return Err(WebhookError::PayloadTooLarge);
+    }
     if header.len() > MAX_SIGNATURE_HEADER_BYTES {
         return Err(WebhookError::MalformedHeader("too long"));
     }
@@ -389,6 +402,34 @@ mod tests {
                 Err(WebhookError::InvalidPayload(_))
             ));
         }
+    }
+
+    #[test]
+    fn payload_size_cap() {
+        // A validly signed event padded to exactly the cap is accepted...
+        let pad = |n: usize| {
+            let head = br#"{"id":"evt_1","type":"x","created":1,"data":{"object":{}},"pad":""#;
+            let tail = br#""}"#;
+            let mut b = head.to_vec();
+            b.resize(n - tail.len(), b'x');
+            b.extend_from_slice(tail);
+            b
+        };
+        let at = pad(MAX_WEBHOOK_PAYLOAD_BYTES);
+        let header = sign_webhook(&secret(), NOW, &at);
+        assert!(verify_webhook_at(&secret(), &header, &at, NOW).is_ok());
+        // ...and one byte more is refused, even with a valid signature.
+        let over = pad(MAX_WEBHOOK_PAYLOAD_BYTES + 1);
+        let header = sign_webhook(&secret(), NOW, &over);
+        assert_eq!(
+            verify_webhook_at(&secret(), &header, &over, NOW),
+            Err(WebhookError::PayloadTooLarge)
+        );
+        // Checked first: a malformed header does not change the answer.
+        assert_eq!(
+            verify_webhook_at(&secret(), "garbage", &over, NOW),
+            Err(WebhookError::PayloadTooLarge)
+        );
     }
 
     #[test]

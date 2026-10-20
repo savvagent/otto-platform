@@ -835,3 +835,48 @@ fn client_debug_does_not_contain_the_key() {
     let c = Client::with_base_url(SecretKey::new(KEY).unwrap(), "http://127.0.0.1:1").unwrap();
     assert!(!format!("{c:?}").contains(KEY));
 }
+
+#[tokio::test]
+async fn raw_meter_keys_are_refused_as_event_names() {
+    let m = Mock::start().await;
+    let c = m.client();
+    for bad in [
+        "otto-factory/jobs_completed",
+        "",
+        "Jobs",
+        &"a".repeat(MAX_EVENT_NAME_LEN + 1),
+    ] {
+        let err = c
+            .create_meter(
+                &CreateMeter {
+                    display_name: "x".into(),
+                    event_name: bad.to_owned(),
+                },
+                &idem("k"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StripeError::InvalidRequest(_)),
+            "{bad}: {err:?}"
+        );
+        let err = c
+            .send_meter_event(
+                &MeterEvent {
+                    event_name: bad.to_owned(),
+                    stripe_customer_id: "cus_1".into(),
+                    value: 1,
+                    identifier: "id".into(),
+                    timestamp: Utc::now(),
+                },
+                &idem("k"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StripeError::InvalidRequest(_)),
+            "{bad}: {err:?}"
+        );
+    }
+    assert!(m.seen().is_empty());
+}

@@ -11,6 +11,7 @@ use serde::Deserialize;
 
 use super::client::{Client, Form};
 use super::error::StripeError;
+use super::event_name::is_event_name_shaped;
 use super::money::ucents_to_unit_amount_decimal;
 use super::secret::IdempotencyKey;
 
@@ -243,6 +244,17 @@ fn check_id(what: &str, id: &str) -> Result<(), StripeError> {
     Ok(())
 }
 
+/// Refuse an event name Stripe would reject or that is plainly not one this
+/// crate produced (e.g. a raw `service/meter` key).
+fn check_event_name(name: &str) -> Result<(), StripeError> {
+    if !is_event_name_shaped(name) {
+        return Err(invalid(
+            "event_name must be 1 to 100 of [a-z0-9_]; map meter keys with meter_event_name",
+        ));
+    }
+    Ok(())
+}
+
 fn push_metadata(form: &mut Form, metadata: &Metadata) -> Result<(), StripeError> {
     for (k, v) in metadata {
         // A bracket would change the nesting of the form key.
@@ -361,6 +373,7 @@ impl Client {
         params: &CreateMeter,
         idempotency_key: &IdempotencyKey,
     ) -> Result<Meter, StripeError> {
+        check_event_name(&params.event_name)?;
         let mut form = Form::default();
         form.push("display_name", params.display_name.as_str());
         form.push("event_name", params.event_name.as_str());
@@ -472,6 +485,7 @@ impl Client {
         event: &MeterEvent,
         idempotency_key: &IdempotencyKey,
     ) -> Result<MeterEventRecord, StripeError> {
+        check_event_name(&event.event_name)?;
         check_id("customer", &event.stripe_customer_id)?;
         if event.value < 0 {
             return Err(invalid("meter event value must not be negative"));
