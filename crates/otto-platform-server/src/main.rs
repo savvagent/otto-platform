@@ -130,9 +130,13 @@ async fn main() -> Result<()> {
 
     // Billing, only when both Stripe secrets are set (`Config` refuses one
     // without the other). Off is a supported state, not a fault: production
-    // boots and serves without it. On, every machine runs the sync loop; a
-    // lease in the database lets one of them sync at a time.
-    let stripe_task = match otto_platform_server::stripe(&config)? {
+    // boots and serves without it. On, every machine runs the sync loop (a
+    // lease in the database lets one of them sync at a time) and the meter
+    // event shipper (leased row claims let them share the outbox).
+    let stripe = otto_platform_server::stripe(&config)?;
+    let shipper_task =
+        otto_platform_server::stripe_shipper::spawn(db.clone(), stripe.as_ref(), stop_rx.clone());
+    let stripe_task = match stripe {
         Some(stripe) => {
             tracing::info!("billing enabled: Stripe is configured");
             Some(tokio::spawn(otto_platform_server::stripe_cmd::run_loop(
@@ -179,6 +183,9 @@ async fn main() -> Result<()> {
         let _ = task.await;
     }
     if let Some(task) = stripe_task {
+        let _ = task.await;
+    }
+    if let Some(task) = shipper_task {
         let _ = task.await;
     }
     tracing::info!("shut down cleanly");
@@ -231,6 +238,17 @@ async fn run_pricebook_command(args: &[String]) -> Result<()> {
 async fn run_stripe_command(args: &[String]) -> Result<()> {
     use otto_platform_server::stripe_cmd;
 
+    // Reads only the outbox: no Stripe key needed.
+    if let [cmd] = args {
+        if cmd == "outbox" {
+            let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+            let db = Db::connect(&database_url)
+                .await
+                .context("could not connect to DATABASE_URL")?;
+            return otto_platform_server::stripe_shipper::write_counts(&db, &mut std::io::stdout())
+                .await;
+        }
+    }
     let cmd =
         stripe_cmd::parse(args).map_err(|e| anyhow::anyhow!("{e}\n\n{}", stripe_cmd::USAGE))?;
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;

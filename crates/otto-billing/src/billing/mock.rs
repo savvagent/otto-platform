@@ -19,6 +19,10 @@
 //!   price twice on one, one active meter per event name, one open schedule
 //!   per subscription, and a schedule update must keep the current phase's
 //!   start.
+//! - **Meter events** ([`MockStripe::meter_events`]): a timestamp more than
+//!   35 days old or more than 5 minutes ahead is `400`, and an `identifier`
+//!   already received is accepted but not counted again (Stripe dedupes on
+//!   it for at least 24 hours).
 //!
 //! Schedules do not run on their own: [`MockStripe::advance_to`] plays them to
 //! a given time, switching each subscription's items as its phases begin.
@@ -105,6 +109,8 @@ struct Inner {
     items: BTreeMap<u64, (String, String, String)>,
     schedules: BTreeMap<String, Value>,
     detached: Vec<String>,
+    /// Meter events Stripe counted, in arrival order, one per identifier.
+    meter_events: Vec<Value>,
     /// Path prefix -> the status every matching request fails with.
     failures: Vec<(String, u16)>,
 }
@@ -361,6 +367,12 @@ impl MockStripe {
     /// Payment methods detached so far, in order.
     pub fn detached(&self) -> Vec<String> {
         self.lock().detached.clone()
+    }
+
+    /// The meter events counted so far, oldest first: one per identifier,
+    /// however many times it was sent.
+    pub fn meter_events(&self) -> Vec<Value> {
+        self.lock().meter_events.clone()
     }
 
     /// A customer as Stripe holds it.
@@ -859,6 +871,36 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
             }
             (StatusCode::OK, schedule)
         }
+        ("POST", ["v1", "billing", "meter_events"]) => {
+            let (Some(event_name), Some(identifier)) = (f("event_name"), f("identifier")) else {
+                return invalid("event_name and identifier are required");
+            };
+            let Some(timestamp) = f("timestamp").and_then(|t| t.parse::<i64>().ok()) else {
+                return invalid("timestamp is required");
+            };
+            if timestamp < now() - 35 * 86_400 {
+                return invalid("Timestamp must be within the past 35 calendar days.");
+            }
+            if timestamp > now() + 5 * 60 {
+                return invalid("Timestamp must not be more than 5 minutes in the future.");
+            }
+            let record = json!({
+                "object": "billing.meter_event", "event_name": event_name,
+                "identifier": identifier, "timestamp": timestamp,
+                "payload": {
+                    "stripe_customer_id": f("payload[stripe_customer_id]"),
+                    "value": f("payload[value]"),
+                },
+            });
+            if !inner
+                .meter_events
+                .iter()
+                .any(|e| e["identifier"] == json!(identifier))
+            {
+                inner.meter_events.push(record.clone());
+            }
+            (StatusCode::OK, record)
+        }
         _ => missing("the mock does not serve this route"),
     }
 }
@@ -886,6 +928,36 @@ mod tests {
         let err = c.create_customer(&b, &key).await.unwrap_err();
         assert_eq!(err.api().unwrap().kind, "idempotency_error");
         assert_eq!(m.lock().customers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn meter_events_dedupe_on_identifier_and_refuse_old_timestamps() {
+        use crate::stripe::MeterEvent;
+        let m = MockStripe::start().await;
+        let c = m.client();
+        let ev = |identifier: &str, age: chrono::Duration| MeterEvent {
+            event_name: "svc__calls".into(),
+            stripe_customer_id: "cus_1".into(),
+            value: 2,
+            identifier: identifier.into(),
+            timestamp: chrono::Utc::now() - age,
+        };
+        let fresh = ev("svc:1", chrono::Duration::zero());
+        c.send_meter_event(&fresh, &IdempotencyKey::new("a").unwrap())
+            .await
+            .unwrap();
+        // The same identifier under another key is accepted, not counted.
+        c.send_meter_event(&fresh, &IdempotencyKey::new("b").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(m.meter_events().len(), 1);
+        let old = ev("svc:2", chrono::Duration::days(36));
+        let err = c
+            .send_meter_event(&old, &IdempotencyKey::new("c").unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(err.api().unwrap().status, 400);
+        assert_eq!(m.meter_events().len(), 1);
     }
 
     #[tokio::test]

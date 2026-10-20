@@ -12,4 +12,5 @@ pub mod meters;
 pub mod plans;
 pub mod pricebook;
 pub mod stripe;
+pub mod stripe_outbox;
 pub mod usage;

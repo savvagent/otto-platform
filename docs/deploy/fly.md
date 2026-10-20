@@ -171,6 +171,21 @@ Notes:
   usage is still metered and kept.
 - Deleting an org does not yet cancel its Stripe subscription. Cancel it in the dashboard.
 - The webhook ledger (`stripe_events`) keeps every handled event id; it is not swept.
+- Metered usage reaches Stripe as meter events. Ingest queues every metered event of an
+  org with a live subscription in `stripe_meter_outbox`, and every machine runs a shipper
+  that sends them, retrying 429s, 5xx and timeouts for up to 12 hours per event (inside
+  Stripe's 24-hour identifier dedupe, so nothing is counted twice). Usage of an org with
+  no live subscription (free, or no card yet) is metered but not billed, and is not billed
+  later when it subscribes. An event Stripe refuses (a 4xx) or that could not be sent in
+  time is kept as `rejected` or `expired` with its error, logged at error level, and not
+  invoiced. To see how many:
+
+  ```bash
+  fly ssh console -a otto-platform -C "otto-platform-server stripe outbox"
+  ```
+
+  A 401/403 (the restricted key lacks *Billing meter events: write*) is retried and
+  logged; fix the key within 12 hours and nothing is lost.
 
 ## The hostname
 
