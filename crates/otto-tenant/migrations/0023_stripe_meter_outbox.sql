@@ -150,6 +150,11 @@ CREATE UNIQUE INDEX stripe_meter_outbox_open_idx
 CREATE INDEX stripe_meter_outbox_pending_period_idx
   ON stripe_meter_outbox (org_id, bucket_start) WHERE status = 'pending';
 
+-- `invoice_shipping`'s "last sent" lookup: the period's sent rows of one org,
+-- so a held invoice's settle check reads that month, not 35 days of history.
+CREATE INDEX stripe_meter_outbox_sent_period_idx
+  ON stripe_meter_outbox (org_id, bucket_start) WHERE status = 'sent';
+
 -- The sweep's: sent rows by age, deleted in bounded batches.
 CREATE INDEX stripe_meter_outbox_sent_idx
   ON stripe_meter_outbox (finished_at) WHERE status = 'sent';
