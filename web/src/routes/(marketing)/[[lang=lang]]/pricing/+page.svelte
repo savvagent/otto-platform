@@ -3,31 +3,37 @@
 
   import { api } from '$lib/api';
   import { m } from '$lib/paraglide/messages';
-  import { parsePlans } from '$lib/pricing';
+  import { parseCatalog, usageByService } from '$lib/pricing';
   import { CONTACT_EMAIL } from '$lib/site';
-  import type { Plan } from '$lib/types';
+  import type { PlansResponse } from '$lib/types';
   import Alert from '$lib/components/Alert.svelte';
   import Button from '$lib/components/Button.svelte';
   import Seo from '$lib/components/Seo.svelte';
   import PlanCard from '$lib/components/marketing/PlanCard.svelte';
+  import ServiceUsage from '$lib/components/marketing/ServiceUsage.svelte';
 
   import type { PageData } from './$types';
 
   /**
-   * Pricing: how plans work, prerendered, and the plans themselves, live.
+   * Pricing: how pricing works, prerendered, and the plans and usage prices
+   * themselves, live.
    *
    * **The prices are never in the HTML file.** They are read from
-   * `GET /api/plans` after mount, which answers from the `plans` table the
-   * server bills against — so a price change is a database change, not a
-   * rebuild, and this page cannot advertise a number the meter does not
-   * charge. The prerendered file holds the explanation (which is what a
-   * crawler indexes); a visitor without JavaScript gets a `<noscript>` line
-   * pointing at sales instead.
+   * `GET /api/plans` after mount, which answers from the `plans` table and the
+   * price book the server bills against — so a price change is a database
+   * change, not a rebuild, and this page cannot advertise a number the meter
+   * does not charge. The prerendered file holds the explanation (which is
+   * what a crawler indexes); a visitor without JavaScript gets a `<noscript>`
+   * line pointing at sales instead.
    *
-   * The explanation is deliberately generic: one plan and one usage bucket
-   * per org, what an operation is, and hard stop versus metered overage —
-   * each a rule the platform enforces. It names no overage rate, discount or
-   * trial, because none exists to point at.
+   * **Two things are priced, separately.** Plans buy features; usage is
+   * billed per service by its value meters, the same on every plan. The
+   * explanation states only the rules of that model — pay as you go, monthly
+   * in arrears, no minimum, management calls free under fair use, a budget
+   * per service — and names no rate, allowance or discount: every number on
+   * the page comes from the server. A meter with no price is not listed by
+   * the server, so a service with none says "no price published yet", and an
+   * empty list says prices are still to come, rather than implying free.
    *
    * Every string is a message call in the markup, as on the landing page:
    * the layout's locale override is only guaranteed while this component
@@ -36,7 +42,7 @@
   let { data }: { data: PageData } = $props();
 
   type PlansState =
-    { status: 'loading' } | { status: 'error' } | { status: 'loaded'; plans: Plan[] };
+    { status: 'loading' } | { status: 'error' } | ({ status: 'loaded' } & PlansResponse);
 
   let plans = $state<PlansState>({ status: 'loading' });
 
@@ -68,8 +74,8 @@
    * cannot act on the difference between an outage and a dropped connection,
    * and the server's message is written in English for the console, not for
    * this page's language. A 200 whose body does not match the contract — no
-   * `plans` array, or a plan with a missing or mistyped field (see
-   * `parsePlans`) — is a failure too, rather than a render that throws or
+   * `plans` or `meters` array, or a plan or meter with a missing or mistyped
+   * field (see `parseCatalog`) — is a failure too, rather than a render that throws or
    * prints `$NaN`. The error itself still goes to the console, so a real bug
    * is not mistaken for an outage by whoever debugs it. An empty list is not
    * a failure (the page points to sales), but it is warned about: the seeded
@@ -84,9 +90,9 @@
     plans = { status: 'loading' };
     let next: PlansState;
     try {
-      const loaded = parsePlans(await api.plans());
-      if (loaded.length === 0) console.warn('pricing: GET /api/plans listed no plans');
-      next = { status: 'loaded', plans: loaded };
+      const loaded = parseCatalog(await api.plans());
+      if (loaded.plans.length === 0) console.warn('pricing: GET /api/plans listed no plans');
+      next = { status: 'loaded', ...loaded };
     } catch (error) {
       console.error('pricing: could not load plans', error);
       next = { status: 'error' };
@@ -120,17 +126,22 @@
     return '';
   });
 
+  /** Usage grouped by service, or `null` until the catalog is in. */
+  const usage = $derived(plans.status === 'loaded' ? usageByService(plans.meters) : null);
+
   const how = [
-    { title: () => m.pricing_shared_title(), body: () => m.pricing_shared_body() },
-    { title: () => m.pricing_ops_title(), body: () => m.pricing_ops_body() },
-    { title: () => m.pricing_overage_title(), body: () => m.pricing_overage_body() }
+    { title: () => m.pricing_how_payg_title(), body: () => m.pricing_how_payg_body() },
+    { title: () => m.pricing_how_free_title(), body: () => m.pricing_how_free_body() },
+    { title: () => m.pricing_how_plans_title(), body: () => m.pricing_how_plans_body() },
+    { title: () => m.pricing_how_budgets_title(), body: () => m.pricing_how_budgets_body() }
   ];
 
   const faq = [
+    { q: () => m.pricing_faq_minimum_q(), a: () => m.pricing_faq_minimum_a() },
+    { q: () => m.pricing_faq_separate_q(), a: () => m.pricing_faq_separate_a() },
+    { q: () => m.pricing_faq_budget_q(), a: () => m.pricing_faq_budget_a() },
     { q: () => m.pricing_faq_change_q(), a: () => m.pricing_faq_change_a() },
-    { q: () => m.pricing_faq_limit_q(), a: () => m.pricing_faq_limit_a() },
-    { q: () => m.pricing_faq_enterprise_q(), a: () => m.pricing_faq_enterprise_a() },
-    { q: () => m.pricing_faq_shared_q(), a: () => m.pricing_faq_shared_a() }
+    { q: () => m.pricing_faq_enterprise_q(), a: () => m.pricing_faq_enterprise_a() }
   ];
 </script>
 
@@ -211,11 +222,52 @@
     </div>
   </section>
 
+  <section aria-labelledby="usage-title">
+    <h2 id="usage-title" class="text-2xl font-semibold tracking-tight text-ink">
+      {m.pricing_usage_heading()}
+    </h2>
+    <p class="mt-3 max-w-3xl text-muted">{m.pricing_usage_intro()}</p>
+
+    <!--
+      Filled by the same request as the plans. A failure is reported once, in
+      the plans region above with its Retry, so this region is empty then
+      rather than repeating the alert.
+    -->
+    <div
+      id="usage"
+      aria-labelledby="usage-title"
+      class="mt-8"
+      aria-busy={mounted && plans.status === 'loading' ? 'true' : 'false'}
+    >
+      {#if !mounted || plans.status === 'error'}
+        <!-- Prerendered, hydrating, or failed: nothing to show here. -->
+      {:else if plans.status === 'loading'}
+        <ul role="list" class="grid gap-4 md:grid-cols-2 lg:grid-cols-3" aria-hidden="true">
+          {#each [0, 1, 2] as i (i)}
+            <li class="otto-card flex animate-pulse flex-col gap-4 p-5">
+              <span class="h-5 w-28 rounded bg-edge/60"></span>
+              <span class="h-4 w-full rounded bg-edge/40"></span>
+              <span class="h-4 w-2/3 rounded bg-edge/40"></span>
+            </li>
+          {/each}
+        </ul>
+      {:else if plans.meters.length === 0}
+        <p class="otto-card p-5 text-muted">{m.pricing_usage_empty()}</p>
+      {:else if usage}
+        <ul role="list" class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {#each usage as service (service.service)}
+            <li class="grid"><ServiceUsage usage={service} lang={data.lang} level={3} /></li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+  </section>
+
   <section aria-labelledby="how-title">
     <h2 id="how-title" class="text-2xl font-semibold tracking-tight text-ink">
       {m.pricing_how_heading()}
     </h2>
-    <ul role="list" class="mt-8 grid gap-8 md:grid-cols-3">
+    <ul role="list" class="mt-8 grid gap-8 md:grid-cols-2 lg:grid-cols-4">
       {#each how as item, i (i)}
         <li class="border-l-2 border-accent/60 pl-4">
           <h3 class="font-semibold text-ink">{item.title()}</h3>

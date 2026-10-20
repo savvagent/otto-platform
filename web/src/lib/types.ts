@@ -199,6 +199,10 @@ export type PlanTier = 'free' | 'team' | 'business' | 'enterprise';
  * One tier as offered (`PublicPlan`): the list price, before any org's
  * negotiated override, read live from the `plans` table.
  *
+ * **A plan buys features, not usage.** It carries no allowance and no overage
+ * rule: usage is priced per service, by value meter, the same on every plan
+ * (see `PricedMeter`).
+ *
  * `monthlyCents` is US cents, and `0` means two different things: free on
  * `free`, *negotiated* on `enterprise`. Read it through `$lib/pricing`'s
  * `priceLabel`, which knows the difference, rather than formatting it
@@ -213,17 +217,52 @@ export interface Plan {
   plan: PlanTier;
   /** A name, so it is shown as given and never translated. */
   displayName: string;
-  /** Billable operations included each month. */
-  includedOps: number;
-  /** Whether going over the bucket stops billable work rather than metering overage. */
-  hardStop: boolean;
   monthlyCents: number;
   features: Record<string, boolean>;
 }
 
-/** `GET /api/plans`: every plan on offer, cheapest tier first. Public, no session. */
+/**
+ * One graduated tier of a meter's price (`PublicTier`).
+ *
+ * Units up to `upTo` in a month are charged `unitAmountUcents` each; the next
+ * tier starts at the unit after. `null` only on the last, unbounded tier. A
+ * first tier priced at `0` is a free allowance.
+ */
+export interface PriceTier {
+  upTo: number | null;
+  /**
+   * Price per unit in **millionths of a US cent** (`1_000_000` is one cent).
+   * Never divide it as a float; `$lib/pricing`'s `unitPrice` formats it
+   * exactly.
+   */
+  unitAmountUcents: number;
+}
+
+/**
+ * One value meter with a price in effect this month (`PublicMeter`). A meter
+ * with no price is not listed at all, so a service with no entries here has
+ * no published usage price yet.
+ */
+export interface PricedMeter {
+  /** The service slug, e.g. `otto-flags`. */
+  service: string;
+  /** The meter's name within the service, e.g. `evaluations`. */
+  meter: string;
+  /** Written by the service, in English; shown as given, like a plan's name. */
+  displayName: string;
+  /** What one unit is, e.g. `evaluation`. Also the service's English. */
+  unit: string;
+  /** Graduated, in order; the last is unbounded. */
+  tiers: PriceTier[];
+}
+
+/**
+ * `GET /api/plans`: every plan on offer, cheapest tier first, and every
+ * metered price in effect this month. Public, no session.
+ */
 export interface PlansResponse {
   plans: Plan[];
+  meters: PricedMeter[];
 }
 
 export interface BrowserSession {
