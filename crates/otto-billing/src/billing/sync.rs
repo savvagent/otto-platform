@@ -752,6 +752,9 @@ async fn ensure_subscription(
     let now = plan.now();
     let (_, anchor) = month_after(now.month)?;
     let mut backdated = None;
+    // When a re-subscription starts unbackdated, mid-hour: see the warning
+    // after commit.
+    let mut started_mid_hour = None;
     let (sub, status, adopted, stripe_plan) = match existing {
         Some(s) => (s.id, s.status, true, None),
         None => {
@@ -772,7 +775,14 @@ async fn ensure_subscription(
                     other.id
                 )));
             }
-            backdated = backdate_start(row, now.month, chrono::Utc::now());
+            let created_at = chrono::Utc::now();
+            backdated = backdate_start(row, now.month, created_at);
+            if row.stripe_subscription_id.is_some()
+                && backdated.is_none()
+                && period::hour_bucket(created_at) < created_at
+            {
+                started_mid_hour = Some(created_at);
+            }
             let params = CreateSubscription {
                 customer,
                 prices: now.price_ids(),
@@ -798,6 +808,10 @@ async fn ensure_subscription(
     sqlx::query(
         "UPDATE subscriptions SET stripe_subscription_id = $2, status = $3, \
            subscription_event_at = CASE WHEN $5 THEN now() ELSE NULL END, \
+           past_due_since = CASE WHEN $3 <> 'past_due' THEN NULL \
+                                 WHEN stripe_subscription_id = $2 AND status = 'past_due' \
+                                   THEN COALESCE(past_due_since, now()) \
+                                 ELSE now() END, \
            stripe_schedule_id = NULL, stripe_plan = $4, updated_at = now() \
          WHERE org_id = $1",
     )
@@ -837,6 +851,26 @@ async fn ensure_subscription(
 
     if backfilled > 0 {
         report.usage_backfilled.push((org, backfilled));
+    }
+    if let Some(start) = started_mid_hour.filter(|_| is_live_status(&status)) {
+        // Outbox rows are hourly and stamped with their hour's start, which
+        // here is before the subscription starts, so Stripe bills none of
+        // this hour's usage to it. Not backdated to the hour because the
+        // previous subscription's last status change falls inside it, and
+        // two subscriptions covering one stretch would bill it twice. Rare
+        // (a cancellation and a new card within one hour): logged, not
+        // repaired.
+        let hour = period::hour_bucket(start);
+        let msg = format!(
+            "org {org}: subscription {sub} started at {start} without backdating, inside the \
+             hour its previous subscription last changed status; this hour's usage (from \
+             {hour}) carries a meter-event timestamp before the subscription starts and will \
+             not be invoiced: {backfilled} units queued by the backfill now, plus whatever is \
+             counted before {}",
+            hour + chrono::Duration::hours(1)
+        );
+        tracing::warn!(%org, subscription = %sub, units_unbilled = backfilled, "{msg}");
+        report.warnings.push(msg);
     }
     if adopted {
         report.subscriptions_adopted.push((org, sub.clone()));

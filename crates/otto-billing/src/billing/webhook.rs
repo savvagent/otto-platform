@@ -25,10 +25,12 @@ use serde_json::{json, Value};
 use super::invoices::invoice_created;
 use super::sync::reconcile_org;
 use super::{
-    actions, idem, lock_row, org_of_customer, read_row, Error, OrgLease, PaymentMethodStatus,
-    Result, SyncReport, LEASE_WAIT, STRIPE_ACTOR,
+    actions, idem, is_live_status, lock_row, org_of_customer, read_row, Error, OrgLease,
+    PaymentMethodStatus, Result, SyncReport, LEASE_WAIT, STRIPE_ACTOR,
 };
+use crate::period::Month;
 use crate::stripe::{Client, WebhookEvent};
+use crate::stripe_outbox;
 
 /// What [`handle_event`] did with an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +410,18 @@ async fn checkout_completed(
 /// `customer.subscription.updated` and `.deleted`: record the status. A
 /// deleted subscription stops billing for the org until its owner puts a
 /// card on file again; sync never re-subscribes a stopped org.
+///
+/// Becoming `past_due` records when (`past_due_since`, the event's
+/// `created`), which starts the payment grace ([`super::gate`]); staying
+/// `past_due` keeps it, and any other status clears it.
+///
+/// **Going live.** A subscription recorded while not yet live (`incomplete`:
+/// its first payment needed the customer) accrued no outbox rows: ingest
+/// queues only for a live one. When it moves to a live status here, the
+/// month's usage counted so far is queued
+/// ([`stripe_outbox::backfill_period`]) in this same transaction, so the
+/// status and its backlog commit together. Backfill is idempotent, and a
+/// replay finds the status already live and queues nothing.
 async fn subscription_changed(
     db: &Db,
     lease: &OrgLease,
@@ -438,8 +452,12 @@ async fn subscription_changed(
         return Ok(ignored("older than the status already recorded"));
     }
     let stops = status == "canceled" && row.billing_stopped_at.is_none();
+    let goes_live = !is_live_status(&row.status) && is_live_status(status);
     sqlx::query(
         "UPDATE subscriptions SET status = $2, subscription_event_at = $3, \
+           past_due_since = CASE WHEN $2 <> 'past_due' THEN NULL \
+                                 WHEN status = 'past_due' THEN COALESCE(past_due_since, $3) \
+                                 ELSE $3 END, \
            billing_stopped_at = CASE WHEN $4 THEN $3 ELSE billing_stopped_at END, \
            stripe_schedule_id = CASE WHEN $4 THEN NULL ELSE stripe_schedule_id END, \
            stripe_plan = CASE WHEN $4 THEN NULL ELSE stripe_plan END, \
@@ -452,6 +470,12 @@ async fn subscription_changed(
     .bind(stops)
     .execute(tx.conn())
     .await?;
+    // The wall-clock month, as the outbox reckons it: always open.
+    let backfilled = if goes_live {
+        stripe_outbox::backfill_period(&mut tx, Month::of(Utc::now())).await?
+    } else {
+        0
+    };
     if row.status != status || stops {
         tx.audit(
             Entry::new(actions::SUBSCRIPTION_STATUS_CHANGED)
@@ -462,6 +486,7 @@ async fn subscription_changed(
                     "from": row.status,
                     "to": status,
                     "billingStopped": stops,
+                    "usageBackfilled": backfilled,
                 })),
         )
         .await?;

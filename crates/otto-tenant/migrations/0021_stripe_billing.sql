@@ -41,6 +41,13 @@ ALTER TABLE subscriptions
   ADD COLUMN stripe_payment_method_id text,
   ADD COLUMN payment_method_event_at  timestamptz,
   ADD COLUMN subscription_event_at    timestamptz,
+  -- When the subscription last became `past_due`: the `created` time of the
+  -- event (or the moment sync read it from Stripe) that moved `status` to
+  -- `past_due` from anything else. Kept while it stays `past_due`, cleared on
+  -- any other status. Billable use is allowed for
+  -- `otto_billing::billing::gate::PAYMENT_GRACE` from it, then refused
+  -- (`payment_required`) until the subscription recovers.
+  ADD COLUMN past_due_since           timestamptz,
   -- Set when Stripe reports the subscription deleted (canceled in the
   -- dashboard, or by dunning). A stopped org is never re-subscribed by sync;
   -- only the owner putting a card on file again clears it.

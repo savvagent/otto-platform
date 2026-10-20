@@ -1550,6 +1550,124 @@ mod tests {
         assert_eq!(mock.invoice("in_paid").unwrap()["auto_advance"], false);
     }
 
+    async fn subscription_event(
+        db: &Db,
+        mock: &MockStripe,
+        event_id: &str,
+        kind: &str,
+        customer: &str,
+        sub: &str,
+        status: &str,
+    ) -> billing::EventOutcome {
+        let event = otto_billing::stripe::WebhookEvent {
+            id: event_id.into(),
+            event_type: kind.into(),
+            created: Utc::now().timestamp(),
+            data: otto_billing::stripe::EventData {
+                object: json!({ "id": sub, "object": "subscription", "customer": customer,
+                                "status": status }),
+            },
+        };
+        billing::handle_event(db, &mock.client(), &event, b"{}")
+            .await
+            .unwrap()
+    }
+
+    /// A subscription recorded before it was live (`incomplete`: its first
+    /// payment needed the customer) queued nothing; when the webhook says it
+    /// is live, the month's usage so far is queued, once.
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn a_subscription_going_live_by_webhook_backfills_its_month_once(pool: PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let mock = MockStripe::start().await;
+        let (org, customer, sub) = subscribed(&db, &pool, &mock).await;
+        sqlx::query("UPDATE subscriptions SET status = 'incomplete' WHERE org_id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let month = Month::of(Utc::now());
+        counted(&db, org, "svc/calls", month, 40).await;
+        assert_eq!(queued(&pool, org).await.0, 0);
+
+        // Still not live: nothing.
+        let updated = "customer.subscription.updated";
+        subscription_event(&db, &mock, "evt_s1", updated, &customer, &sub, "incomplete").await;
+        assert_eq!(queued(&pool, org).await.0, 0);
+
+        assert_eq!(
+            subscription_event(&db, &mock, "evt_s2", updated, &customer, &sub, "active").await,
+            billing::EventOutcome::Handled
+        );
+        assert_eq!(queued(&pool, org).await, (40, vec![customer.clone()]));
+        let detail: Value = sqlx::query_scalar(
+            "SELECT detail FROM audit_events \
+             WHERE org_id = $1 AND action = 'billing.subscription.status_changed' \
+               AND detail->>'to' = 'active'",
+        )
+        .bind(org)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(detail["usageBackfilled"], 40);
+
+        // Replayed, as the same event or another with the same status:
+        // nothing more is queued.
+        assert_eq!(
+            subscription_event(&db, &mock, "evt_s2", updated, &customer, &sub, "active").await,
+            billing::EventOutcome::Duplicate
+        );
+        subscription_event(&db, &mock, "evt_s3", updated, &customer, &sub, "active").await;
+        // Live to live (a failed payment) queues nothing either.
+        subscription_event(&db, &mock, "evt_s4", updated, &customer, &sub, "past_due").await;
+        assert_eq!(queued(&pool, org).await.0, 40);
+        let past_due_since: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT past_due_since FROM subscriptions WHERE org_id = $1")
+                .bind(org)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(past_due_since.is_some(), "the grace has started");
+        subscription_event(&db, &mock, "evt_s5", updated, &customer, &sub, "active").await;
+        let past_due_since: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT past_due_since FROM subscriptions WHERE org_id = $1")
+                .bind(org)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(past_due_since, None, "recovered");
+    }
+
+    /// Re-subscribing within the hour the old subscription was canceled
+    /// cannot be backdated to the hour (the two would overlap), so this
+    /// hour's usage, stamped with the hour's start, is not invoiced: said at
+    /// warn, with the units.
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn a_resubscription_inside_the_hour_warns_of_its_unbilled_usage(pool: PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let mock = MockStripe::start().await;
+        let (org, customer, sub) = subscribed(&db, &pool, &mock).await;
+        let deleted = "customer.subscription.deleted";
+        subscription_event(&db, &mock, "evt_d", deleted, &customer, &sub, "canceled").await;
+        mock.set_subscription_status(&sub, "canceled");
+        // Usage while stopped: counted, not queued.
+        counted(&db, org, "svc/calls", Month::of(Utc::now()), 9).await;
+        // The owner puts a card on file again.
+        sqlx::query("UPDATE subscriptions SET billing_stopped_at = NULL WHERE org_id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (r, out) = run(&db, &mock).await;
+        r.unwrap();
+        let creates = mock.requests("POST", "/v1/subscriptions");
+        assert_eq!(creates.len(), 2);
+        assert_eq!(creates[1].field("backdate_start_date"), None);
+        assert!(out.contains("without backdating"), "{out}");
+        assert!(out.contains("9 units queued by the backfill now"), "{out}");
+    }
+
     #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
     async fn only_one_sync_runs_at_a_time(pool: PgPool) {
         let db = Db::from_pool(pool.clone());

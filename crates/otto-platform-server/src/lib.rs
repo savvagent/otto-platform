@@ -87,7 +87,7 @@ pub fn router(db: Db, billing: Billing) -> Router {
 pub fn app(db: Db, config: &Config) -> Result<Router> {
     let web = otto_web::router(web_state(db.clone(), config)?);
 
-    let app = router(db, Billing::of(config)).merge(web);
+    let app = router(db, internal::billing_of(config)).merge(web);
     // Either way an unmatched API-shaped or undecodable path answers JSON: a
     // client that guessed a route needs something it can parse. The exception
     // is a miss under the bundle that is not a page route, such as a missing
@@ -535,10 +535,10 @@ mod tests {
     #[test]
     fn billing_mode_follows_the_stripe_secrets() {
         let mut config = Config::for_test();
-        assert_eq!(Billing::of(&config), Billing::Disabled);
+        assert_eq!(internal::billing_of(&config), Billing::Disabled);
         config.stripe =
             config::parse_stripe(Some("sk_test_x".into()), Some("whsec_x".into())).unwrap();
-        assert_eq!(Billing::of(&config), Billing::Enabled);
+        assert_eq!(internal::billing_of(&config), Billing::Enabled);
     }
 
     #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]

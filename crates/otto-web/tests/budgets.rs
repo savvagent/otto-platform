@@ -501,6 +501,26 @@ async fn spend_thresholds_and_the_usage_page_are_per_service(pool: PgPool) {
         .send(&billed)
         .await;
     usage.expect(StatusCode::OK);
+    // Things is past its budget with the hard stop on: that is what blocks
+    // it, exactly as `/internal/.../usage-status` says (`budget_exceeded`),
+    // so the console does not ask for a card for it.
+    assert_eq!(usage.body["services"][0]["budget"]["blocked"], true);
+    assert_eq!(usage.body["services"][0]["paymentRequired"], false);
+    assert_eq!(usage.body["services"][1]["paymentRequired"], false);
+    // With the hard stop off, the missing card is what blocks it.
+    put(
+        &owner.session,
+        THINGS,
+        json!({ "monthlyBudgetCents": 1000, "hardStop": false }),
+    )
+    .send(&h.router)
+    .await
+    .expect(StatusCode::OK);
+    let usage = Call::get("/api/orgs/acme/usage")
+        .with_session(&owner.session)
+        .send(&billed)
+        .await;
+    usage.expect(StatusCode::OK);
     assert_eq!(usage.body["services"][0]["paymentRequired"], true);
     assert_eq!(usage.body["services"][1]["paymentRequired"], false);
 
@@ -521,6 +541,39 @@ async fn spend_thresholds_and_the_usage_page_are_per_service(pool: PgPool) {
         .await;
     usage.expect(StatusCode::OK);
     assert_eq!(usage.body["services"][0]["paymentRequired"], false);
+    assert_eq!(usage.body["services"][1]["paymentRequired"], false);
+
+    // Past due within the grace: still nothing; past it, a card again (the
+    // same rule as usage-status, `otto_billing::billing::gate`).
+    let past_due = |days: i32| {
+        let db = h.db.clone();
+        async move {
+            sqlx::query(
+                "UPDATE subscriptions SET status = 'past_due', \
+                   past_due_since = now() - make_interval(days => $2) WHERE org_id = $1",
+            )
+            .bind(org)
+            .bind(days)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+    };
+    let grace = i32::try_from(otto_billing::billing::gate::PAYMENT_GRACE.num_days()).unwrap();
+    past_due(grace - 1).await;
+    let usage = Call::get("/api/orgs/acme/usage")
+        .with_session(&owner.session)
+        .send(&billed)
+        .await;
+    usage.expect(StatusCode::OK);
+    assert_eq!(usage.body["services"][0]["paymentRequired"], false);
+    past_due(grace).await;
+    let usage = Call::get("/api/orgs/acme/usage")
+        .with_session(&owner.session)
+        .send(&billed)
+        .await;
+    usage.expect(StatusCode::OK);
+    assert_eq!(usage.body["services"][0]["paymentRequired"], true);
     assert_eq!(usage.body["services"][1]["paymentRequired"], false);
 }
 

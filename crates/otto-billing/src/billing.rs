@@ -52,8 +52,25 @@
 //!   current hour (or not at all if the earlier one changed status within
 //!   this hour), so no stretch of the month is covered by both. Usage between
 //!   the cancellation and the new start is billed only as far as the backfill
-//!   reaches it (the current hour); a month split across two subscriptions
-//!   gets each one's free allowance.
+//!   reaches it (the current hour, when the new subscription is backdated to
+//!   it); a month split across two subscriptions gets each one's free
+//!   allowance. When the earlier one changed status within this very hour,
+//!   the new one starts mid-hour, unbackdated, and this hour's usage (stamped
+//!   with the hour's start, before it) is not invoiced: logged at warn with
+//!   the units the backfill queued, never repaired.
+//! - **A subscription that goes live after it is recorded** (created
+//!   `incomplete`, then paid) queued nothing while it was not live; the
+//!   `customer.subscription.updated` webhook that records it live backfills
+//!   the month in the same transaction. Sync's adoption only ever adopts a
+//!   live subscription, and backfills as it records it.
+//!
+//! # Paying, and the payment grace
+//!
+//! Usage of a live subscription ([`LIVE_STATUSES`]) is queued for Stripe
+//! whatever the state of its payments, so it is invoiced if they recover.
+//! Whether more billable use is allowed is [`gate`]'s rule: a subscription
+//! that is `unpaid`, or `past_due` (or whose card is `failed` or `detached`)
+//! for [`gate::PAYMENT_GRACE`], answers `payment_required`.
 //!
 //! # Invoices wait for their usage
 //!
@@ -190,7 +207,12 @@ pub const MAX_SCHEDULE_PHASES: usize = 10;
 /// The Stripe subscription statuses that are live: the subscription exists,
 /// accrues usage, and is invoiced (`unpaid` invoices are created but not
 /// collected). Anything else (`canceled`, `incomplete`, `incomplete_expired`,
-/// `paused`) is not.
+/// `paused`) is not. Metered usage of an org with a live subscription is
+/// queued for Stripe, so it is invoiced if a failed payment recovers.
+///
+/// Live is not the same as allowed to run up more billable usage: `unpaid`,
+/// and `past_due` past [`gate::PAYMENT_GRACE`], are live but answer
+/// `payment_required` ([`gate`]).
 pub const LIVE_STATUSES: [&str; 4] = ["active", "trialing", "past_due", "unpaid"];
 
 /// How long an org lease lasts if its holder never releases it (a crash).
@@ -349,6 +371,7 @@ struct SubRow {
     stripe_payment_method_id: Option<String>,
     payment_method_event_at: Option<DateTime<Utc>>,
     subscription_event_at: Option<DateTime<Utc>>,
+    past_due_since: Option<DateTime<Utc>>,
     billing_stopped_at: Option<DateTime<Utc>>,
     stripe_schedule_id: Option<String>,
     stripe_plan: Option<String>,
@@ -357,7 +380,8 @@ struct SubRow {
 const SUB_COLS: &str = "stripe_customer_id, stripe_subscription_id, status, \
                         payment_method_status, stripe_payment_method_id, \
                         payment_method_event_at, subscription_event_at, \
-                        billing_stopped_at, stripe_schedule_id, stripe_plan";
+                        past_due_since, billing_stopped_at, stripe_schedule_id, \
+                        stripe_plan";
 
 impl SubRow {
     fn card(&self) -> Result<PaymentMethodStatus> {

@@ -29,13 +29,13 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRef, Path, Query, State};
 use axum::http::header::CACHE_CONTROL;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use otto_billing::billing;
+use otto_billing::billing::gate::{self, Standing};
 use otto_billing::budgets::{
     self, PendingBudgets, ServiceBudgetStatus, BUDGET_EXCEEDED, SPEND_UNAVAILABLE,
 };
@@ -70,25 +70,35 @@ const MAX_METERS_BODY: usize = 64 * 1024;
 /// 63 + 1 + 63 bytes.
 const MAX_ECHOED_KEY: usize = 128;
 
-/// Whether this deployment bills through Stripe: both Stripe secrets set
-/// ([`crate::Config::stripe`]). Decides whether usage-status may ever answer
-/// `payment_required`: with billing off nobody can put a card on file, so
-/// requiring one would lock every org out of billable use the moment a price
-/// exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Billing {
-    Enabled,
-    Disabled,
+/// Whether this deployment bills through Stripe ([`gate::Billing`]): decides
+/// whether usage-status may ever answer `payment_required`.
+pub use otto_billing::billing::gate::Billing;
+
+/// Billing as `config` sets it up: enabled when both Stripe secrets are set
+/// ([`crate::Config::stripe`]).
+pub fn billing_of(config: &crate::Config) -> Billing {
+    Billing::enabled_if(config.stripe.is_some())
 }
 
-impl Billing {
-    /// Billing as `config` sets it up.
-    pub fn of(config: &crate::Config) -> Self {
-        if config.stripe.is_some() {
-            Self::Enabled
-        } else {
-            Self::Disabled
-        }
+/// What the `/internal` routes share. A route takes the parts it needs
+/// (`State<Db>`, `State<Billing>`) through [`FromRef`], so one that needs
+/// the billing mode cannot be mounted without it: the router does not
+/// compile unless its state provides every handler's.
+#[derive(Debug, Clone)]
+pub struct InternalState {
+    pub db: Db,
+    pub billing: Billing,
+}
+
+impl FromRef<InternalState> for Db {
+    fn from_ref(state: &InternalState) -> Self {
+        state.db.clone()
+    }
+}
+
+impl FromRef<InternalState> for Billing {
+    fn from_ref(state: &InternalState) -> Self {
+        state.billing
     }
 }
 
@@ -114,8 +124,7 @@ pub fn router(db: Db, billing: Billing) -> Router {
             get(team_by_slug),
         )
         .route("/internal/orgs/{org}/teams/{team}", get(team))
-        .layer(axum::Extension(billing))
-        .with_state(db)
+        .with_state(InternalState { db, billing })
 }
 
 /// An org that exists and has not been deleted, or 404.
@@ -371,16 +380,19 @@ fn truncate(s: &str, max: usize) -> String {
 /// here, so a hard stop on one service never blocks another. `budget` is
 /// absent when the org has set none for the caller's service.
 ///
-/// `blocked_reason` says why the caller must refuse billable calls:
-/// `budget_exceeded` (its budget's hard stop) or `payment_required` (billing
-/// is enabled, the org has no live Stripe subscription and the service's
-/// spend this month is above zero, past its free tiers); the budget wins when
-/// both apply. With billing disabled ([`Billing::Disabled`]) there is no way
-/// to put a card on file, so `payment_required` is never answered. The
-/// platform only reports it; resource servers enforce it, and fail open.
-/// Spend is computed only when an answer needs it: with a budget, or without
-/// a live subscription. A caller with a live subscription and no budget never
-/// waits on (or fails with) the price book.
+/// `blocked_reason` says why the caller must refuse billable calls, as
+/// [`gate::blocked_reason`] decides (the same function the console's usage
+/// page uses): `budget_exceeded` (its budget's hard stop) or
+/// `payment_required` (billing is enabled, the org is not in good standing
+/// to pay — no subscription, `unpaid`, or a failed payment past its grace —
+/// and the service's spend this month is above zero, past its free tiers);
+/// the budget wins when both apply. With billing disabled
+/// ([`Billing::Disabled`]) there is no way to put a card on file, so
+/// `payment_required` is never answered. The platform only reports it;
+/// resource servers enforce it, and fail open. Spend is computed only when an
+/// answer needs it ([`gate::needs_spend`]): with a budget, or when payment
+/// is required. An org in good standing with no budget never waits on (or
+/// fails with) the price book.
 ///
 /// The legacy family-wide fields are all still served for clients pinned to
 /// an older `otto-resource`, but `hard_stop` is always `false`: an older
@@ -388,7 +400,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// family-wide count that would let one service's usage stop work in another.
 async fn usage_status(
     State(db): State<Db>,
-    axum::Extension(billing): axum::Extension<Billing>,
+    State(billing): State<Billing>,
     CallingResourceServer(rs): CallingResourceServer,
     Path(org): Path<Uuid>,
 ) -> Result<Json<UsageStatus>, ApiError> {
@@ -452,9 +464,8 @@ struct Gate {
 }
 
 /// The caller's budget this period and whether it must refuse billable
-/// calls, rating its spend only when the answer depends on it: when the
-/// service has a budget, or billing is enabled and the org has no live
-/// Stripe subscription.
+/// calls, rating its spend only when the answer depends on it
+/// ([`gate::needs_spend`]).
 ///
 /// A budget whose spend cannot be computed (a malformed price version, an
 /// overflow) is still reported, with `spend_cents` and `percent_used` null,
@@ -471,17 +482,11 @@ async fn service_gate(
         .await
         .map_err(ApiError::internal)?
         .is_some();
-    // Payment can only be required where a card can be put on file. With
-    // billing off, every org counts as able to pay, so only a budget's hard
-    // stop can block.
-    let can_bill = match billing_mode {
-        Billing::Disabled => true,
-        Billing::Enabled => billing::live_subscription(tx)
-            .await
-            .map_err(ApiError::internal)?
-            .is_some(),
-    };
-    if can_bill && !has_budget {
+    // With billing off every org is in good standing, without a query.
+    let standing: Standing = gate::standing(tx, billing_mode)
+        .await
+        .map_err(ApiError::internal)?;
+    if !gate::needs_spend(has_budget, standing) {
         return Ok(Gate::default());
     }
     let status = budgets::service_status(tx, service, period)
@@ -489,7 +494,7 @@ async fn service_gate(
         .map_err(ApiError::internal)?;
     Ok(Gate {
         budget: wire_budget(&status),
-        blocked_reason: status.blocked_reason(can_bill),
+        blocked_reason: gate::blocked_reason(&status, standing),
     })
 }
 

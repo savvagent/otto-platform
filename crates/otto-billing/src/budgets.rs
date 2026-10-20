@@ -31,13 +31,16 @@
 //! back together, so an alert whose emails could not be queued is retried by
 //! the next ingest rather than recorded without mail.
 //!
-//! **No card, no billable usage.** An org with no live Stripe subscription
-//! whose spend on a service this period is above zero (past the service's
-//! free tiers) must add a payment method: that service's usage-status
-//! reports reason [`PAYMENT_REQUIRED`] ([`ServiceBudgetStatus::blocked_reason`])
-//! and the resource server refuses new billable calls; other services, and
-//! free calls, are unaffected. A budget's hard stop wins when both apply.
-//! While no price is set, spend is zero everywhere and this blocks no one.
+//! **No way to pay, no billable usage.** An org that is not in good standing
+//! to pay (no subscription, a failed payment past its grace; see
+//! [`crate::billing::gate`]) whose spend on a service this period is above
+//! zero (past the service's free tiers) must add a payment method: that
+//! service's usage-status reports reason [`PAYMENT_REQUIRED`] and the
+//! resource server refuses new billable calls; other services, and free
+//! calls, are unaffected. A budget's hard stop wins when both apply. While no
+//! price is set, spend is zero everywhere and this blocks no one. The one
+//! function that decides the reason is
+//! [`crate::billing::gate::blocked_reason`].
 //!
 //! **Spend can be unknown.** A price version the rater refuses, or a total
 //! that overflows, makes a service's spend uncomputable. Readers degrade that
@@ -77,8 +80,9 @@ pub const MAX_MONTHLY_BUDGET_CENTS: i64 = 1_000_000_000;
 /// budget. `otto_resource::BUDGET_EXCEEDED` is the wire contract's copy.
 pub const BUDGET_EXCEEDED: &str = "budget_exceeded";
 
-/// The reason usage-status gives when the org has no live Stripe
-/// subscription and a service's spend this period is above zero.
+/// The reason usage-status gives when the org is not in good standing to
+/// pay ([`crate::billing::gate`]) and a service's spend this period is above
+/// zero.
 /// `otto_resource::PAYMENT_REQUIRED` is the wire contract's copy.
 pub const PAYMENT_REQUIRED: &str = "payment_required";
 
@@ -210,27 +214,6 @@ impl ServiceBudgetStatus {
         match (self.budget.as_ref(), self.spend_cents) {
             (Some(b), Some(spend)) => b.blocks_at(spend),
             _ => false,
-        }
-    }
-
-    /// Whether the org must add a payment method before more billable use of
-    /// this service: it has no live Stripe subscription
-    /// (`live_subscription` false) and the service's spend this period is
-    /// known and above zero. Unknown spend never requires it (fail open).
-    pub fn payment_required(&self, live_subscription: bool) -> bool {
-        !live_subscription && self.spend_cents.is_some_and(|cents| cents > 0)
-    }
-
-    /// Why billable calls of this service must be refused, if they must:
-    /// [`BUDGET_EXCEEDED`] when [`blocked`](Self::blocked), else
-    /// [`PAYMENT_REQUIRED`] when [`payment_required`](Self::payment_required).
-    pub fn blocked_reason(&self, live_subscription: bool) -> Option<&'static str> {
-        if self.blocked() {
-            Some(BUDGET_EXCEEDED)
-        } else if self.payment_required(live_subscription) {
-            Some(PAYMENT_REQUIRED)
-        } else {
-            None
         }
     }
 }
@@ -839,33 +822,6 @@ mod tests {
         let unknown = status(None, Some(budget(1_000, true)));
         assert!(!unknown.blocked(), "unknown spend fails open");
         assert_eq!(unknown.percent_used(), None);
-    }
-
-    #[test]
-    fn payment_is_required_only_without_a_subscription_and_past_free() {
-        let (live, none) = (true, false);
-        assert_eq!(
-            status(Some(0), None).blocked_reason(none),
-            None,
-            "free tier"
-        );
-        assert_eq!(
-            status(Some(1), None).blocked_reason(none),
-            Some(PAYMENT_REQUIRED)
-        );
-        assert_eq!(status(Some(1), None).blocked_reason(live), None);
-        assert_eq!(
-            status(None, None).blocked_reason(none),
-            None,
-            "unknown spend fails open"
-        );
-        // The budget's hard stop wins.
-        let over = status(Some(5_000), Some(budget(1_000, true)));
-        assert_eq!(over.blocked_reason(none), Some(BUDGET_EXCEEDED));
-        assert_eq!(over.blocked_reason(live), Some(BUDGET_EXCEEDED));
-        let soft = status(Some(5_000), Some(budget(1_000, false)));
-        assert_eq!(soft.blocked_reason(none), Some(PAYMENT_REQUIRED));
-        assert_eq!(soft.blocked_reason(live), None);
     }
 
     #[test]
