@@ -157,7 +157,10 @@ pub fn next_wait(now: DateTime<Utc>) -> Duration {
 pub async fn run_loop(db: Db, client: Client, mut shutdown: watch::Receiver<bool>) {
     tracing::info!("stripe sync task started");
     loop {
-        match billing::sync(&db, &client).await {
+        // Checked between orgs, so a shutdown mid-run gives every lease back.
+        let stopping = shutdown.clone();
+        let stop = move || *stopping.borrow();
+        match billing::sync_until(&db, &client, &stop).await {
             Ok(report) => log_report(&report),
             Err(billing::Error::Busy(why)) => {
                 tracing::debug!(%why, "stripe sync skipped: another machine is running it")
@@ -705,6 +708,52 @@ mod tests {
         );
         assert_eq!(subscription_of(&pool, org).await, Some(orphan.id));
         assert_eq!(mock.requests("POST", "/v1/subscriptions").len(), 1);
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn two_live_subscriptions_tagged_with_one_org_are_an_error(pool: PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let mock = MockStripe::start().await;
+        let now = now_month(&db).await;
+        declare(&pool, "svc", &["calls"]).await;
+        price(&pool, "svc/calls", now, 7).await;
+        run(&db, &mock).await.0.unwrap();
+        let org = org_with_card(&db, &pool, &mock, "acme").await;
+        let customer: String =
+            sqlx::query_scalar("SELECT stripe_customer_id FROM subscriptions WHERE org_id = $1")
+                .bind(org)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let price_id: String = sqlx::query_scalar("SELECT stripe_price_id FROM stripe_prices")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let c = mock.client();
+        for _ in 0..2 {
+            c.create_subscription(
+                &CreateSubscription {
+                    customer: customer.clone(),
+                    prices: vec![price_id.clone()],
+                    billing_cycle_anchor: None,
+                    metadata: [("org_id".to_owned(), org.to_string())].into(),
+                },
+                &IdempotencyKey::random(),
+            )
+            .await
+            .unwrap();
+        }
+        let (r, out) = run(&db, &mock).await;
+        assert!(r.is_err(), "{out}");
+        assert!(
+            out.contains(&format!(
+                "2 live Stripe subscriptions are tagged with org {org}"
+            )),
+            "{out}"
+        );
+        // Neither was taken, and no third was made.
+        assert!(subscription_of(&pool, org).await.is_none());
+        assert_eq!(mock.requests("POST", "/v1/subscriptions").len(), 2);
     }
 
     #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]

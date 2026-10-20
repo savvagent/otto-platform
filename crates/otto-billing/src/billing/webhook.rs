@@ -125,12 +125,19 @@ pub async fn handle_event(
                 let lease = OrgLease::acquire(db, org, LEASE_WAIT).await?;
                 let result = match kind {
                     Kind::Checkout => {
-                        checkout_completed(db, client, org, &customer, object, created).await
+                        checkout_completed(db, client, &lease, org, &customer, object, created)
+                            .await
                     }
-                    Kind::Subscription => subscription_changed(db, org, object, created).await,
-                    Kind::InvoicePaid => invoice_settled(db, org, object, created, true).await,
-                    Kind::InvoiceFailed => invoice_settled(db, org, object, created, false).await,
-                    Kind::Detached => card_detached(db, org, object, created).await,
+                    Kind::Subscription => {
+                        subscription_changed(db, &lease, org, object, created).await
+                    }
+                    Kind::InvoicePaid => {
+                        invoice_settled(db, &lease, org, object, created, true).await
+                    }
+                    Kind::InvoiceFailed => {
+                        invoice_settled(db, &lease, org, object, created, false).await
+                    }
+                    Kind::Detached => card_detached(db, &lease, org, object, created).await,
                     Kind::Unhandled => unreachable!("matched above"),
                 };
                 lease.release(db).await;
@@ -194,9 +201,15 @@ async fn record_event(db: &Db, event: &WebhookEvent, created: DateTime<Utc>) -> 
 /// `checkout.session.completed` in setup mode: make the collected card the
 /// customer's default, mark it on file (clearing a stop), detach the card it
 /// replaces, and subscribe the org.
+///
+/// An event older than the one that set the card on file (Stripe delivered
+/// an earlier Checkout late) changes nothing: it is checked before any Stripe
+/// write, so the newer card stays the default, and the stale event's own card
+/// is detached rather than left on the customer.
 async fn checkout_completed(
     db: &Db,
     client: &Client,
+    lease: &OrgLease,
     org: OrgId,
     customer: &str,
     session: &Value,
@@ -217,10 +230,13 @@ async fn checkout_completed(
     let Some(setup_intent) = id_field(session, "setup_intent") else {
         return Ok(ignored("the session has no setup intent"));
     };
-    let row = read_row(db, org).await?;
-    if row.as_ref().and_then(|r| r.stripe_customer_id.as_deref()) != Some(customer) {
+    let Some(row) = read_row(db, org).await? else {
+        return Ok(ignored("the org has no billing row"));
+    };
+    if row.stripe_customer_id.as_deref() != Some(customer) {
         return Ok(ignored("the org's row records another customer"));
     }
+    let stale = !not_older(row.payment_method_event_at, created);
 
     let intent = client.retrieve_setup_intent(setup_intent).await?;
     if intent.status != "succeeded" {
@@ -235,13 +251,28 @@ async fn checkout_completed(
     let Some(pm) = intent.payment_method else {
         return Ok(ignored("the setup intent has no payment method"));
     };
+    if stale {
+        if row.stripe_payment_method_id.as_deref() != Some(pm.as_str()) {
+            lease.renew(db).await?;
+            if let Err(e) = client
+                .detach_payment_method(&pm, &idem("detach-pm", &pm)?)
+                .await
+            {
+                tracing::warn!(%org, error = %e, "could not detach a superseded card");
+            }
+        }
+        return Ok(ignored(
+            "older than the card already on file; its card was detached",
+        ));
+    }
+    lease.renew(db).await?;
     client
         .set_default_payment_method(customer, &pm, &idem("default-pm", &(customer, &pm))?)
         .await?;
 
     // Recorded before the old card is detached: the detach's own webhook then
     // finds a different card on file and is ignored.
-    let mut tx = db.begin(org).await?;
+    let mut tx = lease.begin(db).await?;
     let row = lock_row(&mut tx).await?;
     let changed = row.card()? != PaymentMethodStatus::Active
         || row.stripe_payment_method_id.as_deref() != Some(pm.as_str())
@@ -274,6 +305,7 @@ async fn checkout_completed(
     tx.commit().await?;
 
     if let Some(old) = replaced {
+        lease.renew(db).await?;
         // Not essential: a stale card left attached is only clutter.
         if let Err(e) = client
             .detach_payment_method(&old, &idem("detach-pm", &old)?)
@@ -283,10 +315,18 @@ async fn checkout_completed(
         }
     }
 
+    // The card is on file and committed. Subscribing is sync's job too (it
+    // runs every 15 minutes), so a failure here is logged for it to retry
+    // rather than failing the event, which Stripe would redeliver for days.
     let mut report = SyncReport::default();
-    reconcile_org(db, client, org, STRIPE_ACTOR, &mut report).await?;
-    for w in report.warnings.iter().chain(&report.errors) {
+    if let Err(e) = reconcile_org(db, client, lease, org, STRIPE_ACTOR, &mut report).await {
+        tracing::error!(%org, error = %e, "could not subscribe the org yet; sync retries");
+    }
+    for w in &report.warnings {
         tracing::warn!(%org, "{w}");
+    }
+    for e in &report.errors {
+        tracing::error!(%org, "{e}");
     }
     Ok(EventOutcome::Handled)
 }
@@ -296,6 +336,7 @@ async fn checkout_completed(
 /// card on file again; sync never re-subscribes a stopped org.
 async fn subscription_changed(
     db: &Db,
+    lease: &OrgLease,
     org: OrgId,
     subscription: &Value,
     created: DateTime<Utc>,
@@ -310,7 +351,7 @@ async fn subscription_changed(
     else {
         return Ok(ignored("the subscription has no status"));
     };
-    let mut tx = db.begin(org).await?;
+    let mut tx = lease.begin(db).await?;
     let row = lock_row(&mut tx).await?;
     if row.stripe_subscription_id.as_deref() != Some(id) {
         return Ok(ignored("not the org's current subscription"));
@@ -361,6 +402,7 @@ async fn subscription_changed(
 /// (an old, canceled one) change nothing.
 async fn invoice_settled(
     db: &Db,
+    lease: &OrgLease,
     org: OrgId,
     invoice: &Value,
     created: DateTime<Utc>,
@@ -369,7 +411,7 @@ async fn invoice_settled(
     let Some(subscription) = invoice_subscription(invoice) else {
         return Ok(ignored("the invoice is not for a subscription"));
     };
-    let mut tx = db.begin(org).await?;
+    let mut tx = lease.begin(db).await?;
     let row = lock_row(&mut tx).await?;
     if row.stripe_subscription_id.as_deref() != Some(subscription) {
         return Ok(ignored("not an invoice of the org's current subscription"));
@@ -420,6 +462,7 @@ async fn invoice_settled(
 /// from `data.previous_attributes.customer`.)
 async fn card_detached(
     db: &Db,
+    lease: &OrgLease,
     org: OrgId,
     payment_method: &Value,
     created: DateTime<Utc>,
@@ -427,7 +470,7 @@ async fn card_detached(
     let Some(pm) = id_field(payment_method, "id") else {
         return Ok(ignored("the payment method has no id"));
     };
-    let mut tx = db.begin(org).await?;
+    let mut tx = lease.begin(db).await?;
     let row = lock_row(&mut tx).await?;
     if row.stripe_payment_method_id.as_deref() != Some(pm) {
         return Ok(ignored("not the card on file"));

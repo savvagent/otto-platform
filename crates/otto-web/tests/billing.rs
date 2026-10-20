@@ -926,6 +926,52 @@ async fn a_new_card_replaces_and_detaches_the_old_one(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_older_checkout_delivered_late_does_not_replace_the_newer_card(pool: PgPool) {
+    let s = started(pool).await;
+    let t0 = Utc::now().timestamp() - 100;
+    // The owner went through Checkout twice; Stripe delivers the second
+    // completion first.
+    complete_with(&s, "evt_card2", t0 + 10, "seti_2", "pm_card_2")
+        .await
+        .expect(StatusCode::OK);
+    let sets_before = s
+        .mock
+        .requests("POST", &format!("/v1/customers/{}", s.customer))
+        .len();
+    complete_with(&s, "evt_card1", t0, "seti_1", "pm_card_1")
+        .await
+        .expect(StatusCode::OK);
+
+    // No default-payment-method call for the stale event: Stripe's default
+    // and ours both stay card 2, and card 1 is detached.
+    assert_eq!(
+        s.mock
+            .requests("POST", &format!("/v1/customers/{}", s.customer))
+            .len(),
+        sets_before
+    );
+    assert_eq!(
+        s.mock.customer(&s.customer).unwrap()["invoice_settings"]["default_payment_method"],
+        "pm_card_2"
+    );
+    let pm: String =
+        sqlx::query_scalar("SELECT stripe_payment_method_id FROM subscriptions WHERE org_id = $1")
+            .bind(s.org)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+    assert_eq!(pm, "pm_card_2");
+    assert_eq!(s.mock.detached(), ["pm_card_1"]);
+    assert_eq!(billing_view(&s).await["cardStatus"], "active");
+    let added = audit_actions(&s.pool, s.org)
+        .await
+        .into_iter()
+        .filter(|a| a == "billing.card.added")
+        .count();
+    assert_eq!(added, 1);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn a_canceled_subscription_stops_billing_until_a_new_card(pool: PgPool) {
     let s = started(pool).await;
     let t0 = Utc::now().timestamp() - 100;

@@ -44,12 +44,21 @@ pub async fn start_setup(
     audit: Entry,
 ) -> Result<String> {
     let lease = OrgLease::acquire(db, params.org, LEASE_WAIT).await?;
-    let result = setup(db, client, params, audit).await;
+    let result = setup(db, client, &lease, params, audit).await;
     lease.release(db).await;
     result
 }
 
-async fn setup(db: &Db, client: &Client, params: SetupParams<'_>, audit: Entry) -> Result<String> {
+/// The work of [`start_setup`], under `lease`. Every write after a Stripe
+/// call goes through [`OrgLease::begin`], so a worker that lost the lease
+/// writes nothing.
+async fn setup(
+    db: &Db,
+    client: &Client,
+    lease: &OrgLease,
+    params: SetupParams<'_>,
+    audit: Entry,
+) -> Result<String> {
     let org = params.org;
     let existing = read_row(db, org)
         .await?
@@ -57,11 +66,13 @@ async fn setup(db: &Db, client: &Client, params: SetupParams<'_>, audit: Entry) 
     let customer = match existing {
         Some(customer) => customer,
         None => {
+            lease.renew(db).await?;
             let customer = find_or_create_customer(client, &params).await?;
             // Recorded at once, each in its own short transaction: the map
-            // first (unpinned), then the org's row (pinned).
+            // first (unpinned; true whoever holds the lease, as the customer
+            // is tagged with this org), then the org's row, under the lease.
             record_customer(db, &customer, org).await?;
-            let mut tx = db.begin(org).await?;
+            let mut tx = lease.begin(db).await?;
             sqlx::query(
                 "UPDATE subscriptions SET stripe_customer_id = $2, updated_at = now() \
                  WHERE org_id = $1",
@@ -75,6 +86,7 @@ async fn setup(db: &Db, client: &Client, params: SetupParams<'_>, audit: Entry) 
         }
     };
 
+    lease.renew(db).await?;
     // A fresh session per request: nothing retries this call, and a session
     // replayed from an earlier click may already be completed or expired.
     let session = client
@@ -93,7 +105,7 @@ async fn setup(db: &Db, client: &Client, params: SetupParams<'_>, audit: Entry) 
         .url
         .ok_or_else(|| Error::Unexpected("the Checkout session has no url".into()))?;
 
-    let mut tx = db.begin(org).await?;
+    let mut tx = lease.begin(db).await?;
     tx.audit(
         audit
             .target("org", org.to_string())
@@ -127,4 +139,63 @@ async fn find_or_create_customer(client: &Client, params: &SetupParams<'_>) -> R
         .create_customer(&create, &idem("customer", &create)?)
         .await?;
     Ok(created.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::billing::mock::MockStripe;
+    use std::time::Duration;
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn setup_with_a_lost_lease_writes_and_sends_nothing(pool: sqlx::PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let mock = MockStripe::start().await;
+        let org: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO orgs (slug, name) VALUES ('acme', 'Acme') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let org = OrgId::from(org);
+        let lease = OrgLease::acquire(&db, org, Duration::from_secs(1))
+            .await
+            .unwrap();
+        // Another worker takes the org (the lease expired under a slow call).
+        sqlx::query("UPDATE subscriptions SET lease_token = gen_random_uuid()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let params = SetupParams {
+            org,
+            org_name: "acme",
+            owner_email: None,
+            success_url: "https://otto.test/ok".into(),
+            cancel_url: "https://otto.test/no".into(),
+        };
+        let err = setup(
+            &db,
+            &mock.client(),
+            &lease,
+            params,
+            Entry::new("billing.setup.started"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::LeaseLost(o) if o == org), "{err}");
+        assert!(
+            mock.posts().is_empty(),
+            "a worker without the lease called Stripe"
+        );
+        let (customer, audits): (Option<String>, i64) = sqlx::query_as(
+            "SELECT s.stripe_customer_id, \
+                    (SELECT count(*) FROM audit_events WHERE org_id = $1) \
+             FROM subscriptions s WHERE s.org_id = $1",
+        )
+        .bind(org)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((customer, audits), (None, 0));
+    }
 }

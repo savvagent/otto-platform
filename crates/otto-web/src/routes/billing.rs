@@ -63,7 +63,7 @@ pub fn billing_disabled() -> ApiError {
 pub(crate) fn from_billing(context: &str, e: billing::Error) -> ApiError {
     match e {
         billing::Error::Tenant(inner) => ApiError::from(inner),
-        billing::Error::Busy(_) => ApiError::conflict(
+        billing::Error::Busy(_) | billing::Error::LeaseLost(_) => ApiError::conflict(
             "billing_busy",
             "another billing change for this org is in progress; try again shortly",
         ),

@@ -51,7 +51,10 @@
 //!   and released in short transactions of their own. Every read before a
 //!   call and every write after one is its own short transaction, and none
 //!   is ever opened while another is held, so a burst of requests needs one
-//!   pool connection each at most and cannot deadlock the pool.
+//!   pool connection each at most and cannot deadlock the pool. The lease is
+//!   renewed before every Stripe call, and every write after one opens with
+//!   `UPDATE ... WHERE lease_token = <ours>`: a worker whose lease expired
+//!   and was taken writes nothing ([`Error::LeaseLost`]).
 //! - **Stripe ids are recorded the moment they exist**, each in its own short
 //!   transaction right after the call that made it.
 //! - **Creation looks before it leaps.** Before creating a customer, the org's
@@ -64,7 +67,11 @@
 //!   replays Stripe's first answer; a retry with different ones gets a new
 //!   key rather than Stripe's `idempotency_error`. The hour bounds how long a
 //!   failure Stripe cached under a key keeps being replayed; the look-first
-//!   rule above is what keeps a new key from duplicating anything.
+//!   rule above is what keeps a new key from duplicating anything. Creating a
+//!   subscription is the exception: its key has no hour, so no retry ever
+//!   makes a second one, at the cost of a cached failure blocking it for
+//!   Stripe's 24 hours. More than one live subscription tagged with the org
+//!   is reported as an error, never resolved by picking one.
 //! - **Webhook handlers only move a status forward in event time**, and the
 //!   `stripe_events` ledger is written after an event's effects commit.
 //!
@@ -99,7 +106,7 @@ pub use status::{
     is_live_status, live_subscription, status, BillingStatus, LiveSubscription,
     PaymentMethodStatus, SubscriptionState,
 };
-pub use sync::{sync, SyncReport};
+pub use sync::{sync, sync_until, SyncReport};
 pub use webhook::{handle_event, EventOutcome, HANDLED_EVENT_TYPES};
 
 /// The one currency billed in. Multi-currency is a non-goal.
@@ -187,6 +194,10 @@ pub enum Error {
     /// Another worker holds the lease (an org's, or sync's). Try again.
     #[error("busy: {0}")]
     Busy(String),
+    /// This worker's lease on the org expired and another worker took it,
+    /// so nothing more was written. The other worker carries on.
+    #[error("lost the billing lease on org {0} to another worker; nothing more was written")]
+    LeaseLost(OrgId),
     /// Stripe answered with something billing cannot use.
     #[error("unexpected Stripe response: {0}")]
     Unexpected(String),
@@ -210,12 +221,21 @@ fn idem(scope: &str, params: &impl Debug) -> Result<IdempotencyKey> {
 }
 
 fn idem_at(scope: &str, params: &impl Debug, now: DateTime<Utc>) -> Result<IdempotencyKey> {
-    let digest = Sha256::digest(format!("{params:?}").as_bytes());
-    let hash: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
     Ok(IdempotencyKey::new(format!(
-        "otto-{scope}-{hash}-{}",
+        "{}-{}",
+        idem_stable(scope, params)?.as_str(),
         now.format("%Y%m%d%H")
     ))?)
+}
+
+/// As [`idem`] with no hour: the same parameters always give the same key,
+/// so a retry at any time within Stripe's 24 hours replays the first answer.
+/// For creating a subscription, where a second one would bill twice; the
+/// price is that a failure Stripe cached is replayed for those 24 hours.
+fn idem_stable(scope: &str, params: &impl Debug) -> Result<IdempotencyKey> {
+    let digest = Sha256::digest(format!("{params:?}").as_bytes());
+    let hash: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
+    Ok(IdempotencyKey::new(format!("otto-{scope}-{hash}"))?)
 }
 
 /// 00:00 UTC on the first day of `month`.
@@ -358,6 +378,43 @@ impl OrgLease {
         }
     }
 
+    /// Prove the lease is still ours, and extend it, inside `tx`: the first
+    /// statement of every write made under the lease. An `UPDATE ... WHERE
+    /// lease_token = <ours>` that matches no row means another worker has
+    /// taken the org ([`Error::LeaseLost`]); it also locks the row, so the
+    /// lease cannot change hands before `tx` commits.
+    async fn hold(&self, tx: &mut otto_tenant::Tx<'_>) -> Result<()> {
+        let held = sqlx::query(
+            "UPDATE subscriptions SET lease_until = now() + make_interval(secs => $3) \
+             WHERE org_id = $1 AND lease_token = $2",
+        )
+        .bind(self.org)
+        .bind(self.token)
+        .bind(LEASE_TTL_SECS as f64)
+        .execute(tx.conn())
+        .await?
+        .rows_affected();
+        if held != 1 {
+            return Err(Error::LeaseLost(self.org));
+        }
+        Ok(())
+    }
+
+    /// A transaction pinned to the org for a write under the lease: refused
+    /// with [`Error::LeaseLost`] if the lease is no longer ours.
+    async fn begin(&self, db: &Db) -> Result<otto_tenant::Tx<'static>> {
+        let mut tx = db.begin(self.org).await?;
+        self.hold(&mut tx).await?;
+        Ok(tx)
+    }
+
+    /// Extend the lease in a short transaction of its own, before a Stripe
+    /// call, so a run of calls cannot outlive it unnoticed.
+    async fn renew(&self, db: &Db) -> Result<()> {
+        self.begin(db).await?.commit().await?;
+        Ok(())
+    }
+
     /// Give the lease back. A failure is logged, not returned: the lease
     /// expires on its own, and the work it covered is already done.
     async fn release(self, db: &Db) {
@@ -441,6 +498,54 @@ mod tests {
         assert_ne!(a, idem_at("y", &("cus_1", "pm_1"), t).unwrap());
         let later = t + chrono::Duration::hours(1);
         assert_ne!(a, idem_at("x", &("cus_1", "pm_1"), later).unwrap());
+    }
+
+    #[test]
+    fn a_stable_key_has_no_hour() {
+        let a = idem_stable("subscription", &("cus_1", "pm_1")).unwrap();
+        assert!(!a
+            .as_str()
+            .ends_with(&Utc::now().format("%Y%m%d%H").to_string()));
+        assert_eq!(a, idem_stable("subscription", &("cus_1", "pm_1")).unwrap());
+    }
+
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn a_lost_lease_refuses_every_write(pool: sqlx::PgPool) {
+        let db = Db::from_pool(pool.clone());
+        let org: Uuid = sqlx::query_scalar(
+            "INSERT INTO orgs (slug, name) VALUES ('acme', 'Acme') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let org = OrgId::from(org);
+        let lease = OrgLease::acquire(&db, org, Duration::from_secs(1))
+            .await
+            .unwrap();
+        lease.renew(&db).await.unwrap();
+        assert!(matches!(
+            OrgLease::acquire(&db, org, Duration::from_millis(200)).await,
+            Err(Error::Busy(_))
+        ));
+
+        // It expires and another worker takes it.
+        sqlx::query("UPDATE subscriptions SET lease_until = now() - interval '1 second'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let thief = OrgLease::acquire(&db, org, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert!(matches!(lease.renew(&db).await, Err(Error::LeaseLost(o)) if o == org));
+        assert!(matches!(lease.begin(&db).await, Err(Error::LeaseLost(_))));
+        // Releasing a lost lease leaves the new holder's alone.
+        lease.release(&db).await;
+        thief.renew(&db).await.unwrap();
+        thief.release(&db).await;
+        OrgLease::acquire(&db, org, Duration::from_millis(200))
+            .await
+            .unwrap();
     }
 
     #[test]

@@ -35,8 +35,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    actions, idem, is_live_status, month_after, month_start, read_row, Error, OrgLease,
-    PaymentMethodStatus, Result, SubRow, ITEMS_WARN_AT, MAX_SCHEDULE_PHASES,
+    actions, idem, idem_stable, is_live_status, month_after, month_start, read_row, Error,
+    OrgLease, PaymentMethodStatus, Result, SubRow, ITEMS_WARN_AT, MAX_SCHEDULE_PHASES,
     MAX_SUBSCRIPTION_ITEMS, SYNC_ACTOR,
 };
 use crate::pricebook::{self, Month, Tiers};
@@ -111,10 +111,21 @@ impl SyncReport {
 /// [`Error::Busy`] if another is running. Per-meter, per-version and per-org
 /// failures are collected in [`SyncReport::errors`] and the run carries on.
 pub async fn sync(db: &Db, client: &Client) -> Result<SyncReport> {
+    sync_until(db, client, &|| false).await
+}
+
+/// As [`sync`], stopping between orgs once `stop` says so (a graceful
+/// shutdown), so every lease is given back rather than left to expire. The
+/// orgs not reached are picked up by the next run.
+pub async fn sync_until(
+    db: &Db,
+    client: &Client,
+    stop: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<SyncReport> {
     let token = acquire_sync_lease(db)
         .await?
         .ok_or_else(|| Error::Busy("another stripe sync is running".into()))?;
-    let result = run(db, client).await;
+    let result = run(db, client, stop).await;
     if let Err(e) = release_sync_lease(db, token).await {
         tracing::warn!(error = %e, "could not release the sync lease; it expires on its own");
     }
@@ -149,11 +160,15 @@ async fn release_sync_lease(db: &Db, token: Uuid) -> Result<()> {
     Ok(())
 }
 
-async fn run(db: &Db, client: &Client) -> Result<SyncReport> {
+async fn run(
+    db: &Db,
+    client: &Client,
+    stop: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<SyncReport> {
     let mut report = SyncReport::default();
     sync_meters(db, client, &mut report).await?;
     sync_prices(db, client, &mut report).await?;
-    let plan = Plan::load(db, &mut report.warnings).await?;
+    let mut plan = Plan::load(db, &mut report.warnings).await?;
 
     let mut tx = db.begin_unpinned().await?;
     let orgs: Vec<Uuid> =
@@ -162,6 +177,20 @@ async fn run(db: &Db, client: &Client) -> Result<SyncReport> {
             .await?;
     tx.commit().await?;
     for org in orgs.into_iter().map(OrgId::from) {
+        if stop() {
+            report
+                .warnings
+                .push("stopped early for shutdown; the next run finishes".into());
+            break;
+        }
+        // A month that began during the run changes what "now" is.
+        if current_month(db).await? != plan.now().month {
+            plan = Plan::load(db, &mut report.warnings).await?;
+        }
+        // Nothing to do for this org: no lease taken, nothing written.
+        if !needs_work(db, org, &plan).await? {
+            continue;
+        }
         let lease = match OrgLease::acquire(db, org, ORG_WAIT).await {
             Ok(lease) => lease,
             Err(Error::Busy(_)) => {
@@ -175,13 +204,36 @@ async fn run(db: &Db, client: &Client) -> Result<SyncReport> {
                 continue;
             }
         };
-        let result = reconcile_with(db, client, org, SYNC_ACTOR, &plan, &mut report).await;
+        let result = reconcile_with(db, client, &lease, org, SYNC_ACTOR, &plan, &mut report).await;
         lease.release(db).await;
         if let Err(e) = result {
             report.errors.push(format!("org {org}: {e}"));
         }
     }
     Ok(report)
+}
+
+/// The current month by the database's clock, in a short transaction.
+async fn current_month(db: &Db) -> Result<Month> {
+    let mut tx = db.begin_unpinned().await?;
+    let month = pricebook::current_month(tx.conn()).await?;
+    tx.commit().await?;
+    Ok(month)
+}
+
+/// Whether [`reconcile_with`] could change anything for the org, judged
+/// from its row without the lease (it decides again under the lease).
+async fn needs_work(db: &Db, org: OrgId, plan: &Plan) -> Result<bool> {
+    if plan.now().prices.is_empty() {
+        return Ok(false);
+    }
+    let Some(row) = read_row(db, org).await? else {
+        return Ok(false);
+    };
+    Ok(match row.live_subscription() {
+        Some(_) => row.stripe_plan.as_deref() != Some(plan.fingerprint().as_str()),
+        None => row.card()? == PaymentMethodStatus::Active && row.billing_stopped_at.is_none(),
+    })
 }
 
 // ------------------------------------------------------------------ meters
@@ -549,21 +601,24 @@ impl Plan {
 
 /// Bring one org's subscription to the current plan: create (or adopt) it if
 /// the org should have one, then make its prices match. The caller holds the
-/// org's lease.
+/// org's lease; every Stripe call renews it and every write is made under
+/// it ([`OrgLease::begin`]).
 pub(super) async fn reconcile_org(
     db: &Db,
     client: &Client,
+    lease: &OrgLease,
     org: OrgId,
     actor: &str,
     report: &mut SyncReport,
 ) -> Result<()> {
     let plan = Plan::load(db, &mut report.warnings).await?;
-    reconcile_with(db, client, org, actor, &plan, report).await
+    reconcile_with(db, client, lease, org, actor, &plan, report).await
 }
 
 async fn reconcile_with(
     db: &Db,
     client: &Client,
+    lease: &OrgLease,
     org: OrgId,
     actor: &str,
     plan: &Plan,
@@ -582,7 +637,8 @@ async fn reconcile_with(
             if row.card()? != PaymentMethodStatus::Active || row.billing_stopped_at.is_some() {
                 return Ok(());
             }
-            let Some(sub) = ensure_subscription(db, client, org, &row, plan, actor, report).await?
+            let Some(sub) =
+                ensure_subscription(db, client, lease, org, &row, plan, actor, report).await?
             else {
                 return Ok(());
             };
@@ -592,7 +648,7 @@ async fn reconcile_with(
             (sub, row)
         }
     };
-    reconcile_prices(db, client, org, &sub, &row, plan, actor, report).await
+    reconcile_prices(db, client, lease, org, &sub, &row, plan, actor, report).await
 }
 
 /// Create the org's subscription, or adopt a live one already tagged with the
@@ -600,9 +656,14 @@ async fn reconcile_with(
 /// at once. One item per meter priced this month, `billing_cycle_anchor` at
 /// 00:00 UTC on the first of next month, `proration_behavior=none` (the
 /// client always sends it).
+///
+/// More than one live subscription tagged with the org is an error, not a
+/// choice: billing would double, and only a person can say which to keep.
+#[allow(clippy::too_many_arguments)]
 async fn ensure_subscription(
     db: &Db,
     client: &Client,
+    lease: &OrgLease,
     org: OrgId,
     row: &SubRow,
     plan: &Plan,
@@ -616,17 +677,29 @@ async fn ensure_subscription(
         return Ok(None);
     };
     let org_id = org.to_string();
-    let existing = client
+    lease.renew(db).await?;
+    let mut tagged: Vec<_> = client
         .list_subscriptions(&customer)
         .await?
         .data
         .into_iter()
-        .find(|s| {
+        .filter(|s| {
             s.metadata.get("org_id") == Some(&org_id)
                 && is_live_status(&s.status)
                 // Never the one Stripe already told us is gone.
                 && Some(&s.id) != row.stripe_subscription_id.as_ref()
-        });
+        })
+        .collect();
+    if tagged.len() > 1 {
+        let ids: Vec<&str> = tagged.iter().map(|s| s.id.as_str()).collect();
+        return Err(Error::Unexpected(format!(
+            "{} live Stripe subscriptions are tagged with org {org} ({}); cancel all but \
+             one in the Stripe dashboard",
+            ids.len(),
+            ids.join(", ")
+        )));
+    }
+    let existing = tagged.pop();
     let now = plan.now();
     let (_, anchor) = month_after(now.month)?;
     let (sub, status, adopted, stripe_plan) = match existing {
@@ -640,13 +713,16 @@ async fn ensure_subscription(
             };
             // The card and the subscription this replaces are part of the
             // key, so a re-subscribe after a cancellation is a new request.
-            let key = idem("subscription", &(&params, &pm, &row.stripe_subscription_id))?;
+            // No hour in it: a retry at any time replays the first answer
+            // rather than making a second subscription.
+            let key = idem_stable("subscription", &(&params, &pm, &row.stripe_subscription_id))?;
+            lease.renew(db).await?;
             let s = client.create_subscription(&params, &key).await?;
             (s.id, s.status, false, Some(plan.only_now().fingerprint()))
         }
     };
 
-    let mut tx = db.begin(org).await?;
+    let mut tx = lease.begin(db).await?;
     sqlx::query(
         "UPDATE subscriptions SET stripe_subscription_id = $2, status = $3, \
            subscription_event_at = NULL, stripe_schedule_id = NULL, stripe_plan = $4, \
@@ -720,6 +796,7 @@ async fn open_schedule(
 async fn reconcile_prices(
     db: &Db,
     client: &Client,
+    lease: &OrgLease,
     org: OrgId,
     sub: &str,
     row: &SubRow,
@@ -731,22 +808,25 @@ async fn reconcile_prices(
     if row.stripe_plan.as_deref() == Some(desired.as_str()) {
         return Ok(());
     }
+    lease.renew(db).await?;
     let existing = open_schedule(client, sub, row.stripe_schedule_id.as_deref()).await?;
     let mut changed = Vec::new();
     let (schedule, switches) = if plan.phases.len() == 1 {
         // No switch pending: no schedule, and this month's items right now.
         if let Some(s) = existing {
+            lease.renew(db).await?;
             client
                 .release_schedule(&s.id, &idem("release-schedule", &s.id)?)
                 .await?;
             report.schedules_released.push(org);
         }
-        changed = fix_items(client, org, sub, plan.now(), report).await?;
+        changed = fix_items(db, client, lease, org, sub, plan.now(), report).await?;
         (None, Vec::new())
     } else {
         let s = match existing {
             Some(s) => s,
             None => {
+                lease.renew(db).await?;
                 client
                     .create_schedule_from_subscription(sub, &idem("schedule", &sub)?)
                     .await?
@@ -771,6 +851,7 @@ async fn reconcile_prices(
             });
         }
         let params = UpdateSchedule { phases };
+        lease.renew(db).await?;
         client
             .update_schedule(&s.id, &params, &idem("schedule-update", &(&s.id, &params))?)
             .await?;
@@ -779,7 +860,7 @@ async fn reconcile_prices(
         (Some(s.id), switches)
     };
 
-    let mut tx = db.begin(org).await?;
+    let mut tx = lease.begin(db).await?;
     sqlx::query(
         "UPDATE subscriptions SET stripe_plan = $3, stripe_schedule_id = $4, updated_at = now() \
          WHERE org_id = $1 AND stripe_subscription_id = $2",
@@ -809,8 +890,11 @@ async fn reconcile_prices(
 /// Bring this month's items to `phase` directly (no switch is pending): add
 /// an item for a meter with none, move an item on the wrong price. Without
 /// proration. Returns the meters changed.
+#[allow(clippy::too_many_arguments)]
 async fn fix_items(
+    db: &Db,
     client: &Client,
+    lease: &OrgLease,
     org: OrgId,
     sub: &str,
     phase: &Phase,
@@ -830,6 +914,7 @@ async fn fix_items(
         match by_meter.get(&p.stripe_meter_id) {
             Some((_, price)) if *price == p.stripe_price_id => {}
             Some((item, _)) => {
+                lease.renew(db).await?;
                 client
                     .change_subscription_item_price(
                         item,
@@ -845,6 +930,7 @@ async fn fix_items(
                 p.meter
             )),
             None => {
+                lease.renew(db).await?;
                 client
                     .add_subscription_item(
                         sub,
