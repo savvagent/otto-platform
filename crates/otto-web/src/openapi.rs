@@ -561,33 +561,34 @@ fn plan_schemas() -> Value {
     json!({
         "PlansResponse": {
             "type": "object",
-            "description": "Every plan on offer, cheapest tier first.",
+            "description":
+                "Every plan on offer, cheapest tier first, and the metered prices in \
+                 effect this month. Plans buy features; usage is priced per meter, the \
+                 same on every plan.",
             "properties": {
                 "plans": { "type": "array", "items": reference("PublicPlan") },
+                "meters": {
+                    "type": "array",
+                    "items": reference("PublicMeter"),
+                    "description":
+                        "Every meter with a price in effect this month, by service and \
+                         meter. A meter with no price is not listed.",
+                },
             },
-            "required": ["plans"],
+            "required": ["plans", "meters"],
         },
         "PublicPlan": {
             "type": "object",
             "description":
-                "One tier as offered, before any org's negotiated override. Live from the \
-                 `plans` table.",
+                "One tier as offered: its name, list price and the capabilities it \
+                 unlocks. Live from the `plans` table. Usage is priced by `meters`, \
+                 not by the plan.",
             "properties": {
                 "plan": {
                     "type": "string",
                     "enum": ["free", "team", "business", "enterprise"],
                 },
                 "displayName": { "type": "string" },
-                "includedOps": {
-                    "type": "integer",
-                    "description": "Billable operations included each month.",
-                },
-                "hardStop": {
-                    "type": "boolean",
-                    "description":
-                        "Whether exceeding the bucket stops billable work rather than \
-                         metering overage.",
-                },
                 "monthlyCents": {
                     "type": "integer",
                     "description":
@@ -604,9 +605,54 @@ fn plan_schemas() -> Value {
                          advertised.",
                 },
             },
-            "required": [
-                "plan", "displayName", "includedOps", "hardStop", "monthlyCents", "features",
-            ],
+            "required": ["plan", "displayName", "monthlyCents", "features"],
+        },
+        "PublicMeter": {
+            "type": "object",
+            "description":
+                "One value meter's price, from the price book in effect this month.",
+            "properties": {
+                "service": { "type": "string", "description": "The service slug, e.g. `otto-flags`." },
+                "meter": {
+                    "type": "string",
+                    "description": "The meter's name within its service, e.g. `evaluations`.",
+                },
+                "displayName": { "type": "string" },
+                "unit": { "type": "string", "description": "What one unit is, e.g. `evaluation`." },
+                "tiers": {
+                    "type": "array",
+                    "items": reference("PublicTier"),
+                    "minItems": 1,
+                    "description":
+                        "Graduated tiers, in order. Units up to the first tier's `upTo` in \
+                         a month are charged at its unit amount, the units above that up to \
+                         the next `upTo` at the next one's, and so on; the last tier is \
+                         unbounded. A free allowance is a first tier priced at 0.",
+                },
+            },
+            "required": ["service", "meter", "displayName", "unit", "tiers"],
+        },
+        "PublicTier": {
+            "type": "object",
+            "description": "One graduated tier of a meter's price.",
+            "properties": {
+                "upTo": {
+                    "type": ["integer", "null"],
+                    "format": "int64",
+                    "description":
+                        "The last unit of the month this tier prices; null on the last, \
+                         unbounded tier.",
+                },
+                "unitAmountUcents": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 0,
+                    "description":
+                        "Price per unit in millionths of a US cent (1000000 is one cent). \
+                         A meter's monthly amount is rounded to whole cents once, half up.",
+                },
+            },
+            "required": ["upTo", "unitAmountUcents"],
         },
     })
 }

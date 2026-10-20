@@ -211,3 +211,123 @@ async fn tenant_pinned_code_reads_meters_but_cannot_change_them(pool: PgPool) {
         );
     }
 }
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn tenant_pinned_code_reads_the_price_book_but_cannot_change_it(pool: PgPool) {
+    let db = Db::from_pool(pool.clone());
+
+    // A meter and a price, written the way the operator CLI writes them:
+    // unpinned, as the connecting role. A fixture, not a real rate.
+    sqlx::query(
+        "INSERT INTO resource_servers (resource_uri, name, scopes, default_scopes, service) \
+         VALUES ('https://svc.example/mcp', 'svc', '{a}', '{}', 'svc')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut tx = db.begin_unpinned().await.unwrap();
+    sqlx::query(
+        "INSERT INTO meters (key, service, meter, display_name, unit) \
+         VALUES ('svc/calls', 'svc', 'calls', 'Calls', 'call')",
+    )
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    let version: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO price_versions (meter, effective_month) \
+         VALUES ('svc/calls', '2026-11-01') RETURNING id",
+    )
+    .fetch_one(tx.conn())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO price_tiers (version_id, position, up_to, unit_amount_ucents) \
+         VALUES ($1, 0, 100, 0), ($1, 1, NULL, 7)",
+    )
+    .bind(version)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // The price book is readable from a tenant transaction (billing rates an
+    // org's usage against it) ...
+    let mut tx = db.begin(OrgId::new()).await.unwrap();
+    let amounts: Vec<i64> = sqlx::query_scalar(
+        "SELECT t.unit_amount_ucents FROM price_tiers t \
+         JOIN price_versions v ON v.id = t.version_id \
+         WHERE v.meter = 'svc/calls' ORDER BY t.position",
+    )
+    .fetch_all(tx.conn())
+    .await
+    .unwrap();
+    assert_eq!(amounts, [0, 7]);
+    drop(tx);
+
+    // ... but not writable: one org's transaction must not reprice a meter for
+    // every org.
+    let insert_version = "INSERT INTO price_versions (meter, effective_month) \
+                          VALUES ('svc/calls', '2026-12-01')";
+    let insert_tier = format!(
+        "INSERT INTO price_tiers (version_id, position, up_to, unit_amount_ucents) \
+         VALUES ('{version}', 2, NULL, 1)"
+    );
+    for stmt in [
+        insert_version,
+        "UPDATE price_versions SET effective_month = '2027-01-01'",
+        "DELETE FROM price_versions",
+        "TRUNCATE price_versions CASCADE",
+        insert_tier.as_str(),
+        "UPDATE price_tiers SET unit_amount_ucents = 0",
+        "DELETE FROM price_tiers",
+        "TRUNCATE price_tiers",
+    ] {
+        let mut tx = db.begin(OrgId::new()).await.unwrap();
+        let err = sqlx::query(stmt).execute(tx.conn()).await.expect_err(stmt);
+        assert!(
+            err.to_string().contains("permission denied"),
+            "{stmt}: {err}"
+        );
+    }
+
+    // What a row can state alone is enforced by the schema: first-of-month
+    // versions, positive bounds, non-negative amounts, one unbounded tier, and
+    // only existing meters.
+    for stmt in [
+        "INSERT INTO price_versions (meter, effective_month) VALUES ('svc/calls', '2026-12-02')",
+        "INSERT INTO price_versions (meter, effective_month) VALUES ('svc/nope', '2026-12-01')",
+        "INSERT INTO price_versions (meter, effective_month) VALUES ('svc/calls', '2026-11-01')",
+    ] {
+        let err = sqlx::query(stmt).execute(&pool).await.expect_err(stmt);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("check constraint")
+                || msg.contains("foreign key")
+                || msg.contains("duplicate key"),
+            "{stmt}: {msg}"
+        );
+    }
+    for (position, up_to, amount) in [
+        (2_i16, Some(0_i64), 1_i64),
+        (2, None, -1),
+        (-1, Some(500), 1),
+        (2, None, 1),
+    ] {
+        let err = sqlx::query(
+            "INSERT INTO price_tiers (version_id, position, up_to, unit_amount_ucents) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(version)
+        .bind(position)
+        .bind(up_to)
+        .bind(amount)
+        .execute(&pool)
+        .await
+        .expect_err("a malformed tier");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("check constraint") || msg.contains("duplicate key"),
+            "{position} {up_to:?} {amount}: {msg}"
+        );
+    }
+}

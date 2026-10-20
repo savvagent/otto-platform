@@ -24,6 +24,14 @@
 //!
 //! **Features are allowlisted, not passed through.** See
 //! [`ADVERTISED_FEATURES`].
+//!
+//! **Plans buy features, not usage.** A plan is a name, a list price and the
+//! capabilities it unlocks; usage is priced per value meter, the same on every
+//! plan, by the price book in effect this month (`otto_billing::pricebook`),
+//! listed once alongside the plans as `meters`. Only meters with a price in
+//! effect are listed: an unpriced meter is not on offer yet. Because of the two
+//! caches, a new month's prices can take up to about six minutes after 00:00
+//! UTC on the first to appear.
 
 use std::future::Future;
 use std::time::Duration;
@@ -32,6 +40,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use otto_billing::plans::{list_plans, PlanOffer};
+use otto_billing::pricebook::{self, book_in_effect, current_month, PricedMeter};
 use serde::Serialize;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
@@ -68,6 +77,9 @@ const ADVERTISED_FEATURES: &[&str] = &["auto_rollback"];
 #[serde(rename_all = "camelCase")]
 pub struct PlansResponse {
     pub plans: Vec<PublicPlan>,
+    /// Every metered price in effect this month, by meter key. The same for
+    /// every plan.
+    pub meters: Vec<PublicMeter>,
 }
 
 /// One tier as a pricing page shows it.
@@ -80,8 +92,6 @@ pub struct PlansResponse {
 pub struct PublicPlan {
     pub plan: String,
     pub display_name: String,
-    pub included_ops: i64,
-    pub hard_stop: bool,
     /// List price in US cents. `0` on enterprise means negotiated, not free.
     pub monthly_cents: i32,
     /// Only the [`ADVERTISED_FEATURES`] keys of `plans.features`, and only
@@ -94,10 +104,55 @@ impl From<PlanOffer> for PublicPlan {
         Self {
             plan: p.plan.as_str().to_string(),
             display_name: p.display_name,
-            included_ops: p.included_ops,
-            hard_stop: p.hard_stop,
             monthly_cents: p.monthly_cents,
             features: advertised(p.features),
+        }
+    }
+}
+
+/// One metered price, as a pricing page shows it. Mapped field by field from
+/// [`PricedMeter`], like [`PublicPlan`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicMeter {
+    /// The service slug, e.g. `otto-flags`.
+    pub service: String,
+    /// The meter's name within the service, e.g. `evaluations`.
+    pub meter: String,
+    pub display_name: String,
+    /// What one unit is, e.g. `evaluation`.
+    pub unit: String,
+    /// Graduated tiers, in order; the last is unbounded.
+    pub tiers: Vec<PublicTier>,
+}
+
+/// One graduated tier.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTier {
+    /// The last unit of the month this tier prices; `null` on the last tier.
+    pub up_to: Option<i64>,
+    /// Price per unit, in millionths of a US cent.
+    pub unit_amount_ucents: i64,
+}
+
+impl From<PricedMeter> for PublicMeter {
+    fn from(p: PricedMeter) -> Self {
+        Self {
+            service: p.meter.service,
+            meter: p.meter.meter,
+            display_name: p.meter.display_name,
+            unit: p.meter.unit,
+            tiers: p
+                .version
+                .tiers
+                .as_slice()
+                .iter()
+                .map(|t| PublicTier {
+                    up_to: t.up_to,
+                    unit_amount_ucents: t.unit_amount_ucents,
+                })
+                .collect(),
         }
     }
 }
@@ -308,9 +363,23 @@ fn core_error(e: otto_core::Error) -> ApiError {
     }
 }
 
+/// See [`tenant_error`]. A malformed stored price is the operator's to fix,
+/// so it is a `500`, logged, not something the caller can act on.
+fn pricebook_error(e: pricebook::Error) -> ApiError {
+    match e {
+        pricebook::Error::Db(inner) => ApiError::unavailable("plan catalog", inner),
+        other => ApiError::internal("plan catalog", other),
+    }
+}
+
 async fn load(state: &AppState) -> ApiResult<Bytes> {
     let mut tx = state.db.begin_unpinned().await.map_err(tenant_error)?;
     let rows = list_plans(&mut tx).await.map_err(core_error)?;
+    // The database's month, the clock `pricebook set` judges the future by.
+    let month = current_month(tx.conn()).await.map_err(pricebook_error)?;
+    let book = book_in_effect(tx.conn(), month)
+        .await
+        .map_err(pricebook_error)?;
     tx.commit().await.map_err(tenant_error)?;
 
     if rows.is_empty() {
@@ -320,6 +389,7 @@ async fn load(state: &AppState) -> ApiResult<Bytes> {
     }
     let response = PlansResponse {
         plans: rows.into_iter().map(PublicPlan::from).collect(),
+        meters: book.into_iter().map(PublicMeter::from).collect(),
     };
     serde_json::to_vec(&response)
         .map(Bytes::from)
@@ -349,12 +419,72 @@ mod tests {
     }
 
     #[test]
+    fn a_meter_publishes_its_tiers_and_nothing_else() {
+        use otto_billing::meters::Meter;
+        use otto_billing::pricebook::{PriceVersion, Tier, Tiers};
+
+        let now = chrono::Utc::now();
+        let priced = PricedMeter {
+            meter: Meter {
+                key: "otto-flags/evaluations".into(),
+                service: "otto-flags".into(),
+                meter: "evaluations".into(),
+                display_name: "Flag evaluations".into(),
+                unit: "evaluation".into(),
+                created_at: now,
+                updated_at: now,
+            },
+            version: PriceVersion {
+                id: uuid::Uuid::new_v4(),
+                meter: "otto-flags/evaluations".into(),
+                effective_month: "2026-11".parse().unwrap(),
+                created_at: now,
+                tiers: Tiers::new(vec![
+                    Tier {
+                        up_to: Some(1_000),
+                        unit_amount_ucents: 0,
+                    },
+                    Tier {
+                        up_to: None,
+                        unit_amount_ucents: 7,
+                    },
+                ])
+                .unwrap(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(PublicMeter::from(priced)).unwrap(),
+            json!({
+                "service": "otto-flags",
+                "meter": "evaluations",
+                "displayName": "Flag evaluations",
+                "unit": "evaluation",
+                "tiers": [
+                    { "upTo": 1000, "unitAmountUcents": 0 },
+                    { "upTo": null, "unitAmountUcents": 7 },
+                ],
+            }),
+            "the unbounded tier is an explicit null; ids and dates stay private"
+        );
+    }
+
+    #[test]
+    fn a_malformed_price_is_an_internal_error() {
+        let err = pricebook_error(pricebook::Error::Corrupt {
+            version: uuid::Uuid::nil(),
+            reason: "x".into(),
+        });
+        assert_eq!(err.status, http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
     fn a_database_failure_in_the_loader_is_unavailable() {
         let db = || sqlx::Error::PoolTimedOut;
         for err in [
             tenant_error(otto_tenant::Error::Db(db())),
             core_error(otto_core::Error::Db(db())),
             core_error(otto_core::Error::Tenant(otto_tenant::Error::Db(db()))),
+            pricebook_error(pricebook::Error::Db(db())),
         ] {
             assert_eq!(err.status, http::StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(err.code, "temporarily_unavailable");

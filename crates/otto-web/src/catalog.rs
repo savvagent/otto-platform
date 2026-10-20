@@ -715,18 +715,21 @@ pub fn catalog() -> Vec<Endpoint> {
             .returns("PlansResponse")
             .summary("Public plan catalog")
             .describe(
-                "Every plan on offer, cheapest tier first: what a pricing page reads. \
-                 Public because plans are operator-maintained reference data, not tenant \
-                 data — they belong to no org, and a visitor deciding whether to sign up \
-                 has no credential to present. Read live from the `plans` table, so the \
-                 prices shown are the ones billed against; each instance reuses what it \
-                 read for a minute, and the response is cacheable for five more \
-                 (`Cache-Control: public, max-age=300`). `features` lists only the \
-                 capabilities chosen for advertising, not every key a plan carries. \
-                 A `monthlyCents` of 0 on \
-                 enterprise means negotiated, not free. Lists the published bucket, not \
-                 any org's negotiated override; an org's own figure is \
-                 /api/orgs/{org}/usage.",
+                "Every plan on offer, cheapest tier first, and the metered prices in \
+                 effect this month: what a pricing page reads. Plans buy features, not \
+                 usage: each plan is a name, a list price and the capabilities it \
+                 unlocks, and usage is priced per value meter, the same on every plan, by \
+                 the price book (`meters`, graduated tiers in millionths of a cent). \
+                 Public because plans and prices are operator-maintained reference data, \
+                 not tenant data — they belong to no org, and a visitor deciding whether \
+                 to sign up has no credential to present. Read live from the database, \
+                 so the prices shown are the ones billed against; each instance reuses \
+                 what it read for a minute, and the response is cacheable for five more \
+                 (`Cache-Control: public, max-age=300`), so for up to about six minutes \
+                 after a month begins (00:00 UTC on the first) the previous month's \
+                 metered prices can still be shown. `features` lists only the \
+                 capabilities chosen for advertising, not every key a plan carries. A \
+                 `monthlyCents` of 0 on enterprise means negotiated, not free.",
             ),
         // -------------------------------------------------- tokens & usage
         Endpoint::get("/api/orgs/{org}/tokens", tokens::list_tokens)
