@@ -540,7 +540,13 @@ fn entity_schemas() -> Value {
                 "totalCalls": { "type": "integer" },
                 "periodStart": { "type": "string", "format": "date" },
                 "warning": { "type": "boolean" },
-                "hardStop": { "type": "boolean" },
+                "hardStop": {
+                    "type": "boolean",
+                    "deprecated": true,
+                    "description":
+                        "Always false: the family-wide bucket never stops work. A \
+                         service's own hard stop is `services[].budget.hardStop`.",
+                },
                 "enforced": { "type": "boolean" },
                 "services": {
                     "type": "array",
@@ -863,8 +869,18 @@ fn budget_schemas() -> Value {
                     "oneOf": [reference("Budget"), { "type": "null" }],
                     "description": "Null when no budget is set.",
                 },
+                "paymentRequired": {
+                    "type": "boolean",
+                    "description":
+                        "Whether the service refuses billable calls until the org adds a \
+                         payment method: the org has no live subscription and the \
+                         service's spend this month is above zero (past its free tiers). \
+                         Free calls keep working.",
+                },
             },
-            "required": ["service", "meters", "spendCents", "spendError", "budget"],
+            "required": [
+                "service", "meters", "spendCents", "spendError", "budget", "paymentRequired",
+            ],
         },
         "MeterUsage": {
             "type": "object",

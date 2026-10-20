@@ -35,11 +35,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use otto_billing::billing;
 use otto_billing::budgets::{
     self, PendingBudgets, ServiceBudgetStatus, BUDGET_EXCEEDED, SPEND_UNAVAILABLE,
 };
 use otto_billing::meters::{self, MeterSpec};
-use otto_billing::pricebook::Month;
+use otto_billing::period::{self, Month};
 use otto_billing::usage::{
     self, IngestOutcome, Metered, MeteringFields, ShippedUsage, Shipper, UsageExt,
 };
@@ -123,6 +124,14 @@ async fn live_org(db: &Db, org: Uuid) -> Result<Org, ApiError> {
 /// Every event counts in the caller's own per-service pool, keyed by the
 /// caller's service slug and never by anything the event says. The caller's
 /// declared meters are read once per request, not once per event.
+///
+/// An event whose billing month has already closed (see
+/// `otto_billing::period`) is accepted and billed in the current period.
+///
+/// Each org's transaction first takes the org's ingest lock
+/// ([`usage::lock_org_ingest`]), so concurrent batches for one org run one
+/// after the other instead of deadlocking on each other's counter rows, and
+/// counts the org's events in billed order (period, then `occurred_at`).
 async fn ingest_usage(
     State(db): State<Db>,
     CallingResourceServer(rs): CallingResourceServer,
@@ -169,7 +178,8 @@ async fn ingest_usage(
         }
     }
 
-    for (org, events) in by_org {
+    let now = chrono::Utc::now();
+    for (org, mut events) in by_org {
         if db.get_active_org(OrgId::from(org)).await?.is_none() {
             receipt
                 .rejected
@@ -181,6 +191,12 @@ async fn ingest_usage(
         }
 
         let mut tx = db.begin(OrgId::from(org)).await?;
+        usage::lock_org_ingest(&mut tx).await?;
+        // Stable, so events of one instant keep the batch's order.
+        events.sort_by_key(|(ev, _)| {
+            let at = period::billed_at(ev.occurred_at, now);
+            (Month::of(at), ev.occurred_at)
+        });
         let mut budgets = PendingBudgets::default();
         let mut accepted = 0;
         let mut duplicates = 0;
@@ -327,14 +343,24 @@ fn truncate(s: &str, max: usize) -> String {
 /// a cheap read and may be slightly behind the counters. Reading it is free
 /// and works however much has been used.
 ///
-/// `service`, `meters` and `budget` are the calling resource server's own
-/// only: another service's usage or budget never shows here, so a hard stop on
-/// one service never blocks another. `budget` is absent when the org has set
-/// none for the caller's service. The legacy family-wide fields are
-/// all still served for clients pinned to an older `otto-resource`, but
-/// `hard_stop` is always `false`: an older client blocks on
-/// `hard_stop && billable_count >= included_ops`, and with a family-wide count
-/// that would let one service's usage stop work in another.
+/// `service`, `meters`, `budget` and `blocked_reason` are the calling
+/// resource server's own only: another service's usage or budget never shows
+/// here, so a hard stop on one service never blocks another. `budget` is
+/// absent when the org has set none for the caller's service.
+///
+/// `blocked_reason` says why the caller must refuse billable calls:
+/// `budget_exceeded` (its budget's hard stop) or `payment_required` (the org
+/// has no live Stripe subscription and the service's spend this month is
+/// above zero, past its free tiers); the budget wins when both apply. The
+/// platform only reports it; resource servers enforce it, and fail open.
+/// Spend is computed only when an answer needs it: with a budget, or without
+/// a live subscription. A caller with a live subscription and no budget never
+/// waits on (or fails with) the price book.
+///
+/// The legacy family-wide fields are all still served for clients pinned to
+/// an older `otto-resource`, but `hard_stop` is always `false`: an older
+/// client blocks on `hard_stop && billable_count >= included_ops`, and with a
+/// family-wide count that would let one service's usage stop work in another.
 async fn usage_status(
     State(db): State<Db>,
     CallingResourceServer(rs): CallingResourceServer,
@@ -345,13 +371,13 @@ async fn usage_status(
     let mut tx = db.begin(OrgId::from(org)).await?;
     let usage = tx.current_usage().await?;
     let limits = tx.plan_limits().await?;
-    let (meters, budget) = match rs.service.as_deref() {
+    let (meters, gate) = match rs.service.as_deref() {
         Some(service) => {
             let meters = tx.service_meter_usage(service).await?;
             let period = Month::containing(usage.period_start);
-            (meters, budget_status(&mut tx, service, period).await?)
+            (meters, service_gate(&mut tx, service, period).await?)
         }
-        None => (Vec::new(), None),
+        None => (Vec::new(), Gate::default()),
     };
     tx.rollback().await?;
 
@@ -382,25 +408,48 @@ async fn usage_status(
         },
         service: rs.service,
         meters,
-        budget,
+        budget: gate.budget,
+        blocked_reason: gate.blocked_reason.map(str::to_owned),
     }))
 }
 
-/// The caller's budget this period, or `None` when it has none.
+/// What usage-status says about the caller's spend this period.
+#[derive(Debug, Default)]
+struct Gate {
+    /// `None` when the org has set no budget for the service.
+    budget: Option<BudgetStatus>,
+    /// [`BUDGET_EXCEEDED`], [`budgets::PAYMENT_REQUIRED`], or `None`.
+    blocked_reason: Option<&'static str>,
+}
+
+/// The caller's budget this period and whether it must refuse billable
+/// calls, rating its spend only when the answer depends on it: when the
+/// service has a budget, or the org has no live Stripe subscription.
 ///
 /// A budget whose spend cannot be computed (a malformed price version, an
 /// overflow) is still reported, with `spend_cents` and `percent_used` null,
-/// `blocked` false and reason `spend_unavailable`: enforcement fails open,
-/// visibly. A database error fails the request.
-async fn budget_status(
-    tx: &mut Tx<'_>,
-    service: &str,
-    period: Month,
-) -> Result<Option<BudgetStatus>, ApiError> {
-    budgets::service_status(tx, service, period)
+/// `blocked` false and reason `spend_unavailable`; unknown spend never
+/// requires payment either: enforcement fails open, visibly. A database
+/// error fails the request.
+async fn service_gate(tx: &mut Tx<'_>, service: &str, period: Month) -> Result<Gate, ApiError> {
+    let has_budget = budgets::get_budget(tx, service)
         .await
-        .map(|status| wire_budget(&status))
-        .map_err(ApiError::internal)
+        .map_err(ApiError::internal)?
+        .is_some();
+    let live = billing::live_subscription(tx)
+        .await
+        .map_err(ApiError::internal)?
+        .is_some();
+    if live && !has_budget {
+        return Ok(Gate::default());
+    }
+    let status = budgets::service_status(tx, service, period)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Gate {
+        budget: wire_budget(&status),
+        blocked_reason: status.blocked_reason(live),
+    })
 }
 
 fn wire_budget(status: &ServiceBudgetStatus) -> Option<BudgetStatus> {

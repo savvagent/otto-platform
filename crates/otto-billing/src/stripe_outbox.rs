@@ -2,29 +2,62 @@
 //! #55): the outbox `stripe_meter_outbox` (migration 0023) and the SQL its
 //! shipper needs.
 //!
-//! # Enqueue
+//! # Enqueue: aggregated per hour
 //!
-//! Usage ingest ([`crate::usage::UsageExt::ingest_usage_deferred`]) writes one
-//! row for every accepted **metered** event of an org with a **live Stripe
-//! subscription** (a Stripe customer and a subscription whose status is one of
+//! Usage ingest ([`crate::usage::UsageExt::ingest_usage_deferred`]) adds every
+//! accepted **metered** event of an org with a **live Stripe subscription** (a
+//! Stripe customer and a subscription whose status is one of
 //! [`crate::billing::LIVE_STATUSES`], as [`crate::billing::live_subscription`]
-//! reads it). The insert is a data-modifying CTE of the event's own counter
-//! statement, so it costs no round trip at all, for orgs with or without a
-//! subscription, and commits or aborts with the usage it bills. It cannot fail
-//! the event: every value it writes satisfies the table's checks by
-//! construction (see [`enqueue_fields`]), it locks no row another ingest
-//! needs, and a replayed identifier is `ON CONFLICT DO NOTHING`.
+//! reads it) to an **open row**: the one pending row for the org, the meter's
+//! Stripe event name, the customer and the UTC hour holding the instant the
+//! event is billed at ([`crate::period::billed_at`],
+//! [`crate::period::hour_bucket`]). The first event of the hour creates the
+//! row; every later one adds its quantity (`INSERT … ON CONFLICT … DO UPDATE
+//! SET value = value + EXCLUDED.value` against the partial unique index
+//! `stripe_meter_outbox_open_idx`, whose predicate is [`OPEN_ROW`]). So a busy
+//! org and meter costs one row, and one Stripe call, per hour, not per event.
+//!
+//! - **Identifier.** Each row mints its own (`agg:<uuid>`) when it is created.
+//!   It never derives from an event, so replays are kept out upstream: ingest's
+//!   ledger claim refuses an event already counted before this statement runs.
+//! - **Timestamp.** The meter event's timestamp is the row's `bucket_start`,
+//!   the start of the hour, which is in the same UTC month as every event the
+//!   row carries, never in the future, and at most an hour older than they
+//!   are.
+//! - **A row closes at its first claim.** A row is open only while it is
+//!   pending, has never been claimed (`attempts = 0 AND sending_since IS
+//!   NULL`) and is not full ([`OPEN_ROW_MAX_VALUE`]); the claim sets
+//!   `sending_since`, which takes it out of the index for good. From then on
+//!   its value never changes, so every retry sends what the first attempt
+//!   sent; an event counted after the claim opens a new row (with a new
+//!   identifier) for the same hour.
+//! - **Due at the end of its hour.** A row is first due when its hour has
+//!   ended (`next_attempt_at = bucket_start + 1 hour`), which is what lets it
+//!   collect the hour's events. An event billed in an hour that has already
+//!   ended (a late one) lands in a row that is due at once.
+//! - **Bounded values.** A row's value is at most [`MAX_OUTBOX_VALUE`]
+//!   (10^15, exact as a JSON number). A row past [`OPEN_ROW_MAX_VALUE`] (half
+//!   of it) takes no more additions, and one addition is at most the other
+//!   half ([`MAX_ADDITION`]; an event's quantity is at most
+//!   [`crate::usage::MAX_METER_QUANTITY`], far below it), so a sum can never
+//!   overflow the table's check, and ingest can never fail on it.
+//!
+//! The insert is a data-modifying CTE of the event's own counter statement,
+//! so it costs no round trip at all, for orgs with or without a subscription,
+//! and commits or aborts with the usage it bills. It cannot fail the event:
+//! every value it writes satisfies the table's checks by construction (see
+//! [`enqueue_event_name`]).
 //!
 //! **Not queued, by design:**
 //!
 //! - usage of an org without a live subscription (a free org, or one with no
-//!   card yet): it accrues usage and budgets, but nothing is queued for it,
-//!   and nothing is queued retroactively when it subscribes;
+//!   card yet): it accrues usage and budgets, but nothing is queued for it
+//!   until [`backfill_period`] is called when it subscribes;
 //! - an unmetered event, which is free;
-//! - an event already older than [`MAX_EVENT_AGE`] when it is ingested
-//!   (ingest accepts events back to the start of the previous month). Stripe
-//!   would refuse it, so it is metered and counted on the console but neither
-//!   queued nor counted as lost anywhere.
+//! - an event whose hour is already older than [`MAX_EVENT_AGE`] when it is
+//!   ingested. Ingest re-dates every event of a closed period to the moment
+//!   it arrives ([`crate::period`]), so this cannot happen to an event ingest
+//!   accepts; it is kept as a guard.
 //!
 //! # Shipping
 //!
@@ -38,15 +71,17 @@
 //! has a Stripe billing meter (`stripe_meters`, written by `stripe sync`), so
 //! a meter declared since the last sync never has its events sent to a meter
 //! that does not exist yet (Stripe would accept them and drop them
-//! asynchronously). Such rows wait, pushed back [`UNSYNCED_RECHECK`] at a time
-//! ([`defer_unsynced`]) so they do not head the due index; their retry window
-//! has not started, and they still expire by age ([`expire_stale`]).
+//! asynchronously). Such rows wait (and stay open), pushed back
+//! [`UNSYNCED_RECHECK`] at a time ([`defer_unsynced`], at most
+//! [`DEFER_BATCH`] rows a call) so they do not head the due index; their
+//! retry window has not started, and they still expire by age
+//! ([`expire_stale`]).
 //!
 //! **Fenced writes.** A claim's `sending_since` is its token: a shipper
-//! records a retry or a terminal outcome only while the row still carries the
-//! token of its own claim, so a shipper whose lease lapsed cannot overwrite a
-//! newer claim's state (see [`claim_due`]). A row expired after an attempt
-//! Stripe may have received says so in `last_error`
+//! records any outcome (sent, retry, terminal) only while the row still
+//! carries the token of its own claim, so a shipper whose lease lapsed cannot
+//! overwrite a newer claim's state (see [`claim_due`]). A row expired after an
+//! attempt Stripe may have received says so in `last_error`
 //! ([`MAY_HAVE_BEEN_DELIVERED`]).
 //!
 //! **`sent` means accepted for processing.** Stripe validates meter events
@@ -54,25 +89,24 @@
 //! failures only as `v1.billing.meter.error_report_triggered` events, which
 //! nothing here reads yet.
 //!
-//! **Exactly once.** Every parameter is fixed at enqueue, so a retry sends
-//! the same event. Stripe dedupes meter events on `identifier`
-//! (`<service>:<event_id>`) for at least 24 hours, so a retry of an event
-//! Stripe already took (its answer lost) is dropped by Stripe; if Stripe
-//! answers such a retry with a duplicate-identifier error instead, that too
-//! counts as sent ([`is_duplicate_identifier`]). Retries therefore stop
-//! [`RETRY_WINDOW`] (12 h) after the first attempt Stripe **may** have
-//! received, well inside that 24 h, leaving room for the claim lease and
-//! clock skew: no retry is sent once Stripe could have forgotten the
-//! identifier. A row still failing then is **expired**, as is one whose
-//! event is older than Stripe accepts ([`MAX_EVENT_AGE`], inside Stripe's 35
-//! days).
+//! **Exactly once.** Every parameter is fixed by the first claim, so a retry
+//! sends the same event. Stripe dedupes meter events on `identifier` for at
+//! least 24 hours, so a retry of an event Stripe already took (its answer
+//! lost) is dropped by Stripe; if Stripe answers such a retry with a
+//! duplicate-identifier error instead, that too counts as sent
+//! ([`is_duplicate_identifier`]). Retries therefore stop [`RETRY_WINDOW`]
+//! (12 h) after the first attempt Stripe **may** have received, well inside
+//! that 24 h, leaving room for the claim lease and clock skew: no retry is
+//! sent once Stripe could have forgotten the identifier. A row still failing
+//! then is **expired**, as is one whose hour is older than Stripe accepts
+//! ([`MAX_EVENT_AGE`], inside Stripe's 35 days).
 //!
 //! **The window starts only when Stripe may have the event.** An ambiguous
 //! outcome (a timeout, a transport error, a 5xx, a 409, or an attempt whose
 //! result was never recorded because its shipper died) starts it. A definite
 //! "not received" (401/403: our key; 429: throttled before processing; a
 //! request the client refused before sending) does not, so a long credential
-//! outage or throttling streak is bounded only by the event's age, and is
+//! outage or throttling streak is bounded only by the row's age, and is
 //! fixed in time without losing revenue. The claim records when a send
 //! started (`sending_since`); recording any result clears it, so a claim that
 //! finds it still set knows the previous attempt's answer was lost.
@@ -88,17 +122,25 @@
 //! **Lost revenue is visible.** A `rejected` (terminal 4xx) or `expired` row
 //! is kept, never retried and never swept, with its error in `last_error`;
 //! the shipper logs it at error level and [`outbox_summary`] reports it.
-//! `sent` rows are swept after [`KEEP_SENT_DAYS`]. Deleting an org deletes
-//! its rows, shipped or not.
+//! `sent` rows are swept after [`KEEP_SENT_DAYS`], [`SWEEP_BATCH`] at a time.
+//! Deleting an org deletes its rows, shipped or not.
+//!
+//! # Invoicing
+//!
+//! [`has_pending_before`] tells Stripe invoicing whether an org still has
+//! usage for a period on its way to Stripe; [`backfill_period`] queues the
+//! usage an org accrued before its subscription went live.
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use chrono::{DateTime, Duration, Utc};
-use otto_tenant::{Db, Unpinned};
+use otto_tenant::ids::OrgId;
+use otto_tenant::{Db, Tx, Unpinned};
 use uuid::Uuid;
 
-use crate::billing::Result;
+use crate::billing::{Error, Result, LIVE_STATUSES};
+use crate::period::{self, Month};
 use crate::stripe::{meter_event_name, IdempotencyKey, MeterEvent, StripeError};
 use crate::usage::Metered;
 
@@ -107,7 +149,7 @@ use crate::usage::Metered;
 /// so every retry lands while Stripe still remembers the identifier.
 pub const RETRY_WINDOW: Duration = Duration::hours(12);
 
-/// The oldest event the shipper sends, or ingest queues. Stripe accepts meter
+/// The oldest hour the shipper sends, or ingest queues. Stripe accepts meter
 /// events whose timestamp is within the past 35 days; a day of margin covers
 /// clock skew and the time a send takes.
 pub const MAX_EVENT_AGE: Duration = Duration::days(34);
@@ -118,6 +160,42 @@ pub const CLAIM_LEASE_SECONDS: i64 = 600;
 
 /// `sent` rows are kept this long (Stripe's own 35-day window), then swept.
 pub const KEEP_SENT_DAYS: i32 = 35;
+
+/// The most rows one [`sweep`] statement deletes; it repeats until done.
+pub const SWEEP_BATCH: i64 = 5_000;
+
+/// The most rows one [`defer_unsynced`] call pushes back.
+pub const DEFER_BATCH: i64 = 1_000;
+
+/// The largest value one row (one meter event) carries: 10^15, the
+/// `stripe_meter_outbox_value_range` check of migration 0023. Stripe
+/// documents no upper bound for a meter event's value; this one keeps every
+/// value exact as a JSON number (below 2^53), and is far above what an hour
+/// of real usage reaches.
+pub const MAX_OUTBOX_VALUE: i64 = 1_000_000_000_000_000;
+
+/// A row whose value is past this takes no more additions (it leaves
+/// `stripe_meter_outbox_open_idx`), and the next addition opens a new row.
+pub const OPEN_ROW_MAX_VALUE: i64 = MAX_OUTBOX_VALUE / 2;
+
+/// The largest single addition to a row. An open row plus one addition never
+/// exceeds [`MAX_OUTBOX_VALUE`].
+pub const MAX_ADDITION: i64 = MAX_OUTBOX_VALUE - OPEN_ROW_MAX_VALUE;
+
+/// The predicate of `stripe_meter_outbox_open_idx` (migration 0023), which
+/// every `ON CONFLICT` adding to an open row must repeat for Postgres to
+/// infer that index.
+pub(crate) const OPEN_ROW: &str = "status = 'pending' AND attempts = 0 AND sending_since IS NULL \
+                                   AND value <= 500000000000000";
+
+/// The conflict target and action that add a new row's value to the open row
+/// for its key, if there is one.
+pub(crate) fn add_to_open_row() -> String {
+    format!(
+        "ON CONFLICT (org_id, event_name, stripe_customer_id, bucket_start) WHERE {OPEN_ROW} \
+         DO UPDATE SET value = stripe_meter_outbox.value + EXCLUDED.value"
+    )
+}
 
 /// `last_error` is for a human; anything longer is cut.
 const MAX_ERROR_LEN: usize = 500;
@@ -158,67 +236,53 @@ impl OutboxStatus {
     }
 }
 
-/// The meter-event identifier of an event: `<service>:<event_id>`. Event ids
-/// are unique only per resource server, so the service is part of it. At most
-/// 63 + 1 + 36 = 100 characters for a valid service slug.
-///
-/// ```
-/// use otto_billing::stripe_outbox::identifier;
-/// use uuid::Uuid;
-///
-/// let id = Uuid::nil();
-/// assert_eq!(
-///     identifier("otto-flags", id),
-///     "otto-flags:00000000-0000-0000-0000-000000000000"
-/// );
-/// ```
-pub fn identifier(service: &str, event_id: Uuid) -> String {
-    format!("{service}:{}", event_id.hyphenated())
-}
-
 /// The meter keys this process has already reported as unshippable, so a
 /// meter whose key has no Stripe event name logs once, not once per event.
 static UNSHIPPABLE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-/// What ingest writes to the outbox for an event that happened at
-/// `occurred_at` (as counted) and is ingested at `now`, as `(event_name,
-/// identifier)`, or `None` when the event cannot be billed through Stripe:
-/// unmetered, from a server with no service, already older than
-/// [`MAX_EVENT_AGE`], or a meter whose key has no Stripe event name (logged
-/// once per meter; `stripe sync` reports it too).
+/// The Stripe event name ingest queues an event under, for an event billed in
+/// the hour starting `bucket` and ingested at `now`, or `None` when the event
+/// cannot be billed through Stripe: unmetered, from a server with no
+/// service, an hour already older than [`MAX_EVENT_AGE`], or a meter whose
+/// key has no Stripe event name (logged once per meter; `stripe sync`
+/// reports it too).
 ///
-/// Both values satisfy the table's checks whenever this returns them: the
-/// event name is 1 to 100 of `[a-z0-9_]` ([`meter_event_name`]), and a valid
-/// service slug makes the identifier at most 100 characters.
-pub(crate) fn enqueue_fields(
+/// The name satisfies the table's check whenever this returns it: 1 to 100
+/// of `[a-z0-9_]` ([`meter_event_name`]).
+pub(crate) fn enqueue_event_name(
     service: Option<&str>,
     metered: Option<Metered<'_>>,
-    event_id: Uuid,
-    occurred_at: DateTime<Utc>,
+    bucket: DateTime<Utc>,
     now: DateTime<Utc>,
-) -> Option<(String, String)> {
+) -> Option<String> {
     let (service, metered) = (service?, metered?);
-    if !crate::budgets::is_service_slug(service) || occurred_at < now - MAX_EVENT_AGE {
+    if !crate::budgets::is_service_slug(service) || bucket < now - MAX_EVENT_AGE {
         return None;
     }
-    let name = metered
-        .meter
+    event_name_of(metered.meter, Some(service))
+}
+
+/// The Stripe event name of meter key `meter` (`<service>/<meter>`), when it
+/// has one and, with `service`, belongs to it. Logged once per meter when
+/// it has none.
+fn event_name_of(meter: &str, service: Option<&str>) -> Option<String> {
+    let name = meter
         .split_once('/')
-        .filter(|(svc, _)| *svc == service)
+        .filter(|(svc, _)| service.is_none_or(|s| s == *svc))
         .ok_or(None)
-        .and_then(|(svc, meter)| meter_event_name(svc, meter).map_err(Some));
+        .and_then(|(svc, m)| meter_event_name(svc, m).map_err(Some));
     match name {
-        Ok(name) => Some((name, identifier(service, event_id))),
+        Ok(name) => Some(name),
         Err(e) => {
             let first = UNSHIPPABLE
                 .get_or_init(Default::default)
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(metered.meter.to_owned());
+                .insert(meter.to_owned());
             if first {
                 let why = e.map_or_else(|| "not a <service>/<meter> key".into(), |e| e.to_string());
                 tracing::error!(
-                    meter = metered.meter,
+                    meter,
                     error = %why,
                     "a metered event cannot be billed through Stripe; its usage is counted \
                      but not invoiced"
@@ -237,8 +301,11 @@ pub struct DueMeterEvent {
     pub identifier: String,
     pub event_name: String,
     pub stripe_customer_id: String,
+    /// The sum of the quantities the row collected.
     pub value: i64,
-    pub occurred_at: DateTime<Utc>,
+    /// The start of the UTC hour the row's usage was billed in: the meter
+    /// event's timestamp.
+    pub bucket_start: DateTime<Utc>,
     /// Recorded attempts before this one.
     pub attempts: i32,
     /// When the first attempt Stripe may have received started, if any:
@@ -256,7 +323,7 @@ impl DueMeterEvent {
             stripe_customer_id: self.stripe_customer_id.clone(),
             value: self.value,
             identifier: self.identifier.clone(),
-            timestamp: self.occurred_at,
+            timestamp: self.bucket_start,
         }
     }
 
@@ -271,11 +338,11 @@ impl DueMeterEvent {
         ))?)
     }
 
-    /// Why this row must not be sent at all, as of its claim: its event is
+    /// Why this row must not be sent at all, as of its claim: its hour is
     /// older than Stripe accepts, or its retry window has closed (a row whose
     /// claims kept lapsing). `None` to send it.
     pub fn expired_before_send(&self) -> Option<String> {
-        let why = if self.occurred_at < self.claimed_at - MAX_EVENT_AGE {
+        let why = if self.bucket_start < self.claimed_at - MAX_EVENT_AGE {
             too_old()
         } else if self
             .window_started_at
@@ -302,7 +369,7 @@ pub const MAY_HAVE_BEEN_DELIVERED: &str =
 
 fn too_old() -> String {
     format!(
-        "the event is older than {} days, and Stripe refuses meter events older than 35",
+        "the usage is older than {} days, and Stripe refuses meter events older than 35",
         MAX_EVENT_AGE.num_days()
     )
 }
@@ -416,7 +483,7 @@ async fn delivery_tx(db: &Db) -> Result<Unpinned> {
 }
 
 const DUE_COLS: &str = "o.id, o.org_id, o.identifier, o.event_name, o.stripe_customer_id, \
-                        o.value, o.occurred_at, o.attempts, o.window_started_at, \
+                        o.value, o.bucket_start, o.attempts, o.window_started_at, \
                         now() AS claimed_at";
 
 /// Claim up to `limit` due rows across every org, oldest due first, whose
@@ -425,23 +492,38 @@ const DUE_COLS: &str = "o.id, o.org_id, o.identifier, o.event_name, o.stripe_cus
 /// The claim pushes `next_attempt_at` out by [`CLAIM_LEASE_SECONDS`] in the
 /// statement that selects the rows (`FOR UPDATE SKIP LOCKED`), so several
 /// machines can ship from one table without sending a row twice at once, and
-/// a shipper that dies lets the lease lapse. It sets `sending_since`; a row
+/// a shipper that dies lets the lease lapse. It sets `sending_since`, which
+/// also closes the row to further additions (see the module docs); a row
 /// claimed with it still set had its previous answer lost, which starts its
-/// retry window from that earlier send.
+/// retry window from that earlier send. A row an ingest is adding to right
+/// now is locked, so it is skipped until that ingest commits.
 ///
 /// `sending_since` is also the claim's **fence**: it equals the returned
-/// [`DueMeterEvent::claimed_at`], and [`mark_retry`] and [`mark_terminal`]
-/// write only while it still does. A shipper whose lease lapsed and was
-/// claimed again can therefore never record over the new claim (and clear
-/// the evidence that the new claim's send may be in flight).
+/// [`DueMeterEvent::claimed_at`], and [`mark_sent`], [`mark_retry`] and
+/// [`mark_terminal`] write only while it still does. A shipper whose lease
+/// lapsed and was claimed again can therefore never record over the new claim
+/// (and clear the evidence that the new claim's send may be in flight).
+///
+/// **Cost.** It walks `stripe_meter_outbox_due_idx` (pending rows by
+/// `next_attempt_at`) in order and stops after `limit` claimable rows,
+/// probing `stripe_meters` (its unique `event_name`) per row, however large
+/// the due backlog (a Stripe outage) grows. The meter check is a correlated
+/// subquery rather than `EXISTS` on purpose: as a semi-join the planner joins
+/// every due row to the (tiny) `stripe_meters` first and sorts them all
+/// (measured under `otto_app`'s row-level security at 300k due rows: 330 ms
+/// and a spill to disk, against an index walk of the first rows). The
+/// delivery policies' quals are a per-row filter that does not block the
+/// ordered index scan, so no BYPASSRLS or SECURITY DEFINER route is needed.
+/// Due rows whose meter is unsynced are pushed out of its way by
+/// [`defer_unsynced`].
 pub async fn claim_due(db: &Db, limit: i64) -> Result<Vec<DueMeterEvent>> {
     let mut tx = delivery_tx(db).await?;
     let rows = sqlx::query_as(&format!(
         "WITH due AS ( \
            SELECT id FROM stripe_meter_outbox d \
             WHERE d.status = 'pending' AND d.next_attempt_at <= now() \
-              AND EXISTS (SELECT 1 FROM stripe_meters m WHERE m.event_name = d.event_name) \
-            ORDER BY d.next_attempt_at, d.created_at \
+              AND (SELECT true FROM stripe_meters m WHERE m.event_name = d.event_name) \
+            ORDER BY d.next_attempt_at \
             LIMIT $1 \
             FOR UPDATE SKIP LOCKED \
          ) \
@@ -461,20 +543,28 @@ pub async fn claim_due(db: &Db, limit: i64) -> Result<Vec<DueMeterEvent>> {
     Ok(rows)
 }
 
-/// Record that Stripe accepted the row.
-pub async fn mark_sent(db: &Db, row: &DueMeterEvent) -> Result<()> {
+/// Record that Stripe accepted the row. Returns whether it was recorded:
+/// `false` when this claim no longer holds the row (fenced out, see
+/// [`claim_due`]). The newer claim then sends the same identifier, which
+/// Stripe drops as a duplicate and the newer claim records as sent, so a
+/// fenced-out `sent` loses nothing.
+pub async fn mark_sent(db: &Db, row: &DueMeterEvent) -> Result<bool> {
     let mut tx = delivery_tx(db).await?;
-    sqlx::query(
+    let written = sqlx::query(
         "UPDATE stripe_meter_outbox \
             SET status = 'sent', finished_at = now(), attempts = attempts + 1, \
                 sending_since = NULL, last_error = NULL \
-          WHERE id = $1 AND status = 'pending'",
+          WHERE id = $1 AND status = 'pending' \
+            AND sending_since IS NOT DISTINCT FROM $2",
     )
     .bind(row.id)
+    .bind(row.claimed_at)
     .execute(tx.conn())
-    .await?;
+    .await?
+    .rows_affected()
+        == 1;
     tx.commit().await?;
-    Ok(())
+    Ok(written)
 }
 
 /// Record a retryable failure and schedule the next attempt after the
@@ -497,7 +587,7 @@ pub async fn mark_retry(
     let mut tx = delivery_tx(db).await?;
     let status: Option<String> = sqlx::query_scalar(
         "WITH cur AS ( \
-           SELECT id, occurred_at, now() + make_interval(secs => $3) AS next_at, \
+           SELECT id, bucket_start, now() + make_interval(secs => $3) AS next_at, \
                   COALESCE(window_started_at, \
                            CASE WHEN $7 THEN COALESCE(sending_since, now()) END) AS win \
            FROM stripe_meter_outbox \
@@ -506,7 +596,7 @@ pub async fn mark_retry(
          ), calc AS ( \
            SELECT id, next_at, win, \
                   (next_at > win + make_interval(secs => $4)) IS TRUE \
-                    OR next_at > occurred_at + make_interval(secs => $5) AS expire \
+                    OR next_at > bucket_start + make_interval(secs => $5) AS expire \
            FROM cur \
          ) \
          UPDATE stripe_meter_outbox o \
@@ -576,10 +666,10 @@ pub async fn mark_terminal(
     Ok(written)
 }
 
-/// Expire every pending row whose event has grown older than
-/// [`MAX_EVENT_AGE`] without being claimed (its meter never synced, say, or
-/// billing disabled), and return them, for the shipper to report as lost.
-/// Rows under a live claim are left to their shipper.
+/// Expire every pending row whose hour has grown older than [`MAX_EVENT_AGE`]
+/// without being claimed (its meter never synced, say, or billing disabled),
+/// and return them, for the shipper to report as lost. Rows under a live
+/// claim are left to their shipper.
 pub async fn expire_stale(db: &Db) -> Result<Vec<DueMeterEvent>> {
     let mut tx = delivery_tx(db).await?;
     let rows = sqlx::query_as(&format!(
@@ -590,7 +680,7 @@ pub async fn expire_stale(db: &Db) -> Result<Vec<DueMeterEvent>> {
                                    THEN $3 ELSE '' END \
           WHERE o.status = 'pending' \
             AND (o.sending_since IS NULL OR o.next_attempt_at <= now()) \
-            AND o.occurred_at < now() - make_interval(secs => $1) \
+            AND o.bucket_start < now() - make_interval(secs => $1) \
          RETURNING {DUE_COLS}"
     ))
     .bind(MAX_EVENT_AGE.num_seconds() as f64)
@@ -606,44 +696,246 @@ pub async fn expire_stale(db: &Db) -> Result<Vec<DueMeterEvent>> {
 /// looked at again, so they do not sit at the head of the due index.
 pub const UNSYNCED_RECHECK: Duration = Duration::minutes(5);
 
-/// Push back every due pending row whose meter Stripe does not know yet
-/// (`stripe sync` has not made it) by [`UNSYNCED_RECHECK`], and return how
-/// many there were and how long the oldest has been queued. A row under a
-/// live claim is not touched.
+/// Push back up to [`DEFER_BATCH`] due pending rows whose meter Stripe does
+/// not know yet (`stripe sync` has not made it) by [`UNSYNCED_RECHECK`], and
+/// return how many there were and how long the oldest of them has been
+/// queued. A row under a live claim is not due, so it is not touched; a row
+/// an ingest is adding to is skipped (`SKIP LOCKED`).
+///
+/// The batch bounds the statement however large a backlog of unsynced rows
+/// grows (an ordered walk of `stripe_meter_outbox_due_idx`, as in
+/// [`claim_due`]); the shipper calls this every minute, which is more than
+/// enough to keep them behind the rows it can send.
 pub async fn defer_unsynced(db: &Db) -> Result<(i64, Option<Duration>)> {
     let mut tx = delivery_tx(db).await?;
     let (n, oldest): (i64, Option<f64>) = sqlx::query_as(
-        "WITH deferred AS ( \
+        "WITH waiting AS ( \
+           SELECT id FROM stripe_meter_outbox w \
+            WHERE w.status = 'pending' AND w.next_attempt_at <= now() \
+              AND (SELECT true FROM stripe_meters m WHERE m.event_name = w.event_name) IS NULL \
+            ORDER BY w.next_attempt_at \
+            LIMIT $2 \
+            FOR UPDATE SKIP LOCKED \
+         ), deferred AS ( \
            UPDATE stripe_meter_outbox o \
               SET next_attempt_at = now() + make_interval(secs => $1) \
-            WHERE o.status = 'pending' AND o.next_attempt_at <= now() \
-              AND NOT EXISTS (SELECT 1 FROM stripe_meters m WHERE m.event_name = o.event_name) \
+             FROM waiting \
+            WHERE o.id = waiting.id \
            RETURNING o.created_at \
          ) \
          SELECT count(*), extract(epoch FROM now() - min(created_at))::float8 FROM deferred",
     )
     .bind(UNSYNCED_RECHECK.num_seconds() as f64)
+    .bind(DEFER_BATCH)
     .fetch_one(tx.conn())
     .await?;
     tx.commit().await?;
     Ok((n, oldest.map(|s| Duration::seconds(s.max(0.0) as i64))))
 }
 
-/// Delete `sent` rows finished more than `keep_days` ago. Pending rows are
-/// waiting and lost (`rejected`, `expired`) rows are the record of revenue
-/// that never reached Stripe; neither is ever swept.
+/// Delete `sent` rows finished more than `keep_days` ago, [`SWEEP_BATCH`]
+/// rows per statement (each its own transaction, through
+/// `stripe_meter_outbox_sent_idx`) until none is left, and return how many.
+/// Pending rows are waiting and lost (`rejected`, `expired`) rows are the
+/// record of revenue that never reached Stripe; neither is ever swept.
 pub async fn sweep(db: &Db, keep_days: i32) -> Result<u64> {
-    let mut tx = delivery_tx(db).await?;
-    let n = sqlx::query(
-        "DELETE FROM stripe_meter_outbox \
-          WHERE status = 'sent' AND finished_at < now() - make_interval(days => $1)",
+    let mut total = 0;
+    loop {
+        let mut tx = delivery_tx(db).await?;
+        let n = sqlx::query(
+            "DELETE FROM stripe_meter_outbox \
+              WHERE id IN ( \
+                SELECT id FROM stripe_meter_outbox \
+                 WHERE status = 'sent' AND finished_at < now() - make_interval(days => $1) \
+                 LIMIT $2)",
+        )
+        .bind(keep_days)
+        .bind(SWEEP_BATCH)
+        .execute(tx.conn())
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        total += n;
+        if n < SWEEP_BATCH as u64 {
+            return Ok(total);
+        }
+    }
+}
+
+/// Whether `org_id` has usage still waiting to reach Stripe (a `pending`
+/// row, claimed or not, due or not) billed before `before`: a row whose hour
+/// starts before `before`. Every event a row carries lies in its hour, so for
+/// an hour-aligned `before` (a period's start, [`period::starts_at`]) this is
+/// exactly "usage billed before `before`". `rejected` and `expired` rows will
+/// never reach Stripe and do not count; neither do `sent` ones.
+///
+/// For Stripe invoicing: hold an invoice for a period until this is `false`
+/// for the instant the period ends, so the invoice carries all its usage.
+/// Usage can still be added for a period until it closes
+/// ([`period::closes_at`]); ask after that.
+///
+/// `conn` must be a transaction pinned to `org_id` (`otto_tenant::Tx::conn`),
+/// or an unpinned transaction opted in to the outbox's delivery policies.
+/// Any other connection would see no rows under row-level security and
+/// answer a false `false`, so it is refused with an error instead.
+pub async fn has_pending_before(
+    conn: &mut sqlx::PgConnection,
+    org_id: OrgId,
+    before: DateTime<Utc>,
+) -> Result<bool> {
+    let (pinned, opted_in): (Option<Uuid>, bool) = sqlx::query_as(
+        "SELECT current_org(), \
+                COALESCE(current_setting('app.stripe_meter_delivery', true) = 'on', false)",
     )
-    .bind(keep_days)
-    .execute(tx.conn())
-    .await?
-    .rows_affected();
-    tx.commit().await?;
-    Ok(n)
+    .fetch_one(&mut *conn)
+    .await?;
+    let sees_org = match pinned {
+        Some(pinned) => pinned == org_id.as_uuid(),
+        None => opted_in,
+    };
+    if !sees_org {
+        return Err(Error::Tenant(otto_tenant::Error::Invalid(format!(
+            "has_pending_before needs a transaction pinned to org {org_id} (or one opted in to \
+             the stripe meter outbox's delivery policies)"
+        ))));
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM stripe_meter_outbox \
+                         WHERE org_id = $1 AND status = 'pending' AND bucket_start < $2)",
+    )
+    .bind(org_id)
+    .bind(before)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+/// Queue for Stripe whatever of the org's metered usage in `month` is
+/// counted (`org_meter_period_usage`) but not yet in the outbox, and return
+/// the quantity queued, summed over meters. For Stripe billing to call when
+/// an org's subscription goes live mid-month: usage before that was counted
+/// but never queued.
+///
+/// **Contract.**
+///
+/// - `tx` is pinned to the org. It takes the org's ingest lock
+///   ([`crate::usage::lock_org_ingest`]) first, so no ingest batch of the org
+///   runs between the counters it reads and the rows it writes. Call it in
+///   the transaction that makes the subscription live, or in one after it
+///   commits; either way, every event is queued exactly once: an ingest
+///   committed before it is in the counters it reads, and an ingest after it
+///   sees the live subscription and queues its own events.
+/// - **Idempotent.** For each meter it queues the counted quantity minus the
+///   sum of every outbox row of that org and Stripe event name whose hour is
+///   in `month` (any status, any customer: a row that was sent, or lost, was
+///   already queued once). A second call queues nothing.
+/// - It queues for the org's live subscription's customer, and returns `0`
+///   with no live subscription (there is no one to bill).
+/// - `month` must be a period that is still open ([`period::period_closed`]
+///   is false): the current month, or the previous one during its grace. A
+///   closed or future month is refused with an error. (A closed period's
+///   invoice must not grow; and `sent` rows of a month long past may have
+///   been swept, which would make the subtraction above queue them again.)
+/// - The usage is aggregated like ingest's, into the open row of the hour it
+///   is billed in: the current hour for the current month, or the last hour
+///   of the previous month during its grace (inside it, so on that month's
+///   invoice).
+/// - Meters whose key has no Stripe event name are skipped, as ingest skips
+///   them (logged once per meter).
+///
+/// `sent` rows are swept [`KEEP_SENT_DAYS`] after they were sent, which is
+/// longer than any open period has existed, so none a backfill counts can
+/// have been swept.
+pub async fn backfill_period(tx: &mut Tx<'_>, month: Month) -> Result<u64> {
+    crate::usage::lock_org_ingest(tx).await?;
+    let org = tx.org();
+    let now = Utc::now();
+    let current = Month::of(now);
+    let refuse = |why: &str| {
+        Err(Error::Tenant(otto_tenant::Error::Invalid(format!(
+            "cannot backfill {month}: {why}"
+        ))))
+    };
+    if month > current {
+        return refuse("it has not started");
+    }
+    if period::period_closed(month, now) {
+        return refuse("its period has closed");
+    }
+    let bucket = if month == current {
+        period::hour_bucket(now)
+    } else {
+        // The previous month, during its grace: its last hour.
+        match month.offset(1) {
+            Some(next) => period::starts_at(next) - Duration::hours(1),
+            None => return refuse("it has no successor"),
+        }
+    };
+
+    let customer: Option<String> = sqlx::query_scalar(
+        "SELECT stripe_customer_id FROM subscriptions \
+          WHERE org_id = $1 AND stripe_customer_id IS NOT NULL \
+            AND stripe_subscription_id IS NOT NULL AND status = ANY($2::text[])",
+    )
+    .bind(org)
+    .bind(&LIVE_STATUSES[..])
+    .fetch_optional(tx.conn())
+    .await?;
+    let Some(customer) = customer else {
+        return Ok(0);
+    };
+
+    let counted: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT meter, quantity FROM org_meter_period_usage \
+          WHERE org_id = $1 AND period_start = $2 AND quantity > 0 ORDER BY meter",
+    )
+    .bind(org)
+    .bind(month.first_day())
+    .fetch_all(tx.conn())
+    .await?;
+    let (from, to) = (
+        period::starts_at(month),
+        month.offset(1).map(period::starts_at),
+    );
+
+    let mut queued: u64 = 0;
+    for (meter, quantity) in counted {
+        let Some(event_name) = event_name_of(&meter, None) else {
+            continue;
+        };
+        let already: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(value), 0)::bigint FROM stripe_meter_outbox \
+              WHERE org_id = $1 AND event_name = $2 \
+                AND bucket_start >= $3 AND ($4::timestamptz IS NULL OR bucket_start < $4)",
+        )
+        .bind(org)
+        .bind(&event_name)
+        .bind(from)
+        .bind(to)
+        .fetch_one(tx.conn())
+        .await?;
+        let mut missing = quantity.saturating_sub(already);
+        while missing > 0 {
+            let add = missing.min(MAX_ADDITION);
+            sqlx::query(&format!(
+                "INSERT INTO stripe_meter_outbox \
+                   (org_id, event_name, stripe_customer_id, value, bucket_start, next_attempt_at) \
+                 VALUES ($1, $2, $3, $4, $5, $5 + interval '1 hour') \
+                 {}",
+                add_to_open_row()
+            ))
+            .bind(org)
+            .bind(&event_name)
+            .bind(&customer)
+            .bind(add)
+            .bind(bucket)
+            .execute(tx.conn())
+            .await?;
+            missing -= add;
+            // `add` is positive.
+            queued = queued.saturating_add(add.unsigned_abs());
+        }
+    }
+    Ok(queued)
 }
 
 /// The outbox across every org, for an operator.
@@ -813,41 +1105,49 @@ mod tests {
     }
 
     #[test]
-    fn identifiers_fit_stripes_limit() {
-        let longest = "a".repeat(63);
-        assert_eq!(identifier(&longest, Uuid::new_v4()).len(), 100);
+    fn sums_can_never_overflow_a_row() {
+        // Exact as a JSON number (f64), as Stripe reads it.
+        const { assert!(MAX_OUTBOX_VALUE < 1 << 53) };
+        const { assert!(OPEN_ROW_MAX_VALUE + MAX_ADDITION == MAX_OUTBOX_VALUE) };
+        let per_event = i64::try_from(crate::usage::MAX_METER_QUANTITY).unwrap();
+        assert!(per_event <= MAX_ADDITION);
+        // The index predicate repeats the constant (migration 0023 too).
+        assert!(OPEN_ROW.ends_with(&format!("value <= {OPEN_ROW_MAX_VALUE}")));
+        assert!(add_to_open_row().contains(OPEN_ROW));
     }
 
     #[test]
-    fn enqueue_fields_need_a_service_a_meter_a_name_and_a_young_event() {
-        let id = Uuid::new_v4();
+    fn minted_identifiers_fit_stripes_limit() {
+        // `'agg:' || gen_random_uuid()` in migration 0023.
+        assert!(format!("agg:{}", Uuid::new_v4()).len() <= 100);
+    }
+
+    #[test]
+    fn enqueue_needs_a_service_a_meter_a_name_and_a_young_hour() {
         let now = Utc::now();
         let m = |meter| Some(Metered { meter, quantity: 3 });
-        let fields = |service, metered, at| enqueue_fields(service, metered, id, at, now);
+        let name = |service, metered, at| enqueue_event_name(service, metered, at, now);
         assert_eq!(
-            fields(Some("otto-flags"), m("otto-flags/evaluations"), now),
-            Some((
-                "otto_flags__evaluations".to_owned(),
-                format!("otto-flags:{id}")
-            ))
+            name(Some("otto-flags"), m("otto-flags/evaluations"), now),
+            Some("otto_flags__evaluations".to_owned())
         );
-        assert_eq!(fields(Some("otto-flags"), None, now), None);
-        assert_eq!(fields(None, m("otto-flags/evaluations"), now), None);
+        assert_eq!(name(Some("otto-flags"), None, now), None);
+        assert_eq!(name(None, m("otto-flags/evaluations"), now), None);
         // Another service's key, or a key with no Stripe name.
         assert_eq!(
-            fields(Some("otto-cxp"), m("otto-flags/evaluations"), now),
+            name(Some("otto-cxp"), m("otto-flags/evaluations"), now),
             None
         );
         let long = format!("svc/{}", "m".repeat(99));
-        assert_eq!(fields(Some("svc"), m(&long), now), None);
+        assert_eq!(name(Some("svc"), m(&long), now), None);
         // Too old for Stripe already: not queued.
         let old = now - MAX_EVENT_AGE - Duration::minutes(1);
         assert_eq!(
-            fields(Some("otto-flags"), m("otto-flags/evaluations"), old),
+            name(Some("otto-flags"), m("otto-flags/evaluations"), old),
             None
         );
         let young = now - MAX_EVENT_AGE + Duration::minutes(1);
-        assert!(fields(Some("otto-flags"), m("otto-flags/evaluations"), young).is_some());
+        assert!(name(Some("otto-flags"), m("otto-flags/evaluations"), young).is_some());
     }
 
     fn due(attempts: i32) -> DueMeterEvent {
@@ -855,11 +1155,11 @@ mod tests {
         DueMeterEvent {
             id: Uuid::new_v4(),
             org_id: Uuid::new_v4(),
-            identifier: "svc:1".into(),
+            identifier: "agg:1".into(),
             event_name: "svc__calls".into(),
             stripe_customer_id: "cus_1".into(),
             value: 3,
-            occurred_at: now,
+            bucket_start: period::hour_bucket(now),
             attempts,
             window_started_at: None,
             claimed_at: now,
@@ -870,12 +1170,12 @@ mod tests {
     fn keys_follow_the_attempt_and_the_event_never_changes() {
         let a = due(0);
         let b = due(1);
-        assert_eq!(a.idempotency_key().unwrap().as_str(), "otto-mev-svc:1-1");
-        assert_eq!(b.idempotency_key().unwrap().as_str(), "otto-mev-svc:1-2");
+        assert_eq!(a.idempotency_key().unwrap().as_str(), "otto-mev-agg:1-1");
+        assert_eq!(b.idempotency_key().unwrap().as_str(), "otto-mev-agg:1-2");
         let e = a.meter_event();
         assert_eq!(
             (e.identifier.as_str(), e.value, e.timestamp),
-            ("svc:1", 3, a.occurred_at)
+            ("agg:1", 3, a.bucket_start)
         );
     }
 
@@ -884,14 +1184,14 @@ mod tests {
         let ok = due(0);
         assert_eq!(ok.expired_before_send(), None);
         let mut old = due(0);
-        old.occurred_at = old.claimed_at - Duration::days(40);
+        old.bucket_start = old.claimed_at - Duration::days(40);
         assert!(old.expired_before_send().is_some());
         let mut late = due(3);
         late.window_started_at = Some(late.claimed_at - Duration::hours(13));
         assert!(late.expired_before_send().is_some());
         // No window yet (only definite failures so far): bounded by age only.
         let mut never_received = due(30);
-        never_received.occurred_at = never_received.claimed_at - Duration::days(3);
+        never_received.bucket_start = never_received.claimed_at - Duration::days(3);
         assert_eq!(never_received.expired_before_send(), None);
     }
 

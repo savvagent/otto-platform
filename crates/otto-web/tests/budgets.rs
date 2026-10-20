@@ -7,6 +7,7 @@ mod common;
 use chrono::Utc;
 use common::{add_member, onboard, org_with_owner, Call, Harness};
 use http::StatusCode;
+use otto_billing::budgets::PendingBudgets;
 use otto_billing::usage::{Metered, ShippedUsage, UsageExt};
 use otto_core::orgs::Role;
 use otto_tenant::ids::OrgId;
@@ -66,7 +67,8 @@ async fn harness(pool: PgPool) -> Harness {
 /// Ingest `quantity` of `meter` for `org`, as the platform's ingest does.
 async fn ingest(h: &Harness, org: OrgId, uri: &str, service: &str, meter: &str, quantity: i64) {
     let mut tx = h.db.begin(org).await.unwrap();
-    tx.ingest_usage(
+    let mut budgets = PendingBudgets::default();
+    tx.ingest_usage_deferred(
         uri,
         &ShippedUsage {
             event_id: Uuid::new_v4(),
@@ -77,9 +79,11 @@ async fn ingest(h: &Harness, org: OrgId, uri: &str, service: &str, meter: &str, 
             service: Some(service),
             metered: Some(Metered { meter, quantity }),
         },
+        &mut budgets,
     )
     .await
     .unwrap();
+    budgets.run(&mut tx).await.unwrap();
     tx.commit().await.unwrap();
 }
 
@@ -454,7 +458,13 @@ async fn spend_thresholds_and_the_usage_page_are_per_service(pool: PgPool) {
             "spendCents": 1050,
             "spendError": null,
             "budget": usage.body["services"][0]["budget"].clone(),
+            // No subscription, and spend past zero: add a card.
+            "paymentRequired": true,
         })
+    );
+    assert_eq!(
+        usage.body["hardStop"], false,
+        "the legacy flag is never served, as in /internal"
     );
     assert_eq!(usage.body["services"][0]["budget"]["percentUsed"], 105);
     assert_eq!(usage.body["services"][0]["budget"]["blocked"], true);
@@ -465,6 +475,29 @@ async fn spend_thresholds_and_the_usage_page_are_per_service(pool: PgPool) {
     );
     assert_eq!(usage.body["services"][1]["spendCents"], 0);
     assert_eq!(usage.body["services"][1]["budget"]["blocked"], false);
+    assert_eq!(
+        usage.body["services"][1]["paymentRequired"], false,
+        "free usage never needs a card"
+    );
+
+    // A live subscription: nothing needs a card.
+    sqlx::query(
+        "INSERT INTO subscriptions (org_id, stripe_customer_id, stripe_subscription_id, status) \
+         VALUES ($1, 'cus_acme', 'sub_acme', 'active') \
+         ON CONFLICT (org_id) DO UPDATE SET stripe_customer_id = 'cus_acme', \
+           stripe_subscription_id = 'sub_acme', status = 'active'",
+    )
+    .bind(org)
+    .execute(h.db.pool())
+    .await
+    .unwrap();
+    let usage = Call::get("/api/orgs/acme/usage")
+        .with_session(&owner.session)
+        .send(&h.router)
+        .await;
+    usage.expect(StatusCode::OK);
+    assert_eq!(usage.body["services"][0]["paymentRequired"], false);
+    assert_eq!(usage.body["services"][1]["paymentRequired"], false);
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
@@ -550,6 +583,10 @@ async fn a_pricing_fault_degrades_only_its_own_service(pool: PgPool) {
     assert_eq!(widgets["meters"][0]["quantity"], 5);
     assert_eq!(widgets["spendCents"], Value::Null);
     assert_eq!(widgets["spendError"], "pricing_unavailable");
+    assert_eq!(
+        widgets["paymentRequired"], false,
+        "unknown spend never needs a card"
+    );
     assert_eq!(widgets["budget"]["percentUsed"], Value::Null);
     assert_eq!(
         widgets["budget"]["blocked"], false,

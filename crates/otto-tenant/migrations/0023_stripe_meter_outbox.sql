@@ -1,26 +1,46 @@
 -- Metered usage to Stripe meter events (savvagent/otto-platform#64, epic #55).
 --
--- Usage ingest (`otto_billing::usage`) writes one row here for every accepted
--- metered event of an org with a live Stripe subscription, in the same
+-- Usage ingest (`otto_billing::usage`) adds every accepted metered event of an
+-- org with a live Stripe subscription to an outbox row here, in the same
 -- statement that counts the event, so the row commits or aborts with the
 -- usage it bills. The server's shipper loop (`stripe_shipper`, only when
 -- billing is enabled) sends each row to Stripe as one meter event and records
 -- the outcome; the SQL it needs is `otto_billing::stripe_outbox`.
 --
--- Every parameter of the meter event is fixed at enqueue and never changes,
--- so a retry sends exactly what the first attempt sent:
+-- AGGREGATED. A row is not one usage event but the sum of many: ingest adds
+-- an event's quantity to the org's OPEN row for (event_name,
+-- stripe_customer_id, bucket_start), creating it if there is none
+-- (`INSERT ... ON CONFLICT ... DO UPDATE SET value = value + EXCLUDED.value`
+-- against `stripe_meter_outbox_open_idx`). A row is open while it is pending,
+-- has never been claimed (`attempts = 0 AND sending_since IS NULL`) and is
+-- not full (`value <= 500000000000000`, `stripe_outbox::OPEN_ROW_MAX_VALUE`).
+-- The first claim closes it for good: from then on its value, and every other
+-- parameter of its meter event, is fixed, so every retry sends exactly what
+-- the first attempt sent, and an event counted after the claim opens a new
+-- row. Replays never reach here: ingest's ledger claim (`claim_usage_event`)
+-- refuses an event already counted before this statement runs.
 --
---   identifier          `<service>:<event_id>`. Resource servers mint event
---                       ids, which are unique only per server, so the service
---                       slug is part of it. Stripe dedupes meter events on it
---                       for at least 24 hours. At most 63 + 1 + 36 = 100
---                       characters, Stripe's limit.
+--   identifier          `agg:<uuid>`, minted when the row is created (40
+--                       characters; Stripe's limit is 100). Stripe dedupes
+--                       meter events on it for at least 24 hours.
 --   event_name          `otto_billing::stripe::meter_event_name` of the meter.
---   stripe_customer_id  the org's customer when the event was ingested. If the
+--   stripe_customer_id  the org's customer when the usage was ingested. If the
 --                       org's customer later changes, the row keeps the one
 --                       whose live subscription the usage accrued under.
---   value               the event's quantity.
---   occurred_at         when the work happened, as ingest counted it.
+--   value               the sum of the quantities added, 1 to 10^15
+--                       (`stripe_outbox::MAX_OUTBOX_VALUE`; exact as a JSON
+--                       number). A row stops taking additions once past half
+--                       of that, and one addition is at most the other half,
+--                       so a sum can never overflow the check, and ingest can
+--                       never fail on it.
+--   bucket_start        the start of the UTC hour holding the instant the
+--                       usage was billed at (`otto_billing::period`): the
+--                       meter event's timestamp. Every event in a row lies in
+--                       that hour, so in the same UTC month as the timestamp.
+--
+-- A row is first due when its hour has ended (`next_attempt_at` starts at
+-- `bucket_start + 1 hour`), so a busy org and meter sends one meter event per
+-- hour rather than one per event.
 --
 -- `status` is a closed vocabulary:
 --   pending   waiting to be sent (or being sent, under a claim lease)
@@ -36,11 +56,13 @@
 -- meter events asynchronously and reports failures as separate events.
 --
 -- A row is only sent once its `event_name` has a Stripe meter (`stripe_meters`,
--- written by `stripe sync`); until then it waits, and expires by age only.
+-- written by `stripe sync`); until then it waits (and stays open), and
+-- expires by age only.
 -- Deleting an org deletes its rows, shipped or not.
 -- `rejected` and `expired` rows are revenue that did not reach Stripe. They
 -- are kept with `last_error` for an operator, never swept, and logged at
--- error level when they happen.
+-- error level when they happen. `sent` rows are swept in bounded batches
+-- through `stripe_meter_outbox_sent_idx`.
 --
 -- TENANT-scoped, with the standard `<table>_tenant_isolation` policy, so a
 -- pinned transaction (ingest) writes and sees its own org's rows only. The
@@ -49,25 +71,26 @@
 -- only when no org is pinned AND the transaction opted in with
 -- `set_config('app.stripe_meter_delivery', 'on', true)`, which only
 -- `otto_billing::stripe_outbox`'s delivery functions do. There is no delivery
--- INSERT policy: rows are only ever created by a pinned ingest transaction.
+-- INSERT policy: rows are only ever created by a pinned transaction.
 
 CREATE TABLE stripe_meter_outbox (
   id                 uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
   org_id             uuid        NOT NULL REFERENCES orgs (id) ON DELETE CASCADE,
-  identifier         text        NOT NULL,
+  identifier         text        NOT NULL DEFAULT ('agg:' || gen_random_uuid()::text),
   event_name         text        NOT NULL,
   stripe_customer_id text        NOT NULL,
   value              bigint      NOT NULL,
-  occurred_at        timestamptz NOT NULL,
+  bucket_start       timestamptz NOT NULL,
   status             text        NOT NULL DEFAULT 'pending',
   attempts           integer     NOT NULL DEFAULT 0,
-  -- Next time the shipper may pick this row up. Also the claim lease: claiming
-  -- pushes it forward, so two machines never send the same row at once.
+  -- Next time the shipper may pick this row up: the end of its hour at first
+  -- (ingest sets it), then the backoff. Also the claim lease: claiming pushes
+  -- it forward, so two machines never send the same row at once.
   next_attempt_at    timestamptz NOT NULL DEFAULT now(),
   -- When the first attempt Stripe may have received started (a timeout, a
   -- 5xx, or an answer that was never recorded). The retry window is measured
   -- from it. Definite refusals before processing (401, 403, 429) leave it
-  -- unset, so they are bounded by the event's age alone.
+  -- unset, so they are bounded by the row's age (its hour) alone.
   window_started_at  timestamptz,
   -- Set by a claim, cleared when the attempt's result is recorded. A claim
   -- that finds it still set knows the previous attempt's answer was lost, and
@@ -87,8 +110,11 @@ CREATE TABLE stripe_meter_outbox (
     CHECK (char_length(event_name) BETWEEN 1 AND 100),
   CONSTRAINT stripe_meter_outbox_customer_len
     CHECK (char_length(stripe_customer_id) BETWEEN 1 AND 255),
-  -- `otto_billing::usage::MAX_METER_QUANTITY`, as 0019's CHECK.
-  CONSTRAINT stripe_meter_outbox_value_range CHECK (value BETWEEN 1 AND 1000000000),
+  -- `otto_billing::stripe_outbox::MAX_OUTBOX_VALUE`: a sum of quantities.
+  CONSTRAINT stripe_meter_outbox_value_range CHECK (value BETWEEN 1 AND 1000000000000000),
+  -- A whole UTC hour (epoch seconds are UTC, whatever the session's zone).
+  CONSTRAINT stripe_meter_outbox_bucket_hour
+    CHECK (extract(epoch FROM bucket_start) % 3600 = 0),
   CONSTRAINT stripe_meter_outbox_status
     CHECK (status IN ('pending', 'sent', 'rejected', 'expired')),
   CONSTRAINT stripe_meter_outbox_finished
@@ -98,7 +124,20 @@ CREATE TABLE stripe_meter_outbox (
 CREATE INDEX stripe_meter_outbox_due_idx
   ON stripe_meter_outbox (next_attempt_at) WHERE status = 'pending';
 
-CREATE INDEX stripe_meter_outbox_org_idx ON stripe_meter_outbox (org_id, created_at);
+-- The one open row per org, meter event name, customer and hour that ingest
+-- adds to. Its predicate is repeated verbatim by the ON CONFLICT clauses in
+-- `otto_billing::usage` and `otto_billing::stripe_outbox` (a test checks it).
+CREATE UNIQUE INDEX stripe_meter_outbox_open_idx
+  ON stripe_meter_outbox (org_id, event_name, stripe_customer_id, bucket_start)
+  WHERE status = 'pending' AND attempts = 0 AND sending_since IS NULL
+    AND value <= 500000000000000;
+
+-- The sweep's: sent rows by age, deleted in bounded batches.
+CREATE INDEX stripe_meter_outbox_sent_idx
+  ON stripe_meter_outbox (finished_at) WHERE status = 'sent';
+
+-- Deleting an org (ON DELETE CASCADE), and one org's rows.
+CREATE INDEX stripe_meter_outbox_org_idx ON stripe_meter_outbox (org_id);
 
 ALTER TABLE stripe_meter_outbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE stripe_meter_outbox FORCE ROW LEVEL SECURITY;

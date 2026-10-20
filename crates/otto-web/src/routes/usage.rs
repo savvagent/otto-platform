@@ -15,13 +15,14 @@
 //! *why* it has run out.
 
 use axum::extract::{Json, State};
+use otto_billing::billing;
 use otto_billing::budgets;
 use otto_billing::pricebook::Month;
 use otto_billing::usage::{MeterPeriodUsage, PeriodUsage, PlanLimits, UsageExt};
 use otto_tenant::audit::AuditEvent;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::routes::budgets::{from_budgets, spend_error, BudgetView};
 use crate::session::OrgCtx;
 use crate::state::AppState;
@@ -47,8 +48,9 @@ pub struct UsageStatus {
     /// True once the org has used four fifths of its bucket. Worth surfacing to
     /// a human.
     pub warning: bool,
-    /// Whether exceeding the bucket stops billable work rather than metering
-    /// overage.
+    /// **Deprecated**, always `false`, as `/internal/.../usage-status` serves
+    /// it: the family-wide bucket never stops work. A service's own budget
+    /// hard stop is `services[].budget.hardStop`.
     pub hard_stop: bool,
     /// Whether the resource servers are currently refusing calls over the
     /// bucket at all. See [`crate::state::Config::enforce_quotas`].
@@ -74,6 +76,11 @@ pub struct ServiceUsage {
     pub spend_error: Option<&'static str>,
     /// `None` when no budget is set.
     pub budget: Option<BudgetView>,
+    /// Whether the service is refusing billable calls until the org adds a
+    /// payment method: the org has no live subscription, and the service's
+    /// spend this month is above zero (past its free tiers). Never with
+    /// unknown spend.
+    pub payment_required: bool,
 }
 
 /// One meter's quantity this month.
@@ -116,6 +123,8 @@ impl UsageStatus {
         } else {
             usage.billable_count as f64 >= limits.included_ops as f64 * WARN_AT
         };
+        // `limits.hard_stop` (the plan's flag) is deliberately not served:
+        // see the field.
         Self {
             plan: limits.display_name,
             included_ops: limits.included_ops,
@@ -127,7 +136,7 @@ impl UsageStatus {
             total_calls: usage.total_count,
             period_start: usage.period_start,
             warning,
-            hard_stop: limits.hard_stop,
+            hard_stop: false,
             enforced,
             services,
         }
@@ -145,10 +154,15 @@ pub async fn get_usage(State(state): State<AppState>, ctx: OrgCtx) -> ApiResult<
     let statuses = budgets::org_status(&mut tx, period)
         .await
         .map_err(|e| from_budgets("read service usage", e))?;
+    let live = billing::live_subscription(&mut tx)
+        .await
+        .map_err(|e| ApiError::internal("read the org's subscription", e))?
+        .is_some();
     let mut services = Vec::with_capacity(statuses.len());
     for status in statuses {
         let meters = tx.service_meter_usage(&status.service).await?;
         services.push(ServiceUsage {
+            payment_required: status.payment_required(live),
             budget: BudgetView::of(&status),
             spend_error: spend_error(&status),
             meters: meters.into_iter().map(Into::into).collect(),
@@ -236,6 +250,11 @@ mod tests {
     fn the_warning_starts_at_four_fifths() {
         assert!(!status(399, 500).warning);
         assert!(status(400, 500).warning);
+    }
+
+    #[test]
+    fn the_legacy_hard_stop_is_never_served() {
+        assert!(!status(900, 500).hard_stop, "the plan's own flag is true");
     }
 
     #[test]

@@ -233,15 +233,36 @@ pub struct UsageStatus {
     pub meters: Vec<MeterUsage>,
     /// The calling service's monthly budget and where its spend stands
     /// against it. `None` when the org has set no budget for this service, or
-    /// from an older platform. Read [`budget_exceeded`](Self::budget_exceeded)
-    /// to decide whether to refuse a billable call.
+    /// from an older platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetStatus>,
+    /// Why the calling service must refuse billable calls now, or `None`
+    /// when it need not (and from an older platform):
+    ///
+    /// - [`BUDGET_EXCEEDED`]: the org's hard stop for this service is on and
+    ///   its spend has reached its budget (as [`budget_exceeded`](Self::budget_exceeded));
+    /// - [`PAYMENT_REQUIRED`]: the org has no live subscription (no card on
+    ///   file), and this service's spend this month is above zero, that is,
+    ///   past whatever its free tiers include.
+    ///
+    /// The budget wins when both apply. Read
+    /// [`billable_blocked`](Self::billable_blocked) to decide whether to
+    /// refuse a billable call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
 }
 
-/// The reason [`BudgetStatus::reason`] gives when the calling service's hard
-/// stop has refused billable work, and the error code a resource server
-/// should refuse a billable call with.
+/// The [`UsageStatus::blocked_reason`] of an org with no live subscription
+/// (no card on file) whose usage of the calling service this month is past
+/// its free tiers, and the error code a resource server should refuse a
+/// billable call with: the org must add a payment method in the console.
+/// Spend is zero while no price is set, so no org is refused for this until
+/// prices exist.
+pub const PAYMENT_REQUIRED: &str = "payment_required";
+
+/// The reason [`BudgetStatus::reason`] and [`UsageStatus::blocked_reason`]
+/// give when the calling service's hard stop has refused billable work, and
+/// the error code a resource server should refuse a billable call with.
 pub const BUDGET_EXCEEDED: &str = "budget_exceeded";
 
 /// The reason [`BudgetStatus::reason`] gives when the platform could not
@@ -358,8 +379,42 @@ impl UsageStatus {
     /// Whether the calling service's budget hard stop refuses billable calls
     /// now. `false` with no budget, when spend is unknown, and from a
     /// platform that sends none: see [`BudgetStatus`] on failing open.
+    /// [`billable_blocked`](Self::billable_blocked) covers this and every
+    /// other reason to refuse.
     pub fn budget_exceeded(&self) -> bool {
         self.budget.as_ref().is_some_and(|b| b.blocked)
+    }
+
+    /// Whether the calling service must refuse billable calls now, for any
+    /// reason: [`blocked_reason`](Self::blocked_reason) is set
+    /// ([`BUDGET_EXCEEDED`] or [`PAYMENT_REQUIRED`], refuse with that code),
+    /// or the budget's hard stop says so (a platform that predates
+    /// `blocked_reason`). Free calls are never refused, and reading usage is
+    /// always free.
+    ///
+    /// **Enforcement fails open.** The platform never refuses usage itself;
+    /// a resource server that cannot reach it, or gets an answer without
+    /// these fields, treats the service as not blocked.
+    ///
+    /// ```
+    /// let body = serde_json::json!({
+    ///     "org_id": "8b5c6f8e-6a43-4f53-9a49-0f1f7a1d2b3c",
+    ///     "plan": "free",
+    ///     "period_start": "2026-10-01",
+    ///     "billable_count": 0,
+    ///     "total_count": 0,
+    ///     "included_ops": 500,
+    ///     "hard_stop": false,
+    ///     "service": "otto-flags",
+    ///     "blocked_reason": "payment_required"
+    /// });
+    /// let status: otto_resource::UsageStatus = serde_json::from_value(body).unwrap();
+    /// assert!(status.billable_blocked());
+    /// assert!(!status.budget_exceeded());
+    /// assert_eq!(status.blocked_reason.as_deref(), Some(otto_resource::PAYMENT_REQUIRED));
+    /// ```
+    pub fn billable_blocked(&self) -> bool {
+        self.blocked_reason.is_some() || self.budget_exceeded()
     }
 
     /// This month's usage of one of the caller's meters, by key.
@@ -426,7 +481,10 @@ pub struct UsageEvent {
     /// Feeds the legacy family-wide counters and this service's billable
     /// count. A metered event's quantity counts whatever this says.
     pub billable: bool,
-    /// When the work happened (decides the billing month).
+    /// When the work happened, which decides the billing month while that
+    /// month is open. A month closes 2 hours into the next UTC month; an
+    /// event that arrives later is still accepted, and billed in the month it
+    /// arrived in. Ship promptly.
     pub occurred_at: DateTime<Utc>,
     /// The shipping resource server's service slug. Optional: the platform
     /// knows who is calling, and only checks that this, when sent, matches.
@@ -470,7 +528,9 @@ pub struct RejectedEvent {
 /// can delete the whole batch from its outbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageReceipt {
-    /// Newly counted.
+    /// Newly counted. Includes **late** events: an event whose billing month
+    /// had already closed when it arrived (2 hours into the next UTC month)
+    /// is still accepted, and counted in the month it arrived in.
     pub accepted: u32,
     /// Already counted by an earlier call; nothing changed.
     pub duplicates: u32,
