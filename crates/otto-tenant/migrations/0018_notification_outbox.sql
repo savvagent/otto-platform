@@ -17,8 +17,8 @@
 -- (local development, `#[sqlx::test]`, the current Fly deployment) RLS does not
 -- apply to it at all. Where it is the non-exempt schema owner (managed
 -- Postgres), FORCE ROW LEVEL SECURITY applies the tenant policy, which is
--- never true unpinned, and the task would see nothing. The second policy below
--- is what lets it work there. It admits a row only when BOTH
+-- never true unpinned, and the task would see nothing. The delivery policies below
+-- are what let it work there. It admits a row only when BOTH
 --
 --   * no org is pinned (`current_org()` IS NULL), so a tenant transaction can
 --     never use it, whatever else it sets; and
@@ -71,12 +71,19 @@ ALTER TABLE notification_outbox FORCE ROW LEVEL SECURITY;
 CREATE POLICY notification_outbox_tenant_isolation ON notification_outbox
   USING (org_id = current_org()) WITH CHECK (org_id = current_org());
 
-CREATE POLICY notification_outbox_delivery ON notification_outbox
-  USING (
-    current_org() IS NULL
-    AND current_setting('app.notification_delivery', true) = 'on'
-  )
-  WITH CHECK (
-    current_org() IS NULL
-    AND current_setting('app.notification_delivery', true) = 'on'
-  );
+-- One policy per command, and none for INSERT: an opted-in unpinned
+-- transaction may read, update, and delete rows across orgs, but cannot
+-- create one for any org. Rows are only ever created by a pinned transaction,
+-- through the tenant policy above.
+CREATE POLICY notification_outbox_delivery_select ON notification_outbox
+  FOR SELECT
+  USING (current_org() IS NULL AND current_setting('app.notification_delivery', true) = 'on');
+
+CREATE POLICY notification_outbox_delivery_update ON notification_outbox
+  FOR UPDATE
+  USING (current_org() IS NULL AND current_setting('app.notification_delivery', true) = 'on')
+  WITH CHECK (current_org() IS NULL AND current_setting('app.notification_delivery', true) = 'on');
+
+CREATE POLICY notification_outbox_delivery_delete ON notification_outbox
+  FOR DELETE
+  USING (current_org() IS NULL AND current_setting('app.notification_delivery', true) = 'on');

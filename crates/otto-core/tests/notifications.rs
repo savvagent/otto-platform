@@ -255,3 +255,119 @@ async fn failures_back_off_and_give_up_after_the_budget(pool: PgPool) {
     );
     assert!(notifications::claim_due(&db, 10).await.unwrap().is_empty());
 }
+
+/// The real delivery functions, on a pool whose every connection runs as
+/// `otto_app` (neither owner nor superuser), so FORCE ROW LEVEL SECURITY and
+/// the delivery policies are what decide, exactly as for a schema-owner
+/// connection on managed Postgres.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn delivery_works_across_orgs_under_row_level_security(pool: PgPool) {
+    let owner = db(pool.clone());
+    let mut ids = Vec::new();
+    for slug in ["acme", "globex", "initech"] {
+        let t = tenant(&owner, slug).await;
+        let mut tx = owner.begin(t.org).await.unwrap();
+        ids.push(
+            notifications::enqueue_email(&mut tx, "owner@x.test", "s", "b")
+                .await
+                .unwrap(),
+        );
+        tx.commit().await.unwrap();
+    }
+    // Old enough to sweep once finished.
+    sqlx::query("UPDATE notification_outbox SET created_at = now() - interval '30 days'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let restricted = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE otto_app").execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let who: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&restricted)
+        .await
+        .unwrap();
+    assert_eq!(who, "otto_app");
+    let app = Db::from_pool(restricted.clone());
+
+    let mut due = notifications::claim_due(&app, 10).await.unwrap();
+    due.sort_by_key(|d| ids.iter().position(|i| *i == d.id));
+    assert_eq!(
+        due.iter().map(|d| d.id).collect::<Vec<_>>(),
+        ids,
+        "every org's row is claimed"
+    );
+
+    notifications::mark_sent(&app, due[0].id).await.unwrap();
+    assert!(
+        !notifications::mark_attempt_failed(&app, &due[1], "smtp: 451", false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        notifications::mark_attempt_failed(&app, &due[2], "smtp: 550", true)
+            .await
+            .unwrap()
+    );
+
+    let states: Vec<(bool, bool, i32)> = sqlx::query_as(
+        "SELECT sent_at IS NOT NULL, failed_at IS NOT NULL, attempts \
+           FROM notification_outbox WHERE id = ANY($1) ORDER BY array_position($1, id)",
+    )
+    .bind(&ids)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        states,
+        vec![(true, false, 1), (false, false, 1), (false, true, 1)]
+    );
+
+    // A finished row is final: a late duplicate result does not touch it.
+    notifications::mark_attempt_failed(&app, &due[0], "late", false)
+        .await
+        .unwrap();
+    let sent_err: Option<String> =
+        sqlx::query_scalar("SELECT last_error FROM notification_outbox WHERE id = $1")
+            .bind(ids[0])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(sent_err, None);
+
+    // Sweep removes the sent and the failed row, never the queued one.
+    assert_eq!(notifications::sweep(&app, 14).await.unwrap(), 2);
+    let left: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM notification_outbox")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, vec![ids[1]]);
+
+    // Opted in and unpinned, it still cannot create a row for any org.
+    let mut tx = restricted.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.notification_delivery', 'on', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let org: uuid::Uuid = sqlx::query_scalar("SELECT id FROM orgs LIMIT 1")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let err = sqlx::query(
+        "INSERT INTO notification_outbox (org_id, recipient, subject, body_text) \
+         VALUES ($1, 'x@y.test', 's', 'b')",
+    )
+    .bind(org)
+    .execute(&mut *tx)
+    .await
+    .expect_err("an unpinned insert was admitted");
+    assert!(err.to_string().contains("row-level security"), "{err}");
+}

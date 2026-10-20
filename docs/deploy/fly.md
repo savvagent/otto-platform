@@ -40,6 +40,39 @@ fly secrets set -a otto-platform \
   OTTO_EMAIL_FROM='otto <alerts@savvagent.com>'
 ```
 
+**Turning email on sends the backlog.** With the secrets unset, every notification is kept
+in `notification_outbox`, never dropped. Setting them makes the next release send all of it,
+oldest first, including alerts that are long out of date. To start clean instead, mark the
+backlog failed before setting the secrets:
+
+```sql
+SET app.notification_delivery = 'on';  -- needed only if the role is not a superuser
+UPDATE notification_outbox
+   SET failed_at = now(), last_error = 'discarded: queued before email was enabled'
+ WHERE sent_at IS NULL AND failed_at IS NULL;
+```
+
+**Wrong credentials.** A rejected SMTP login logs one `error` ("the SMTP server rejected
+our credentials") and keeps every message queued, retrying with backoff for about a day
+(32 attempts). Fix `OTTO_SMTP_URL` within that window and nothing is lost. A message the
+server refuses outright (`550 no such user`) is given up at once.
+
+**Re-queueing failed messages.** Rows that ran out of attempts stay with `failed_at` and
+`last_error` set. After fixing the cause, connect (`fly postgres connect -a otto-db -d
+otto_platform`) and put them back in the queue. Narrow the `WHERE` to what you mean to
+resend, by age or by error:
+
+```sql
+SET app.notification_delivery = 'on';  -- needed only if the role is not a superuser
+UPDATE notification_outbox
+   SET failed_at = NULL, attempts = 0, next_attempt_at = now()
+ WHERE failed_at IS NOT NULL
+   AND sent_at IS NULL
+   AND created_at > now() - interval '2 days'
+   -- AND last_error LIKE 'smtp: permanent error (535)%'
+;
+```
+
 ## The hostname
 
 DNS is at Namecheap and stays there.

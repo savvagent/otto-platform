@@ -36,10 +36,11 @@ use uuid::Uuid;
 use crate::error::{Error, Result};
 
 /// Send attempts before a row is given up on and marked failed. With
-/// [`crate::lifecycle::backoff_seconds`] (10 s doubling to an hour) this spans
-/// a little over three hours, long enough to ride out an SMTP provider's bad
-/// afternoon; an alert older than that is stale anyway.
-pub const MAX_ATTEMPTS: i32 = 10;
+/// [`crate::lifecycle::backoff_seconds`] (10 s doubling to an hour) the 31
+/// waits between the 32 attempts add up to 84 310 s, about 23.4 hours: a
+/// provider outage or a credentials fix within a day loses nothing.
+/// `retry_window_is_about_a_day` computes it from the constants.
+pub const MAX_ATTEMPTS: i32 = 32;
 
 /// How long a claimed row is invisible to other delivery tasks. Comfortably
 /// longer than the delivery task's SMTP timeout, so a slow send is not picked
@@ -232,7 +233,7 @@ pub async fn mark_sent(db: &Db, id: Uuid) -> Result<()> {
     sqlx::query(
         "UPDATE notification_outbox \
             SET sent_at = now(), attempts = attempts + 1, last_error = NULL \
-          WHERE id = $1",
+          WHERE id = $1 AND sent_at IS NULL AND failed_at IS NULL",
     )
     .bind(id)
     .execute(tx.conn())
@@ -243,7 +244,12 @@ pub async fn mark_sent(db: &Db, id: Uuid) -> Result<()> {
 
 /// Record a failed attempt and schedule the retry, or give up when
 /// [`MAX_ATTEMPTS`] is spent or the failure is `permanent` (the server refused
-/// the recipient outright; asking again will not change its mind).
+/// this recipient or message for good, e.g. `550 no such user`; asking again
+/// will not change its mind). A failure that is about the sender rather than
+/// the message, such as rejected SMTP credentials, must not be `permanent`:
+/// it would discard every queued email instead of waiting for the fix.
+///
+/// A row already sent or given up on is left alone.
 ///
 /// `error` is stored as given and shown to operators: the caller is
 /// responsible for it holding no secret. Returns `true` if the row was given
@@ -263,7 +269,7 @@ pub async fn mark_attempt_failed(
                 last_error = $3, \
                 next_attempt_at = now() + make_interval(secs => $4), \
                 failed_at = CASE WHEN $5 THEN now() END \
-          WHERE id = $1",
+          WHERE id = $1 AND sent_at IS NULL AND failed_at IS NULL",
     )
     .bind(email.id)
     .bind(attempts)
@@ -296,6 +302,15 @@ pub async fn sweep(db: &Db, keep_days: i32) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_window_is_about_a_day() {
+        let window: i64 = (1..MAX_ATTEMPTS)
+            .map(crate::lifecycle::backoff_seconds)
+            .sum();
+        assert_eq!(window, 84_310, "update MAX_ATTEMPTS' doc comment");
+        assert!((20 * 3600..=26 * 3600).contains(&window), "{window} s");
+    }
 
     #[test]
     fn ordinary_addresses_are_accepted() {

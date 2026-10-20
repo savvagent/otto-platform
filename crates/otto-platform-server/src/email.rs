@@ -5,8 +5,12 @@
 //! [`run`] is a polling loop shaped like [`crate::webhooks::run`]: claim due
 //! rows across every org, send each through a [`Mailer`], record the result. A
 //! failure is retried with exponential backoff (10 s doubling to an hour) for
-//! [`otto_core::notifications::MAX_ATTEMPTS`] attempts, then left in the table
-//! marked failed with the last error, for an operator to read. Claims carry a
+//! [`otto_core::notifications::MAX_ATTEMPTS`] attempts (about a day), then
+//! left in the table marked failed with the last error, for an operator to
+//! read. A refusal the server calls permanent (5xx on the recipient or the
+//! message, e.g. `550 no such user`) is given up at once; an authentication
+//! refusal is not, because it is a fault in our configuration rather than in
+//! the message, and giving up would discard every queued alert. Claims carry a
 //! lease, so running this task in every replica is safe. Delivery is
 //! at-least-once: a send that succeeds but cannot be recorded is sent again
 //! after the lease lapses.
@@ -21,10 +25,11 @@
 //! the password in both their raw and percent-decoded forms.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use futures::future::join_all;
+use futures::StreamExt;
 use lettre::message::header::ContentType;
 use lettre::message::Mailbox;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -35,12 +40,29 @@ use tokio::sync::watch;
 
 use crate::config::EmailConfig;
 
-const BATCH: i64 = 20;
+/// Rows claimed per pass. Small on purpose: every claimed row's lease starts
+/// at the claim, so the whole pass must finish inside it (asserted below).
+const BATCH: i64 = 8;
+/// SMTP conversations in flight at once per pass. A provider throttles a
+/// burst of parallel connections long before it minds a short queue.
+const CONCURRENCY: usize = 4;
 const POLL: Duration = Duration::from_secs(5);
-/// Per SMTP conversation. Well inside
-/// [`otto_core::notifications::CLAIM_LEASE_SECONDS`], so a slow server cannot
-/// let a claimed row be claimed again mid-send.
-const SMTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// lettre's own timeout bounds only the TCP connect; the TLS handshake and
+/// every command and reply after it are unbounded in its async transport.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The whole send, connect to final reply. Without it a server that accepts
+/// the connection and then says nothing stalls the pass for every org, lets
+/// the claim lease lapse so another replica sends the same row, and hangs
+/// shutdown.
+pub const SEND_DEADLINE: Duration = Duration::from_secs(30);
+/// The slowest possible pass (every send hitting [`SEND_DEADLINE`], in
+/// `BATCH / CONCURRENCY` waves) takes at most half of
+/// [`otto_core::notifications::CLAIM_LEASE_SECONDS`], so no row is claimed
+/// again by another replica while its send is still running.
+const _: () = assert!(
+    (BATCH as u64).div_ceil(CONCURRENCY as u64) * SEND_DEADLINE.as_secs() * 2
+        <= otto_core::notifications::CLAIM_LEASE_SECONDS as u64
+);
 const SWEEP_EVERY: Duration = Duration::from_secs(3600);
 /// Finished rows are kept this long so an operator can still see them.
 const KEEP_DAYS: i32 = 14;
@@ -83,6 +105,7 @@ impl SendError {
         }
     }
 
+    /// Never retried: the server refused this message or recipient for good.
     pub fn permanent(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -110,6 +133,11 @@ pub struct SmtpMailer {
     /// Strings that must never appear in an error we hand out, longest first
     /// so a password containing the username is removed whole.
     secrets: Vec<String>,
+    deadline: Duration,
+    /// Set once an authentication refusal has been logged at `error`, so wrong
+    /// credentials say so loudly once rather than once per queued message.
+    /// Cleared by a successful send, so a later regression is reported again.
+    auth_reported: AtomicBool,
 }
 
 impl std::fmt::Debug for SmtpMailer {
@@ -124,7 +152,7 @@ impl SmtpMailer {
     pub fn new(config: &EmailConfig) -> Result<Self> {
         let transport = AsyncSmtpTransport::<Tokio1Executor>::from_url(&config.smtp_url)
             .map_err(|_| anyhow!("OTTO_SMTP_URL is not a URL the SMTP client accepts"))?
-            .timeout(Some(SMTP_TIMEOUT))
+            .timeout(Some(CONNECT_TIMEOUT))
             .build();
         let from = config
             .from
@@ -134,7 +162,34 @@ impl SmtpMailer {
             transport,
             from,
             secrets: secrets_of(&config.smtp_url),
+            deadline: SEND_DEADLINE,
+            auth_reported: AtomicBool::new(false),
         })
+    }
+
+    /// Override [`SEND_DEADLINE`], for tests that cannot wait a minute.
+    pub fn with_send_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    fn classify(&self, e: &lettre::transport::smtp::Error) -> SendError {
+        let message = self.redact(&format!("smtp: {e}"));
+        if is_auth_refusal(e) {
+            if !self.auth_reported.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    error = %message,
+                    "the SMTP server rejected our credentials: check OTTO_SMTP_URL. \
+                     Every notification email fails until it is fixed"
+                );
+            }
+            return SendError::transient(message);
+        }
+        if e.is_permanent() {
+            SendError::permanent(message)
+        } else {
+            SendError::transient(message)
+        }
     }
 
     fn redact(&self, text: &str) -> String {
@@ -155,12 +210,26 @@ impl Mailer for SmtpMailer {
             .header(ContentType::TEXT_PLAIN)
             .body(email.body_text.clone())
             .map_err(|e| SendError::permanent(format!("message could not be built: {e}")))?;
-        self.transport
-            .send(message)
-            .await
-            .map(|_| ())
-            .map_err(|e| SendError::transient(self.redact(&format!("smtp: {e}"))))
+        match tokio::time::timeout(self.deadline, self.transport.send(message)).await {
+            Ok(Ok(_)) => {
+                self.auth_reported.store(false, Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(Err(e)) => Err(self.classify(&e)),
+            Err(_) => Err(SendError::transient(format!(
+                "smtp: no complete reply within {} s",
+                self.deadline.as_secs_f32()
+            ))),
+        }
     }
+}
+
+/// 530/534/535/538: the server refused to authenticate us (RFC 4954). lettre
+/// reports these as permanent, which they are for the credentials but not for
+/// the message.
+fn is_auth_refusal(e: &lettre::transport::smtp::Error) -> bool {
+    e.status()
+        .is_some_and(|code| matches!(code.to_string().as_str(), "530" | "534" | "535" | "538"))
 }
 
 /// The URL itself, and its userinfo raw and percent-decoded. Empty strings are
@@ -226,12 +295,18 @@ pub async fn run<M: Mailer>(db: Db, mailer: M, mut shutdown: watch::Receiver<boo
     }
 }
 
-/// One pass: claim up to a batch of due emails and send them concurrently.
-/// Returns how many were attempted.
+/// One pass: claim up to a batch of due emails and send them, at most
+/// [`CONCURRENCY`] at a time. Returns how many were attempted.
 pub async fn deliver_due<M: Mailer>(db: &Db, mailer: &M) -> otto_core::Result<usize> {
     let due = notifications::claim_due(db, BATCH).await?;
     let n = due.len();
-    join_all(due.iter().map(|d| deliver_one(db, mailer, d))).await;
+    // Collected first: a lazy `map` adapter inside the stream trips the
+    // compiler's higher-ranked `Send` inference once this is `tokio::spawn`ed.
+    let sends: Vec<_> = due.iter().map(|d| deliver_one(db, mailer, d)).collect();
+    futures::stream::iter(sends)
+        .buffer_unordered(CONCURRENCY)
+        .collect::<Vec<()>>()
+        .await;
     Ok(n)
 }
 
