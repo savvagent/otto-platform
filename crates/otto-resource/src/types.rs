@@ -241,9 +241,11 @@ pub struct UsageStatus {
     ///
     /// - [`BUDGET_EXCEEDED`]: the org's hard stop for this service is on and
     ///   its spend has reached its budget (as [`budget_exceeded`](Self::budget_exceeded));
-    /// - [`PAYMENT_REQUIRED`]: the org has no live subscription (no card on
-    ///   file), and this service's spend this month is above zero, that is,
-    ///   past whatever its free tiers include.
+    /// - [`PAYMENT_REQUIRED`]: the org is not in good standing to be billed
+    ///   (no card on file, an unpaid subscription, or a failed payment past
+    ///   its grace period), and this service's spend this month is above
+    ///   zero, that is, past whatever its free tiers include. Only reported
+    ///   when the platform has billing switched on.
     ///
     /// The budget wins when both apply. Read
     /// [`billable_blocked`](Self::billable_blocked) to decide whether to
@@ -252,10 +254,12 @@ pub struct UsageStatus {
     pub blocked_reason: Option<String>,
 }
 
-/// The [`UsageStatus::blocked_reason`] of an org with no live subscription
-/// (no card on file) whose usage of the calling service this month is past
+/// The [`UsageStatus::blocked_reason`] of an org not in good standing to be
+/// billed (no card on file, an unpaid subscription, or a failed payment past
+/// its grace period) whose usage of the calling service this month is past
 /// its free tiers, and the error code a resource server should refuse a
-/// billable call with: the org must add a payment method in the console.
+/// billable call with: an owner must add or fix the payment method in the
+/// console. Only reported when the platform has billing switched on.
 /// Spend is zero while no price is set, so no org is refused for this until
 /// prices exist.
 pub const PAYMENT_REQUIRED: &str = "payment_required";
