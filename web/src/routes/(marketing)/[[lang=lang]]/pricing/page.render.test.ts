@@ -273,7 +273,7 @@ describe('the pricing page', () => {
 
     const flags = card('Otto Flags');
     expect(flags.textContent).toContain('Billed per evaluation');
-    expect(flags.textContent).toContain('First 1,000 free every month');
+    expect(flags.textContent).toContain('First 1,000 units free every month');
     // No free first tier, so no "free" claim.
     expect(card('Otto Factory').textContent).not.toContain('free every month');
     // A service with nothing priced says so, rather than vanishing or reading as free.
@@ -406,33 +406,67 @@ describe('the pricing page', () => {
     unmount(instance);
   });
 
-  it('treats an answer without a meters array as a failure, not as "no prices yet"', async () => {
+  it('still shows the plans when the answer has no meters array, and logs it', async () => {
     plans.mockResolvedValue({ plans: SEEDED } as never);
     const instance = mountPage();
     await settle();
 
-    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
-      'Pricing could not be loaded.'
-    );
-    expect(container.textContent).not.toContain('Usage prices have not been published yet.');
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(card('Team').textContent).toContain('$29');
+    expect(usageRegion().textContent).toContain('Usage prices have not been published yet.');
+    expect(consoleError).toHaveBeenCalledOnce();
     expect((consoleError.mock.calls[0]?.[1] as Error).message).toContain('meters array');
 
     unmount(instance);
   });
 
-  it('treats a meter with a broken tier table as a failure, never a wrong price', async () => {
+  it('drops only a meter with a broken tier table, never showing a wrong price', async () => {
     plans.mockResolvedValue({
       plans: SEEDED,
-      meters: [{ ...FLAG_EVALUATIONS, tiers: [{ upTo: null, unitAmountUcents: 1.5 }] }]
+      meters: [
+        FACTORY_JOBS,
+        { ...FLAG_EVALUATIONS, tiers: [{ upTo: null, unitAmountUcents: 1.5 }] }
+      ]
     });
     const instance = mountPage();
     await settle();
 
-    expect(container.querySelector('[role="alert"]')).not.toBeNull();
-    expect(container.querySelectorAll('table')).toHaveLength(0);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(card('Team').textContent).toContain('$29');
+    expect(usageRegion().querySelectorAll('table')).toHaveLength(1);
+    expect(meterRows('Jobs completed')).toHaveLength(3);
+    expect(card('Otto Flags').textContent).toContain('No usage price published yet.');
+    expect(consoleError).toHaveBeenCalledOnce();
     expect((consoleError.mock.calls[0]?.[1] as Error).message).toContain(
-      'meters[0].tiers[0].unitAmountUcents'
+      'meters[1].tiers[0].unitAmountUcents'
     );
+
+    unmount(instance);
+  });
+
+  it('shows one table for a meter the answer lists twice', async () => {
+    plans.mockResolvedValue({
+      plans: SEEDED,
+      meters: [FLAG_EVALUATIONS, { ...FLAG_EVALUATIONS, displayName: 'Flag evaluations (copy)' }]
+    });
+    const instance = mountPage();
+    await settle();
+
+    expect(card('Otto Flags').querySelectorAll('table')).toHaveLength(1);
+    expect(card('Otto Flags').textContent).not.toContain('(copy)');
+    expect(consoleError).toHaveBeenCalledOnce();
+
+    unmount(instance);
+  });
+
+  it('wraps each tier table so a narrow screen scrolls it, not the page', async () => {
+    plans.mockResolvedValue(PRICED);
+    const instance = mountPage();
+    await settle();
+
+    for (const table of usageRegion().querySelectorAll('table')) {
+      expect(table.parentElement?.classList.contains('overflow-x-auto')).toBe(true);
+    }
 
     unmount(instance);
   });

@@ -375,7 +375,7 @@
   "marketing_locale_hint_dismiss": "Dismiss",
   "marketing_product_more": "More about {name}",
   "marketing_home_title": "Otto: hosted MCP services for teams of coding agents",
-  "marketing_home_description": "Otto Factory and Otto Flags: hosted MCP servers your coding agents use to coordinate work and manage feature flags. One account, one plan.",
+  "marketing_home_description": "Otto Factory and Otto Flags: hosted MCP servers your coding agents use to coordinate work and manage feature flags. One account, pay as you go per service.",
   "landing_hero_eyebrow": "The otto-* family",
   "landing_hero_title": "Hosted infrastructure your coding agents operate, through MCP",
   "landing_hero_subtitle": "Point an agent at one HTTPS endpoint and sign in once in the browser. From then on it can coordinate work with the rest of your team, or ship changes behind feature flags, with tools scoped to your organization.",
@@ -461,7 +461,16 @@
   "pricing_usage_col_units": "Units each month",
   "pricing_usage_col_price": "Price per unit",
   "pricing_usage_unit": "Billed per {unit}",
-  "pricing_usage_free_allowance": "First {units} free every month",
+  "pricing_usage_free_allowance": [
+    {
+      "declarations": ["input count", "input units", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "First unit free every month",
+        "countPlural=other": "First {units} units free every month"
+      }
+    }
+  ],
   "pricing_tier_up_to": "Up to {to}",
   "pricing_tier_between": "{from} to {to}",
   "pricing_tier_above": "{from} and above",
@@ -471,13 +480,13 @@
   "pricing_how_free_title": "Management calls are free",
   "pricing_how_free_body": "The tool calls your agents make to manage a service are free under fair use. Only each service’s value meters are billed.",
   "pricing_how_plans_title": "Plans buy features, not usage",
-  "pricing_how_plans_body": "A plan adds features such as seats, single sign-on and support. Usage is priced the same on every plan.",
+  "pricing_how_plans_body": "A plan adds features such as extra seats and support. Usage is priced the same on every plan.",
   "pricing_how_budgets_title": "A budget for each service",
-  "pricing_how_budgets_body": "Owners can set a monthly budget per service, with alerts as spend approaches it and an optional hard stop.",
+  "pricing_how_budgets_body": "Owners and admins can set a monthly budget per service, with alerts as spend approaches it and an optional hard stop.",
   "pricing_faq_minimum_q": "Is there a minimum or a commitment?",
   "pricing_faq_minimum_a": "There is no minimum for production use. Each month you are invoiced, in arrears, for what each service metered. A paid plan is billed for its features, separately from usage.",
   "pricing_faq_budget_q": "Can we cap what a service costs?",
-  "pricing_faq_budget_a": "Yes. An owner can set a monthly budget for each service. Alerts warn as spend approaches it, and an optional hard stop halts that service’s billable calls at the budget while its free calls keep working.",
+  "pricing_faq_budget_a": "Yes. Owners and admins can set a monthly budget for each service. Alerts warn as spend approaches it, and an optional hard stop halts that service’s billable calls at the budget while its free calls keep working.",
   "pricing_faq_separate_q": "Is usage counted separately for each service?",
   "pricing_faq_separate_a": "Yes. Each service has its own meters and its own budget, so usage in one service never stops work in another."
 }

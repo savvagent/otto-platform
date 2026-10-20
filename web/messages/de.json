@@ -375,7 +375,7 @@
   "marketing_locale_hint_dismiss": "Schließen",
   "marketing_product_more": "Mehr über {name}",
   "marketing_home_title": "Otto: gehostete MCP-Dienste für Teams von Coding-Agenten",
-  "marketing_home_description": "Otto Factory und Otto Flags: gehostete MCP-Server, über die deine Coding-Agenten Arbeit koordinieren und Feature-Flags verwalten. Ein Konto, ein Tarif.",
+  "marketing_home_description": "Otto Factory und Otto Flags: gehostete MCP-Server, über die deine Agenten Arbeit koordinieren und Feature-Flags verwalten. Ein Konto, Abrechnung pro Dienst.",
   "landing_hero_eyebrow": "Die otto-*-Familie",
   "landing_hero_title": "Gehostete Infrastruktur, die deine Coding-Agenten selbst bedienen – über MCP",
   "landing_hero_subtitle": "Richte einen Agenten auf einen einzigen HTTPS-Endpunkt ein und melde dich einmal im Browser an. Danach kann er die Arbeit mit dem Rest deines Teams abstimmen oder Änderungen hinter Feature-Flags ausliefern – mit Tools, die auf deine Organisation beschränkt sind.",
@@ -461,7 +461,16 @@
   "pricing_usage_col_units": "Einheiten pro Monat",
   "pricing_usage_col_price": "Preis pro Einheit",
   "pricing_usage_unit": "Abgerechnet pro {unit}",
-  "pricing_usage_free_allowance": "Die ersten {units} Einheiten jeden Monat kostenlos",
+  "pricing_usage_free_allowance": [
+    {
+      "declarations": ["input count", "input units", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Die erste Einheit jeden Monat kostenlos",
+        "countPlural=other": "Die ersten {units} Einheiten jeden Monat kostenlos"
+      }
+    }
+  ],
   "pricing_tier_up_to": "Bis {to}",
   "pricing_tier_between": "{from} bis {to}",
   "pricing_tier_above": "Ab {from}",
@@ -471,13 +480,13 @@
   "pricing_how_free_title": "Verwaltungsaufrufe sind kostenlos",
   "pricing_how_free_body": "Die Tool-Aufrufe, mit denen deine Agenten einen Dienst verwalten, sind bei fairer Nutzung kostenlos. Abgerechnet werden nur die Wertzähler jedes Dienstes.",
   "pricing_how_plans_title": "Tarife kaufen Funktionen, keine Nutzung",
-  "pricing_how_plans_body": "Ein Tarif ergänzt Funktionen wie Plätze, Single Sign-on und Support. Die Nutzung kostet in jedem Tarif gleich viel.",
+  "pricing_how_plans_body": "Ein Tarif ergänzt Funktionen wie zusätzliche Plätze und Support. Die Nutzung kostet in jedem Tarif gleich viel.",
   "pricing_how_budgets_title": "Ein Budget für jeden Dienst",
-  "pricing_how_budgets_body": "Inhaber können pro Dienst ein Monatsbudget festlegen, mit Warnungen, wenn die Ausgaben sich ihm nähern, und einem optionalen harten Stopp.",
+  "pricing_how_budgets_body": "Inhaber und Admins können pro Dienst ein Monatsbudget festlegen, mit Warnungen, wenn die Ausgaben sich ihm nähern, und einem optionalen harten Stopp.",
   "pricing_faq_minimum_q": "Gibt es einen Mindestbetrag oder eine Bindung?",
   "pricing_faq_minimum_a": "Für den Produktivbetrieb gibt es keinen Mindestbetrag. Jeden Monat erhältst du im Nachhinein eine Rechnung für das, was jeder Dienst gemessen hat. Ein kostenpflichtiger Tarif wird für seine Funktionen abgerechnet, getrennt von der Nutzung.",
   "pricing_faq_budget_q": "Können wir die Kosten eines Dienstes begrenzen?",
-  "pricing_faq_budget_a": "Ja. Ein Inhaber kann für jeden Dienst ein Monatsbudget festlegen. Warnungen melden sich, wenn die Ausgaben sich ihm nähern, und ein optionaler harter Stopp hält die abrechenbaren Aufrufe dieses Dienstes beim Budget an, während seine kostenlosen Aufrufe weiter funktionieren.",
+  "pricing_faq_budget_a": "Ja. Inhaber und Admins können für jeden Dienst ein Monatsbudget festlegen. Warnungen melden sich, wenn die Ausgaben sich ihm nähern, und ein optionaler harter Stopp hält die abrechenbaren Aufrufe dieses Dienstes beim Budget an, während seine kostenlosen Aufrufe weiter funktionieren.",
   "pricing_faq_separate_q": "Wird die Nutzung für jeden Dienst getrennt gezählt?",
   "pricing_faq_separate_a": "Ja. Jeder Dienst hat eigene Zähler und ein eigenes Budget, sodass die Nutzung eines Dienstes niemals die Arbeit eines anderen stoppt."
 }

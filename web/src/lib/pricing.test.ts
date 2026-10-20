@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { m } from '$lib/paraglide/messages';
 import { getLocale, locales, overwriteGetLocale } from '$lib/paraglide/runtime';
@@ -138,7 +138,7 @@ describe('unitPrice', () => {
 describe('meterTiers', () => {
   it('reads a free first tier as an allowance, then prices the rest', () => {
     expect(meterTiers(meter(), 'en')).toEqual({
-      freeAllowance: '1,000',
+      freeAllowance: { count: 1000, units: '1,000' },
       rows: [
         { range: { kind: 'upTo', to: '1,000' }, price: { kind: 'free' } },
         { range: { kind: 'above', from: '1,001' }, price: { kind: 'unit', amount: '$0.00000007' } }
@@ -197,8 +197,8 @@ describe('meterTiers', () => {
       }),
       'hi'
     );
-    expect(tiers.freeAllowance).toBe('10,00,000');
-    expect(meterTiers(meter(), 'de').freeAllowance).toBe('1.000');
+    expect(tiers.freeAllowance).toEqual({ count: 1_000_000, units: '10,00,000' });
+    expect(meterTiers(meter(), 'de').freeAllowance).toEqual({ count: 1000, units: '1.000' });
   });
 });
 
@@ -266,13 +266,35 @@ describe('parseCatalog', () => {
     }
   });
 
-  /** Missing is not "no prices yet": the page would say "coming soon" about a broken answer. */
-  it('refuses a body without a meters array', () => {
+  /** The plans still render; the fault is reported once, not swallowed. */
+  it('reads a body without a meters array as no usage prices, and reports it once', () => {
     for (const meters of [undefined, null, {}, 'x']) {
-      expect(() => parseCatalog({ plans: [plan()], meters }), String(meters)).toThrow(
-        /meters array/
-      );
+      const report = vi.fn();
+      expect(parseCatalog({ plans: [plan()], meters }, report), String(meters)).toEqual({
+        plans: [plan()],
+        meters: []
+      });
+      expect(report).toHaveBeenCalledOnce();
+      expect(String(report.mock.calls[0]?.[0])).toMatch(/meters array/);
     }
+  });
+
+  it('reports nothing for a well-formed answer', () => {
+    const report = vi.fn();
+    parseCatalog({ plans: [plan()], meters: [meter()] }, report);
+    expect(report).not.toHaveBeenCalled();
+  });
+
+  it('keeps the first of two meters with the same service and meter, and reports the rest', () => {
+    const report = vi.fn();
+    const first = meter();
+    const again = meter({ displayName: 'Evaluations, again' });
+    const other = meter({ meter: 'rollbacks', displayName: 'Rollbacks' });
+    const { meters } = parseCatalog({ plans: [], meters: [first, again, other, again] }, report);
+    expect(meters).toEqual([first, other]);
+    expect(report).toHaveBeenCalledTimes(2);
+    expect(String(report.mock.calls[0]?.[0])).toContain('meters[1] repeats otto-flags/evaluations');
+    expect(String(report.mock.calls[1]?.[0])).toContain('meters[3]');
   });
 
   it('drops the retired allowance fields rather than passing them on', () => {
@@ -315,7 +337,8 @@ describe('parseCatalog', () => {
     }
   });
 
-  it('refuses a meter with a missing or mistyped field, naming it', () => {
+  /** Dropped on its own: the plans and the other meters are still shown. */
+  it('drops a meter with a missing or mistyped field, reporting it by name', () => {
     const cases: Array<[field: string, value: unknown]> = [
       ['service', undefined],
       ['service', ''],
@@ -327,21 +350,27 @@ describe('parseCatalog', () => {
       ['tiers', 'free']
     ];
     for (const [field, value] of cases) {
+      const report = vi.fn();
+      const good = meter({ service: 'otto-cxp' });
       const bad = { ...meter(), [field]: value };
       expect(
-        () => parseCatalog({ plans: [], meters: [meter(), bad] }),
+        parseCatalog({ plans: [plan()], meters: [good, bad] }, report),
         `${field}=${String(value)}`
-      ).toThrow(`meters[1].${field}`);
+      ).toEqual({ plans: [plan()], meters: [good] });
+      expect(report).toHaveBeenCalledOnce();
+      expect(String(report.mock.calls[0]?.[0])).toContain(`meters[1].${field}`);
     }
-    expect(() => parseCatalog({ plans: [], meters: ['x'] })).toThrow('meters[0]');
+    const report = vi.fn();
+    expect(parseCatalog({ plans: [], meters: ['x'] }, report).meters).toEqual([]);
+    expect(String(report.mock.calls[0]?.[0])).toContain('meters[0]');
   });
 
   /**
    * A tier table the page would have to guess about — a price that is not a
    * whole number of millionths, a bound that goes backwards, an unbounded tier
-   * that is not last — would print a wrong price, so it fails the answer.
+   * that is not last — would print a wrong price, so that meter is dropped.
    */
-  it('refuses tiers that do not form a graduated table, naming the tier', () => {
+  it('drops a meter whose tiers do not form a graduated table, naming the tier', () => {
     const cases: Array<[tiers: unknown[], where: string]> = [
       [[{ upTo: null, unitAmountUcents: -1 }], 'tiers[0].unitAmountUcents'],
       [[{ upTo: null, unitAmountUcents: 1.5 }], 'tiers[0].unitAmountUcents'],
@@ -374,10 +403,12 @@ describe('parseCatalog', () => {
       [[null], 'tiers[0]']
     ];
     for (const [tiers, where] of cases) {
+      const report = vi.fn();
       expect(
-        () => parseCatalog({ plans: [], meters: [meter({ tiers: tiers as never })] }),
+        parseCatalog({ plans: [], meters: [meter({ tiers: tiers as never })] }, report).meters,
         JSON.stringify(tiers)
-      ).toThrow(`meters[0].${where}`);
+      ).toEqual([]);
+      expect(String(report.mock.calls[0]?.[0])).toContain(`meters[0].${where}`);
     }
   });
 });
@@ -390,7 +421,27 @@ describe('the pricing copy', () => {
   it('keeps the meta description within 160 characters in every locale', () => {
     for (const locale of locales) {
       expect(m.pricing_description({}, { locale }).length, locale).toBeLessThanOrEqual(160);
+      expect(
+        m.marketing_home_description({}, { locale }).length,
+        `home ${locale}`
+      ).toBeLessThanOrEqual(160);
     }
+  });
+
+  /** "First 1 units free" is the bug a plain string would ship. */
+  it('says a free allowance of one unit in the singular, in every locale', () => {
+    for (const locale of locales) {
+      const one = m.pricing_usage_free_allowance({ count: 1, units: '1' }, { locale });
+      const many = m.pricing_usage_free_allowance({ count: 1000, units: '1,000' }, { locale });
+      expect(one, locale).not.toBe(many);
+      expect(many, locale).toContain('1,000');
+    }
+    expect(m.pricing_usage_free_allowance({ count: 1, units: '1' }, { locale: 'en' })).toBe(
+      'First unit free every month'
+    );
+    expect(m.pricing_usage_free_allowance({ count: 1000, units: '1,000' }, { locale: 'en' })).toBe(
+      'First 1,000 units free every month'
+    );
   });
 
   /**
@@ -401,12 +452,12 @@ describe('the pricing copy', () => {
    */
   it('no longer describes usage as operations or as one shared allowance, in any locale', () => {
     const retired: Record<string, RegExp> = {
-      en: /\boperations?\b|\bops\b|bucket|allowance|one plan covers/i,
-      es: /operaci[oó]n|cuota|un solo plan cubre/i,
-      de: /operation|kontingent|ein tarif gilt für alle/i,
-      fr: /op[ée]ration|enveloppe|un seul forfait couvre/i,
-      it: /operazion|quota|un solo piano copre/i,
-      hi: /ऑपरेशन|कोटा|एक प्लान में otto की सभी/i
+      en: /\boperations?\b|\bops\b|bucket|allowance|one plan covers|one plan\./i,
+      es: /operaci[oó]n|cuota|un solo plan cubre|un plan\./i,
+      de: /operation|kontingent|ein tarif gilt für alle|ein tarif\./i,
+      fr: /op[ée]ration|enveloppe|un seul forfait couvre|un forfait\./i,
+      it: /operazion|quota|un solo piano copre|un piano\./i,
+      hi: /ऑपरेशन|कोटा|एक प्लान में otto की सभी|एक प्लान।/i
     };
     for (const locale of locales) {
       const catalog = JSON.parse(
@@ -416,7 +467,7 @@ describe('the pricing copy', () => {
         )
       ) as Record<string, unknown>;
       for (const [key, value] of Object.entries(catalog)) {
-        if (!/^(pricing|landing|product)_/.test(key)) continue;
+        if (!/^(pricing|landing|product|marketing)_/.test(key)) continue;
         expect(JSON.stringify(value), `${locale} ${key}`).not.toMatch(retired[locale]!);
       }
     }

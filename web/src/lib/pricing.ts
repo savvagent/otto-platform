@@ -41,9 +41,18 @@ const isCount = (value: unknown): value is number =>
  * charges. Refusing the whole answer turns any of those into the page's
  * existing "could not be loaded" state, and the error says which field.
  *
- * A missing `meters` array is refused too, rather than read as "no prices
- * yet": the page says something specific about an empty list, and saying it
- * about a broken answer would be a claim the server never made.
+ * **Usage prices degrade instead of blanking the page.** The plans are the
+ * page's core, so a fault in `meters` costs only the usage prices it
+ * touches, and each fault is handed to `report` (by default
+ * `console.error`) so it is not mistaken for "no prices yet" by whoever
+ * debugs it:
+ *
+ * - no `meters` array at all reads as no published usage prices;
+ * - a meter with a missing or mistyped field, or tiers that do not form a
+ *   graduated table, is dropped on its own — a wrong price is never shown,
+ *   and the other meters still are;
+ * - a second meter with the same `service` and `meter` is dropped, keeping
+ *   the first, so one meter never shows two price tables.
  *
  * Fields the contract no longer has (the retired `includedOps` and
  * `hardStop`) are dropped, not copied: an older cached answer cannot put an
@@ -53,18 +62,42 @@ const isCount = (value: unknown): value is number =>
  * value that is not an object is read as no features (see `featureLabels`)
  * rather than failing the page.
  */
-export function parseCatalog(body: unknown): PlansResponse {
+export function parseCatalog(body: unknown, report: ReportProblem = logProblem): PlansResponse {
   if (!isRecord(body) || !Array.isArray(body.plans)) {
     throw new Error('GET /api/plans answered without a plans array');
   }
+  const plans = body.plans.map(parsePlan);
+
   if (!Array.isArray(body.meters)) {
-    throw new Error('GET /api/plans answered without a meters array');
+    report(new Error('GET /api/plans answered without a meters array; showing no usage prices'));
+    return { plans, meters: [] };
   }
-  return {
-    plans: body.plans.map(parsePlan),
-    meters: body.meters.map(parseMeter)
-  };
+
+  const meters: PricedMeter[] = [];
+  const seen = new Set<string>();
+  body.meters.forEach((raw: unknown, i) => {
+    let meter: PricedMeter;
+    try {
+      meter = parseMeter(raw, i);
+    } catch (problem) {
+      report(problem instanceof Error ? problem : new Error(String(problem)));
+      return;
+    }
+    const key = `${meter.service}/${meter.meter}`;
+    if (seen.has(key)) {
+      report(new Error(`GET /api/plans: meters[${i}] repeats ${key}; keeping the first`));
+      return;
+    }
+    seen.add(key);
+    meters.push(meter);
+  });
+  return { plans, meters };
 }
+
+/** Where `parseCatalog` sends a fault it recovered from. */
+export type ReportProblem = (problem: Error) => void;
+
+const logProblem: ReportProblem = (problem) => console.error('pricing:', problem);
 
 function parsePlan(raw: unknown, i: number): Plan {
   const bad = (field: string) =>
@@ -126,16 +159,40 @@ function parseMeter(raw: unknown, i: number): PricedMeter {
 export type PriceLabel =
   { kind: 'contact' } | { kind: 'free' } | { kind: 'monthly'; amount: string };
 
-function dollars(cents: number, locale: Locale): string {
-  // Whole dollars drop the `.00` a list price never shows; anything else keeps
-  // both decimals rather than rounding a real price to a wrong one.
-  const whole = cents % 100 === 0;
+/**
+ * A whole number of `10^-scale` dollars (cents are scale 2, millionths of a
+ * cent scale 8), as the page language writes US dollars — exactly.
+ *
+ * **Never a float.** The integer is split into whole dollars and a
+ * `scale`-digit fraction with `BigInt`, and the resulting decimal *string* is
+ * what `Intl.NumberFormat` formats: it formats a numeric string at full
+ * precision, so `7` millionths of a cent prints as $0.00000007 rather than
+ * rounding noise, and a large amount keeps every digit. Trailing zeros past
+ * `minimumFractionDigits` are dropped.
+ */
+function formatUsd(
+  amount: number,
+  scale: number,
+  minimumFractionDigits: number,
+  locale: Locale
+): string {
+  const value = BigInt(amount);
+  const one = 10n ** BigInt(scale);
+  const whole = value / one;
+  const fraction = (value % one).toString().padStart(scale, '0').replace(/0+$/, '');
+  const decimal = fraction === '' ? `${whole}` : `${whole}.${fraction}`;
   return new Intl.NumberFormat(locale, {
     style: 'currency',
     currency: 'USD',
-    minimumFractionDigits: whole ? 0 : 2,
-    maximumFractionDigits: whole ? 0 : 2
-  }).format(cents / 100);
+    minimumFractionDigits,
+    maximumFractionDigits: scale
+  }).format(decimal as `${number}`);
+}
+
+function dollars(cents: number, locale: Locale): string {
+  // Whole dollars drop the `.00` a list price never shows; anything else keeps
+  // both decimals rather than rounding a real price to a wrong one.
+  return formatUsd(cents, 2, cents % 100 === 0 ? 0 : 2, locale);
 }
 
 /**
@@ -159,39 +216,19 @@ function formatCount(count: number, locale: Locale): string {
 /** A per-unit price: the word "free", or an exact dollar amount. */
 export type UnitPrice = { kind: 'free' } | { kind: 'unit'; amount: string };
 
-/** Millionths of a cent in one US dollar. */
-const UCENTS_PER_DOLLAR = 100_000_000n;
-const UCENT_DIGITS = 8;
+/** Decimal places in a price stored in millionths of a cent. */
+const UCENT_SCALE = 8;
 
 /**
- * A price in millionths of a US cent, as the page language writes dollars.
- *
- * **Exact, never a float.** The book stores prices as whole millionths of a
- * cent, so `7` is $0.00000007; dividing by 1e8 as a float would print
- * rounding noise for some values and lose digits for large ones. The integer
- * is split into whole dollars and an eight-digit fraction with `BigInt`, and
- * the resulting decimal *string* is what `Intl.NumberFormat` formats — it
- * formats a numeric string at full precision. At least two decimals, as money
- * reads; trailing zeros past that are dropped, so 150 000 is `$0.0015`.
+ * A price in millionths of a US cent, as the page language writes dollars:
+ * exact (see `formatUsd`), with at least two decimals as money reads, so
+ * 150 000 is `$0.0015` and 100 000 000 is `$1.00`.
  *
  * `0` is the word "free" rather than `$0.00`.
  */
 export function unitPrice(ucents: number, locale: Locale): UnitPrice {
   if (ucents === 0) return { kind: 'free' };
-  const value = BigInt(ucents);
-  const whole = value / UCENTS_PER_DOLLAR;
-  const fraction = (value % UCENTS_PER_DOLLAR)
-    .toString()
-    .padStart(UCENT_DIGITS, '0')
-    .replace(/0+$/, '');
-  const decimal = fraction === '' ? `${whole}` : `${whole}.${fraction}`;
-  const amount = new Intl.NumberFormat(locale, {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: UCENT_DIGITS
-  }).format(decimal as `${number}`);
-  return { kind: 'unit', amount };
+  return { kind: 'unit', amount: formatUsd(ucents, UCENT_SCALE, 2, locale) };
 }
 
 /**
@@ -214,11 +251,12 @@ export interface TierRow {
 
 export interface MeterTiers {
   /**
-   * The formatted size of the free allowance — "first N free" — when the
-   * first tier is priced at 0 and bounded, else `null`. A single free,
-   * unbounded tier has no N to name, so it is just a "free" row.
+   * The size of the free allowance — "first N free" — when the first tier is
+   * priced at 0 and bounded, else `null`: `count` to choose the plural form,
+   * `units` to print. A single free, unbounded tier has no N to name, so it
+   * is just a "free" row.
    */
-  freeAllowance: string | null;
+  freeAllowance: { count: number; units: string } | null;
   rows: TierRow[];
 }
 
@@ -234,7 +272,7 @@ export function meterTiers(meter: PricedMeter, locale: Locale): MeterTiers {
   const first = tiers[0];
   const freeAllowance =
     first && first.unitAmountUcents === 0 && first.upTo !== null
-      ? formatCount(first.upTo, locale)
+      ? { count: first.upTo, units: formatCount(first.upTo, locale) }
       : null;
 
   const rows = tiers.map((tier, i): TierRow => {
@@ -253,7 +291,7 @@ export function meterTiers(meter: PricedMeter, locale: Locale): MeterTiers {
   return { freeAllowance, rows };
 }
 
-export interface ServiceUsage {
+export interface ServiceUsageGroup {
   /** The slug meters carry, e.g. `otto-flags`. */
   service: string;
   /**
@@ -274,8 +312,8 @@ export interface ServiceUsage {
  * Every described service is listed even with nothing priced, so the page can
  * say so per service rather than letting a service silently vanish.
  */
-export function usageByService(meters: readonly PricedMeter[]): ServiceUsage[] {
-  const groups = new Map<string, ServiceUsage>();
+export function usageByService(meters: readonly PricedMeter[]): ServiceUsageGroup[] {
+  const groups = new Map<string, ServiceUsageGroup>();
   for (const s of SERVICES) {
     const service = connectorName(s);
     groups.set(service, { service, name: s.name, meters: [] });

@@ -377,7 +377,7 @@
   "marketing_locale_hint_dismiss": "Descartar",
   "marketing_product_more": "Más sobre {name}",
   "marketing_home_title": "Otto: servicios MCP alojados para equipos de agentes de programación",
-  "marketing_home_description": "Otto Factory y Otto Flags: servidores MCP alojados con los que tus agentes coordinan el trabajo y gestionan feature flags. Una cuenta, un plan.",
+  "marketing_home_description": "Otto Factory y Otto Flags: servidores MCP alojados con los que tus agentes coordinan el trabajo y gestionan feature flags. Una cuenta, pago por servicio.",
   "landing_hero_eyebrow": "La familia otto-*",
   "landing_hero_title": "Infraestructura alojada que tus agentes de programación operan a través de MCP",
   "landing_hero_subtitle": "Apunta un agente a un único endpoint HTTPS e inicia sesión una vez en el navegador. A partir de ahí puede coordinar el trabajo con el resto de tu equipo o publicar cambios detrás de feature flags, con herramientas limitadas a tu organización.",
@@ -463,7 +463,17 @@
   "pricing_usage_col_units": "Unidades al mes",
   "pricing_usage_col_price": "Precio por unidad",
   "pricing_usage_unit": "Se factura por {unit}",
-  "pricing_usage_free_allowance": "Las primeras {units} unidades gratis cada mes",
+  "pricing_usage_free_allowance": [
+    {
+      "declarations": ["input count", "input units", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "La primera unidad gratis cada mes",
+        "countPlural=many": "Las primeras {units} de unidades gratis cada mes",
+        "countPlural=other": "Las primeras {units} unidades gratis cada mes"
+      }
+    }
+  ],
   "pricing_tier_up_to": "Hasta {to}",
   "pricing_tier_between": "De {from} a {to}",
   "pricing_tier_above": "{from} en adelante",
@@ -473,13 +483,13 @@
   "pricing_how_free_title": "Las llamadas de gestión son gratis",
   "pricing_how_free_body": "Las llamadas a herramientas que hacen tus agentes para gestionar un servicio son gratis con un uso razonable. Solo se facturan los medidores de valor de cada servicio.",
   "pricing_how_plans_title": "Los planes compran funciones, no uso",
-  "pricing_how_plans_body": "Un plan añade funciones como puestos, inicio de sesión único y soporte. El uso cuesta lo mismo en todos los planes.",
+  "pricing_how_plans_body": "Un plan añade funciones como puestos adicionales y soporte. El uso cuesta lo mismo en todos los planes.",
   "pricing_how_budgets_title": "Un presupuesto para cada servicio",
-  "pricing_how_budgets_body": "Los propietarios pueden fijar un presupuesto mensual por servicio, con alertas a medida que el gasto se acerca y un corte opcional al alcanzarlo.",
+  "pricing_how_budgets_body": "Los propietarios y administradores pueden fijar un presupuesto mensual por servicio, con alertas a medida que el gasto se acerca y un corte opcional al alcanzarlo.",
   "pricing_faq_minimum_q": "¿Hay un mínimo o un compromiso?",
   "pricing_faq_minimum_a": "No hay mínimo para uso en producción. Cada mes recibes una factura, a mes vencido, por lo que midió cada servicio. Un plan de pago se factura por sus funciones, aparte del uso.",
   "pricing_faq_budget_q": "¿Podemos limitar lo que cuesta un servicio?",
-  "pricing_faq_budget_a": "Sí. Un propietario puede fijar un presupuesto mensual para cada servicio. Las alertas avisan cuando el gasto se acerca, y un corte opcional detiene las llamadas facturables de ese servicio al llegar al presupuesto, mientras sus llamadas gratuitas siguen funcionando.",
+  "pricing_faq_budget_a": "Sí. Los propietarios y administradores pueden fijar un presupuesto mensual para cada servicio. Las alertas avisan cuando el gasto se acerca, y un corte opcional detiene las llamadas facturables de ese servicio al llegar al presupuesto, mientras sus llamadas gratuitas siguen funcionando.",
   "pricing_faq_separate_q": "¿El uso se cuenta por separado para cada servicio?",
   "pricing_faq_separate_a": "Sí. Cada servicio tiene sus propios medidores y su propio presupuesto, así que el uso de un servicio nunca detiene el trabajo de otro."
 }

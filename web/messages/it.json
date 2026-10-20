@@ -377,7 +377,7 @@
   "marketing_locale_hint_dismiss": "Chiudi",
   "marketing_product_more": "Scopri {name}",
   "marketing_home_title": "Otto: servizi MCP ospitati per team di agenti di programmazione",
-  "marketing_home_description": "Otto Factory e Otto Flags: server MCP ospitati con cui i tuoi agenti coordinano il lavoro e gestiscono i feature flag. Un account, un piano.",
+  "marketing_home_description": "Otto Factory e Otto Flags: server MCP ospitati con cui i tuoi agenti coordinano il lavoro e gestiscono i feature flag. Un account, paghi a consumo per servizio.",
   "landing_hero_eyebrow": "La famiglia otto-*",
   "landing_hero_title": "Infrastruttura ospitata che i tuoi agenti di programmazione gestiscono tramite MCP",
   "landing_hero_subtitle": "Collega un agente a un unico endpoint HTTPS e accedi una volta nel browser. Da lì in poi può coordinare il lavoro con il resto del team o rilasciare modifiche dietro feature flag, con strumenti limitati alla tua organizzazione.",
@@ -463,7 +463,17 @@
   "pricing_usage_col_units": "Unità al mese",
   "pricing_usage_col_price": "Prezzo per unità",
   "pricing_usage_unit": "Fatturato per {unit}",
-  "pricing_usage_free_allowance": "Le prime {units} unità gratis ogni mese",
+  "pricing_usage_free_allowance": [
+    {
+      "declarations": ["input count", "input units", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "La prima unità gratis ogni mese",
+        "countPlural=many": "Le prime {units} unità gratis ogni mese",
+        "countPlural=other": "Le prime {units} unità gratis ogni mese"
+      }
+    }
+  ],
   "pricing_tier_up_to": "Fino a {to}",
   "pricing_tier_between": "Da {from} a {to}",
   "pricing_tier_above": "Da {from} in su",
@@ -473,13 +483,13 @@
   "pricing_how_free_title": "Le chiamate di gestione sono gratuite",
   "pricing_how_free_body": "Le chiamate agli strumenti che i tuoi agenti fanno per gestire un servizio sono gratuite entro un uso equo. Si pagano solo i contatori di valore di ogni servizio.",
   "pricing_how_plans_title": "I piani comprano funzioni, non utilizzo",
-  "pricing_how_plans_body": "Un piano aggiunge funzioni come postazioni, single sign-on e supporto. L’utilizzo costa uguale su ogni piano.",
+  "pricing_how_plans_body": "Un piano aggiunge funzioni come postazioni aggiuntive e supporto. L’utilizzo costa uguale su ogni piano.",
   "pricing_how_budgets_title": "Un budget per ogni servizio",
-  "pricing_how_budgets_body": "I proprietari possono impostare un budget mensile per servizio, con avvisi man mano che la spesa si avvicina e un blocco rigido facoltativo.",
+  "pricing_how_budgets_body": "I proprietari e gli amministratori possono impostare un budget mensile per servizio, con avvisi man mano che la spesa si avvicina e un blocco rigido facoltativo.",
   "pricing_faq_minimum_q": "C’è un minimo o un vincolo?",
   "pricing_faq_minimum_a": "Non c’è un minimo per l’uso in produzione. Ogni mese ricevi una fattura, a consuntivo, per ciò che ogni servizio ha misurato. Un piano a pagamento è fatturato per le sue funzioni, separatamente dall’utilizzo.",
   "pricing_faq_budget_q": "Possiamo limitare quanto costa un servizio?",
-  "pricing_faq_budget_a": "Sì. Un proprietario può impostare un budget mensile per ogni servizio. Gli avvisi segnalano quando la spesa si avvicina, e un blocco rigido facoltativo ferma le chiamate a pagamento di quel servizio al raggiungimento del budget, mentre le sue chiamate gratuite continuano a funzionare.",
+  "pricing_faq_budget_a": "Sì. I proprietari e gli amministratori possono impostare un budget mensile per ogni servizio. Gli avvisi segnalano quando la spesa si avvicina, e un blocco rigido facoltativo ferma le chiamate a pagamento di quel servizio al raggiungimento del budget, mentre le sue chiamate gratuite continuano a funzionare.",
   "pricing_faq_separate_q": "L’utilizzo è conteggiato separatamente per ogni servizio?",
   "pricing_faq_separate_a": "Sì. Ogni servizio ha i propri contatori e il proprio budget, quindi l’utilizzo di un servizio non ferma mai il lavoro di un altro."
 }

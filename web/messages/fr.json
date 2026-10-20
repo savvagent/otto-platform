@@ -377,7 +377,7 @@
   "marketing_locale_hint_dismiss": "Fermer",
   "marketing_product_more": "En savoir plus sur {name}",
   "marketing_home_title": "Otto : des services MCP hébergés pour les équipes d’agents de code",
-  "marketing_home_description": "Otto Factory et Otto Flags : des serveurs MCP hébergés pour que vos agents coordonnent le travail et gèrent les feature flags. Un compte, un forfait.",
+  "marketing_home_description": "Otto Factory et Otto Flags : des serveurs MCP hébergés pour que vos agents coordonnent le travail et gèrent les feature flags. Un compte, facturé par service.",
   "landing_hero_eyebrow": "La famille otto-*",
   "landing_hero_title": "Une infrastructure hébergée que vos agents de code pilotent via MCP",
   "landing_hero_subtitle": "Pointez un agent vers un seul endpoint HTTPS et connectez-vous une fois dans le navigateur. Il peut ensuite coordonner le travail avec le reste de votre équipe ou livrer des changements derrière des feature flags, avec des outils limités à votre organisation.",
@@ -463,7 +463,17 @@
   "pricing_usage_col_units": "Unités par mois",
   "pricing_usage_col_price": "Prix par unité",
   "pricing_usage_unit": "Facturé par {unit}",
-  "pricing_usage_free_allowance": "Les {units} premières unités gratuites chaque mois",
+  "pricing_usage_free_allowance": [
+    {
+      "declarations": ["input count", "input units", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "La première unité gratuite chaque mois",
+        "countPlural=many": "Les {units} premières unités gratuites chaque mois",
+        "countPlural=other": "Les {units} premières unités gratuites chaque mois"
+      }
+    }
+  ],
   "pricing_tier_up_to": "Jusqu’à {to}",
   "pricing_tier_between": "De {from} à {to}",
   "pricing_tier_above": "{from} et plus",
@@ -473,13 +483,13 @@
   "pricing_how_free_title": "Les appels de gestion sont gratuits",
   "pricing_how_free_body": "Les appels d’outils que vos agents font pour gérer un service sont gratuits dans le cadre d’un usage raisonnable. Seuls les compteurs de valeur de chaque service sont facturés.",
   "pricing_how_plans_title": "Les forfaits achètent des fonctions, pas de l’usage",
-  "pricing_how_plans_body": "Un forfait ajoute des fonctions comme des sièges, l’authentification unique et le support. L’usage coûte le même prix sur tous les forfaits.",
+  "pricing_how_plans_body": "Un forfait ajoute des fonctions comme des sièges supplémentaires et le support. L’usage coûte le même prix sur tous les forfaits.",
   "pricing_how_budgets_title": "Un budget pour chaque service",
-  "pricing_how_budgets_body": "Les propriétaires peuvent fixer un budget mensuel par service, avec des alertes à l’approche de ce budget et un arrêt strict facultatif.",
+  "pricing_how_budgets_body": "Les propriétaires et les administrateurs peuvent fixer un budget mensuel par service, avec des alertes à l’approche de ce budget et un arrêt strict facultatif.",
   "pricing_faq_minimum_q": "Y a-t-il un minimum ou un engagement ?",
   "pricing_faq_minimum_a": "Il n’y a pas de minimum pour un usage en production. Chaque mois, vous êtes facturé à terme échu pour ce que chaque service a mesuré. Un forfait payant est facturé pour ses fonctions, séparément de l’usage.",
   "pricing_faq_budget_q": "Peut-on plafonner le coût d’un service ?",
-  "pricing_faq_budget_a": "Oui. Un propriétaire peut fixer un budget mensuel pour chaque service. Des alertes préviennent à l’approche de ce budget, et un arrêt strict facultatif bloque les appels facturables de ce service une fois le budget atteint, tandis que ses appels gratuits continuent de fonctionner.",
+  "pricing_faq_budget_a": "Oui. Les propriétaires et les administrateurs peuvent fixer un budget mensuel pour chaque service. Des alertes préviennent à l’approche de ce budget, et un arrêt strict facultatif bloque les appels facturables de ce service une fois le budget atteint, tandis que ses appels gratuits continuent de fonctionner.",
   "pricing_faq_separate_q": "L’usage est-il compté séparément pour chaque service ?",
   "pricing_faq_separate_a": "Oui. Chaque service a ses propres compteurs et son propre budget : l’usage d’un service n’arrête jamais le travail d’un autre."
 }
