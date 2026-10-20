@@ -5,7 +5,7 @@
 mod common;
 
 use common::{db, tenant};
-use otto_core::notifications::{self, DueEmail, MAX_ATTEMPTS};
+use otto_core::notifications::{self, DueEmail, FailureRecorded, MAX_ATTEMPTS};
 use otto_tenant::Db;
 use sqlx::PgPool;
 
@@ -182,7 +182,11 @@ async fn a_claim_leases_the_row_so_it_is_not_claimed_twice(pool: PgPool) {
     assert_eq!(first.iter().map(|d| d.id).collect::<Vec<_>>(), vec![id]);
     assert!(notifications::claim_due(&db, 10).await.unwrap().is_empty());
 
-    notifications::mark_sent(&db, id).await.unwrap();
+    assert!(notifications::mark_sent(&db, &first[0]).await.unwrap());
+    assert!(
+        !notifications::mark_sent(&db, &first[0]).await.unwrap(),
+        "a second result for a sent row was recorded"
+    );
     let (sent, attempts): (bool, i32) = sqlx::query_as(
         "SELECT sent_at IS NOT NULL, attempts FROM notification_outbox WHERE id = $1",
     )
@@ -200,10 +204,10 @@ async fn failures_back_off_and_give_up_after_the_budget(pool: PgPool) {
     let id = queue_one(&db).await;
     let due = notifications::claim_due(&db, 10).await.unwrap().remove(0);
 
-    let gave_up = notifications::mark_attempt_failed(&db, &due, "smtp: timed out", false)
+    let recorded = notifications::mark_attempt_failed(&db, &due, "smtp: timed out", false)
         .await
         .unwrap();
-    assert!(!gave_up);
+    assert_eq!(recorded, FailureRecorded::Retrying);
     let (attempts, error, delay, failed): (i32, String, f64, bool) = sqlx::query_as(
         "SELECT attempts, last_error, \
                 extract(epoch FROM next_attempt_at - now())::float8, failed_at IS NOT NULL \
@@ -222,14 +226,23 @@ async fn failures_back_off_and_give_up_after_the_budget(pool: PgPool) {
         "first retry in ~10 s, got {delay}"
     );
 
-    let last = DueEmail {
-        attempts: MAX_ATTEMPTS - 1,
-        ..due.clone()
-    };
-    assert!(
+    // The last attempt in the budget gives up. Claimed afresh: the first
+    // claim's result is recorded, so its token no longer holds the row.
+    sqlx::query(
+        "UPDATE notification_outbox SET next_attempt_at = now(), attempts = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(MAX_ATTEMPTS - 1)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let last: DueEmail = notifications::claim_due(&db, 10).await.unwrap().remove(0);
+    assert_eq!(last.attempts, MAX_ATTEMPTS - 1);
+    assert_eq!(
         notifications::mark_attempt_failed(&db, &last, "smtp: timed out", false)
             .await
-            .unwrap()
+            .unwrap(),
+        FailureRecorded::GaveUp
     );
 
     // A permanent refusal gives up at once.
@@ -248,11 +261,133 @@ async fn failures_back_off_and_give_up_after_the_budget(pool: PgPool) {
         .into_iter()
         .find(|d| d.id == id2)
         .unwrap();
-    assert!(
+    assert_eq!(
         notifications::mark_attempt_failed(&db, &due2, "smtp 550", true)
             .await
-            .unwrap()
+            .unwrap(),
+        FailureRecorded::GaveUp
     );
+    assert!(notifications::claim_due(&db, 10).await.unwrap().is_empty());
+}
+
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct State {
+    attempts: i32,
+    sent: bool,
+    failed: bool,
+    last_error: Option<String>,
+    /// Seconds until the row is due again (negative: overdue).
+    due_in: f64,
+    sending: bool,
+}
+
+async fn state(db: &Db, id: uuid::Uuid) -> State {
+    sqlx::query_as(
+        "SELECT attempts, sent_at IS NOT NULL AS sent, failed_at IS NOT NULL AS failed, \
+                last_error, extract(epoch FROM next_attempt_at - now())::float8 AS due_in, \
+                sending_since IS NOT NULL AS sending \
+           FROM notification_outbox WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+/// Let `id`'s current claim lapse, as a task stalled past its lease would.
+async fn lapse(db: &Db, id: uuid::Uuid) {
+    sqlx::query("UPDATE notification_outbox SET next_attempt_at = now() - interval '1 second' WHERE id = $1")
+        .bind(id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+}
+
+/// A task whose lease lapsed (row claimed again by a second task) reports a
+/// failure: it must not reschedule the row under the second claim, which
+/// would make it due, and sendable by a third task, while the second task's
+/// send is still in flight.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_lapsed_claims_failure_cannot_overwrite_the_newer_claim(pool: PgPool) {
+    let db = db(pool);
+    let id = queue_one(&db).await;
+
+    let stale = notifications::claim_due(&db, 10).await.unwrap().remove(0);
+    lapse(&db, id).await;
+    let fresh = notifications::claim_due(&db, 10).await.unwrap().remove(0);
+    assert_eq!(fresh.id, id);
+    assert_ne!(fresh.claimed_at, stale.claimed_at, "claims share a token");
+    let before = state(&db, id).await;
+    assert!(before.sending && before.due_in > 60.0, "{before:?}");
+
+    for permanent in [false, true] {
+        assert_eq!(
+            notifications::mark_attempt_failed(&db, &stale, "smtp: timed out", permanent)
+                .await
+                .unwrap(),
+            FailureRecorded::Superseded
+        );
+    }
+    let after = state(&db, id).await;
+    assert_eq!(
+        (
+            after.attempts,
+            after.sent,
+            after.failed,
+            after.last_error.as_deref(),
+            after.sending
+        ),
+        (0, false, false, None, true),
+        "the stale claim wrote over the fresh one"
+    );
+    assert!(
+        after.due_in > 60.0,
+        "the fresh claim's lease was cut short: {after:?}"
+    );
+    assert!(
+        notifications::claim_due(&db, 10).await.unwrap().is_empty(),
+        "a third task could claim the row mid-send"
+    );
+
+    // The fresh claim's own result is recorded as usual.
+    assert_eq!(
+        notifications::mark_attempt_failed(&db, &fresh, "smtp: 451", false)
+            .await
+            .unwrap(),
+        FailureRecorded::Retrying
+    );
+    let s = state(&db, id).await;
+    assert_eq!((s.attempts, s.sending), (1, false));
+    assert_eq!(s.last_error.as_deref(), Some("smtp: 451"));
+}
+
+/// A delivered message is a fact whichever claim delivered it: a lapsed
+/// claim's successful send finishes the row, and the newer claim's result
+/// then changes nothing, so a failed duplicate cannot schedule yet another.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_lapsed_claims_success_finishes_the_row_for_good(pool: PgPool) {
+    let db = db(pool);
+    let id = queue_one(&db).await;
+
+    let stale = notifications::claim_due(&db, 10).await.unwrap().remove(0);
+    lapse(&db, id).await;
+    let fresh = notifications::claim_due(&db, 10).await.unwrap().remove(0);
+
+    assert!(notifications::mark_sent(&db, &stale).await.unwrap());
+    assert_eq!(
+        notifications::mark_attempt_failed(&db, &fresh, "smtp: 451", false)
+            .await
+            .unwrap(),
+        FailureRecorded::Superseded
+    );
+    assert!(!notifications::mark_sent(&db, &fresh).await.unwrap());
+
+    let s = state(&db, id).await;
+    assert_eq!(
+        (s.attempts, s.sent, s.failed, s.last_error, s.sending),
+        (1, true, false, None, false)
+    );
+    lapse(&db, id).await;
     assert!(notifications::claim_due(&db, 10).await.unwrap().is_empty());
 }
 
@@ -306,16 +441,18 @@ async fn delivery_works_across_orgs_under_row_level_security(pool: PgPool) {
         "every org's row is claimed"
     );
 
-    notifications::mark_sent(&app, due[0].id).await.unwrap();
-    assert!(
-        !notifications::mark_attempt_failed(&app, &due[1], "smtp: 451", false)
+    assert!(notifications::mark_sent(&app, &due[0]).await.unwrap());
+    assert_eq!(
+        notifications::mark_attempt_failed(&app, &due[1], "smtp: 451", false)
             .await
-            .unwrap()
+            .unwrap(),
+        FailureRecorded::Retrying
     );
-    assert!(
+    assert_eq!(
         notifications::mark_attempt_failed(&app, &due[2], "smtp: 550", true)
             .await
-            .unwrap()
+            .unwrap(),
+        FailureRecorded::GaveUp
     );
 
     let states: Vec<(bool, bool, i32)> = sqlx::query_as(
@@ -332,9 +469,12 @@ async fn delivery_works_across_orgs_under_row_level_security(pool: PgPool) {
     );
 
     // A finished row is final: a late duplicate result does not touch it.
-    notifications::mark_attempt_failed(&app, &due[0], "late", false)
-        .await
-        .unwrap();
+    assert_eq!(
+        notifications::mark_attempt_failed(&app, &due[0], "late", false)
+            .await
+            .unwrap(),
+        FailureRecorded::Superseded
+    );
     let sent_err: Option<String> =
         sqlx::query_scalar("SELECT last_error FROM notification_outbox WHERE id = $1")
             .bind(ids[0])

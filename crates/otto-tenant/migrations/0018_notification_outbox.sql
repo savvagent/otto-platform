@@ -48,6 +48,12 @@ CREATE TABLE notification_outbox (
   -- Next time a delivery task may pick this row up. Also the lease: claiming a
   -- row pushes this forward, so two replicas never send the same row at once.
   next_attempt_at timestamptz NOT NULL DEFAULT now(),
+  -- The current claim's token: when it was claimed. A delivery task records
+  -- a failed attempt only while this still equals its own claim's token, so a
+  -- task whose lease lapsed (and whose row was claimed again) cannot
+  -- reschedule the row under the newer claim and let a third task send it
+  -- while the second is still sending. Cleared when a result is recorded.
+  sending_since   timestamptz,
   sent_at         timestamptz,
   -- Set once the retry budget is spent or the server refused the message
   -- permanently. The row stays for an operator to read `last_error`.
@@ -63,7 +69,9 @@ CREATE INDEX notification_outbox_due_idx
   ON notification_outbox (next_attempt_at)
   WHERE sent_at IS NULL AND failed_at IS NULL;
 
-CREATE INDEX notification_outbox_org_idx ON notification_outbox (org_id, created_at);
+-- For the org foreign key's ON DELETE CASCADE and the tenant policy. Nothing
+-- reads an org's mail in created_at order, so the key is the org alone.
+CREATE INDEX notification_outbox_org_idx ON notification_outbox (org_id);
 
 ALTER TABLE notification_outbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notification_outbox FORCE ROW LEVEL SECURITY;

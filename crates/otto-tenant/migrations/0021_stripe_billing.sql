@@ -7,6 +7,12 @@
 -- Additive only: new columns on `subscriptions` (0003) and five new global
 -- tables.
 
+-- Fail fast rather than queue: a migration waiting for a lock on a busy table
+-- makes every later query on that table wait behind it. Failing the boot lets
+-- the next boot retry. SET LOCAL ends with this migration's transaction (sqlx
+-- runs each migration in one).
+SET LOCAL lock_timeout = '5s';
+
 -- ------------------------------------------------------------ subscriptions
 --
 -- 0003 already holds `stripe_customer_id`, `stripe_subscription_id` and
@@ -99,6 +105,10 @@ CREATE TABLE stripe_events (
   CONSTRAINT stripe_events_id_len CHECK (char_length(event_id) BETWEEN 1 AND 255),
   CONSTRAINT stripe_events_type_len CHECK (char_length(event_type) BETWEEN 1 AND 255)
 );
+
+-- What `otto_billing::billing::sweep_events` deletes by: ledger rows older than
+-- the retention window, oldest first, a bounded batch at a time.
+CREATE INDEX stripe_events_processed_at ON stripe_events (processed_at);
 
 -- The Stripe billing meter (and the Stripe product its prices hang off) for
 -- each platform meter, written by `stripe sync`.

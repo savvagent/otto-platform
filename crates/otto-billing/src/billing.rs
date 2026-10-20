@@ -107,7 +107,10 @@ pub use status::{
     PaymentMethodStatus, SubscriptionState,
 };
 pub use sync::{sync, sync_until, SyncReport};
-pub use webhook::{handle_event, EventOutcome, HANDLED_EVENT_TYPES};
+pub use webhook::{
+    handle_event, sweep_events, EventOutcome, EVENT_RETENTION_DAYS, HANDLED_EVENT_TYPES,
+    MIN_EVENT_RETENTION_DAYS,
+};
 
 /// The one currency billed in. Multi-currency is a non-goal.
 pub const CURRENCY: &str = "usd";

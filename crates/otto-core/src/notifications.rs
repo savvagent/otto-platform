@@ -30,6 +30,7 @@
 //! # }
 //! ```
 
+use chrono::{DateTime, Utc};
 use otto_tenant::{Db, Tx, Unpinned};
 use uuid::Uuid;
 
@@ -102,10 +103,20 @@ pub async fn enqueue_email(
 /// dot. Every address this platform holds came from a sign-in or an invite, so
 /// the narrow form loses nothing real and refuses everything that could smuggle
 /// a second header or recipient into the message.
+///
+/// The error never contains the address: it is a person's, and callers log
+/// these errors.
+///
+/// ```
+/// use otto_core::notifications::validate_recipient;
+/// assert!(validate_recipient("owner@acme.example").is_ok());
+/// let err = validate_recipient("owner@localhost").unwrap_err();
+/// assert!(!err.to_string().contains("owner"));
+/// ```
 pub fn validate_recipient(addr: &str) -> Result<()> {
     let invalid = |why: &str| {
         Err(Error::Invalid(format!(
-            "{addr:?} is not an email address: {why}"
+            "the recipient is not an email address: {why}"
         )))
     };
 
@@ -183,6 +194,24 @@ pub struct DueEmail {
     pub body_text: String,
     /// Attempts made before this one.
     pub attempts: i32,
+    /// This claim's token: the row's `sending_since` as the claim set it.
+    /// [`mark_attempt_failed`] writes only while the row still carries it.
+    pub claimed_at: DateTime<Utc>,
+}
+
+/// What [`mark_attempt_failed`] recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureRecorded {
+    /// The attempt is recorded and the row will be tried again after the
+    /// backoff.
+    Retrying,
+    /// The attempt is recorded and the row is given up on: the retry budget
+    /// is spent or the failure was permanent.
+    GaveUp,
+    /// Nothing was written: this claim no longer holds the row. Its lease
+    /// lapsed and another task claimed it again (or already recorded a
+    /// result), and that task's claim decides what happens next.
+    Superseded,
 }
 
 /// An unpinned transaction opted in to the outbox's delivery policy
@@ -203,6 +232,13 @@ async fn delivery_tx(db: &Db) -> Result<Unpinned> {
 /// replicas can run a delivery task against one table without ever sending the
 /// same row twice at once. A task that dies after claiming lets the lease
 /// lapse and the row becomes due again.
+///
+/// A claim also sets `sending_since`, its **fence**: it equals the returned
+/// [`DueEmail::claimed_at`], and [`mark_attempt_failed`] writes only while it
+/// still does. A task whose lease lapsed and whose row was claimed again can
+/// therefore never reschedule the row under the newer claim, which would make
+/// it due while that claim's send is still in flight and let a third task
+/// send it too.
 pub async fn claim_due(db: &Db, limit: i64) -> Result<Vec<DueEmail>> {
     let mut tx = delivery_tx(db).await?;
     let rows = sqlx::query_as(
@@ -214,10 +250,12 @@ pub async fn claim_due(db: &Db, limit: i64) -> Result<Vec<DueEmail>> {
             FOR UPDATE SKIP LOCKED \
          ) \
          UPDATE notification_outbox n \
-            SET next_attempt_at = now() + make_interval(secs => $2) \
+            SET next_attempt_at = now() + make_interval(secs => $2), \
+                sending_since = now() \
            FROM due \
           WHERE n.id = due.id \
-         RETURNING n.id, n.org_id, n.recipient, n.subject, n.body_text, n.attempts",
+         RETURNING n.id, n.org_id, n.recipient, n.subject, n.body_text, n.attempts, \
+                   n.sending_since AS claimed_at",
     )
     .bind(limit)
     .bind(CLAIM_LEASE_SECONDS as f64)
@@ -227,19 +265,31 @@ pub async fn claim_due(db: &Db, limit: i64) -> Result<Vec<DueEmail>> {
     Ok(rows)
 }
 
-/// Record a successful send.
-pub async fn mark_sent(db: &Db, id: Uuid) -> Result<()> {
+/// Record a successful send. Returns whether it was recorded: `false` when
+/// the row is already sent or given up on.
+///
+/// Deliberately **not** fenced by the claim, unlike [`mark_attempt_failed`]
+/// (and like `otto_billing::stripe_outbox::mark_sent`): a delivered message is
+/// a fact whichever claim delivered it. Recording it from a lapsed claim
+/// finishes the row, and clears the fence, so the newer claim's result (a
+/// duplicate send, or a failure that would schedule yet another) changes
+/// nothing. Fencing it out instead would leave the row to be sent again if
+/// the newer claim's send failed.
+pub async fn mark_sent(db: &Db, email: &DueEmail) -> Result<bool> {
     let mut tx = delivery_tx(db).await?;
-    sqlx::query(
+    let written = sqlx::query(
         "UPDATE notification_outbox \
-            SET sent_at = now(), attempts = attempts + 1, last_error = NULL \
+            SET sent_at = now(), attempts = attempts + 1, last_error = NULL, \
+                sending_since = NULL \
           WHERE id = $1 AND sent_at IS NULL AND failed_at IS NULL",
     )
-    .bind(id)
+    .bind(email.id)
     .execute(tx.conn())
-    .await?;
+    .await?
+    .rows_affected()
+        == 1;
     tx.commit().await?;
-    Ok(())
+    Ok(written)
 }
 
 /// Record a failed attempt and schedule the retry, or give up when
@@ -250,37 +300,48 @@ pub async fn mark_sent(db: &Db, id: Uuid) -> Result<()> {
 /// `From:` (`5.7.x`), must not be `permanent`: it would discard every queued
 /// email instead of waiting for the fix.
 ///
-/// A row already sent or given up on is left alone.
+/// Fenced: written only while the row still carries `email`'s claim token
+/// ([`DueEmail::claimed_at`], see [`claim_due`]) and is neither sent nor given
+/// up on; otherwise nothing is written and the result is
+/// [`FailureRecorded::Superseded`].
 ///
 /// `error` is stored as given and shown to operators: the caller is
-/// responsible for it holding no secret. Returns `true` if the row was given
-/// up on.
+/// responsible for it holding no secret.
 pub async fn mark_attempt_failed(
     db: &Db,
     email: &DueEmail,
     error: &str,
     permanent: bool,
-) -> Result<bool> {
-    let attempts = email.attempts + 1;
+) -> Result<FailureRecorded> {
+    let attempts = email.attempts.saturating_add(1);
     let gave_up = permanent || attempts >= MAX_ATTEMPTS;
     let mut tx = delivery_tx(db).await?;
-    sqlx::query(
+    let written = sqlx::query(
         "UPDATE notification_outbox \
             SET attempts = $2, \
                 last_error = $3, \
                 next_attempt_at = now() + make_interval(secs => $4), \
-                failed_at = CASE WHEN $5 THEN now() END \
-          WHERE id = $1 AND sent_at IS NULL AND failed_at IS NULL",
+                failed_at = CASE WHEN $5 THEN now() END, \
+                sending_since = NULL \
+          WHERE id = $1 AND sent_at IS NULL AND failed_at IS NULL \
+            AND sending_since IS NOT DISTINCT FROM $6",
     )
     .bind(email.id)
     .bind(attempts)
     .bind(error)
     .bind(crate::lifecycle::backoff_seconds(attempts) as f64)
     .bind(gave_up)
+    .bind(email.claimed_at)
     .execute(tx.conn())
-    .await?;
+    .await?
+    .rows_affected()
+        == 1;
     tx.commit().await?;
-    Ok(gave_up)
+    Ok(match (written, gave_up) {
+        (false, _) => FailureRecorded::Superseded,
+        (true, true) => FailureRecorded::GaveUp,
+        (true, false) => FailureRecorded::Retrying,
+    })
 }
 
 /// Delete sent and failed rows older than `keep_days`. Queued rows are never
@@ -353,6 +414,22 @@ mod tests {
         }
         let long = format!("{}@acme.example", "a".repeat(65));
         assert!(validate_recipient(&long).is_err());
+    }
+
+    #[test]
+    fn a_refusal_never_repeats_the_address() {
+        for bad in [
+            "secret.person@localhost",
+            "secret.person@-acme.example",
+            "secret..person@acme.example",
+            "secret.person@acme.example\r\nBcc: x@evil.example",
+            "Secret Person <secret.person@acme.example>",
+        ] {
+            let err = validate_recipient(bad).unwrap_err().to_string();
+            for part in ["secret", "acme", "localhost", "evil"] {
+                assert!(!err.contains(part), "{err:?} repeats {part:?} of {bad:?}");
+            }
+        }
     }
 
     #[test]

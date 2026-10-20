@@ -11,14 +11,28 @@
 use crate::error::{Error, Result};
 use crate::ids::OrgId;
 use crate::isolation::IsolationReport;
+use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPoolOptions, Postgres};
 use sqlx::{PgPool, Transaction};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::OnceCell;
 
 /// The tenant migrations, exposed so a consumer's tests can hand them to
 /// `#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]`.
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+///
+/// **Rollback-safe.** The migrator ignores applied migrations it does not
+/// know (sqlx's `ignore_missing`), so a release rolled back after a newer one
+/// migrated the database still boots, instead of refusing with
+/// `VersionMissing`. That is sound only because migrations are additive: a
+/// newer schema is a superset an older binary can run against. A migration
+/// that is not (a dropped or renamed column an older release still reads)
+/// needs a release that stops using it first. Every migration it *does* know
+/// is still checked against its applied checksum.
+pub static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| {
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.set_ignore_missing(true);
+    migrator
+});
 
 /// The default application role that tenant transactions run as. Matches the
 /// role migration `0004_rls.sql` creates; override it per [`Db`] with
@@ -157,6 +171,9 @@ impl Db {
     /// Apply all migrations. Safe to run from several replicas at once: sqlx
     /// takes a Postgres advisory lock for the duration, so the losers wait
     /// rather than racing each other through the same DDL.
+    ///
+    /// Applied migrations newer than this binary are ignored, so a rolled-back
+    /// release still boots; see [`MIGRATOR`].
     pub async fn migrate(&self) -> Result<()> {
         MIGRATOR
             .run(&self.pool)

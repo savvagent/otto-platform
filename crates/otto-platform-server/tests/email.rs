@@ -160,6 +160,28 @@ async fn a_permanent_failure_is_given_up_at_once(pool: PgPool) {
     assert!(r.failed && !r.sent, "{r:?}");
 }
 
+/// A server that echoes the recipient in its refusal (most do) must not get
+/// the address into the logged and stored error.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_refusal_echoing_the_recipient_is_recorded_without_it(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let id = queue(&db, "Owner@Acme.Example").await;
+    let mailer = FakeMailer {
+        fail: Some(SendError::permanent(
+            "smtp: permanent error (550): 5.1.1 <owner@acme.example>: user unknown",
+        )),
+        ..FakeMailer::default()
+    };
+    email::deliver_due(&db, &mailer).await.unwrap();
+    let r = row(&db, id).await;
+    assert!(r.failed, "{r:?}");
+    let error = r.last_error.unwrap();
+    assert_eq!(
+        error,
+        "smtp: permanent error (550): 5.1.1 <<recipient>>: user unknown"
+    );
+}
+
 /// How the scripted server behaves.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Script {
