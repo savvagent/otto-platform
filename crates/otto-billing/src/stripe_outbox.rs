@@ -38,8 +38,16 @@
 //! has a Stripe billing meter (`stripe_meters`, written by `stripe sync`), so
 //! a meter declared since the last sync never has its events sent to a meter
 //! that does not exist yet (Stripe would accept them and drop them
-//! asynchronously). Such rows wait; their retry window has not started, and
-//! they still expire by age ([`expire_stale`]).
+//! asynchronously). Such rows wait, pushed back [`UNSYNCED_RECHECK`] at a time
+//! ([`defer_unsynced`]) so they do not head the due index; their retry window
+//! has not started, and they still expire by age ([`expire_stale`]).
+//!
+//! **Fenced writes.** A claim's `sending_since` is its token: a shipper
+//! records a retry or a terminal outcome only while the row still carries the
+//! token of its own claim, so a shipper whose lease lapsed cannot overwrite a
+//! newer claim's state (see [`claim_due`]). A row expired after an attempt
+//! Stripe may have received says so in `last_error`
+//! ([`MAY_HAVE_BEEN_DELIVERED`]).
 //!
 //! **`sent` means accepted for processing.** Stripe validates meter events
 //! asynchronously (an unknown customer, an archived meter) and reports
@@ -267,21 +275,30 @@ impl DueMeterEvent {
     /// older than Stripe accepts, or its retry window has closed (a row whose
     /// claims kept lapsing). `None` to send it.
     pub fn expired_before_send(&self) -> Option<String> {
-        if self.occurred_at < self.claimed_at - MAX_EVENT_AGE {
-            return Some(too_old());
-        }
-        if self
+        let why = if self.occurred_at < self.claimed_at - MAX_EVENT_AGE {
+            too_old()
+        } else if self
             .window_started_at
             .is_some_and(|start| self.claimed_at > start + RETRY_WINDOW)
         {
-            return Some(format!(
+            format!(
                 "not sent within {} hours of the first attempt Stripe may have received",
                 RETRY_WINDOW.num_hours()
-            ));
-        }
-        None
+            )
+        } else {
+            return None;
+        };
+        Some(match self.window_started_at {
+            Some(_) => format!("{why}{MAY_HAVE_BEEN_DELIVERED}"),
+            None => why,
+        })
     }
 }
+
+/// Appended to the error of a row expired after an attempt Stripe may have
+/// received: its usage may be on the invoice after all.
+pub const MAY_HAVE_BEEN_DELIVERED: &str =
+    " (an earlier attempt may have been delivered: check Stripe before re-billing)";
 
 fn too_old() -> String {
     format!(
@@ -411,6 +428,12 @@ const DUE_COLS: &str = "o.id, o.org_id, o.identifier, o.event_name, o.stripe_cus
 /// a shipper that dies lets the lease lapse. It sets `sending_since`; a row
 /// claimed with it still set had its previous answer lost, which starts its
 /// retry window from that earlier send.
+///
+/// `sending_since` is also the claim's **fence**: it equals the returned
+/// [`DueMeterEvent::claimed_at`], and [`mark_retry`] and [`mark_terminal`]
+/// write only while it still does. A shipper whose lease lapsed and was
+/// claimed again can therefore never record over the new claim (and clear
+/// the evidence that the new claim's send may be in flight).
 pub async fn claim_due(db: &Db, limit: i64) -> Result<Vec<DueMeterEvent>> {
     let mut tx = delivery_tx(db).await?;
     let rows = sqlx::query_as(&format!(
@@ -458,7 +481,8 @@ pub async fn mark_sent(db: &Db, row: &DueMeterEvent) -> Result<()> {
 /// backoff (10 s doubling to an hour), or expire the row when that attempt
 /// would fall outside its [`RETRY_WINDOW`] or past [`MAX_EVENT_AGE`]. With
 /// `maybe_received`, this attempt starts the window if nothing has yet.
-/// Returns the row's new status.
+/// Returns the row's new status, or `None` when this claim no longer holds
+/// the row (fenced out; nothing was written).
 ///
 /// `error` is Stripe's error, already scrubbed of the secret key by the
 /// client; it is cut to a readable length here.
@@ -467,7 +491,7 @@ pub async fn mark_retry(
     row: &DueMeterEvent,
     error: &str,
     maybe_received: bool,
-) -> Result<OutboxStatus> {
+) -> Result<Option<OutboxStatus>> {
     let attempts = row.attempts.saturating_add(1);
     let backoff = otto_core::lifecycle::backoff_seconds(attempts);
     let mut tx = delivery_tx(db).await?;
@@ -478,6 +502,7 @@ pub async fn mark_retry(
                            CASE WHEN $7 THEN COALESCE(sending_since, now()) END) AS win \
            FROM stripe_meter_outbox \
            WHERE id = $1 AND status = 'pending' \
+             AND sending_since IS NOT DISTINCT FROM $8 \
          ), calc AS ( \
            SELECT id, next_at, win, \
                   (next_at > win + make_interval(secs => $4)) IS TRUE \
@@ -492,7 +517,9 @@ pub async fn mark_retry(
                 status = CASE WHEN calc.expire THEN 'expired' ELSE 'pending' END, \
                 finished_at = CASE WHEN calc.expire THEN now() END, \
                 last_error = CASE WHEN calc.expire \
-                  THEN 'retry window closed; last error: ' || $6 ELSE $6 END \
+                  THEN 'retry window closed; last error: ' || $6 \
+                       || CASE WHEN calc.win IS NOT NULL THEN $9 ELSE '' END \
+                  ELSE $6 END \
            FROM calc \
           WHERE o.id = calc.id \
          RETURNING o.status",
@@ -504,45 +531,49 @@ pub async fn mark_retry(
     .bind(MAX_EVENT_AGE.num_seconds() as f64)
     .bind(truncate(error))
     .bind(maybe_received)
+    .bind(row.claimed_at)
+    .bind(MAY_HAVE_BEEN_DELIVERED)
     .fetch_optional(tx.conn())
     .await?;
     tx.commit().await?;
-    // No row: already finished by another shipper whose lease outlived ours.
-    Ok(status
-        .as_deref()
-        .and_then(OutboxStatus::parse)
-        .unwrap_or(OutboxStatus::Pending))
+    Ok(status.as_deref().and_then(OutboxStatus::parse))
 }
 
 /// Record the row as never to be sent: `status` is [`OutboxStatus::Rejected`]
 /// or [`OutboxStatus::Expired`]; anything else is treated as rejected.
+/// Returns whether it was recorded: `false` when this claim no longer holds
+/// the row (fenced out, see [`claim_due`]).
 pub async fn mark_terminal(
     db: &Db,
     row: &DueMeterEvent,
     status: OutboxStatus,
     error: &str,
     attempted: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let status = if status == OutboxStatus::Expired {
         status
     } else {
         OutboxStatus::Rejected
     };
     let mut tx = delivery_tx(db).await?;
-    sqlx::query(
+    let written = sqlx::query(
         "UPDATE stripe_meter_outbox \
             SET status = $2, finished_at = now(), last_error = $3, sending_since = NULL, \
                 attempts = attempts + $4 \
-          WHERE id = $1 AND status = 'pending'",
+          WHERE id = $1 AND status = 'pending' \
+            AND sending_since IS NOT DISTINCT FROM $5",
     )
     .bind(row.id)
     .bind(status.as_str())
     .bind(truncate(error))
     .bind(i32::from(attempted))
+    .bind(row.claimed_at)
     .execute(tx.conn())
-    .await?;
+    .await?
+    .rows_affected()
+        == 1;
     tx.commit().await?;
-    Ok(())
+    Ok(written)
 }
 
 /// Expire every pending row whose event has grown older than
@@ -554,17 +585,48 @@ pub async fn expire_stale(db: &Db) -> Result<Vec<DueMeterEvent>> {
     let rows = sqlx::query_as(&format!(
         "UPDATE stripe_meter_outbox o \
             SET status = 'expired', finished_at = now(), sending_since = NULL, \
-                last_error = $2 \
-          WHERE o.status = 'pending' AND o.next_attempt_at <= now() \
+                last_error = $2 || CASE WHEN o.window_started_at IS NOT NULL \
+                                        OR o.sending_since IS NOT NULL \
+                                   THEN $3 ELSE '' END \
+          WHERE o.status = 'pending' \
+            AND (o.sending_since IS NULL OR o.next_attempt_at <= now()) \
             AND o.occurred_at < now() - make_interval(secs => $1) \
          RETURNING {DUE_COLS}"
     ))
     .bind(MAX_EVENT_AGE.num_seconds() as f64)
     .bind(format!("{} before it could be sent", too_old()))
+    .bind(MAY_HAVE_BEEN_DELIVERED)
     .fetch_all(tx.conn())
     .await?;
     tx.commit().await?;
     Ok(rows)
+}
+
+/// How long rows whose meter Stripe does not know yet wait before they are
+/// looked at again, so they do not sit at the head of the due index.
+pub const UNSYNCED_RECHECK: Duration = Duration::minutes(5);
+
+/// Push back every due pending row whose meter Stripe does not know yet
+/// (`stripe sync` has not made it) by [`UNSYNCED_RECHECK`], and return how
+/// many there were and how long the oldest has been queued. A row under a
+/// live claim is not touched.
+pub async fn defer_unsynced(db: &Db) -> Result<(i64, Option<Duration>)> {
+    let mut tx = delivery_tx(db).await?;
+    let (n, oldest): (i64, Option<f64>) = sqlx::query_as(
+        "WITH deferred AS ( \
+           UPDATE stripe_meter_outbox o \
+              SET next_attempt_at = now() + make_interval(secs => $1) \
+            WHERE o.status = 'pending' AND o.next_attempt_at <= now() \
+              AND NOT EXISTS (SELECT 1 FROM stripe_meters m WHERE m.event_name = o.event_name) \
+           RETURNING o.created_at \
+         ) \
+         SELECT count(*), extract(epoch FROM now() - min(created_at))::float8 FROM deferred",
+    )
+    .bind(UNSYNCED_RECHECK.num_seconds() as f64)
+    .fetch_one(tx.conn())
+    .await?;
+    tx.commit().await?;
+    Ok((n, oldest.map(|s| Duration::seconds(s.max(0.0) as i64))))
 }
 
 /// Delete `sent` rows finished more than `keep_days` ago. Pending rows are

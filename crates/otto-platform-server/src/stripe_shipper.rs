@@ -72,6 +72,11 @@ const _: () = assert!(
     BATCH as u64 * SEND_DEADLINE.as_secs() * 2 <= stripe_outbox::CLAIM_LEASE_SECONDS as u64
 );
 const SWEEP_EVERY: Duration = Duration::from_secs(3600);
+/// How long rows may wait for their Stripe meter before an error says so.
+const UNSYNCED_WARN_AFTER: chrono::Duration = chrono::Duration::hours(1);
+/// How often that error may repeat.
+const UNSYNCED_WARN_EVERY: Duration = Duration::from_secs(3600);
+static UNSYNCED_WARNED: Mutex<Option<Instant>> = Mutex::new(None);
 const EXPIRE_EVERY: Duration = Duration::from_secs(60);
 /// Log lines a minute about lost usage, and separately about retries, before
 /// the rest are counted.
@@ -170,7 +175,8 @@ pub async fn run(db: Db, client: Client, mut shutdown: watch::Receiver<bool>) {
 }
 
 /// Expire rows grown too old to send without ever being claimed, and report
-/// each as lost.
+/// each as lost; then push back rows whose meter Stripe does not know yet,
+/// and say so (at most once an hour) once the oldest has waited an hour.
 async fn expire_stale(db: &Db) {
     match stripe_outbox::expire_stale(db).await {
         Ok(rows) => {
@@ -181,8 +187,27 @@ async fn expire_stale(db: &Db) {
                     "too old before it could be sent",
                 );
             }
+            lost_logs_summary();
         }
         Err(e) => tracing::warn!(error = %e, "expiring stale stripe meter events failed"),
+    }
+    match stripe_outbox::defer_unsynced(db).await {
+        Ok((n, Some(oldest))) if oldest >= UNSYNCED_WARN_AFTER => {
+            let mut last = UNSYNCED_WARNED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if last.is_none_or(|t| t.elapsed() >= UNSYNCED_WARN_EVERY) {
+                *last = Some(Instant::now());
+                tracing::error!(
+                    events = n,
+                    oldest_minutes = oldest.num_minutes(),
+                    "metered usage is waiting for a Stripe meter that does not exist yet: \
+                     run `otto-platform-server stripe sync` and read its errors"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "deferring unsynced stripe meter events failed"),
     }
 }
 
@@ -223,6 +248,7 @@ pub async fn ship_due_with_deadline(
         .collect::<Vec<()>>()
         .await;
     retry_logs_summary();
+    lost_logs_summary();
     Ok(PassReport {
         claimed,
         sent: tally.sent.load(Ordering::Relaxed),
@@ -263,16 +289,18 @@ async fn ship_one(
 ) {
     let recorded = async {
         if let Some(why) = row.expired_before_send() {
-            stripe_outbox::mark_terminal(db, row, OutboxStatus::Expired, &why, false).await?;
-            report_lost(row, OutboxStatus::Expired, &why);
+            if stripe_outbox::mark_terminal(db, row, OutboxStatus::Expired, &why, false).await? {
+                report_lost(row, OutboxStatus::Expired, &why);
+            }
             return Ok(());
         }
         let key = match row.idempotency_key() {
             Ok(key) => key,
             Err(billing::Error::Stripe(e)) => {
                 let e = e.to_string();
-                stripe_outbox::mark_terminal(db, row, OutboxStatus::Rejected, &e, false).await?;
-                report_lost(row, OutboxStatus::Rejected, &e);
+                if stripe_outbox::mark_terminal(db, row, OutboxStatus::Rejected, &e, false).await? {
+                    report_lost(row, OutboxStatus::Rejected, &e);
+                }
                 return Ok(());
             }
             Err(other) => return Err(other),
@@ -315,8 +343,9 @@ async fn ship_one(
                 maybe_received,
             } => retry(db, row, &error, maybe_received).await,
             Verdict::Reject(e) => {
-                stripe_outbox::mark_terminal(db, row, OutboxStatus::Rejected, &e, true).await?;
-                report_lost(row, OutboxStatus::Rejected, &e);
+                if stripe_outbox::mark_terminal(db, row, OutboxStatus::Rejected, &e, true).await? {
+                    report_lost(row, OutboxStatus::Rejected, &e);
+                }
                 Ok(())
             }
         }
@@ -349,7 +378,9 @@ async fn retry(
             "stripe meter event failed; will retry"
         );
     }
-    if stripe_outbox::mark_retry(db, row, error, maybe_received).await? == OutboxStatus::Expired {
+    if stripe_outbox::mark_retry(db, row, error, maybe_received).await?
+        == Some(OutboxStatus::Expired)
+    {
         report_lost(row, OutboxStatus::Expired, error);
     }
     Ok(())
@@ -405,19 +436,25 @@ fn retry_logs_summary() {
     }
 }
 
-/// Log a row whose usage will never reach Stripe, at error level, within
-/// [`LOST_LOGS`]' budget; the rest are counted and reported with the next
-/// line that is logged.
-fn report_lost(row: &DueMeterEvent, status: OutboxStatus, error: &str) {
-    if !LOST_LOGS.allow() {
-        return;
-    }
+/// One line, at the end of each pass, for the lost-usage errors the budget
+/// held back, so the end of a burst is reported without waiting for the next
+/// loss.
+fn lost_logs_summary() {
     let held = LOST_LOGS.take_held_back();
     if held > 0 {
         tracing::error!(
             events = held,
             "more metered usage was not billed; see `otto-platform-server stripe outbox`"
         );
+    }
+}
+
+/// Log a row whose usage will never reach Stripe, at error level, within
+/// [`LOST_LOGS`]' budget; the rest are counted and reported by
+/// [`lost_logs_summary`].
+fn report_lost(row: &DueMeterEvent, status: OutboxStatus, error: &str) {
+    if !LOST_LOGS.allow() {
+        return;
     }
     tracing::error!(
         outbox_id = %row.id,

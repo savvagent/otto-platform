@@ -488,13 +488,15 @@ async fn terminal_failures_are_recorded_and_never_retried(pool: PgPool) {
     assert!(old_row
         .last_error
         .as_deref()
-        .is_some_and(|e| e.contains("older than")));
+        .is_some_and(|e| e.contains("older than") && !e.contains("may have been delivered")));
     let late_row = w.row(&identifier_of(&late)).await;
     assert_eq!(late_row.status, "expired");
     assert!(late_row
         .last_error
         .as_deref()
-        .is_some_and(|e| e.contains("retry window closed") && e.contains("503")));
+        .is_some_and(|e| e.contains("retry window closed")
+            && e.contains("503")
+            && e.contains("may have been delivered")));
 
     // None of them is claimed again, and the lost ones are counted.
     w.make_due().await;
@@ -542,7 +544,12 @@ async fn a_row_whose_window_closed_unsent_expires_without_a_call(pool: PgPool) {
         .await
         .unwrap();
     assert!(mock.requests("POST", METER_EVENTS).is_empty());
-    assert_eq!(w.row(&identifier_of(&ev)).await.status, "expired");
+    let row = w.row(&identifier_of(&ev)).await;
+    assert_eq!(row.status, "expired");
+    assert!(row
+        .last_error
+        .as_deref()
+        .is_some_and(|e| e.contains("may have been delivered")));
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
@@ -720,7 +727,12 @@ async fn a_row_waits_until_stripe_knows_its_meter(pool: PgPool) {
     .unwrap();
     assert_eq!(waiting, None);
 
-    // Waiting still expires by age.
+    // Waiting rows are pushed back so they do not head the due index...
+    let (deferred, oldest) = stripe_outbox::defer_unsynced(&w.db).await.unwrap();
+    assert_eq!(deferred, 2);
+    assert!(oldest.is_some());
+    assert_eq!(stripe_outbox::defer_unsynced(&w.db).await.unwrap().0, 0);
+    // ...and still expire by age.
     let expired = stripe_outbox::expire_stale(&w.db).await.unwrap();
     assert_eq!(
         expired
@@ -731,8 +743,16 @@ async fn a_row_waits_until_stripe_knows_its_meter(pool: PgPool) {
     );
     assert_eq!(w.row(&identifier_of(&stale)).await.status, "expired");
 
-    // Once sync has made the meter, it ships.
+    // Once sync has made the meter, it ships at its next recheck.
     w.sync_meter().await;
+    assert_eq!(
+        stripe_shipper::ship_due(&w.db, &mock.client())
+            .await
+            .unwrap()
+            .claimed,
+        0
+    );
+    w.make_due().await;
     let report = stripe_shipper::ship_due(&w.db, &mock.client())
         .await
         .unwrap();
@@ -933,4 +953,62 @@ async fn a_pass_without_progress_does_not_start_the_next_at_once(pool: PgPool) {
         .await
         .expect("stops on shutdown")
         .unwrap();
+}
+
+/// A shipper whose lease lapsed and was claimed again cannot record over the
+/// new claim: its writes are fenced by the claim's `sending_since`.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_stale_shipper_cannot_record_over_a_newer_claim(pool: PgPool) {
+    let w = world(pool).await;
+    let org = w
+        .org("live", Billing::Subscribed("cus_live", "active"))
+        .await;
+    let ev = event(org, Some(2));
+    w.ship(vec![ev]).await;
+
+    let first = stripe_outbox::claim_due(&w.db, 10).await.unwrap().remove(0);
+    // Its lease lapses; another shipper claims the row.
+    sqlx::query("UPDATE stripe_meter_outbox SET next_attempt_at = now() - interval '1 second'")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let second = stripe_outbox::claim_due(&w.db, 10).await.unwrap().remove(0);
+    assert_ne!(first.claimed_at, second.claimed_at);
+    // The first claim's answer was never recorded: the window starts there.
+    assert_eq!(second.window_started_at, Some(first.claimed_at));
+
+    let state = || async {
+        sqlx::query_as::<_, (String, i32, Option<DateTime<Utc>>)>(
+            "SELECT status, attempts, sending_since FROM stripe_meter_outbox",
+        )
+        .fetch_one(&w.pool)
+        .await
+        .unwrap()
+    };
+    // The stale shipper's definite failure, and a terminal: no effect.
+    assert_eq!(
+        stripe_outbox::mark_retry(&w.db, &first, "HTTP 401", false)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        !stripe_outbox::mark_terminal(&w.db, &first, OutboxStatus::Rejected, "HTTP 400", true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        state().await,
+        ("pending".to_owned(), 0, Some(second.claimed_at)),
+        "the newer claim's in-flight marker survives"
+    );
+
+    // The current claim records normally.
+    assert_eq!(
+        stripe_outbox::mark_retry(&w.db, &second, "HTTP 429", false)
+            .await
+            .unwrap(),
+        Some(OutboxStatus::Pending)
+    );
+    assert_eq!(state().await, ("pending".to_owned(), 1, None));
 }
