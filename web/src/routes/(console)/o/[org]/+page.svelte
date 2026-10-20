@@ -6,8 +6,9 @@
   import { useOrg } from '$lib/org.svelte';
   import { roleLabel } from '$lib/labels';
   import { SERVICES } from '$lib/services';
-  import type { OrgMember, Team, UsageStatus } from '$lib/types';
+  import type { BudgetsResponse, OrgMember, Team, UsageStatus } from '$lib/types';
   import Alert from '$lib/components/Alert.svelte';
+  import BudgetAlerts from '$lib/components/BudgetAlerts.svelte';
   import Card from '$lib/components/Card.svelte';
   import Empty from '$lib/components/Empty.svelte';
   import Loading from '$lib/components/Loading.svelte';
@@ -15,15 +16,16 @@
   import ServiceLink from '$lib/components/ServiceLink.svelte';
 
   /**
-   * The organization overview: who is in it, what plan it is on, how much of
-   * the period's bucket has gone, and where to go to use the services it has.
+   * The organization overview: who is in it, what plan it is on, what each
+   * metered service has cost this month against any budget (with any budget
+   * alerts this month has fired), and where to go to use the services it has.
    *
    * It owns identity and billing only. What an org *does* with a service (queues,
    * repositories, trackers) lives in that service's own console, or, for a
    * service with none, in the person's AI assistant; this page links to each
    * from `SERVICES` through `ServiceLink`, which knows which is which.
    *
-   * The three reads land as one value so a render never pairs one request's
+   * The four reads land as one value so a render never pairs one request's
    * member count with another's meter. They are plain `GET`s, not polled: nothing
    * here changes while nobody is touching the browser.
    */
@@ -34,6 +36,8 @@
     members: OrgMember[];
     teams: Team[];
     usage: UsageStatus;
+    /** `undefined` when the budgets read failed: alerts are optional here. */
+    budgets: BudgetsResponse | undefined;
   }
 
   let overview = $state<Overview | undefined>(undefined);
@@ -48,15 +52,26 @@
 
     void (async () => {
       try {
-        const [members, teams, usage] = await Promise.all([
+        // Budgets only feed the alerts, so a failed budgets read leaves them
+        // out (with a quiet note) instead of blanking the overview.
+        const [members, teams, usage, budgets] = await Promise.allSettled([
           api.members(slug),
           api.teams(slug),
-          api.usage(slug)
+          api.usage(slug),
+          api.budgets(slug)
         ]);
+        if (members.status === 'rejected') throw members.reason;
+        if (teams.status === 'rejected') throw teams.reason;
+        if (usage.status === 'rejected') throw usage.reason;
         // A fast navigation between two orgs can land the first fetch after the
         // second; applying it would show one org's numbers under the other's name.
         if (org.slug !== slug) return;
-        overview = { members, teams, usage };
+        overview = {
+          members: members.value,
+          teams: teams.value,
+          usage: usage.value,
+          budgets: budgets.status === 'fulfilled' ? budgets.value : undefined
+        };
       } catch (e) {
         if (org.slug === slug) error = messageFor(e, m.overview_load_failed());
       }
@@ -89,6 +104,12 @@
   {:else if !overview}
     <Loading what={m.overview_loading()} />
   {:else}
+    {#if overview.budgets}
+      <BudgetAlerts services={overview.budgets.services} />
+    {:else}
+      <p class="text-xs text-faint">{m.usage_alerts_unavailable()}</p>
+    {/if}
+
     <div class="grid grid-cols-2 gap-3">
       {#each tiles as tile (tile.href)}
         <a class="otto-card px-4 py-3 transition hover:bg-raised" href="/o/{org.slug}/{tile.href}">
@@ -107,7 +128,15 @@
             {m.overview_period_details()}
           </a>
         {/snippet}
-        <Meter usage={overview.usage} compact />
+        {#if overview.usage.services.length === 0}
+          <p class="text-sm text-faint">{m.overview_spend_empty()}</p>
+        {:else}
+          <ul class="space-y-3">
+            {#each overview.usage.services as service (service.service)}
+              <li><Meter usage={service} compact /></li>
+            {/each}
+          </ul>
+        {/if}
       </Card>
 
       <Card title={m.overview_services_title()} description={m.overview_services_description()}>

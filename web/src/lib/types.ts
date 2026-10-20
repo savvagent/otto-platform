@@ -179,17 +179,116 @@ export interface TeamMember {
   joinedAt: string;
 }
 
+/**
+ * `GET /api/orgs/{org}/usage`: this month's metered usage and spend, per
+ * service.
+ *
+ * **Only part of the body is declared, on purpose.** The server still sends
+ * the retired family-wide bucket beside `services` (`includedOps`,
+ * `billableUsed`, `remaining`, `totalCalls`, `warning`, `hardStop`,
+ * `enforced`). Usage is now priced per service, by value meter, so the
+ * console no longer presents any of those, and leaving them undeclared makes
+ * `npm run check` fail on a page that starts reading them again.
+ */
 export interface UsageStatus {
   plan: string;
-  includedOps: number;
-  billableUsed: number;
-  remaining: number;
-  totalCalls: number;
+  /** First day of the UTC billing month, `YYYY-MM-DD`. */
   periodStart: string;
-  warning: boolean;
+  /** Each service with declared meters, by slug. */
+  services: ServiceUsage[];
+}
+
+/** One meter's quantity this month (`MeterUsageView`). */
+export interface MeterUsage {
+  /** `<service>/<meter>`, e.g. `otto-flags/evaluations`. */
+  meter: string;
+  /** Written by the service, in English; shown as given. */
+  displayName: string;
+  /** What one unit is, e.g. `evaluation`. Also the service's English. */
+  unit: string;
+  quantity: number;
+}
+
+/**
+ * Why a service's spend is `null`. The one value today: the price could not
+ * be read. Spend that is unknown is shown as unknown, never as `$0`.
+ */
+export type SpendError = 'pricing_unavailable';
+
+/** An alert threshold, in percent of the monthly budget. */
+export type BudgetThreshold = 50 | 80 | 100;
+
+/** A service's budget, and where spend stands against it (`BudgetView`). */
+export interface BudgetView {
+  /** 1 to `MAX_MONTHLY_BUDGET_CENTS`, in US cents. */
+  monthlyBudgetCents: number;
   hardStop: boolean;
-  /** Whether the server is currently refusing billable calls over the bucket. */
-  enforced: boolean;
+  /** Whole percent spent, rounded down; can exceed 100. `null` when spend is unknown. */
+  percentUsed: number | null;
+  /** Hard stop on and spend at or past the budget: billable calls are refused. */
+  blocked: boolean;
+  updatedAt: string;
+}
+
+/** One metered service's usage this month (`ServiceUsage`). */
+export interface ServiceUsage {
+  /** The service slug, e.g. `otto-flags`. */
+  service: string;
+  meters: MeterUsage[];
+  /** US cents, or `null` when it cannot be computed; `spendError` says why. */
+  spendCents: number | null;
+  spendError: SpendError | null;
+  /** `null` when no budget is set. */
+  budget: BudgetView | null;
+}
+
+/** One service's budget and spend this month (`ServiceBudgetView`). */
+export interface ServiceBudget {
+  service: string;
+  spendCents: number | null;
+  spendError: SpendError | null;
+  /**
+   * The thresholds whose alerts have fired this month, ascending. Kept when
+   * the budget changes, so it can name a threshold the current budget is not
+   * at: an alert already sent is not sent again.
+   */
+  thresholdsReached: BudgetThreshold[];
+  budget: BudgetView | null;
+}
+
+/** `GET /api/orgs/{org}/budgets` (`BudgetsView`). */
+export interface BudgetsResponse {
+  /** First day of the UTC billing month the spend is for, `YYYY-MM-DD`. */
+  periodStart: string;
+  /** Every service with declared meters, budgeted or not. */
+  services: ServiceBudget[];
+}
+
+/** The body of `PUT /api/orgs/{org}/budgets/{service}`. */
+export interface SetBudgetRequest {
+  monthlyBudgetCents: number;
+  hardStop: boolean;
+}
+
+/** Whether the org has a usable card on file (`PaymentMethodStatus`). */
+export type CardStatus = 'none' | 'active' | 'failed' | 'detached';
+
+/** `GET /api/orgs/{org}/billing` (`BillingStatusView`). Owner only. */
+export interface BillingStatus {
+  /** Whether this deployment bills through Stripe at all. */
+  billingEnabled: boolean;
+  cardStatus: CardStatus;
+  /** Stripe's subscription status (`active`, `past_due`, ...), or `null` with none. */
+  subscriptionStatus: string | null;
+  /** Whether usage is invoiced through the subscription. */
+  subscriptionLive: boolean;
+  /** Stripe canceled the subscription; resumes once a card is put on file again. */
+  billingStopped: boolean;
+}
+
+/** `POST /api/orgs/{org}/billing/setup`: Stripe Checkout, in setup mode. */
+export interface SetupSession {
+  url: string;
 }
 
 /** The tiers, cheapest first — the order `GET /api/plans` lists them in. */

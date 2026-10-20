@@ -170,7 +170,7 @@ export type PriceLabel =
  * rounding noise, and a large amount keeps every digit. Trailing zeros past
  * `minimumFractionDigits` are dropped.
  */
-function formatUsd(
+export function formatUsd(
   amount: number,
   scale: number,
   minimumFractionDigits: number,
