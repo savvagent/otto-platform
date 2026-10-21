@@ -44,10 +44,10 @@ function render(slug: string) {
 
 describe('a link to a service', () => {
   it('leaves for the web console of a service that has one', () => {
-    const { instance, link } = render('factory');
+    const { instance, link } = render('tower');
 
     expect(link.getAttribute('href')).toBe('https://otto-factory.savvagent.com');
-    expect(link.textContent?.trim()).toBe('Otto Factory');
+    expect(link.textContent?.trim()).toBe('Otto Tower');
     expect(link.hasAttribute('aria-label')).toBe(false);
     expect(link.hasAttribute('data-sveltekit-reload')).toBe(false);
 

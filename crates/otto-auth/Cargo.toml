@@ -27,7 +27,7 @@ hickory-resolver.workspace = true
 reqwest.workspace = true
 # `net` for tokio::net::lookup_host: the SSRF-pinning resolver's inner lookup
 # (ssrf.rs), which vets every resolved address before a connection is made.
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "time"] }
 # StreamExt, for reading an IdP response body in capped chunks (oidc.rs): an
 # admin- or IdP-controlled URL must not be able to push an unbounded response
 # into this process's memory.

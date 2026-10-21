@@ -34,7 +34,7 @@ const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const SITE_ORIGIN = 'https://otto.savvagent.com';
 
 /** Mirrors the slugs in `src/lib/services.ts`. */
-const PRODUCT_SLUGS = ['factory', 'flags', 'cxp'];
+const PRODUCT_SLUGS = ['tower', 'flags', 'cxp'];
 
 /** Mirrors `MARKETING_PATHS` in `src/lib/sitemap.ts`. */
 export const PAGE_PATHS = ['/', '/pricing', ...PRODUCT_SLUGS.map((slug) => `/products/${slug}`)];

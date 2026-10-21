@@ -81,12 +81,20 @@ export function dollarsInput(cents: number): string {
 }
 
 /**
+ * Service slugs that were renamed. Usage and budget rows written before the
+ * rename still carry the old slug, and must keep a display name.
+ */
+const LEGACY_SERVICE_NAMES: ReadonlyMap<string, string> = new Map([['otto-factory', 'Otto Tower']]);
+
+/**
  * The name a service slug (`otto-flags`) goes by in the header and on the
  * product pages, or the slug itself for a service this console does not
  * describe yet: its usage is real either way.
  */
 export function serviceName(slug: string): string {
-  return SERVICES.find((s) => connectorName(s) === slug)?.name ?? slug;
+  return (
+    SERVICES.find((s) => connectorName(s) === slug)?.name ?? LEGACY_SERVICE_NAMES.get(slug) ?? slug
+  );
 }
 
 /** One budget alert to show in the console. */

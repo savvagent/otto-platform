@@ -33,5 +33,5 @@ pub mod ids;
 pub mod isolation;
 
 pub use db::{Db, Tx, Unpinned};
-pub use error::{Error, Result};
+pub use error::{is_retryable_lock_failure, Error, Result};
 pub use ids::{OrgId, TeamId, UserId};

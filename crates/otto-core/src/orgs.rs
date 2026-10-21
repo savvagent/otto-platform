@@ -387,6 +387,25 @@ impl OrgsExt for Db {
         // token list honest, and the credentials that could still *mint* a
         // token or a membership have to go too: outstanding authorization
         // codes (redemption also checks `deleted_at`) and pending invites.
+        //
+        // First wait for every refresh or code redemption in the org that is
+        // in flight: each holds its refresh token's or code's row until it
+        // commits the pair it minted, which the updates below could not see
+        // before then. With the wait, each update's fresh snapshot sees the
+        // new pair and revokes it too. Refresh rows, then code rows, then the
+        // updates (`otto_auth::resources`'s lock order).
+        sqlx::query(
+            "SELECT 1 FROM refresh_tokens WHERE org_id = $1 AND revoked_at IS NULL FOR UPDATE",
+        )
+        .bind(id)
+        .execute(tx.conn())
+        .await?;
+        sqlx::query(
+            "SELECT 1 FROM authorization_codes WHERE org_id = $1 AND consumed_at IS NULL FOR UPDATE",
+        )
+        .bind(id)
+        .execute(tx.conn())
+        .await?;
         for table in ["access_tokens", "refresh_tokens"] {
             sqlx::query(&format!(
                 "UPDATE {table} SET revoked_at = now() WHERE org_id = $1 AND revoked_at IS NULL"

@@ -371,7 +371,8 @@ pub fn earliest_occurred_at(now: DateTime<Utc>) -> DateTime<Utc> {
 /// hashtext(org_id::text))`). The two-key form lives in its own key space,
 /// apart from the one-`bigint` advisory locks elsewhere (the auth rate
 /// limiter's, sqlx's migration lock); any other two-key advisory lock must
-/// use a different first key.
+/// use a different first key. The usage-ledger lock
+/// (`otto_auth::resources::USAGE_LEDGER_LOCK_NAMESPACE`) is `0x0055_1002`.
 pub const INGEST_LOCK_NAMESPACE: i32 = 0x0055_1001;
 
 /// Take the org's ingest lock for the rest of `tx`, waiting for any other
@@ -412,8 +413,8 @@ static INGEST_SQL: LazyLock<String> = LazyLock::new(|| {
         "WITH event AS ( \
            INSERT INTO usage_events \
              (org_id, user_id, tool, billable, created_at, resource_uri, meter, quantity) \
-           VALUES ($1, (SELECT id FROM users WHERE id = $2), $3, $4, $5, $6, \
-                   $7::text, $8::bigint) \
+           VALUES ($1, (SELECT id FROM users WHERE id = $2), $3, $4, $5, \
+                   canonical_resource_uri($6::text), $7::text, $8::bigint) \
          ), legacy AS ( \
            INSERT INTO org_period_usage (org_id, period_start, billable_count, total_count) \
            VALUES ($1, date_trunc('month', $5::timestamptz AT TIME ZONE 'utc')::date, \
@@ -486,6 +487,24 @@ pub trait UsageExt {
     /// batch's events are counted, before committing. Take
     /// [`lock_org_ingest`] first, and feed a batch's events in billed order
     /// (period, then `occurred_at`).
+    ///
+    /// Lock order (the canonical statement is the "Lock order" section of
+    /// `otto_auth::resources`). The event's dedupe claim (`claim_usage_event`)
+    /// takes the usage-ledger advisory lock of `resource_uri` shared, and a
+    /// resource rename takes it exclusively before it locks the
+    /// `resource_servers` row it moves. So in an ingest transaction the first
+    /// claim must come before any write that references `resource_servers`:
+    /// such a write (a row with a foreign key to it, such as a service's pool,
+    /// budget or alert rows, or a `FOR SHARE`/`FOR UPDATE` read of it) holds a
+    /// lock on that row, and waiting for the ledger lock while holding it
+    /// deadlocks against a rename waiting for the row. This method claims
+    /// before it writes anything; a caller that adds writes of its own to the
+    /// transaction makes them after its first call.
+    ///
+    /// The event is recorded under the canonical URI `resource_uri` names
+    /// (`canonical_resource_uri`, migration 0026), read after the claim, so
+    /// a batch that authenticated before a rename and claimed after it files
+    /// its `usage_events` row under the new URI, like its dedupe entry.
     fn ingest_usage_deferred(
         &mut self,
         resource_uri: &str,

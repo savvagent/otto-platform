@@ -180,7 +180,7 @@
           How to add the service to the assistants people actually use, one
           short paragraph each. The client names are products, so they are not
           translated; the steps are. Shown for every service with an endpoint,
-          a web console or not: Factory's agents connect the same way.
+          a web console or not: Tower's agents connect the same way.
         -->
         <section
           id="connect"

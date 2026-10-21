@@ -98,8 +98,16 @@ describe('formatPercent', () => {
 describe('serviceName', () => {
   it('names a described service, and shows any other slug as given', () => {
     expect(serviceName('otto-flags')).toBe('Otto Flags');
-    expect(serviceName('otto-factory')).toBe('Otto Factory');
+    expect(serviceName('otto-tower')).toBe('Otto Tower');
+    // Rows written before the rename still carry the old slug.
+    expect(serviceName('otto-factory')).toBe('Otto Tower');
     expect(serviceName('otto-new')).toBe('otto-new');
+  });
+
+  it('never names a slug after an inherited object property', () => {
+    for (const slug of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+      expect(serviceName(slug)).toBe(slug);
+    }
   });
 });
 
@@ -123,11 +131,11 @@ describe('budgetAlerts', () => {
     const alerts = budgetAlerts([
       row({ service: 'otto-flags', thresholdsReached: [50, 80] }),
       row({ service: 'otto-cxp', thresholdsReached: [] }),
-      row({ service: 'otto-factory', thresholdsReached: [50] })
+      row({ service: 'otto-tower', thresholdsReached: [50] })
     ]);
     expect(alerts).toEqual([
       { service: 'otto-flags', threshold: 80, blocked: false },
-      { service: 'otto-factory', threshold: 50, blocked: false }
+      { service: 'otto-tower', threshold: 50, blocked: false }
     ]);
   });
 

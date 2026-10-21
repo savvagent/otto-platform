@@ -1229,6 +1229,271 @@ async fn with_an_empty_registry_nothing_can_be_authorized(pool: PgPool) {
     assert!(page.text.contains("no resource server is registered"));
 }
 
+// ------------------------------------------------ a renamed resource server
+
+/// Where `RESOURCE` moves to in the alias tests; `RESOURCE` stays as its alias.
+const RENAMED: &str = "https://things-v2.otto.test/mcp";
+
+async fn rename_resource(h: &Harness) {
+    otto_auth::resources::rename(
+        &h.db,
+        RESOURCE,
+        RENAMED,
+        Some(chrono::Utc::now() + chrono::Duration::days(90)),
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+fn alias_authorize_url(client_id: &str, challenge: &str) -> String {
+    format!(
+        "{}&resource={}",
+        authorize_url(client_id, challenge, "things:read things:write", "s"),
+        percent_encode(RESOURCE)
+    )
+}
+
+async fn exchange(h: &Harness, pairs: &[(&str, &str)]) -> common::Reply {
+    Call::post("/oauth/token").form(pairs).send(&h.router).await
+}
+
+/// A client configured before the rename keeps naming the old URI, now a live
+/// alias, in every step of the flow (savvagent/otto-platform#89). It is
+/// authorized for the renamed server: the page pins the canonical URI, and
+/// the code and tokens are bound to it.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_client_naming_a_live_alias_is_authorized_for_the_renamed_server(pool: PgPool) {
+    let h = harness(pool).await;
+    rename_resource(&h).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org_id = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &alias_authorize_url(&client_id, &challenge),
+    )
+    .await;
+    assert_eq!(
+        page.field("resource"),
+        Some(RENAMED),
+        "the form pins the canonical URI, not the alias the client named"
+    );
+    let granted = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&org_id.to_string(), "allow"),
+    )
+    .await;
+    granted.expect(StatusCode::SEE_OTHER);
+    let code = query_param(&location(&granted), "code").expect("no code in the callback");
+    let bound: String = sqlx::query_scalar("SELECT resource FROM authorization_codes")
+        .fetch_one(h.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(bound, RENAMED);
+
+    // The token request repeats the alias.
+    let tokens = exchange(
+        &h,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("client_id", &client_id),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", &verifier),
+            ("resource", RESOURCE),
+        ],
+    )
+    .await;
+    tokens.expect(StatusCode::OK);
+    let access = tokens.body["access_token"].as_str().unwrap();
+    otto_auth::tokens::introspect(&h.db, access, RENAMED)
+        .await
+        .expect("the token is for the renamed server");
+
+    // So does the refresh.
+    let refresh = tokens.body["refresh_token"].as_str().unwrap();
+    let refreshed = exchange(
+        &h,
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh),
+            ("client_id", &client_id),
+            ("resource", RESOURCE),
+        ],
+    )
+    .await;
+    refreshed.expect(StatusCode::OK);
+    let stored: Vec<String> = sqlx::query_scalar(
+        "SELECT resource FROM access_tokens UNION ALL SELECT resource FROM refresh_tokens",
+    )
+    .fetch_all(h.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored.len(), 4);
+    assert!(stored.iter().all(|r| r == RENAMED), "{stored:?}");
+}
+
+/// A consent form submitted with the alias in place of the pinned canonical
+/// URI names the same server, so the seal (which pins the resolved resource)
+/// still matches; the code is bound to the canonical URI.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_consent_form_naming_the_alias_is_the_same_resource(pool: PgPool) {
+    let h = harness(pool).await;
+    rename_resource(&h).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org_id = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (_, challenge) = pkce();
+
+    let mut page = common::consent_page(
+        &h,
+        &rob.session,
+        &alias_authorize_url(&client_id, &challenge),
+    )
+    .await;
+    page.set_field("resource", RESOURCE);
+    common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&org_id.to_string(), "allow"),
+    )
+    .await
+    .expect(StatusCode::SEE_OTHER);
+    let bound: String = sqlx::query_scalar("SELECT resource FROM authorization_codes")
+        .fetch_one(h.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(bound, RENAMED);
+}
+
+/// Once the alias has expired or been dropped it is an unknown URI: the
+/// authorize page refuses it and so does the token endpoint, as
+/// `invalid_target`, even for grants made while it was live.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_ended_alias_is_refused_at_authorize_and_token(pool: PgPool) {
+    let h = harness(pool).await;
+    rename_resource(&h).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org_id = org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &alias_authorize_url(&client_id, &challenge),
+    )
+    .await;
+    let granted = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&org_id.to_string(), "allow"),
+    )
+    .await;
+    let code = query_param(&location(&granted), "code").expect("no code in the callback");
+    let tokens = exchange(
+        &h,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("client_id", &client_id),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", &verifier),
+        ],
+    )
+    .await;
+    tokens.expect(StatusCode::OK);
+    let refresh = tokens.body["refresh_token"].as_str().unwrap().to_string();
+    // A second code, granted while the alias was live and redeemed after.
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &alias_authorize_url(&client_id, &challenge),
+    )
+    .await;
+    let granted = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&org_id.to_string(), "allow"),
+    )
+    .await;
+    let late_code = query_param(&location(&granted), "code").expect("no code in the callback");
+
+    sqlx::query(
+        "UPDATE resource_server_aliases SET sunset_at = now() - interval '1 second' \
+         WHERE alias_uri = $1",
+    )
+    .bind(RESOURCE)
+    .execute(h.db.pool())
+    .await
+    .unwrap();
+
+    let page = Call::get(alias_authorize_url(&client_id, &challenge))
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    page.expect(StatusCode::BAD_REQUEST);
+    assert!(
+        page.text.contains("not a registered resource"),
+        "{}",
+        page.text
+    );
+    assert!(page.headers.get(http::header::LOCATION).is_none());
+
+    let refused = exchange(
+        &h,
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh),
+            ("client_id", &client_id),
+            ("resource", RESOURCE),
+        ],
+    )
+    .await;
+    refused.expect(StatusCode::BAD_REQUEST);
+    assert_eq!(refused.body["error"], "invalid_target");
+
+    let refused = exchange(
+        &h,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &late_code),
+            ("client_id", &client_id),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", &verifier),
+            ("resource", RESOURCE),
+        ],
+    )
+    .await;
+    refused.expect(StatusCode::BAD_REQUEST);
+    assert_eq!(refused.body["error"], "invalid_target");
+
+    // Dropped is no different, and the grant itself still refreshes when the
+    // client names the canonical URI.
+    otto_auth::resources::drop_alias(&h.db, RESOURCE)
+        .await
+        .unwrap();
+    let decision = consent_for(&h, &rob, &client_id, &challenge, "", RESOURCE).await;
+    decision.expect(StatusCode::BAD_REQUEST);
+    assert!(decision.headers.get(http::header::LOCATION).is_none());
+    exchange(
+        &h,
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh),
+            ("client_id", &client_id),
+            ("resource", RENAMED),
+        ],
+    )
+    .await
+    .expect(StatusCode::OK);
+}
+
 // ------------------------------------------------- discovery under an outage
 
 /// The open discovery document reads the registry. A database that cannot

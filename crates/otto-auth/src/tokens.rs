@@ -125,8 +125,20 @@ pub struct IssueParams<'a> {
     pub with_refresh: bool,
 }
 
-/// Mint an access token, and optionally a refresh token.
+/// Mint an access token, and optionally a refresh token, in one transaction.
 pub async fn issue(db: &Db, p: IssueParams<'_>) -> Result<IssuedTokens> {
+    let mut tx = db.begin_unpinned().await?;
+    let issued = issue_on(tx.conn(), p).await?;
+    tx.commit().await?;
+    Ok(issued)
+}
+
+/// [`issue`] on a connection the caller holds a transaction on, so the pair
+/// commits or rolls back with the rest of it.
+pub(crate) async fn issue_on(
+    conn: &mut sqlx::PgConnection,
+    p: IssueParams<'_>,
+) -> Result<IssuedTokens> {
     let access = crypto::generate(prefix::ACCESS);
     let expires_at = Utc::now() + Duration::minutes(ACCESS_TTL_MINUTES);
     let scopes: Vec<String> = p.scopes.to_vec();
@@ -143,7 +155,7 @@ pub async fn issue(db: &Db, p: IssueParams<'_>) -> Result<IssuedTokens> {
     .bind(&scopes)
     .bind(p.resource)
     .bind(expires_at)
-    .fetch_one(db.pool())
+    .fetch_one(&mut *conn)
     .await?;
 
     let refresh_plaintext = if p.with_refresh {
@@ -161,7 +173,7 @@ pub async fn issue(db: &Db, p: IssueParams<'_>) -> Result<IssuedTokens> {
         .bind(&scopes)
         .bind(p.resource)
         .bind(Utc::now() + Duration::days(REFRESH_TTL_DAYS))
-        .execute(db.pool())
+        .execute(&mut *conn)
         .await?;
         Some(refresh.into_plaintext())
     } else {
@@ -186,7 +198,9 @@ struct TokenRow {
     org_id: OrgId,
     client_id: Option<String>,
     scopes: Vec<String>,
-    resource: String,
+    /// Whether the token's `resource` is `expected_resource` or an alias of it
+    /// ([`crate::resources::audience_matches_sql`]), decided in the same read.
+    audience_ok: bool,
     kind: TokenKind,
     expires_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
@@ -201,11 +215,14 @@ struct TokenRow {
 pub async fn introspect(db: &Db, presented: &str, expected_resource: &str) -> Result<Principal> {
     let hash = crypto::hash(presented.trim());
 
-    let row: Option<TokenRow> = sqlx::query_as(
-        "SELECT id, user_id, org_id, client_id, scopes, resource, kind, expires_at, revoked_at \
-         FROM access_tokens WHERE token_hash = $1",
-    )
+    let row: Option<TokenRow> = sqlx::query_as(&format!(
+        "SELECT t.id, t.user_id, t.org_id, t.client_id, t.scopes, t.kind, t.expires_at, \
+                t.revoked_at, {} AS audience_ok \
+         FROM access_tokens t WHERE t.token_hash = $1",
+        crate::resources::audience_matches_sql("t.resource", "$2")
+    ))
     .bind(&hash)
+    .bind(expected_resource)
     .fetch_optional(db.pool())
     .await?;
 
@@ -222,8 +239,10 @@ pub async fn introspect(db: &Db, presented: &str, expected_resource: &str) -> Re
     }
     // Audience check. Constant-time is unnecessary here (the resource is public
     // and not a secret), but exact match is essential — no prefix, no suffix,
-    // no "starts with our host".
-    if t.resource != expected_resource {
+    // no "starts with our host". Exact against the canonical URI, or against an
+    // alias of it: a token minted under the old URI by a transaction that
+    // raced a rename (which rewrites the rest) is still this server's.
+    if !t.audience_ok {
         return Err(AuthError::WrongAudience);
     }
 
@@ -244,6 +263,11 @@ pub async fn introspect(db: &Db, presented: &str, expected_resource: &str) -> Re
         expires_at: t.expires_at,
     })
 }
+
+/// How long a token redemption (refresh or code exchange) waits for its
+/// grant's row before giving up, as `SET LOCAL`. The token endpoint maps the
+/// lock timeout to a retriable 503 (`otto_tenant::is_retryable_lock_failure`).
+pub(crate) const REDEMPTION_LOCK_TIMEOUT: &str = "SET LOCAL lock_timeout = '5s'";
 
 /// A row from `refresh_tokens`.
 #[derive(sqlx::FromRow)]
@@ -269,6 +293,14 @@ struct RefreshRow {
 /// and [`AuthError::InvalidGrant`] is returned. That is the correct response to
 /// a replay: either the client is buggy or the token leaked, and only one of
 /// those is safe to ignore, so we assume the other.
+///
+/// One transaction, which locks the presented token's row first (`FOR
+/// UPDATE`): a concurrent revocation (a member removal, an org deletion)
+/// either commits before the read, which then sees it and refuses, or waits
+/// for this refresh to commit, and the consume refuses a row revoked or
+/// consumed meanwhile. Any refusal rolls the successor back and leaves the
+/// presented token as it was. Lock order (`crate::resources`): this one
+/// refresh row, then new token rows; the resource server is only read.
 pub async fn redeem_refresh(
     db: &Db,
     presented: &str,
@@ -276,21 +308,33 @@ pub async fn redeem_refresh(
     requested_resource: Option<&str>,
 ) -> Result<(IssuedTokens, UserId, OrgId, bool)> {
     let hash = crypto::hash(presented.trim());
+    let mut tx = db.begin_unpinned().await?;
+    // Everything below runs on this one connection, never a second pool
+    // connection under the row lock. A wait on the row (another redemption,
+    // a revocation, a rename's rewrite) gives up after this; the token
+    // endpoint answers that with a retriable 503 and the token is untouched.
+    sqlx::query(REDEMPTION_LOCK_TIMEOUT)
+        .execute(tx.conn())
+        .await?;
 
     let row: Option<RefreshRow> = sqlx::query_as(
         "SELECT id, user_id, org_id, client_id, scopes, resource, expires_at, consumed_at, revoked_at \
-         FROM refresh_tokens WHERE token_hash = $1",
+         FROM refresh_tokens WHERE token_hash = $1 FOR UPDATE",
     )
     .bind(&hash)
-    .fetch_optional(db.pool())
+    .fetch_optional(tx.conn())
     .await?;
 
     let r = row.ok_or_else(|| AuthError::InvalidGrant("unknown refresh token".into()))?;
 
     // Reuse: revoke the family before returning, so the attacker's stolen
-    // successor stops working too.
+    // successor stops working too. Not in this transaction, whose short lock
+    // timeout would turn a busy family row into a retriable refusal with the
+    // family still live: end it first (it has written nothing), so no second
+    // connection is taken under its lock, and revoke until that succeeds.
     if r.consumed_at.is_some() {
-        revoke_family(db, r.user_id, r.org_id, &r.client_id).await?;
+        tx.rollback().await?;
+        revoke_family_after_theft(db, r.user_id, r.org_id, &r.client_id).await?;
         return Err(AuthError::InvalidGrant(
             "refresh token was already used; the token family has been revoked".into(),
         ));
@@ -308,35 +352,56 @@ pub async fn redeem_refresh(
             "refresh token was issued to a different client".into(),
         ));
     }
+    // A disabled resource server gets no new tokens, refreshed ones included.
+    // The token may be bound to an alias (a mint that raced a rename); it is
+    // still that server's, and its successor is bound to the canonical URI.
+    //
     // RFC 8707 §2.2: a refresh request may name a resource, and if it does it
-    // must be the one the token was issued for.
-    if requested_resource.is_some_and(|res| res != r.resource) {
+    // must be the one the token was issued for: its canonical URI or a live
+    // alias of it, compared canonical to canonical. A URI that names no server
+    // (an expired or dropped alias included) is `invalid_target`. Both are
+    // decided in one statement, so a rename cannot fall between them. Every
+    // refusal here leaves the token unconsumed.
+    let crate::resources::GrantResource::Bound(resource) =
+        crate::resources::resolve_active_grant(tx.conn(), &r.resource, requested_resource).await?
+    else {
         return Err(AuthError::InvalidGrant(
             "refresh token was issued for a different resource".into(),
         ));
-    }
-    // A disabled resource server gets no new tokens, refreshed ones included.
-    crate::resources::get_active(db, &r.resource).await?;
+    };
 
-    let issued = issue(
-        db,
+    let issued = issue_on(
+        tx.conn(),
         IssueParams {
             user_id: r.user_id,
             org_id: r.org_id,
             client_id: Some(client_id),
             scopes: &r.scopes,
-            resource: &r.resource,
+            resource: &resource.resource_uri,
             with_refresh: true,
         },
     )
     .await?;
 
-    // Consume the presented token last, so a failure to mint the successor
-    // leaves the caller's existing token usable rather than stranding them.
-    sqlx::query("UPDATE refresh_tokens SET consumed_at = now() WHERE id = $1")
-        .bind(r.id)
-        .execute(db.pool())
-        .await?;
+    // Consume the presented token last, in the same transaction, so a
+    // failure to mint the successor leaves the caller's existing token usable
+    // rather than stranding them. Refused, rolling the successor back, if the
+    // row was revoked or consumed since it was read (the lock makes that a
+    // guard rather than a race).
+    let consumed = sqlx::query(
+        "UPDATE refresh_tokens SET consumed_at = now() \
+         WHERE id = $1 AND consumed_at IS NULL AND revoked_at IS NULL",
+    )
+    .bind(r.id)
+    .execute(tx.conn())
+    .await?
+    .rows_affected();
+    if consumed == 0 {
+        return Err(AuthError::InvalidGrant(
+            "refresh token was revoked or used while it was being redeemed".into(),
+        ));
+    }
+    tx.commit().await?;
 
     Ok((issued, r.user_id, r.org_id, false))
 }
@@ -350,6 +415,28 @@ pub async fn redeem_refresh(
 /// attacker holding a live credential.
 pub async fn revoke_family(db: &Db, user: UserId, org: OrgId, client_id: &str) -> Result<u64> {
     let mut tx = db.begin_unpinned().await?;
+    let revoked = revoke_family_on(tx.conn(), user, org, client_id).await?;
+    tx.commit().await?;
+    Ok(revoked)
+}
+
+async fn revoke_family_on(
+    conn: &mut sqlx::PgConnection,
+    user: UserId,
+    org: OrgId,
+    client_id: &str,
+) -> Result<u64> {
+    // Wait for a refresh of the family in flight (see `revoke_all_in_org_on`).
+    sqlx::query(
+        "SELECT 1 FROM refresh_tokens \
+         WHERE user_id = $1 AND org_id = $2 AND client_id = $3 AND revoked_at IS NULL \
+         FOR UPDATE",
+    )
+    .bind(user)
+    .bind(org)
+    .bind(client_id)
+    .execute(&mut *conn)
+    .await?;
 
     let access = sqlx::query(
         "UPDATE access_tokens SET revoked_at = now() \
@@ -358,7 +445,7 @@ pub async fn revoke_family(db: &Db, user: UserId, org: OrgId, client_id: &str) -
     .bind(user)
     .bind(org)
     .bind(client_id)
-    .execute(tx.conn())
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
@@ -369,12 +456,71 @@ pub async fn revoke_family(db: &Db, user: UserId, org: OrgId, client_id: &str) -
     .bind(user)
     .bind(org)
     .bind(client_id)
-    .execute(tx.conn())
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
-    tx.commit().await?;
     Ok(access + refresh)
+}
+
+/// How many times [`revoke_family_after_theft`] tries, and how long each try
+/// may wait for a lock.
+const THEFT_REVOCATION_ATTEMPTS: u32 = 5;
+const THEFT_REVOCATION_LOCK_TIMEOUT: &str = "SET LOCAL lock_timeout = '30s'";
+
+/// The theft response of a replayed refresh token or authorization code:
+/// revoke the family, in its own transaction, waiting as long as it takes
+/// for a busy row (each try up to 30 s, retried after a lock timeout or a
+/// deadlock, a bounded number of times). Only once it has committed does the
+/// caller refuse the replay with `invalid_grant`.
+///
+/// It must never fail open. If every try fails, the error is logged and
+/// returned as an internal error (500), never as the retriable lock failure
+/// the token endpoint answers with a 503: a retry must not be invited while
+/// the family is still live.
+pub(crate) async fn revoke_family_after_theft(
+    db: &Db,
+    user: UserId,
+    org: OrgId,
+    client_id: &str,
+) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let tried: std::result::Result<(), AuthError> = async {
+            let mut tx = db.begin_unpinned().await?;
+            sqlx::query(THEFT_REVOCATION_LOCK_TIMEOUT)
+                .execute(tx.conn())
+                .await?;
+            revoke_family_on(tx.conn(), user, org, client_id).await?;
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
+        let err = match tried {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let retryable =
+            matches!(&err, AuthError::Db(d) if otto_tenant::is_retryable_lock_failure(d));
+        if retryable && attempt < THEFT_REVOCATION_ATTEMPTS {
+            tracing::warn!(error = %err, attempt, "token family revocation after reuse was busy; retrying");
+            tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt))).await;
+            continue;
+        }
+        tracing::error!(
+            error = %err,
+            %user,
+            %org,
+            "could not revoke a token family after its refresh token or code was replayed"
+        );
+        // Re-wrapped so it is a plain internal error at the token endpoint,
+        // not the retriable 503 a bare lock failure maps to.
+        return Err(match err {
+            AuthError::Db(d) => AuthError::Tenant(otto_tenant::Error::Db(d)),
+            other => other,
+        });
+    }
 }
 
 /// Revoke one token by its presented value (RFC 7009). Idempotent and silent:
@@ -424,7 +570,7 @@ pub async fn mint_pat(
     }
     // Same registry checks as the OAuth path: a PAT must not be a way around
     // an unregistered or disabled resource, or a scope its server never defined.
-    let rs = crate::resources::get_active(db, resource).await?;
+    let rs = crate::resources::resolve_active(db, resource).await?;
     let scopes = rs.grant_scopes(scopes)?;
     // `grant_scopes` returns an empty list only when nothing was asked for and
     // the resource has no defaults. Refused rather than stored as a token that
@@ -539,6 +685,15 @@ async fn revoke_all_in_org_on(
     user: UserId,
     org: OrgId,
 ) -> Result<u64> {
+    // First wait for any refresh or code redemption of the member's in
+    // flight. Each holds its grant's row (the refresh token, the code) until
+    // it commits the pair it minted, which no statement here can see before
+    // then. Locking those rows waits for it, and the updates below, each with
+    // a fresh snapshot, then see the new pair and revoke it too. Without the
+    // wait the access-token update could run before the pair commits and the
+    // refresh-token update's snapshot predate it, leaving both alive.
+    lock_grants_in_flight(conn, user, org).await?;
+
     let access = sqlx::query(
         "UPDATE access_tokens SET revoked_at = now() \
          WHERE user_id = $1 AND org_id = $2 AND revoked_at IS NULL",
@@ -560,7 +715,47 @@ async fn revoke_all_in_org_on(
     .execute(&mut *conn)
     .await?;
 
+    // And codes not yet redeemed, which would otherwise mint a fresh pair:
+    // code redemption checks the org is live, not that the user is still in
+    // it.
+    sqlx::query(
+        "UPDATE authorization_codes SET consumed_at = now() \
+         WHERE user_id = $1 AND org_id = $2 AND consumed_at IS NULL",
+    )
+    .bind(user)
+    .bind(org)
+    .execute(&mut *conn)
+    .await?;
+
     Ok(access)
+}
+
+/// Lock a member's live refresh tokens and unredeemed codes in `org`, so the
+/// caller waits for every redemption of one in flight to commit. The lock
+/// order of a revocation (`crate::resources`): refresh rows, then code rows,
+/// then the updates.
+async fn lock_grants_in_flight(
+    conn: &mut sqlx::PgConnection,
+    user: UserId,
+    org: OrgId,
+) -> Result<()> {
+    sqlx::query(
+        "SELECT 1 FROM refresh_tokens \
+         WHERE user_id = $1 AND org_id = $2 AND revoked_at IS NULL FOR UPDATE",
+    )
+    .bind(user)
+    .bind(org)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "SELECT 1 FROM authorization_codes \
+         WHERE user_id = $1 AND org_id = $2 AND consumed_at IS NULL FOR UPDATE",
+    )
+    .bind(user)
+    .bind(org)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// Revoke one token by id, scoped to its owner so a user cannot revoke another's.
