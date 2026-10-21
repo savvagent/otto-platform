@@ -4,7 +4,7 @@
 `otto-platform-server` serves everything: the API, the OAuth authorization server, and the
 `web/` bundle, which is the prerendered marketing pages and the console (`web/build`, baked
 into the image at `/srv/console`). There is no edge in front,
-which is also how `otto-factory.savvagent.com` runs. An optional Cloudflare Worker
+which is also how `otto-tower.savvagent.com` runs. An optional Cloudflare Worker
 alternative is in [`cloudflare.md`](cloudflare.md).
 
 One origin matters here for two reasons. The session is a `__Host-` cookie, which the
@@ -442,7 +442,7 @@ fly certs show otto.savvagent.com -a otto-platform   # prints the records to cre
 ```
 
 Create at Namecheap what `fly certs show` prints: an `A` and `AAAA` for `otto` (the
-app's IPs, as for `otto-factory`), or a `CNAME` for `otto` to `otto-platform.fly.dev` if you
+app's IPs, as for `otto-tower`), or a `CNAME` for `otto` to `otto-platform.fly.dev` if you
 prefer. Then `fly certs check otto.savvagent.com -a otto-platform` until it reports issued.
 
 **Settle this before the first passkey is registered.** Changing the host later invalidates

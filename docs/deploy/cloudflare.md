@@ -92,7 +92,7 @@ override: `npx wrangler deploy --var OTTO_ORIGIN:https://other.fly.dev`.
    (`"custom_domain": true` in `wrangler.jsonc`) creates the DNS record and certificate
    itself, but only inside a zone Cloudflare serves. If `savvagent.com` DNS is still at
    Namecheap, moving it is a nameserver change that affects every record on the domain
-   (including `otto-factory.savvagent.com`). Copy the existing records across first. If
+   (including `otto-tower.savvagent.com`). Copy the existing records across first. If
    that is not wanted, see "Without Cloudflare" below.
 2. Authenticate wrangler (`npx wrangler login`) as a user who can edit that zone.
 3. Deploy with `--env production`. Wrangler attaches `otto.savvagent.com` to the Worker.

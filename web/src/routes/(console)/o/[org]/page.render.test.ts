@@ -99,10 +99,10 @@ describe('the organization overview', () => {
     expect(tiles.some((t) => t?.includes('2') && t.includes('Members'))).toBe(true);
     expect(tiles.some((t) => t?.includes('1') && t.includes('Teams'))).toBe(true);
 
-    // Otto Factory has a web console to leave for; Flags and CXP do not, so
+    // Otto Tower has a web console to leave for; Flags and CXP do not, so
     // they go to their connect cards, badged as connectors.
-    const factory = container.querySelector('a[href="https://otto-factory.savvagent.com"]');
-    expect(factory?.textContent?.trim()).toBe('Otto Factory');
+    const tower = container.querySelector('a[href="https://otto-tower.savvagent.com"]');
+    expect(tower?.textContent?.trim()).toBe('Otto Tower');
     for (const [slug, name] of [
       ['flags', 'Otto Flags'],
       ['cxp', 'Otto CXP']

@@ -28,7 +28,7 @@ describe('localizedPath', () => {
     ['en', '/pricing', '/pricing'],
     ['es', '/', '/es'],
     ['es', '/pricing', '/es/pricing'],
-    ['hi', '/products/factory', '/hi/products/factory']
+    ['hi', '/products/tower', '/hi/products/tower']
   ] as const)('%s %s -> %s', (lang, path, expected) => {
     expect(localizedPath(lang, path)).toBe(expected);
   });
@@ -72,7 +72,7 @@ describe('stripLocale', () => {
 
   it('round-trips with localizedPath', () => {
     for (const lang of MARKETING_LOCALES) {
-      for (const path of ['/', '/pricing', '/products/factory']) {
+      for (const path of ['/', '/pricing', '/products/tower']) {
         expect(stripLocale(localizedPath(lang, path))).toEqual({ lang, path });
       }
     }
