@@ -50,12 +50,14 @@ There is one resource server. Its canonical `resource_uri` is renamed to the ott
 
 **OAuth flows.** Authorize, code redemption, refresh and PAT issuance resolve a live alias to its canonical row. They store and compare canonical URIs.
 
-**Expired or dropped aliases** behave exactly like an unknown URI: `invalid_target`, and introspection authentication fails.
+**Expired or dropped aliases** behave exactly like an unknown URI when a client or resource server names one: `invalid_target`, and introspection authentication fails. A grant still bound to the alias string (minted by a request that raced the rename) stays good for its server; `drop-alias` revokes those grants in its transaction (amended in the integration review).
+
+**Concurrency (amended in the integration review).** The rename rewrites tokens before it touches the server's row, the order the user paths (org deletion, member removal) take them in, and the usage-ledger lock is per URI, so a rename pauses only its own server's ingest. The canonical lock order of every path is in the `otto_auth::resources` module docs.
 
 **Operator commands:**
 - `resource rename <old-uri> <new-uri> --alias-until <RFC3339> [--name <name>]`
 - `resource drop-alias <alias-uri>`
-- `resource list` and `resource describe` show aliases with their sunset
+- `resource list` and `resource show` show aliases with their sunset and state (`show` is read-only; `describe` replaces scope descriptions)
 
 **Deploy-order consequences.**
 - Before the rename, the running otto-factory binary (`OF_RESOURCE_URI` = old URI) authenticates as the canonical URI.
@@ -124,7 +126,7 @@ The code PRs change no deployed values: not `fly.toml` env values, Worker routes
 
 1. Release and deploy otto-platform with P1, P2a and P2b.
 2. Release and deploy otto-factory with F1, F2 and F3. The new binary declares `otto-tower/jobs_completed`. The platform rejects that, because it is outside the service's namespace, so the shipper retries and **pauses shipping, losing nothing**. Expect a repeated declaration-failure log line.
-3. Run the preflight. In production, `otto-platform-server resource describe` and a read-only check show no `otto-factory/*` rows in `stripe_meters` or `stripe_prices`.
+3. Run the preflight. In production, `otto-platform-server resource show <old-uri>` reports no rename-service blockers (no `otto-factory/*` metered usage or rows in `stripe_meters`, `stripe_prices` or the Stripe meter outbox), and `resource rename-service <old-uri> otto-tower --dry-run` reports what it would move, changing nothing.
 4. **Immediately** run `resource rename-service <old-uri> otto-tower`. The shipper's next retry declares the meter and drains the queue.
 5. Set up the new host: `fly certs add otto-tower.savvagent.com`, DNS, the Worker route and the custom domain.
 6. Run `resource rename <old-uri> <new-uri> --alias-until <sunset> --name otto-tower`, then confirm `resource list` shows the alias.
