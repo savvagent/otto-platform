@@ -23,6 +23,9 @@ pub enum ApiError {
     BadRequest(String),
     NotFound,
     TooLarge(String),
+    /// Refused for now, nothing changed, and the same request should succeed
+    /// on a retry (a 503, which the client treats as retriable).
+    Unavailable(String),
     /// Anything the caller cannot fix. Logged here, never shown.
     Internal,
 }
@@ -61,6 +64,11 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(d) => (StatusCode::BAD_REQUEST, "invalid_request", d),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found", "not found".to_owned()),
             ApiError::TooLarge(d) => (StatusCode::PAYLOAD_TOO_LARGE, "too_large", d),
+            ApiError::Unavailable(d) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                d,
+            ),
             ApiError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",

@@ -18,22 +18,53 @@
 -- pool (`org_service_period_usage`), and that pool is service data, not
 -- billing data, so it is re-keyed with the rest.
 --
--- Why a SECURITY DEFINER function. The blocker counts and the re-keys have to
--- see every org's rows, and five of these tables are FORCE ROW LEVEL SECURITY.
--- An operator transaction running as a role that is neither superuser nor
--- BYPASSRLS (the managed-Postgres shape, see `otto_tenant::isolation`) sees
--- none of their rows, so a plain transaction would find no blockers and move
--- nothing: a vacuous pass. Running as the owner fixes that where the owner is
--- exempt; where it is not, the per-command policies below admit every row,
--- but only to an unpinned transaction that opted in with
--- `set_config('app.service_rename', 'on', true)`, which only this function
--- does, the same shape as the email (0018) and Stripe meter (0023) delivery
--- policies. A pinned transaction never satisfies them, so tenant code gains
--- nothing. The function refuses to run pinned for the same reason: there the
--- tenant policy would show it one org's rows and it would pass vacuously.
+-- Precondition: pause the service's usage shipping first. The rename is safe
+-- against a batch in flight (below), but such a batch is refused with a
+-- retriable error, and a metered event under an old key is then rejected as
+-- `unknown_meter` on retry, for good.
+--
+-- Why a SECURITY DEFINER function. The blocker counts have to see every org's
+-- rows, and six of these tables are FORCE ROW LEVEL SECURITY. An operator
+-- transaction running as a role that is neither superuser nor BYPASSRLS (the
+-- managed-Postgres shape, see `otto_tenant::isolation`) sees none of their
+-- rows, so a plain transaction would find no blockers: a vacuous pass. Running
+-- as the owner fixes that where the owner is exempt; where it is not, the
+-- SELECT policies below admit every row, but only to an unpinned transaction
+-- that opted in with `set_config('app.service_rename', 'on', true)`, which by
+-- convention only this function does. That is the threat model of the email
+-- (0018) and Stripe meter (0023) delivery policies: any unpinned session could
+-- set it, and a pinned one (all tenant code) never satisfies them. The
+-- function refuses to run pinned for the same reason: there the tenant policy
+-- would show it one org's rows and it would pass vacuously.
 --
 -- Everything happens in the caller's transaction, so the checks and the
 -- re-keys commit or abort together.
+--
+-- Racing ingest. Ingest reads the shipper's service and declared meters before
+-- its per-org transactions, without locks, so a batch in flight when a rename
+-- commits would otherwise write usage, pools and Stripe outbox rows under the
+-- old slug afterwards, stranding them. The database rules that out:
+--
+--   - Foreign keys, added below, tie every new metered row to a declared meter
+--     and every new pool, budget and alert to a registered service. An insert
+--     under a key the rename has moved away fails. They are NOT VALID: they
+--     bind every row written from now on and skip proving the existing ones,
+--     which were all written against declared meters and registered services
+--     but which nothing needs to rescan (`usage_events` is the largest table
+--     there is). So existing data cannot fail this migration.
+--   - The function locks the three service-keyed tables against writes
+--     (SHARE ROW EXCLUSIVE) before it counts anything. Ingest writes a pool in
+--     the same statement as every usage, per-meter and outbox row, and that
+--     statement takes its table locks before it writes any of them. So a batch
+--     that has written anything commits before the counts are taken (its rows
+--     are then counted as blockers, or moved), and one that has not waits
+--     until the rename commits and then fails its foreign key. Ingest answers
+--     that with a retriable 503 and the shipper resends the batch, which is
+--     then judged against the new slug.
+--
+-- The lock pauses all usage ingest for as long as the rename runs, which with
+-- 0025's index on `usage_events (meter)` is milliseconds. The function's own
+-- lock_timeout keeps it from queueing every ingest behind a long transaction.
 
 -- Fail fast rather than queue: a migration waiting for a lock on a busy table
 -- makes every later query on that table wait behind it. Failing the boot lets
@@ -41,35 +72,40 @@
 -- runs each migration in one).
 SET LOCAL lock_timeout = '5s';
 
-CREATE POLICY usage_events_service_rename_select ON usage_events
-  FOR SELECT
-  USING (current_org() IS NULL AND current_setting('app.service_rename', true) = 'on');
+-- The meter FKs restrict: billing data must never follow a key anywhere, and
+-- the rename refuses while any exists. The service FKs cascade: pools,
+-- budgets and alerts are service data and move with the slug, both here and
+-- under `set-service` (which is only allowed while no meter is declared, so no
+-- budget exists, but unmetered pools may). Cascades run as the table owner and
+-- bypass row-level security, so they reach every org's rows.
+ALTER TABLE usage_events
+  ADD CONSTRAINT usage_events_meter_declared
+    FOREIGN KEY (meter) REFERENCES meters (key) NOT VALID;
+ALTER TABLE org_meter_period_usage
+  ADD CONSTRAINT org_meter_period_usage_meter_declared
+    FOREIGN KEY (meter) REFERENCES meters (key) NOT VALID;
+ALTER TABLE org_service_period_usage
+  ADD CONSTRAINT org_service_period_usage_service_registered
+    FOREIGN KEY (service) REFERENCES resource_servers (service) ON UPDATE CASCADE NOT VALID;
+ALTER TABLE service_budgets
+  ADD CONSTRAINT service_budgets_service_registered
+    FOREIGN KEY (service) REFERENCES resource_servers (service) ON UPDATE CASCADE NOT VALID;
+ALTER TABLE budget_alerts
+  ADD CONSTRAINT budget_alerts_service_registered
+    FOREIGN KEY (service) REFERENCES resource_servers (service) ON UPDATE CASCADE NOT VALID;
 
-CREATE POLICY org_meter_period_usage_service_rename_select ON org_meter_period_usage
-  FOR SELECT
-  USING (current_org() IS NULL AND current_setting('app.service_rename', true) = 'on');
-
-CREATE POLICY stripe_meter_outbox_service_rename_select ON stripe_meter_outbox
-  FOR SELECT
-  USING (current_org() IS NULL AND current_setting('app.service_rename', true) = 'on');
-
--- The three re-keyed tenant tables need UPDATE as well, which reads the rows
--- it changes through the SELECT policies and writes them through WITH CHECK.
 DO $$
 DECLARE
   t text;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['org_service_period_usage', 'service_budgets', 'budget_alerts'] LOOP
+  FOREACH t IN ARRAY ARRAY[
+    'usage_events', 'org_meter_period_usage', 'stripe_meter_outbox',
+    'org_service_period_usage', 'service_budgets', 'budget_alerts'
+  ] LOOP
     EXECUTE format(
       'CREATE POLICY %I ON %I FOR SELECT '
       'USING (current_org() IS NULL AND current_setting(''app.service_rename'', true) = ''on'')',
       t || '_service_rename_select', t
-    );
-    EXECUTE format(
-      'CREATE POLICY %I ON %I FOR UPDATE '
-      'USING (current_org() IS NULL AND current_setting(''app.service_rename'', true) = ''on'') '
-      'WITH CHECK (current_org() IS NULL AND current_setting(''app.service_rename'', true) = ''on'')',
-      t || '_service_rename_update', t
     );
   END LOOP;
 END $$;
@@ -86,6 +122,7 @@ END $$;
 --         blocker and its count
 --   23505 the new slug is taken, by another resource server or by rows a
 --         past service of that name left behind
+--   55P03 ingest held its tables longer than lock_timeout; retry
 --   0A000 called from an org-pinned transaction
 CREATE FUNCTION rename_service(p_resource_uri text, p_new text)
 RETURNS TABLE (
@@ -99,6 +136,7 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_temp
+SET lock_timeout = '10s'
 AS $$
 DECLARE
   v_old text;
@@ -117,6 +155,7 @@ DECLARE
   n_stripe_prices bigint;
   n_outbox bigint;
   blockers text[] := ARRAY[]::text[];
+  n_servers bigint;
   n_meters bigint;
   n_prices bigint;
   n_pools bigint;
@@ -132,6 +171,13 @@ BEGIN
       quote_literal(coalesce(p_new, 'NULL'))
       USING ERRCODE = '22023';
   END IF;
+
+  -- First, before any other lock, so that an ingest transaction that has
+  -- written a pool row finishes before anything below looks (see the header).
+  -- Taking it later could deadlock: an ingest holding a pool row could be
+  -- waiting on the resource server row locked next.
+  LOCK TABLE org_service_period_usage, service_budgets, budget_alerts
+    IN SHARE ROW EXCLUSIVE MODE;
 
   -- Locking the row serializes this against a concurrent rename or
   -- set-service of the same resource server.
@@ -160,9 +206,9 @@ BEGIN
       quote_literal(p_new)
       USING ERRCODE = '23505';
   END IF;
-  -- The pools and budgets carry no foreign key to the slug, so a service
-  -- once named `p_new` may have left rows that the re-keyed ones would
-  -- collide with (or silently merge into).
+  -- Rows from before the foreign keys above may name a service no longer
+  -- registered, so one once named `p_new` may have left rows that the moved
+  -- ones would collide with (or silently merge into).
   IF EXISTS (SELECT 1 FROM org_service_period_usage u WHERE u.service = p_new)
      OR EXISTS (SELECT 1 FROM service_budgets b WHERE b.service = p_new)
      OR EXISTS (SELECT 1 FROM budget_alerts a WHERE a.service = p_new) THEN
@@ -211,13 +257,20 @@ BEGIN
             HINT = 'a service can be renamed only before any of its usage is metered or synced to Stripe';
   END IF;
 
+  -- Counted now because the cascade below moves them: the tables are locked,
+  -- so the counts are exact.
+  SELECT count(*) INTO n_pools FROM org_service_period_usage u WHERE u.service = v_old;
+  SELECT count(*) INTO n_budgets FROM service_budgets b WHERE b.service = v_old;
+  SELECT count(*) INTO n_alerts FROM budget_alerts a WHERE a.service = v_old;
+
   -- One statement, because the foreign keys between these three are not
   -- deferrable: `meters.service` references `resource_servers.service` and
   -- `price_versions.meter` references `meters.key`, and no order of separate
   -- updates leaves every row pointing at something that exists. Within one
   -- statement the (NO ACTION) checks run at its end, when all three have
-  -- moved. `stripe_meters` and `stripe_prices` also reference `meters.key`,
-  -- and were just shown to have no row for these meters.
+  -- moved. The other tables referencing `meters.key` were just shown to have
+  -- no row for these meters; the pools, budgets and alerts follow
+  -- `resource_servers.service` by cascade.
   WITH rs AS (
     UPDATE resource_servers r SET service = p_new, updated_at = now()
      WHERE r.resource_uri = p_resource_uri
@@ -231,16 +284,12 @@ BEGIN
      WHERE v.meter LIKE v_prefix || '%'
     RETURNING 1
   )
-  SELECT (SELECT count(*) FROM m), (SELECT count(*) FROM p)
-    INTO n_meters, n_prices
-    FROM (SELECT count(*) FROM rs) AS rs_done;
-
-  UPDATE org_service_period_usage u SET service = p_new WHERE u.service = v_old;
-  GET DIAGNOSTICS n_pools = ROW_COUNT;
-  UPDATE service_budgets b SET service = p_new WHERE b.service = v_old;
-  GET DIAGNOSTICS n_budgets = ROW_COUNT;
-  UPDATE budget_alerts a SET service = p_new WHERE a.service = v_old;
-  GET DIAGNOSTICS n_alerts = ROW_COUNT;
+  SELECT (SELECT count(*) FROM rs), (SELECT count(*) FROM m), (SELECT count(*) FROM p)
+    INTO n_servers, n_meters, n_prices;
+  -- The row is locked above, so anything else is a bug worth stopping for.
+  IF n_servers <> 1 THEN
+    RAISE EXCEPTION 'rename_service updated % resource servers, expected 1', n_servers;
+  END IF;
 
   -- Closed again, so the rest of the caller's transaction is as unprivileged
   -- as it was before the call.

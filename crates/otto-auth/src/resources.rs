@@ -298,6 +298,12 @@ pub struct ServiceRenameCounts {
 /// meter event. Otherwise it is refused with every blocker and its count
 /// named. Unmetered usage does not block; its pool moves.
 ///
+/// **Pause the service's usage shipping first.** A batch in flight cannot
+/// strand rows under the old slug (foreign keys and a table lock in migration
+/// 0024 see to that), but it is refused with a retriable 503, and on retry a
+/// metered event naming an old meter key is rejected as `unknown_meter` for
+/// good. While the rename runs, all usage ingest waits for it.
+///
 /// The checks and the re-keys run in the `rename_service` SQL function
 /// (migration 0024), a SECURITY DEFINER that sees every org's rows. A plain
 /// transaction on a role that is neither superuser nor BYPASSRLS would see
@@ -324,7 +330,7 @@ pub async fn rename_service(db: &Db, resource_uri: &str, service: &str) -> Resul
     .bind(service)
     .fetch_one(tx.conn())
     .await
-    .map_err(rename_error)?;
+    .map_err(|e| rename_error(e, service))?;
     let resource = sqlx::query_as(&format!(
         "SELECT {COLS} FROM resource_servers WHERE resource_uri = $1"
     ))
@@ -349,17 +355,34 @@ pub async fn rename_service(db: &Db, resource_uri: &str, service: &str) -> Resul
 
 /// The `rename_service` function reports each refusal under its own SQLSTATE
 /// (see migration 0024) with an operator-readable message, passed on as is.
-fn rename_error(e: sqlx::Error) -> AuthError {
-    let refusal = match &e {
-        sqlx::Error::Database(d) => d.code().map(|c| (c.into_owned(), d.message().to_owned())),
-        _ => None,
+/// A violation raised by a constraint instead (a race the function's own
+/// checks lost) is reworded: its raw text names an index, not the mistake.
+fn rename_error(e: sqlx::Error, service: &str) -> AuthError {
+    let sqlx::Error::Database(d) = &e else {
+        return AuthError::Db(e);
     };
-    match refusal {
-        Some((code, msg)) if code == "P0002" => AuthError::InvalidTarget(msg),
-        // Not a slug; no service yet, or billing data blocks it; slug taken.
-        Some((code, msg)) if ["22023", "55000", "23505"].contains(&code.as_str()) => {
-            AuthError::InvalidRequest(msg)
-        }
+    let raised_by_function = d.constraint().is_none();
+    let msg = d.message().to_owned();
+    match d.code().as_deref() {
+        Some("P0002") => AuthError::InvalidTarget(msg),
+        // Not a slug; no service yet, or billing data blocks it.
+        Some("22023" | "55000") => AuthError::InvalidRequest(msg),
+        Some("23505") if raised_by_function => AuthError::InvalidRequest(msg),
+        Some("23505") => AuthError::InvalidRequest(format!(
+            "service {service:?} is already assigned to another resource server, or has \
+             usage pools or budgets left from an earlier service of that name"
+        )),
+        // A Stripe meter or price created for an old meter after the blocker
+        // count; nothing changed, and running it again names the blocker.
+        Some("23503") => AuthError::InvalidRequest(format!(
+            "billing data appeared under the service's meters while renaming it to \
+             {service:?}; nothing changed, run it again to see what blocks it"
+        )),
+        Some("55P03") => AuthError::InvalidRequest(
+            "usage ingest held the service's tables too long; nothing changed, try again \
+             (with the service's usage shipping paused)"
+                .into(),
+        ),
         _ => AuthError::Db(e),
     }
 }

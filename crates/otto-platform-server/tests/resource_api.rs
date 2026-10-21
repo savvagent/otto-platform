@@ -2948,8 +2948,23 @@ async fn rename_service_validates_the_new_slug_and_the_resource(pool: PgPool) {
     assert!(err.to_string().contains("set-service"), "{err}");
 
     // Pools or budgets an earlier service of the new name left behind would
-    // collide with (or silently merge into) the moved ones.
-    budget(&w.db, w.org, "otto-tower").await;
+    // collide with (or silently merge into) the moved ones. Such rows predate
+    // the foreign keys of migration 0024, which refuse a new one, so the
+    // fixture skips them the way a row written before it did.
+    let mut tx = w.db.pool().begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO service_budgets (org_id, service, monthly_budget_cents) \
+         VALUES ($1, 'otto-tower', 1000)",
+    )
+    .bind(w.org.as_uuid())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
     let err = resources::rename_service(&w.db, FACTORY, "otto-tower")
         .await
         .unwrap_err();
@@ -2996,7 +3011,9 @@ async fn a_blocker_in_another_org_is_seen_without_an_rls_exemption(pool: PgPool)
     }
 
     // Roles are cluster-wide and test databases share the cluster, so this
-    // tolerates another run having created it.
+    // tolerates another run having created it. It is left in place on purpose:
+    // NOLOGIN and holding nothing outside the throwaway databases, it is
+    // harmless, and dropping it would race a concurrent run still using it.
     sqlx::query(&format!(
         "DO $$ BEGIN \
            CREATE ROLE {ROLE} NOLOGIN NOSUPERUSER NOBYPASSRLS; \
@@ -3099,4 +3116,221 @@ async fn a_blocker_in_another_org_is_seen_without_an_rls_exemption(pool: PgPool)
             "{table}"
         );
     }
+}
+
+/// The function's own refusals that the Rust wrapper normally gets in first:
+/// a malformed slug, and an org-pinned transaction (where the tenant policy
+/// would show it one org's rows), here as the owning superuser so it is the
+/// function refusing and not a missing grant.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_rename_function_refuses_a_bad_slug_and_a_pinned_transaction(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let code = |e: sqlx::Error| e.as_database_error().unwrap().code().unwrap().into_owned();
+
+    let err = sqlx::query("SELECT * FROM rename_service($1, 'Otto_Tower')")
+        .bind(FACTORY)
+        .fetch_all(w.db.pool())
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "22023");
+
+    let mut tx = w.db.pool().begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.org_id', $1, true)")
+        .bind(w.org.as_uuid().to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let err = sqlx::query("SELECT * FROM rename_service($1, 'otto-tower')")
+        .bind(FACTORY)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "0A000");
+    drop(tx);
+    assert_eq!(rows_with(&w.db, "meters", "key", JOBS).await, 1);
+}
+
+/// After a rename nothing can be written under the old slug or meter keys:
+/// the foreign keys of migration 0024 refuse it, whoever writes it.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn nothing_can_be_written_under_a_renamed_slug(pool: PgPool) {
+    let w = metered_world(pool).await;
+    resources::rename_service(&w.db, FACTORY, "otto-tower")
+        .await
+        .unwrap();
+    let org = w.org.as_uuid();
+    for stmt in [
+        format!(
+            "INSERT INTO usage_events (org_id, tool, billable, meter, quantity) \
+             VALUES ('{org}', 't', true, '{JOBS}', 1)"
+        ),
+        format!(
+            "INSERT INTO org_meter_period_usage (org_id, meter, period_start, quantity) \
+             VALUES ('{org}', '{JOBS}', date_trunc('month', now())::date, 1)"
+        ),
+        format!(
+            "INSERT INTO org_service_period_usage (org_id, service, period_start) \
+             VALUES ('{org}', 'otto-factory', date_trunc('month', now())::date)"
+        ),
+        format!(
+            "INSERT INTO service_budgets (org_id, service, monthly_budget_cents) \
+             VALUES ('{org}', 'otto-factory', 100)"
+        ),
+        format!(
+            "INSERT INTO budget_alerts (org_id, service, period_start, threshold) \
+             VALUES ('{org}', 'otto-factory', date_trunc('month', now())::date, 50)"
+        ),
+    ] {
+        let err = sqlx::query(&stmt)
+            .execute(w.db.pool())
+            .await
+            .expect_err(&stmt);
+        assert!(
+            err.as_database_error()
+                .is_some_and(|d| d.is_foreign_key_violation()),
+            "{stmt}: {err}"
+        );
+    }
+}
+
+/// An ingest transaction for `w.org`, shaped exactly as `POST
+/// /internal/usage` runs one, that has counted one otto-factory event (metered
+/// under `meter`, or not) and is still open.
+async fn open_factory_ingest(w: &World, meter: Option<&'static str>) -> otto_tenant::Tx<'static> {
+    use otto_billing::budgets::PendingBudgets;
+    use otto_billing::usage::{IngestOutcome, Metered, ShippedUsage, UsageExt};
+
+    let mut tx = w.db.begin(w.org).await.unwrap();
+    otto_billing::usage::lock_org_ingest(&mut tx).await.unwrap();
+    let out = tx
+        .ingest_usage_deferred(
+            FACTORY,
+            &ShippedUsage {
+                event_id: Uuid::new_v4(),
+                user: None,
+                tool: "t",
+                billable: true,
+                occurred_at: Utc::now(),
+                service: Some("otto-factory"),
+                metered: meter.map(|meter| Metered { meter, quantity: 1 }),
+            },
+            &mut PendingBudgets::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, IngestOutcome::Counted);
+    tx
+}
+
+/// Whether `task` is still waiting after a moment: long enough for it to
+/// reach a lock it would wait on, and far too long for it to have run.
+async fn still_waiting<T>(task: &tokio::task::JoinHandle<T>) -> bool {
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    !task.is_finished()
+}
+
+/// A rename started while an ingest transaction is open waits for it, and
+/// then sees what it wrote: an unmetered event's pool is moved with the rest,
+/// a metered one blocks the rename. Either way nothing is left under the old
+/// slug.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_rename_waits_for_an_open_ingest_and_then_counts_it(pool: PgPool) {
+    let w = metered_world(pool).await;
+
+    // Unmetered: the pool row it wrote moves.
+    let ingest = open_factory_ingest(&w, None).await;
+    let db = w.db.clone();
+    let rename =
+        tokio::spawn(async move { resources::rename_service(&db, FACTORY, "otto-tower").await });
+    assert!(still_waiting(&rename).await, "the rename did not wait");
+    ingest.commit().await.unwrap();
+    let renamed = rename.await.unwrap().unwrap();
+    assert_eq!(renamed.moved.service_pools, 1);
+    assert_eq!(service_pool(&w.db, "otto-tower").await, Some((1, 1)));
+    assert_eq!(service_pool(&w.db, "otto-factory").await, None);
+
+    // Metered: back to the old slug (nothing is metered yet), then the usage
+    // an open ingest wrote blocks the rename.
+    resources::rename_service(&w.db, FACTORY, "otto-factory")
+        .await
+        .unwrap();
+    let ingest = open_factory_ingest(&w, Some(JOBS)).await;
+    let db = w.db.clone();
+    let rename =
+        tokio::spawn(async move { resources::rename_service(&db, FACTORY, "otto-tower").await });
+    assert!(still_waiting(&rename).await, "the rename did not wait");
+    ingest.commit().await.unwrap();
+    let err = rename.await.unwrap().unwrap_err();
+    assert!(
+        err.to_string().ends_with(
+            "has billing data under its meters: 1 usage_events, 1 org_meter_period_usage"
+        ),
+        "{err}"
+    );
+    assert_eq!(meter_quantity(&w.db, JOBS).await, Some(1));
+    assert_eq!(rows_with(&w.db, "meters", "key", JOBS).await, 1);
+}
+
+/// A batch in flight when a rename commits (it authenticated, and so read the
+/// old slug, before the rename committed, and reached its writes after) is
+/// refused with a retriable 503 and writes nothing. Resent, it is judged
+/// against the new slug: the unmetered event counts in the otto-tower pool,
+/// the event under the old meter key is `unknown_meter`.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_batch_in_flight_across_a_rename_is_refused_retriably_and_strands_nothing(pool: PgPool) {
+    let w = metered_world(pool).await;
+
+    // The rename, run and held open: it holds the pool table lock that every
+    // ingest statement needs.
+    let mut rename = w.db.pool().begin().await.unwrap();
+    sqlx::query("SELECT * FROM rename_service($1, 'otto-tower')")
+        .bind(FACTORY)
+        .fetch_all(&mut *rename)
+        .await
+        .unwrap();
+
+    let batch = vec![
+        usage_event(w.org, None, Uuid::new_v4(), true),
+        metered(w.org, JOBS, Some(2)),
+    ];
+    let (db, auth, sent) = (w.db.clone(), w.factory_basic(), batch.clone());
+    let ingest = tokio::spawn(async move { post_usage(&db, &auth, sent).await });
+    assert!(still_waiting(&ingest).await, "the batch did not wait");
+    rename.commit().await.unwrap();
+
+    let (status, body) = ingest.await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "temporarily_unavailable", "{body}");
+    assert!(otto_resource::Error::Status {
+        status: status.as_u16(),
+        body: body.to_string(),
+    }
+    .is_retriable());
+    for (table, column) in [
+        ("org_service_period_usage", "service"),
+        ("usage_events", "meter"),
+        ("org_meter_period_usage", "meter"),
+    ] {
+        let value = if column == "service" {
+            "otto-factory"
+        } else {
+            JOBS
+        };
+        assert_eq!(rows_with(&w.db, table, column, value).await, 0, "{table}");
+    }
+    let claimed: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_event_ids")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed, 0,
+        "a refused batch must leave its event ids unclaimed"
+    );
+
+    let (status, receipt) = post_usage(&w.db, &w.factory_basic(), batch).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["accepted"], 1, "{receipt}");
+    assert_eq!(rejection_codes(&receipt), ["unknown_meter"]);
+    assert_eq!(service_pool(&w.db, "otto-tower").await, Some((1, 1)));
+    assert_eq!(service_pool(&w.db, "otto-factory").await, None);
 }

@@ -1,0 +1,21 @@
+-- no-transaction
+--
+-- An index on `usage_events (meter)` for `rename_service` (0024,
+-- savvagent/otto-platform#86). Its blocker count looks for `<old>/` meters,
+-- and changing a meter's key makes the new `usage_events_meter_declared`
+-- foreign key look for rows still naming it. Without an index each is a full
+-- scan of the largest table there is, run while the rename holds ingest off.
+--
+-- Built CONCURRENTLY so building it never blocks ingest, which is why this
+-- migration runs outside a transaction (the directive on the first line) and
+-- is one statement: a multi-statement string would run as one implicit
+-- transaction, which CONCURRENTLY refuses. If a build is interrupted it
+-- leaves an invalid index that IF NOT EXISTS then skips; that only costs the
+-- rename speed, never correctness, and `REINDEX INDEX CONCURRENTLY
+-- usage_events_meter` repairs it.
+--
+-- `text_pattern_ops` so the prefix match (`LIKE '<old>/%'`) can use it as
+-- well as the foreign key's equality lookup; partial because unmetered events,
+-- nearly all of them, have no meter.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS usage_events_meter
+  ON usage_events (meter text_pattern_ops) WHERE meter IS NOT NULL;

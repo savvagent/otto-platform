@@ -37,7 +37,9 @@
 //! meters, their prices, and every org's usage pools and budgets to the new
 //! name. It is refused, naming each blocker and its count, once anything under
 //! the old meters records money: metered usage, a Stripe meter or price, or a
-//! queued Stripe meter event.
+//! queued Stripe meter event. Pause the service's usage shipping first: a
+//! batch in flight is refused (retriably) rather than stranded, and on retry a
+//! metered event under an old meter key is rejected as unknown.
 //!
 //! Secrets are printed once, on stdout, and cannot be read back: the
 //! introspection secret is stored hashed, the webhook secret sealed. Losing
@@ -60,7 +62,8 @@ commands:
   set-service <resource-uri> <slug>   assign the service slug its value meters are keyed by
   rename-service <resource-uri> <new-slug>
                                       move its meters, prices, pools and budgets to a new slug,
-                                      while none of its usage is metered or in Stripe
+                                      while none of its usage is metered or in Stripe;
+                                      pause the service's usage shipping first
   describe <resource-uri> [--scope-description a=text]... [--clear]
                                       replace the scope descriptions shown on the consent screen
   rotate-secret <resource-uri>        issue a new introspection credential
