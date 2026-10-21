@@ -19,9 +19,9 @@ describe('product page entries', () => {
   it('lists every service in every locale, English unprefixed', async () => {
     const all = await entries();
     expect(all).toHaveLength(SERVICES.length * locales.length);
-    expect(all).toContainEqual({ slug: 'factory' });
+    expect(all).toContainEqual({ slug: 'tower' });
     expect(all).toContainEqual({ lang: 'es', slug: 'flags' });
-    expect(all).not.toContainEqual({ lang: baseLocale, slug: 'factory' });
+    expect(all).not.toContainEqual({ lang: baseLocale, slug: 'tower' });
   });
 });
 

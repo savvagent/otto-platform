@@ -6,7 +6,7 @@
  * organization (sign-in, passkeys, members, teams, SSO, usage, audit), and each
  * product is a service on its own host that signs in here with OAuth.
  *
- * **Not every service has a web console.** Otto Factory serves one, which links
+ * **Not every service has a web console.** Otto Tower serves one, which links
  * back to this console, so a person never has to know a hostname. Otto Flags
  * and Otto CXP are agent-only: their origin answers a browser with a JSON 404,
  * and the place a person uses them is their AI assistant, with the service
@@ -84,23 +84,26 @@ export interface Service {
 
 const CONFIGURED: readonly Service[] = [
   {
-    slug: 'factory',
-    name: 'Otto Factory',
+    slug: 'tower',
+    name: 'Otto Tower',
+    // Still the old host: otto-tower.savvagent.com does not resolve until the
+    // cutover (docs/specs/2026-10-21-otto-tower-rename-design.md, D4), and the
+    // old host keeps serving until its sunset. Reverting this commit is the flip.
     consoleUrl: 'https://otto-factory.savvagent.com',
-    // `OF_RESOURCE_URI` in otto-factory's `fly.toml`: the MCP endpoint is
+    // `OF_RESOURCE_URI` in the service's `fly.toml`: the MCP endpoint is
     // `/mcp` on the service's own origin.
     mcpUrl: 'https://otto-factory.savvagent.com/mcp',
     copy: {
-      title: () => m.product_factory_title(),
-      description: () => m.product_factory_description(),
-      tagline: () => m.product_factory_tagline(),
-      summary: () => m.product_factory_summary(),
+      title: () => m.product_tower_title(),
+      description: () => m.product_tower_description(),
+      tagline: () => m.product_tower_tagline(),
+      summary: () => m.product_tower_summary(),
       features: () => [
-        m.product_factory_feature_jobs(),
-        m.product_factory_feature_visibility(),
-        m.product_factory_feature_leases(),
-        m.product_factory_feature_trackers(),
-        m.product_factory_feature_install()
+        m.product_tower_feature_jobs(),
+        m.product_tower_feature_visibility(),
+        m.product_tower_feature_leases(),
+        m.product_tower_feature_trackers(),
+        m.product_tower_feature_install()
       ]
     }
   },

@@ -208,7 +208,7 @@ describe('usageByService', () => {
     const cxp = meter({ service: 'otto-cxp', meter: 'tickets', displayName: 'Tickets' });
     const groups = usageByService([cxp, flags]);
     expect(groups.map((g) => [g.service, g.name, g.meters])).toEqual([
-      ['otto-factory', 'Otto Factory', []],
+      ['otto-tower', 'Otto Tower', []],
       ['otto-flags', 'Otto Flags', [flags]],
       ['otto-cxp', 'Otto CXP', [cxp]]
     ]);

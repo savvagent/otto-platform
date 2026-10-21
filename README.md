@@ -1,7 +1,7 @@
 # otto-platform
 
 The shared identity/auth/billing/tenant-isolation substrate for the otto-*
-family of agent-facing MCP servers (otto-factory, otto-flags, and future
+family of agent-facing MCP servers (otto-tower, otto-flags, and future
 otto-* services).
 
 ## Relationship to otto-factory, otto-flags, and the design doc
@@ -20,7 +20,7 @@ short:
 - One physical **identity database** (this repo's Postgres) holds `orgs`,
   `users`, `org_members`, auth, and billing. It is the single source of truth
   for "who is this org" and "what can they do."
-- Each otto-* service keeps its **own domain database** (otto-factory's
+- Each otto-* service keeps its **own domain database** (otto-tower's
   jobs/repos/leases; otto-flags' flags/environments/targeting). They share no
   tables, only the same `org_id` UUID namespace — no cross-database foreign
   keys, application-level referential integrity only.
@@ -28,7 +28,7 @@ short:
   (RFC 8707 resource indicators). A token minted for one otto-* service
   cannot be replayed against another.
 
-It is deployed at `https://otto.savvagent.com`. otto-factory is its first
+It is deployed at `https://otto.savvagent.com`. otto-tower is its first
 resource server: it depends on `otto-tenant` and `otto-resource` from this repo,
 validates bearer tokens through introspection, and its console signs in here
 with OAuth. otto-flags is meant to be the second, needing nothing from the
@@ -75,7 +75,7 @@ crates/
 │                         plan catalog (/api/plans). Routes and the
 │                         OpenAPI document come from one catalog. Built on
 │                         otto-tenant, otto-core, otto-billing, otto-auth.
-├── otto-resource/        what a resource server (otto-factory, otto-flags)
+├── otto-resource/        what a resource server (otto-tower, otto-flags)
 │                         links: introspection, usage and lookup clients
 │                         with 60 s caches, webhook signature verification.
 │                         No database dependency.

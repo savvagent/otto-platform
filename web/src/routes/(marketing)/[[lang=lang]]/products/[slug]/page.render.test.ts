@@ -4,7 +4,7 @@
  * and the MCP endpoint an agent is pointed at, as text that can be copied.
  *
  * Its primary button depends on whether the product has a web console of its
- * own. Otto Factory does, and the button leaves for it; Otto Flags and Otto
+ * own. Otto Tower does, and the button leaves for it; Otto Flags and Otto
  * CXP live inside the visitor's AI assistant, so theirs stays on the page and
  * points at the connect card.
  */
@@ -58,7 +58,7 @@ describe('the product page', () => {
   it('names the product in the h1 and shows its MCP endpoint', () => {
     const instance = mount(Page, {
       target: container,
-      props: { data: { lang: 'en', slug: 'factory' } }
+      props: { data: { lang: 'en', slug: 'tower' } }
     });
 
     flushSync();
@@ -71,12 +71,12 @@ describe('the product page', () => {
       h.textContent?.includes('Otto Flags')
     );
     expect(card).toBeDefined();
-    expect(headings[0]?.textContent).toContain('Otto Factory');
+    expect(headings[0]?.textContent).toContain('Otto Tower');
     expect(container.textContent).toContain('https://otto-factory.savvagent.com/mcp');
 
     // The page title is the name and the product's own title phrase, with no
     // closing full stop; the description is the short SEO one, not the summary.
-    expect(document.title).toBe('Otto Factory: Coordination for teams of coding agents');
+    expect(document.title).toBe('Otto Tower: Coordination for teams of coding agents');
     const description = document.head.querySelector('meta[name="description"]');
     expect(description?.getAttribute('content')?.length).toBeLessThanOrEqual(160);
 
@@ -92,17 +92,17 @@ describe('the product page', () => {
     // The service's own console names its destination; the arrow marking it
     // as off-site is decoration, so it is not part of the accessible name.
     const open = container.querySelector('a[href="https://otto-factory.savvagent.com"]');
-    expect(open?.textContent).toContain('Open the Otto Factory console');
+    expect(open?.textContent).toContain('Open the Otto Tower console');
     expect(open?.querySelector('[aria-hidden="true"]')?.textContent).toBe('↗');
 
     // The other products are cross-linked; this one is not linked to itself.
     expect(container.querySelector('a[href="/products/flags"]')).not.toBeNull();
-    expect(container.querySelector('a[href="/products/factory"]')).toBeNull();
+    expect(container.querySelector('a[href="/products/tower"]')).toBeNull();
 
     unmount(instance);
   });
 
-  it('renders Otto Flags as its own page, cross-linking Factory', () => {
+  it('renders Otto Flags as its own page, cross-linking Tower', () => {
     const instance = mountProduct('flags');
 
     const headings = container.querySelectorAll('h1');
@@ -111,14 +111,14 @@ describe('the product page', () => {
     expectNoSkips(headingLevels(container));
     expect(container.textContent).toContain('https://otto-flags.savvagent.com/mcp');
     expect(container.textContent).toContain('Automatic rollback on Team plans and above.');
-    expect(container.querySelector('a[href="/products/factory"]')).not.toBeNull();
+    expect(container.querySelector('a[href="/products/tower"]')).not.toBeNull();
     expect(container.querySelector('a[href="/products/flags"]')).toBeNull();
 
     unmount(instance);
   });
 
   it('turns "Create account" into "Open console" for a signed-in visitor', () => {
-    const instance = mountProduct('factory');
+    const instance = mountProduct('tower');
     expect(linkText('/signup')).toBe('Create account');
 
     session.me = {
@@ -138,11 +138,9 @@ describe('the product page', () => {
   });
 
   it("keeps the way into a product's own web console when it has one", () => {
-    const instance = mountProduct('factory');
+    const instance = mountProduct('tower');
 
-    expect(linkText('https://otto-factory.savvagent.com')).toContain(
-      'Open the Otto Factory console'
-    );
+    expect(linkText('https://otto-factory.savvagent.com')).toContain('Open the Otto Tower console');
     expect(container.querySelector('a[href="#connect"]')).toBeNull();
     expect(container.textContent).not.toContain('has no web console of its own');
 
@@ -200,7 +198,7 @@ describe('the product page', () => {
   });
 
   it('gives the connect card a focusable target, setup steps, and the Claude Code command', () => {
-    for (const slug of ['factory', 'flags', 'cxp']) {
+    for (const slug of ['tower', 'flags', 'cxp']) {
       const instance = mountProduct(slug);
 
       const connect = container.querySelector('#connect');
@@ -210,12 +208,14 @@ describe('the product page', () => {
 
       const text = connect?.textContent ?? '';
       expect(text).toContain('Connector address');
-      expect(text).toContain(`https://otto-${slug}.savvagent.com/mcp`);
+      // Otto Tower stays on its old host until the otto-tower cutover.
+      const host = slug === 'tower' ? 'otto-factory' : `otto-${slug}`;
+      expect(text).toContain(`https://${host}.savvagent.com/mcp`);
       expect(text).toContain('Add custom connector');
       expect(text).toContain('ChatGPT');
       expect(text).toContain('developer mode');
       expect(text).toContain(
-        `claude mcp add --transport http otto-${slug} https://otto-${slug}.savvagent.com/mcp`
+        `claude mcp add --transport http otto-${slug} https://${host}.savvagent.com/mcp`
       );
       expect(text).toContain('/mcp');
       expectNoSkips(headingLevels(container));

@@ -68,8 +68,8 @@ const FLAG_EVALUATIONS: PricedMeter = {
   ]
 };
 
-const FACTORY_JOBS: PricedMeter = {
-  service: 'otto-factory',
+const TOWER_JOBS: PricedMeter = {
+  service: 'otto-tower',
   meter: 'jobs',
   displayName: 'Jobs completed',
   unit: 'job',
@@ -80,7 +80,7 @@ const FACTORY_JOBS: PricedMeter = {
   ]
 };
 
-const PRICED: PlansResponse = { plans: SEEDED, meters: [FACTORY_JOBS, FLAG_EVALUATIONS] };
+const PRICED: PlansResponse = { plans: SEEDED, meters: [TOWER_JOBS, FLAG_EVALUATIONS] };
 
 const plans = vi.mocked(api.plans);
 
@@ -257,7 +257,7 @@ describe('the pricing page', () => {
     const services = Array.from(usageRegion().querySelectorAll('h3')).map((h) =>
       h.textContent?.trim()
     );
-    expect(services).toEqual(['Otto Factory', 'Otto Flags', 'Otto CXP']);
+    expect(services).toEqual(['Otto Tower', 'Otto Flags', 'Otto CXP']);
 
     // Exact prices from millionths of a cent; the first unit of each tier is
     // the one after the tier before.
@@ -275,7 +275,7 @@ describe('the pricing page', () => {
     expect(flags.textContent).toContain('Billed per evaluation');
     expect(flags.textContent).toContain('First 1,000 units free every month');
     // No free first tier, so no "free" claim.
-    expect(card('Otto Factory').textContent).not.toContain('free every month');
+    expect(card('Otto Tower').textContent).not.toContain('free every month');
     // A service with nothing priced says so, rather than vanishing or reading as free.
     expect(card('Otto CXP').textContent).toContain('No usage price published yet.');
     expect(card('Otto CXP').querySelector('table')).toBeNull();
@@ -423,10 +423,7 @@ describe('the pricing page', () => {
   it('drops only a meter with a broken tier table, never showing a wrong price', async () => {
     plans.mockResolvedValue({
       plans: SEEDED,
-      meters: [
-        FACTORY_JOBS,
-        { ...FLAG_EVALUATIONS, tiers: [{ upTo: null, unitAmountUcents: 1.5 }] }
-      ]
+      meters: [TOWER_JOBS, { ...FLAG_EVALUATIONS, tiers: [{ upTo: null, unitAmountUcents: 1.5 }] }]
     });
     const instance = mountPage();
     await settle();

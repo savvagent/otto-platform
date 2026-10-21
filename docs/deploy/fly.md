@@ -442,7 +442,7 @@ fly certs show otto.savvagent.com -a otto-platform   # prints the records to cre
 ```
 
 Create at Namecheap what `fly certs show` prints: an `A` and `AAAA` for `otto` (the
-app's IPs, as for `otto-factory`), or a `CNAME` for `otto` to `otto-platform.fly.dev` if you
+app's IPs, as for `otto-tower`), or a `CNAME` for `otto` to `otto-platform.fly.dev` if you
 prefer. Then `fly certs check otto.savvagent.com -a otto-platform` until it reports issued.
 
 **Settle this before the first passkey is registered.** Changing the host later invalidates

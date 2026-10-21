@@ -12,7 +12,7 @@ the usage meter and the audit log. Both talk to `otto-platform-server`'s API
 
 What it does **not** hold is any product's own domain: queues, repositories, trackers and
 agent connection live in each service, which signs in here with OAuth, and are used through
-its own web console (Otto Factory's, for one) or, for an agent-only service such as Otto Flags
+its own web console (Otto Tower's, for one) or, for an agent-only service such as Otto Flags
 or Otto CXP, through the person's AI assistant. The products are a small list in
 [`src/lib/services.ts`](src/lib/services.ts), which the console header links from and the
 marketing pages describe; see "Adding a product" below.

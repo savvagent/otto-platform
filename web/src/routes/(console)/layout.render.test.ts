@@ -38,7 +38,7 @@ afterEach(() => {
 });
 
 describe('the console header', () => {
-  it('links out to Factory, and to the connect cards of Flags and CXP', () => {
+  it('links out to Tower, and to the connect cards of Flags and CXP', () => {
     const children = createRawSnippet(() => ({ render: () => '<p>page</p>' }));
     const instance = mount(Layout, { target: container, props: { children } });
     flushSync();
@@ -50,7 +50,7 @@ describe('the console header', () => {
       a.getAttribute('aria-label') ?? a.textContent?.trim()
     ]);
     expect(links).toEqual([
-      ['https://otto-factory.savvagent.com', 'Otto Factory'],
+      ['https://otto-factory.savvagent.com', 'Otto Tower'],
       ['/products/flags#connect', 'Otto Flags, connector'],
       ['/products/cxp#connect', 'Otto CXP, connector']
     ]);

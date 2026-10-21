@@ -33,25 +33,25 @@ const defaultGetLocale = getLocale;
 afterEach(() => overwriteGetLocale(defaultGetLocale));
 
 describe('the services list', () => {
-  it('ships Otto Factory, Otto Flags and Otto CXP, over https', () => {
+  it('ships Otto Tower, Otto Flags and Otto CXP, over https', () => {
     expect(SERVICES.map((s) => [s.slug, s.name])).toEqual([
-      ['factory', 'Otto Factory'],
+      ['tower', 'Otto Tower'],
       ['flags', 'Otto Flags'],
       ['cxp', 'Otto CXP']
     ]);
     for (const service of SERVICES) {
-      expect(service.mcpUrl).toBe(`https://otto-${service.slug}.savvagent.com/mcp`);
+      expect(service.mcpUrl).toBe(`https://${expectedHost(service.slug)}/mcp`);
     }
   });
 
   /**
-   * Only Otto Factory serves a web console. Flags and CXP answer a browser
+   * Only Otto Tower serves a web console. Flags and CXP answer a browser
    * at their origin with a JSON 404, so a `consoleUrl` on either would put a
    * dead end back in the header.
    */
-  it('gives a web console to Otto Factory only', () => {
+  it('gives a web console to Otto Tower only', () => {
     expect(SERVICES.map((s) => [s.slug, s.consoleUrl])).toEqual([
-      ['factory', 'https://otto-factory.savvagent.com'],
+      ['tower', 'https://otto-factory.savvagent.com'],
       ['flags', undefined],
       ['cxp', undefined]
     ]);
@@ -150,8 +150,8 @@ describe('the services list', () => {
 
 describe('where a link to a service goes', () => {
   it('leaves for the web console when there is one', () => {
-    const factory = serviceBySlug('factory')!;
-    expect(serviceLink(factory, 'en')).toEqual({
+    const tower = serviceBySlug('tower')!;
+    expect(serviceLink(tower, 'en')).toEqual({
       kind: 'console',
       href: 'https://otto-factory.savvagent.com'
     });
@@ -173,11 +173,20 @@ describe('where a link to a service goes', () => {
   });
 });
 
+/**
+ * Every service is served from `otto-<slug>.savvagent.com`, except Otto Tower,
+ * which stays on its old host until the otto-tower cutover. Reverting the
+ * commit that added this exception is the URL flip.
+ */
+function expectedHost(slug: string): string {
+  return slug === 'tower' ? 'otto-factory.savvagent.com' : `otto-${slug}.savvagent.com`;
+}
+
 describe('the Claude Code command', () => {
   it("names each server after its host, so it matches the service's own docs", () => {
-    expect(SERVICES.map(connectorName)).toEqual(['otto-factory', 'otto-flags', 'otto-cxp']);
+    expect(SERVICES.map(connectorName)).toEqual(['otto-tower', 'otto-flags', 'otto-cxp']);
     for (const service of SERVICES) {
-      expect(new URL(service.mcpUrl!).hostname.split('.')[0]).toBe(connectorName(service));
+      expect(new URL(service.mcpUrl!).hostname).toBe(expectedHost(service.slug));
     }
   });
 
