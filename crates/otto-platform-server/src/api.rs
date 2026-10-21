@@ -125,10 +125,26 @@ pub struct CallingResourceServer {
     /// The canonical row, whichever URI the caller named. Usage ingest, dedupe
     /// and the token audience check key on `server.resource_uri`.
     pub server: ResourceServer,
-    /// The URI the caller authenticated as: the Basic client id (the canonical
-    /// URI or a live alias), or the canonical URI on the Bearer path, which
-    /// names none. Only introspection reads it, as the `aud` it answers with.
-    pub authenticated_uri: String,
+    /// The URI the caller authenticated as. Introspection's `aud`, and
+    /// nothing else.
+    pub audience: AuthenticatedAudience,
+}
+
+/// The URI a resource server authenticated as: the Basic client id (its
+/// canonical URI or a live alias), or its canonical URI on the Bearer path,
+/// which names none.
+///
+/// **For introspection's `aud` only.** It may be an alias, so never store,
+/// key or compare anything by it; that is what `server.resource_uri` is for.
+/// A type of its own, built only here and readable only as a string, so it
+/// cannot be passed where a resource URI is expected by accident.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedAudience(String);
+
+impl AuthenticatedAudience {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl<S> FromRequestParts<S> for CallingResourceServer
@@ -159,13 +175,13 @@ where
                 .await
                 .map(|r| Self {
                     server: r.server,
-                    authenticated_uri: r.uri,
+                    audience: AuthenticatedAudience(r.named_as),
                 })
         } else if scheme.eq_ignore_ascii_case("bearer") {
             resources::authenticate_secret(db, rest)
                 .await
                 .map(|rs| Self {
-                    authenticated_uri: rs.resource_uri.clone(),
+                    audience: AuthenticatedAudience(rs.resource_uri.clone()),
                     server: rs,
                 })
         } else {

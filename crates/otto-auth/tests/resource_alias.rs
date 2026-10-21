@@ -195,12 +195,15 @@ async fn resolve_finds_the_canonical_row_by_either_uri(pool: PgPool) {
 
     let by_new = resources::resolve(&db, NEW).await.unwrap().unwrap();
     assert_eq!(by_new.server.resource_uri, NEW);
-    assert_eq!(by_new.uri, NEW);
+    assert_eq!(by_new.named_as, NEW);
     assert!(by_new.alias.is_none());
 
     let by_old = resources::resolve(&db, OLD).await.unwrap().unwrap();
     assert_eq!(by_old.server.resource_uri, NEW, "the row stays canonical");
-    assert_eq!(by_old.uri, OLD, "the URI it was named by is kept apart");
+    assert_eq!(
+        by_old.named_as, OLD,
+        "the URI it was named by is kept apart"
+    );
     assert_eq!(by_old.alias.as_ref().unwrap().alias_uri, OLD);
 
     assert!(resources::resolve(&db, "https://nobody.example/mcp")
@@ -477,7 +480,7 @@ async fn a_resource_server_authenticates_as_its_canonical_uri_or_a_live_alias(po
             .await
             .unwrap();
         assert_eq!(a.server.resource_uri, NEW, "{uri}");
-        assert_eq!(a.uri, uri);
+        assert_eq!(a.named_as, uri);
     }
     // The alias is not a way in for another server's credential.
     let err = resources::authenticate_introspection(&db, OLD, &flags_secret)
@@ -513,4 +516,133 @@ async fn a_resource_server_authenticates_as_its_canonical_uri_or_a_live_alias(po
     assert!(resources::authenticate_introspection(&db, NEW, &secret)
         .await
         .is_ok());
+}
+
+// ---- races and guards ----
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_token_minted_under_the_old_uri_after_the_rename_is_still_good(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register(&db, OLD, "otto-factory").await;
+    register(&db, FLAGS, "otto-flags").await;
+    let (user, org) = member(&db).await;
+    resources::rename(&db, OLD, NEW, Some(sunset()), None)
+        .await
+        .unwrap();
+    // What a mint that read the old canonical URI before the rename committed
+    // writes after it.
+    let late = token(&db, user, org, OLD).await;
+    assert_eq!(count(&db, "access_tokens", "resource", OLD).await, 1);
+    assert!(tokens::introspect(&db, &late, NEW).await.is_ok());
+    // Still only for its own server, and even once the alias is dropped.
+    assert!(matches!(
+        tokens::introspect(&db, &late, FLAGS).await,
+        Err(AuthError::WrongAudience)
+    ));
+    resources::drop_alias(&db, OLD).await.unwrap();
+    assert!(tokens::introspect(&db, &late, NEW).await.is_ok());
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn only_tokens_still_usable_are_rewritten(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register(&db, OLD, "otto-factory").await;
+    let (user, org) = member(&db).await;
+    let live = token(&db, user, org, OLD).await;
+    let revoked = token(&db, user, org, OLD).await;
+    tokens::revoke_presented(&db, &revoked).await.unwrap();
+    token(&db, user, org, OLD).await;
+    sqlx::query(
+        "UPDATE access_tokens SET expires_at = now() - interval '1 minute' \
+         WHERE token_hash NOT IN ($1, $2)",
+    )
+    .bind(otto_auth::crypto::hash(&live))
+    .bind(otto_auth::crypto::hash(&revoked))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    code(&db, user, org, OLD).await;
+    code(&db, user, org, OLD).await;
+    sqlx::query(
+        "UPDATE authorization_codes SET consumed_at = now() \
+         WHERE ctid = (SELECT min(ctid) FROM authorization_codes)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let r = resources::rename(&db, OLD, NEW, Some(sunset()), None)
+        .await
+        .unwrap();
+    assert_eq!(r.rewritten.access_tokens, 1);
+    assert_eq!(r.rewritten.authorization_codes, 1);
+    assert_eq!(count(&db, "access_tokens", "resource", OLD).await, 2);
+    assert!(tokens::introspect(&db, &live, NEW).await.is_ok());
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn alias_rows_cannot_be_truncated(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register(&db, OLD, "otto-factory").await;
+    resources::rename(&db, OLD, NEW, Some(sunset()), None)
+        .await
+        .unwrap();
+    let err = sqlx::query("TRUNCATE resource_server_aliases")
+        .execute(db.pool())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("never deleted"), "{err}");
+    assert_eq!(resources::aliases(&db).await.unwrap().len(), 1);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn tenant_pinned_code_cannot_touch_aliases(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register(&db, OLD, "otto-factory").await;
+    let (_, org) = member(&db).await;
+    for stmt in [
+        format!(
+            "INSERT INTO resource_server_aliases (alias_uri, resource_uri, sunset_at) \
+             VALUES ('https://squat.example/mcp', '{OLD}', now() + interval '1 day')"
+        ),
+        "UPDATE resource_server_aliases SET dropped_at = now()".to_owned(),
+        "SELECT count(*) FROM resource_server_aliases".to_owned(),
+    ] {
+        let mut tx = db.begin(org).await.unwrap();
+        let err = sqlx::query(&stmt).execute(tx.conn()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("permission denied"),
+            "{stmt}: {err}"
+        );
+    }
+    assert!(resources::aliases(&db).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_rename_waits_for_a_claim_in_flight_then_gives_up_cleanly(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register(&db, OLD, "otto-factory").await;
+    let (_, org) = member(&db).await;
+
+    // A claim whose transaction stays open past the rename's lock timeout.
+    let mut claiming = db.begin(org).await.unwrap();
+    let out: String = sqlx::query_scalar("SELECT claim_usage_event($1, $2, $3)")
+        .bind(OLD)
+        .bind(Uuid::new_v4())
+        .bind(org.as_uuid())
+        .fetch_one(claiming.conn())
+        .await
+        .unwrap();
+    assert_eq!(out, "new");
+
+    let err = resources::rename(&db, OLD, NEW, Some(sunset()), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AuthError::InvalidRequest(m) if m.contains("run it again")),
+        "{err:?}"
+    );
+    claiming.commit().await.unwrap();
+    assert!(resources::get(&db, OLD).await.unwrap().is_some());
+    assert!(resources::aliases(&db).await.unwrap().is_empty());
 }

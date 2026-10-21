@@ -570,7 +570,7 @@ async fn introspection_credentials_authenticate_only_their_resource(pool: PgPool
         .await
         .unwrap();
     assert_eq!(rs.server.resource_uri, FLAGS);
-    assert_eq!(rs.uri, FLAGS);
+    assert_eq!(rs.named_as, FLAGS);
 
     // Another resource's URI with this credential fails.
     assert!(resources::authenticate_introspection(&db, FACTORY, &first)

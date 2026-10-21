@@ -3797,3 +3797,131 @@ async fn the_operator_cli_renames_shows_and_drops_aliases(pool: PgPool) {
         .await
         .is_err());
 }
+
+/// An open ingest transaction for `w.org` that has claimed `event` under
+/// `uri` (unmetered, no service), shaped as `POST /internal/usage` runs one.
+async fn open_unmetered_ingest(w: &World, uri: &str, event: Uuid) -> otto_tenant::Tx<'static> {
+    use otto_billing::budgets::PendingBudgets;
+    use otto_billing::usage::{IngestOutcome, ShippedUsage, UsageExt};
+
+    let mut tx = w.db.begin(w.org).await.unwrap();
+    otto_billing::usage::lock_org_ingest(&mut tx).await.unwrap();
+    let out = tx
+        .ingest_usage_deferred(
+            uri,
+            &ShippedUsage {
+                event_id: event,
+                user: None,
+                tool: "t",
+                billable: true,
+                occurred_at: Utc::now(),
+                service: None,
+                metered: None,
+            },
+            &mut PendingBudgets::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, IngestOutcome::Counted);
+    tx
+}
+
+/// A claim made under the old URI and still uncommitted when the rename
+/// starts: the rename waits for it, then rewrites it, so the event cannot be
+/// counted again under the new URI.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_uri_rename_waits_for_an_open_claim_and_then_rewrites_it(pool: PgPool) {
+    let w = world(pool).await;
+    let event = Uuid::new_v4();
+    let ingest = open_unmetered_ingest(&w, FACTORY, event).await;
+
+    let db = w.db.clone();
+    let rename = tokio::spawn(async move {
+        resources::rename(&db, FACTORY, TOWER, Some(alias_sunset()), None).await
+    });
+    assert!(waiting_on_a_lock(w.db.pool(), &rename).await);
+    ingest.commit().await.unwrap();
+    let renamed = rename.await.unwrap().unwrap();
+    assert_eq!(renamed.rewritten.usage_event_ids, 1);
+
+    let (_, r) = post_usage(
+        &w.db,
+        &basic(TOWER, &w.factory_secret),
+        vec![usage_event(w.org, None, event, true)],
+    )
+    .await;
+    assert_eq!(r, json!({ "accepted": 0, "duplicates": 1, "rejected": [] }));
+    assert_eq!(
+        rows_with(&w.db, "usage_event_ids", "resource_uri", FACTORY).await,
+        0
+    );
+}
+
+/// A claim that arrives while a rename is running (here: a transaction holding
+/// the rename's lock with the rename written but not committed) waits for it,
+/// then files under the new canonical URI, though the batch authenticated
+/// against the old one.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_claim_during_a_uri_rename_waits_and_files_under_the_new_uri(pool: PgPool) {
+    let w = world(pool).await;
+    let event = Uuid::new_v4();
+    let (_, r) = post_usage(
+        &w.db,
+        &w.factory_basic(),
+        vec![usage_event(w.org, None, event, true)],
+    )
+    .await;
+    assert_eq!(r["accepted"], 1);
+
+    // The rename's steps, held open.
+    let mut renaming = w.db.pool().begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(resources::USAGE_LEDGER_LOCK)
+        .execute(&mut *renaming)
+        .await
+        .unwrap();
+    for (sql, binds) in [
+        (
+            "UPDATE resource_servers SET resource_uri = $2 WHERE resource_uri = $1",
+            [FACTORY, TOWER],
+        ),
+        (
+            "INSERT INTO resource_server_aliases (alias_uri, resource_uri, sunset_at) \
+             VALUES ($1, $2, now() + interval '1 day')",
+            [FACTORY, TOWER],
+        ),
+        (
+            "UPDATE usage_event_ids SET resource_uri = $2 WHERE resource_uri = $1",
+            [FACTORY, TOWER],
+        ),
+    ] {
+        sqlx::query(sql)
+            .bind(binds[0])
+            .bind(binds[1])
+            .execute(&mut *renaming)
+            .await
+            .unwrap();
+    }
+
+    // The old binary resends the event under the old URI, which (as far as
+    // anything committed says) is still canonical.
+    let db = w.db.clone();
+    let auth = w.factory_basic();
+    let org = w.org;
+    let resend = tokio::spawn(async move {
+        post_usage(&db, &auth, vec![usage_event(org, None, event, true)]).await
+    });
+    assert!(waiting_on_a_lock(w.db.pool(), &resend).await);
+    renaming.commit().await.unwrap();
+    let (status, r) = resend.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r, json!({ "accepted": 0, "duplicates": 1, "rejected": [] }));
+    assert_eq!(
+        rows_with(&w.db, "usage_event_ids", "resource_uri", FACTORY).await,
+        0
+    );
+    assert_eq!(
+        rows_with(&w.db, "usage_event_ids", "resource_uri", TOWER).await,
+        1
+    );
+}

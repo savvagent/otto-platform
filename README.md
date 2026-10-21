@@ -160,9 +160,9 @@ On startup it will:
 Set `OTTO_RUN_MIGRATIONS=0` to skip step 2 (e.g. a deployment that migrates
 as a separate step ahead of a rolling restart).
 
-A resource server must be registered (`otto_auth::resources::register`, which
-each service calls at its own startup) before clients can authorize against
-it. The authorization server serves every registered one; a client names its
+A resource server must be registered by an operator
+(`otto-platform-server resource register`, below) before clients can authorize
+against it. The authorization server serves every registered one; a client names its
 target with the RFC 8707 `resource` parameter, which may be omitted only while
 exactly one is registered.
 
@@ -255,7 +255,16 @@ from `set-service`.
 
 A resource server's URI is the audience every token for it carries, and the
 identity it authenticates to the platform with. `rename` moves it to a new
-canonical URI and keeps the old one working as a **time-boxed alias**:
+canonical URI and keeps the old one working as a **time-boxed alias**.
+
+**Do not run `rename` in production until alias resolution in the OAuth
+flows (savvagent/otto-platform#89) is deployed:** until then a client that still
+sends the old URI as its `resource` is refused with `invalid_target` at
+authorize, token and refresh. **Pause the server's usage shipping first**, and
+run it at low traffic: all usage ingest waits while it runs, and it waits for
+ingest and token traffic on the server's rows. If they stay busy past its
+five-second lock timeout (or deadlock with it) it gives up, changing nothing,
+and says to run it again.
 
 ```sh
 otto-platform-server resource rename https://otto-factory.example/mcp \
@@ -266,10 +275,17 @@ otto-platform-server resource list   # the alias is listed under its server
 In one transaction it changes the canonical URI (webhook deliveries and older
 aliases follow), records the old URI as an alias live until the
 `--alias-until` sunset (RFC 3339, in the future), rewrites the `resource` of
-every access token, refresh token and authorization code to the new URI (so
-issued tokens stay valid past the sunset), and rewrites the usage dedupe
-ledger, so an event shipped before the rename is still a duplicate after it.
-`--name` also changes the name on the consent screen.
+every still-usable access token, refresh token and authorization code (not
+revoked, consumed or expired) to the new URI, so issued tokens stay valid past
+the sunset, and rewrites the usage dedupe ledger, so an event shipped before
+the rename is still a duplicate after it, under either URI. `--name` also
+changes the name on the consent screen. A token still bound to the old URI
+(one minted by a request that raced the rename) introspects as the server's
+own all the same.
+
+Lifecycle webhook deliveries move with the server. Delivery is at least once
+anyway, and a delivery in flight while the rename commits may be sent again;
+receivers already dedupe on the event id.
 
 Until the sunset the server may authenticate (introspection and the internal
 API, HTTP Basic) as either URI. Introspection answers with `aud` set to the

@@ -49,24 +49,48 @@ CREATE TRIGGER resource_server_aliases_never_deleted
   BEFORE DELETE ON resource_server_aliases
   FOR EACH STATEMENT EXECUTE FUNCTION resource_server_aliases_keep();
 
--- Only the operator CLI, connecting as itself, writes aliases. Tenant code
--- (otto_app) may read them, as it may read `resource_servers`, but 0004's
--- default privileges would also let it mint or end one.
+CREATE TRIGGER resource_server_aliases_never_truncated
+  BEFORE TRUNCATE ON resource_server_aliases
+  FOR EACH STATEMENT EXECUTE FUNCTION resource_server_aliases_keep();
+
+-- Only the operator CLI and authentication, both connecting as themselves,
+-- touch aliases; tenant code (otto_app) has no business with them, and 0004's
+-- default privileges would let it mint or end one. It gets nothing, as with
+-- `usage_event_ids` (0009): `claim_usage_event` reads them as its definer.
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'otto_app') THEN
-    EXECUTE 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON resource_server_aliases FROM otto_app';
+    EXECUTE 'REVOKE ALL ON resource_server_aliases FROM otto_app';
   END IF;
 EXCEPTION WHEN insufficient_privilege THEN
-  RAISE NOTICE 'could not revoke otto_app''s write access to resource_server_aliases';
+  RAISE NOTICE 'could not revoke otto_app''s access to resource_server_aliases';
 END $$;
 
--- Dedupe is keyed by the canonical URI. The rename rewrites the ledger in its
--- transaction, but a usage batch authenticated before the rename committed
--- still carries the old URI for its remaining events; resolving it here, per
--- claim, files them under the canonical URI too. Any alias resolves, live or
--- not: it only ever names its own server. Same signature, so 0009's grants
--- stand.
+-- Dedupe is keyed by the canonical URI, and a rename must not let one event
+-- be claimed under both URIs. The rename rewrites the ledger in its
+-- transaction; this function keeps claims from slipping past that rewrite.
+--
+-- Every claim first takes the usage-ledger advisory lock (key
+-- 8031172057417213031, `otto_auth::resources::USAGE_LEDGER_LOCK`) SHARED,
+-- held until the claiming transaction ends. `resource rename` takes it
+-- EXCLUSIVE before it reads or writes anything else of the server's, so:
+--
+--   - it waits for every claim in flight to commit or abort, and its ledger
+--     rewrite then sees what they wrote;
+--   - a claim arriving while the rename runs waits for it, and only then
+--     resolves its URI (next statement, fresh snapshot), finding the new
+--     alias and so the new canonical URI.
+--
+-- The URI is resolved through any alias, live or not (an alias only ever
+-- names its own server), so a batch authenticated before a rename, still
+-- carrying the old URI, files its later events under the new one.
+--
+-- No deadlock: while it waits for the lock the rename holds only its other
+-- advisory lock (the URI namespace), which no claimer takes, and claimers take
+-- this lock before any row the rename will touch. `rename_service` (0024) does
+-- not take it, so its lock order with ingest is unchanged.
+--
+-- Same signature, so 0009's grants stand.
 CREATE OR REPLACE FUNCTION claim_usage_event(p_resource_uri text, p_event_id uuid, p_org_id uuid)
 RETURNS text
 LANGUAGE plpgsql
@@ -74,9 +98,11 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 DECLARE
-  v_uri text := p_resource_uri;
+  v_uri text;
   existing uuid;
 BEGIN
+  PERFORM pg_advisory_xact_lock_shared(8031172057417213031);
+
   SELECT a.resource_uri INTO v_uri
     FROM resource_server_aliases a
    WHERE a.alias_uri = p_resource_uri;

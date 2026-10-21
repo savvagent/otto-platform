@@ -65,7 +65,7 @@ async fn introspect(
     // expects to see.
     let body = match tokens::introspect(&db, token, &caller.server.resource_uri).await {
         Ok(p) => match db.active_member_role(p.org_id, p.user_id).await? {
-            Some(role) => active(&caller.authenticated_uri, p, role),
+            Some(role) => active(caller.audience.as_str(), p, role),
             None => IntrospectionResponse::inactive(),
         },
         // Unknown, revoked, expired, and wrong-audience are one answer.
