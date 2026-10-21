@@ -3,7 +3,7 @@
 //! server.
 
 use axum::extract::{FromRef, FromRequestParts};
-use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, WWW_AUTHENTICATE};
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, RETRY_AFTER, WWW_AUTHENTICATE};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -23,9 +23,16 @@ pub enum ApiError {
     BadRequest(String),
     NotFound,
     TooLarge(String),
+    /// Refused for now, nothing changed, and the same request should succeed
+    /// on a retry: a 503 with `Retry-After`, which the client treats as
+    /// retriable.
+    Unavailable(String),
     /// Anything the caller cannot fix. Logged here, never shown.
     Internal,
 }
+
+/// How long a [`ApiError::Unavailable`] caller is asked to wait.
+pub const RETRY_AFTER_SECS: u32 = 5;
 
 impl ApiError {
     pub fn internal(e: impl std::fmt::Display) -> Self {
@@ -52,6 +59,7 @@ impl From<otto_core::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let retry_after = matches!(self, ApiError::Unavailable(_));
         let (status, code, description) = match self {
             ApiError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
@@ -61,6 +69,11 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(d) => (StatusCode::BAD_REQUEST, "invalid_request", d),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found", "not found".to_owned()),
             ApiError::TooLarge(d) => (StatusCode::PAYLOAD_TOO_LARGE, "too_large", d),
+            ApiError::Unavailable(d) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                d,
+            ),
             ApiError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
@@ -74,6 +87,11 @@ impl IntoResponse for ApiError {
             .into_response();
         res.headers_mut()
             .insert(CACHE_CONTROL, "no-store".parse().expect("static header"));
+        if retry_after {
+            // Seconds, as otto-web's 503s say it.
+            res.headers_mut()
+                .insert(RETRY_AFTER, RETRY_AFTER_SECS.into());
+        }
         if status == StatusCode::UNAUTHORIZED {
             res.headers_mut().insert(
                 WWW_AUTHENTICATE,
@@ -147,5 +165,19 @@ pub fn wire_role(role: otto_core::orgs::Role) -> otto_resource::Role {
         Role::Owner => otto_resource::Role::Owner,
         Role::Admin => otto_resource::Role::Admin,
         Role::Member => otto_resource::Role::Member,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_is_a_503_with_retry_after() {
+        let res = ApiError::Unavailable("later".into()).into_response();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(res.headers().get(RETRY_AFTER).unwrap(), "5");
+        let res = ApiError::Internal.into_response();
+        assert!(res.headers().get(RETRY_AFTER).is_none());
     }
 }

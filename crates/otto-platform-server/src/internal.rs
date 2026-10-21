@@ -143,7 +143,10 @@ async fn live_org(db: &Db, org: Uuid) -> Result<Org, ApiError> {
 /// lost just sends the batch again. Events are grouped by org and each org's
 /// events share one pinned transaction, so a database error part-way through an
 /// org rolls that org back whole. The caller gets a 500 and resends everything,
-/// which the dedupe makes harmless.
+/// which the dedupe makes harmless. A batch that raced a `resource
+/// rename-service` (it read the old slug, and the rename committed before it
+/// wrote) is refused the same way, as a 503 `temporarily_unavailable` rather
+/// than a 500; see [`renamed_mid_flight`].
 ///
 /// An event the platform can never accept is reported in `rejected` instead
 /// of failing the batch, so one poison event cannot wedge the shipper's
@@ -248,7 +251,8 @@ async fn ingest_usage(
                     },
                     &mut budgets,
                 )
-                .await?;
+                .await
+                .map_err(renamed_mid_flight)?;
             match outcome {
                 IngestOutcome::Counted => accepted += 1,
                 IngestOutcome::Duplicate => duplicates += 1,
@@ -268,6 +272,42 @@ async fn ingest_usage(
     }
 
     Ok(Json(receipt))
+}
+
+/// The foreign keys (migration 0024) that refuse a row written under a
+/// service slug or meter key a `rename-service` moved away after this batch
+/// read the caller's service and declared meters.
+const RENAMED_KEYS: &[&str] = &[
+    "usage_events_meter_declared",
+    "org_meter_period_usage_meter_declared",
+    "org_service_period_usage_service_registered",
+];
+
+/// A batch that raced a service rename: retriable, not an internal error. The
+/// org's transaction is rolled back (its event ids unclaimed with it), orgs
+/// already committed come back as duplicates, and the resent batch is judged
+/// against the new slug, where a metered event under an old key is
+/// `unknown_meter` like any undeclared one.
+fn renamed_mid_flight(e: otto_core::Error) -> ApiError {
+    let raced = match &e {
+        otto_core::Error::Db(sqlx::Error::Database(d))
+        | otto_core::Error::Tenant(otto_tenant::Error::Db(sqlx::Error::Database(d))) => {
+            d.is_foreign_key_violation()
+                && d.constraint().is_some_and(|c| RENAMED_KEYS.contains(&c))
+        }
+        _ => false,
+    };
+    if raced {
+        tracing::warn!(error = %e, "usage batch raced a service rename; asking for a retry");
+        ApiError::Unavailable(
+            "this resource server's service was renamed while the batch was being counted; \
+             one org's events were not recorded, resend the whole batch (events already \
+             recorded come back as duplicates)"
+                .into(),
+        )
+    } else {
+        ApiError::from(e)
+    }
 }
 
 /// The meter keys `service` has declared, read only when the batch names a

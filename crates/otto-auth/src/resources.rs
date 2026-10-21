@@ -11,9 +11,9 @@
 //!
 //! A service registers itself with [`register`], an idempotent upsert of its
 //! name and scopes that it can run at every startup. Disabling a resource
-//! server, issuing its introspection credential, and assigning its service
-//! slug ([`set_service`]) are operator actions and are never touched by
-//! `register`.
+//! server, issuing its introspection credential, and assigning or renaming its
+//! service slug ([`set_service`], [`rename_service`]) are operator actions and
+//! are never touched by `register`.
 
 use std::collections::BTreeMap;
 
@@ -232,7 +232,12 @@ pub async fn set_scope_descriptions(
 ///
 /// Setting the slug it already has is a no-op. A slug held by another resource
 /// server is refused, and so is renaming a service that has declared meters:
-/// everything keyed by the old name would be stranded.
+/// everything keyed by the old name would be stranded (use [`rename_service`]).
+///
+/// Changing the slug carries the service's unmetered usage pools with it (a
+/// cascading foreign key, migration 0024); before 0024 they stayed under the
+/// old slug. A pool an earlier service of the target name left behind would
+/// collide with a moved one, and that is refused too.
 pub async fn set_service(db: &Db, resource_uri: &str, service: &str) -> Result<ResourceServer> {
     if !is_service_slug(service) {
         return Err(AuthError::InvalidRequest(format!(
@@ -249,8 +254,18 @@ pub async fn set_service(db: &Db, resource_uri: &str, service: &str) -> Result<R
     .fetch_optional(db.pool())
     .await
     .map_err(|e| match &e {
+        sqlx::Error::Database(d)
+            if d.is_unique_violation()
+                && d.constraint() == Some("resource_servers_service_key") =>
+        {
+            AuthError::InvalidRequest(format!(
+                "service {service:?} is already assigned to another resource server"
+            ))
+        }
+        // The cascade moving the pools hit one already under the new slug.
         sqlx::Error::Database(d) if d.is_unique_violation() => AuthError::InvalidRequest(format!(
-            "service {service:?} is already assigned to another resource server"
+            "service {service:?} still has usage pools from an earlier service of that name; \
+             {resource_uri:?} cannot be moved onto them"
         )),
         sqlx::Error::Database(d) if d.is_foreign_key_violation() => {
             AuthError::InvalidRequest(format!(
@@ -263,6 +278,128 @@ pub async fn set_service(db: &Db, resource_uri: &str, service: &str) -> Result<R
     row.ok_or_else(|| {
         AuthError::InvalidTarget(format!("{resource_uri:?} is not a registered resource"))
     })
+}
+
+/// What [`rename_service`] did.
+#[derive(Debug, Clone)]
+pub struct ServiceRename {
+    /// The slug the resource server had.
+    pub previous_service: String,
+    /// The resource server as it is now.
+    pub resource: ResourceServer,
+    /// How many rows of each kind moved to the new slug.
+    pub moved: ServiceRenameCounts,
+}
+
+/// Rows [`rename_service`] re-keyed, by kind. All zero when the slug did not
+/// change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServiceRenameCounts {
+    pub meters: i64,
+    pub price_versions: i64,
+    /// `org_service_period_usage` rows, every org's.
+    pub service_pools: i64,
+    pub service_budgets: i64,
+    pub budget_alerts: i64,
+}
+
+/// Rename a resource server's service slug after it has declared meters: the
+/// one change [`set_service`] refuses. Its meters (`<old>/<m>` becomes
+/// `<new>/<m>`), their price versions, and every org's service pools, budgets
+/// and budget alerts move to the new slug in one transaction.
+///
+/// Allowed only while nothing under the old meters records money: no metered
+/// usage events or per-meter totals, no Stripe meter or price, no queued Stripe
+/// meter event. Otherwise it is refused with every blocker and its count
+/// named. Unmetered usage does not block; its pool moves.
+///
+/// **Pause the service's usage shipping first.** A batch in flight cannot
+/// strand rows under the old slug (foreign keys and a table lock in migration
+/// 0024 see to that), but it is refused with a retriable 503, and on retry a
+/// metered event naming an old meter key is rejected as `unknown_meter` for
+/// good. While the rename runs, all usage ingest waits for it.
+///
+/// The checks and the re-keys run in the `rename_service` SQL function
+/// (migration 0024), a SECURITY DEFINER that sees every org's rows. A plain
+/// transaction on a role that is neither superuser nor BYPASSRLS would see
+/// none of the row-level-secured ones, find no blockers and move nothing.
+///
+/// Renaming to the slug it already has is a no-op. A resource server with no
+/// slug yet is refused: [`set_service`] assigns the first one.
+pub async fn rename_service(db: &Db, resource_uri: &str, service: &str) -> Result<ServiceRename> {
+    if !is_service_slug(service) {
+        return Err(AuthError::InvalidRequest(format!(
+            "service {service:?} must be a lower-case slug: a letter, then up to 62 \
+             letters, digits or hyphens"
+        )));
+    }
+    // Unpinned on purpose: the function refuses an org-pinned transaction,
+    // where the tenant policy would show it one org's rows.
+    let mut tx = db.begin_unpinned().await?;
+    let row: (String, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT previous_service, meters, price_versions, service_pools, service_budgets, \
+                budget_alerts \
+         FROM rename_service($1, $2)",
+    )
+    .bind(resource_uri)
+    .bind(service)
+    .fetch_one(tx.conn())
+    .await
+    .map_err(|e| rename_error(e, service))?;
+    let resource = sqlx::query_as(&format!(
+        "SELECT {COLS} FROM resource_servers WHERE resource_uri = $1"
+    ))
+    .bind(resource_uri)
+    .fetch_one(tx.conn())
+    .await?;
+    tx.commit().await?;
+    let (previous_service, meters, price_versions, service_pools, service_budgets, budget_alerts) =
+        row;
+    Ok(ServiceRename {
+        previous_service,
+        resource,
+        moved: ServiceRenameCounts {
+            meters,
+            price_versions,
+            service_pools,
+            service_budgets,
+            budget_alerts,
+        },
+    })
+}
+
+/// The `rename_service` function reports each refusal under its own SQLSTATE
+/// (see migration 0024) with an operator-readable message, passed on as is.
+/// A violation raised by a constraint instead (a race the function's own
+/// checks lost) is reworded: its raw text names an index, not the mistake.
+fn rename_error(e: sqlx::Error, service: &str) -> AuthError {
+    let sqlx::Error::Database(d) = &e else {
+        return AuthError::Db(e);
+    };
+    let raised_by_function = d.constraint().is_none();
+    let msg = d.message().to_owned();
+    match d.code().as_deref() {
+        Some("P0002") => AuthError::InvalidTarget(msg),
+        // Not a slug; no service yet, or billing data blocks it.
+        Some("22023" | "55000") => AuthError::InvalidRequest(msg),
+        Some("23505") if raised_by_function => AuthError::InvalidRequest(msg),
+        Some("23505") => AuthError::InvalidRequest(format!(
+            "service {service:?} is already assigned to another resource server, or has \
+             usage pools or budgets left from an earlier service of that name"
+        )),
+        // A Stripe meter or price created for an old meter after the blocker
+        // count; nothing changed, and running it again names the blocker.
+        Some("23503") => AuthError::InvalidRequest(format!(
+            "billing data appeared under the service's meters while renaming it to \
+             {service:?}; nothing changed, run it again to see what blocks it"
+        )),
+        Some("55P03") => AuthError::InvalidRequest(
+            "usage ingest was writing while the rename waited for it, so the service's usage \
+             shipping is not paused; nothing changed. Pause it, then run this again"
+                .into(),
+        ),
+        _ => AuthError::Db(e),
+    }
 }
 
 /// Look up a resource server that may currently be issued tokens.
