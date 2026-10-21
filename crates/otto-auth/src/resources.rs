@@ -232,7 +232,12 @@ pub async fn set_scope_descriptions(
 ///
 /// Setting the slug it already has is a no-op. A slug held by another resource
 /// server is refused, and so is renaming a service that has declared meters:
-/// everything keyed by the old name would be stranded.
+/// everything keyed by the old name would be stranded (use [`rename_service`]).
+///
+/// Changing the slug carries the service's unmetered usage pools with it (a
+/// cascading foreign key, migration 0024); before 0024 they stayed under the
+/// old slug. A pool an earlier service of the target name left behind would
+/// collide with a moved one, and that is refused too.
 pub async fn set_service(db: &Db, resource_uri: &str, service: &str) -> Result<ResourceServer> {
     if !is_service_slug(service) {
         return Err(AuthError::InvalidRequest(format!(
@@ -249,8 +254,18 @@ pub async fn set_service(db: &Db, resource_uri: &str, service: &str) -> Result<R
     .fetch_optional(db.pool())
     .await
     .map_err(|e| match &e {
+        sqlx::Error::Database(d)
+            if d.is_unique_violation()
+                && d.constraint() == Some("resource_servers_service_key") =>
+        {
+            AuthError::InvalidRequest(format!(
+                "service {service:?} is already assigned to another resource server"
+            ))
+        }
+        // The cascade moving the pools hit one already under the new slug.
         sqlx::Error::Database(d) if d.is_unique_violation() => AuthError::InvalidRequest(format!(
-            "service {service:?} is already assigned to another resource server"
+            "service {service:?} still has usage pools from an earlier service of that name; \
+             {resource_uri:?} cannot be moved onto them"
         )),
         sqlx::Error::Database(d) if d.is_foreign_key_violation() => {
             AuthError::InvalidRequest(format!(
@@ -379,8 +394,8 @@ fn rename_error(e: sqlx::Error, service: &str) -> AuthError {
              {service:?}; nothing changed, run it again to see what blocks it"
         )),
         Some("55P03") => AuthError::InvalidRequest(
-            "usage ingest held the service's tables too long; nothing changed, try again \
-             (with the service's usage shipping paused)"
+            "usage ingest was writing while the rename waited for it, so the service's usage \
+             shipping is not paused; nothing changed. Pause it, then run this again"
                 .into(),
         ),
         _ => AuthError::Db(e),

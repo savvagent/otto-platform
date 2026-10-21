@@ -9,10 +9,14 @@
 -- Built CONCURRENTLY so building it never blocks ingest, which is why this
 -- migration runs outside a transaction (the directive on the first line) and
 -- is one statement: a multi-statement string would run as one implicit
--- transaction, which CONCURRENTLY refuses. If a build is interrupted it
--- leaves an invalid index that IF NOT EXISTS then skips; that only costs the
--- rename speed, never correctness, and `REINDEX INDEX CONCURRENTLY
--- usage_events_meter` repairs it.
+-- transaction, which CONCURRENTLY refuses. A build can be cancelled (by the
+-- deadlock detector, say, when another instance waiting on the migration
+-- lock holds a snapshot it must wait out), which leaves an invalid index that
+-- IF NOT EXISTS then skips while the migration is still recorded as applied.
+-- Correctness never depends on it, but without it the rename's lookups are
+-- full scans of `usage_events` run while all usage ingest waits, so
+-- `rename_service` refuses to run until it is valid: `REINDEX INDEX
+-- CONCURRENTLY usage_events_meter` repairs it.
 --
 -- `text_pattern_ops` so the prefix match (`LIKE '<old>/%'`) can use it as
 -- well as the foreign key's equality lookup; partial because unmetered events,

@@ -62,9 +62,20 @@
 --     that with a retriable 503 and the shipper resends the batch, which is
 --     then judged against the new slug.
 --
--- The lock pauses all usage ingest for as long as the rename runs, which with
--- 0025's index on `usage_events (meter)` is milliseconds. The function's own
--- lock_timeout keeps it from queueing every ingest behind a long transaction.
+-- The lock pauses all usage ingest for as long as the rename runs. 0025's
+-- index on `usage_events (meter)` keeps that to index lookups rather than full
+-- scans of the largest table, and the function refuses to run while that
+-- index is missing or invalid. Its own short lock_timeout keeps it from
+-- queueing every ingest behind a transaction it would wait on: with shipping
+-- paused nothing should hold these tables, so any wait means the precondition
+-- was not met.
+--
+-- A change to `set-service` too. The service foreign keys cascade, so a slug
+-- changed with `set-service` (only possible while the service has declared
+-- no meters, so it has no budgets) now carries the service's unmetered usage
+-- pools with it, where before they stayed behind under the old slug. A pool
+-- left under the target slug by an earlier service of that name makes the
+-- change fail on the pool's primary key, and `set_service` reports that.
 
 -- Fail fast rather than queue: a migration waiting for a lock on a busy table
 -- makes every later query on that table wait behind it. Failing the boot lets
@@ -122,7 +133,9 @@ END $$;
 --         blocker and its count
 --   23505 the new slug is taken, by another resource server or by rows a
 --         past service of that name left behind
---   55P03 ingest held its tables longer than lock_timeout; retry
+--   55000 also: the `usage_events_meter` index (0025) is missing or invalid
+--   55P03 ingest held its tables longer than lock_timeout (shipping not
+--         paused); nothing changed
 --   0A000 called from an org-pinned transaction
 CREATE FUNCTION rename_service(p_resource_uri text, p_new text)
 RETURNS TABLE (
@@ -136,7 +149,7 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_temp
-SET lock_timeout = '10s'
+SET lock_timeout = '2s'
 AS $$
 DECLARE
   v_old text;
@@ -170,6 +183,18 @@ BEGIN
     RAISE EXCEPTION 'service % must be a lower-case slug: a letter, then up to 62 letters, digits or hyphens',
       quote_literal(coalesce(p_new, 'NULL'))
       USING ERRCODE = '22023';
+  END IF;
+
+  -- Without the index every lookup below is a full scan of `usage_events`,
+  -- run while all ingest waits. A CONCURRENTLY build that was cancelled
+  -- leaves it invalid, and 0025's IF NOT EXISTS then never retries it.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_index i
+     WHERE i.indexrelid = to_regclass('usage_events_meter') AND i.indisvalid
+  ) THEN
+    RAISE EXCEPTION 'index usage_events_meter is missing or invalid, so a rename would scan usage_events while all usage ingest waits; run REINDEX INDEX CONCURRENTLY usage_events_meter (or re-run migration 0025''s CREATE INDEX after dropping it) first'
+      USING ERRCODE = '55000',
+            HINT = 'run REINDEX INDEX CONCURRENTLY usage_events_meter';
   END IF;
 
   -- First, before any other lock, so that an ingest transaction that has

@@ -3222,11 +3222,32 @@ async fn open_factory_ingest(w: &World, meter: Option<&'static str>) -> otto_ten
     tx
 }
 
-/// Whether `task` is still waiting after a moment: long enough for it to
-/// reach a lock it would wait on, and far too long for it to have run.
-async fn still_waiting<T>(task: &tokio::task::JoinHandle<T>) -> bool {
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    !task.is_finished()
+/// Waits until `task` is blocked on a lock in this test's database, as
+/// Postgres reports it, and returns whether it is still unfinished. Panics
+/// after a deadline: the task never came to wait on anything.
+async fn waiting_on_a_lock<T>(pool: &PgPool, task: &tokio::task::JoinHandle<T>) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return !task.is_finished();
+        }
+        assert!(
+            !task.is_finished(),
+            "the task finished without waiting on a lock"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing came to wait on a lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// A rename started while an ingest transaction is open waits for it, and
@@ -3242,7 +3263,7 @@ async fn a_rename_waits_for_an_open_ingest_and_then_counts_it(pool: PgPool) {
     let db = w.db.clone();
     let rename =
         tokio::spawn(async move { resources::rename_service(&db, FACTORY, "otto-tower").await });
-    assert!(still_waiting(&rename).await, "the rename did not wait");
+    assert!(waiting_on_a_lock(w.db.pool(), &rename).await);
     ingest.commit().await.unwrap();
     let renamed = rename.await.unwrap().unwrap();
     assert_eq!(renamed.moved.service_pools, 1);
@@ -3258,7 +3279,7 @@ async fn a_rename_waits_for_an_open_ingest_and_then_counts_it(pool: PgPool) {
     let db = w.db.clone();
     let rename =
         tokio::spawn(async move { resources::rename_service(&db, FACTORY, "otto-tower").await });
-    assert!(still_waiting(&rename).await, "the rename did not wait");
+    assert!(waiting_on_a_lock(w.db.pool(), &rename).await);
     ingest.commit().await.unwrap();
     let err = rename.await.unwrap().unwrap_err();
     assert!(
@@ -3294,12 +3315,29 @@ async fn a_batch_in_flight_across_a_rename_is_refused_retriably_and_strands_noth
         metered(w.org, JOBS, Some(2)),
     ];
     let (db, auth, sent) = (w.db.clone(), w.factory_basic(), batch.clone());
-    let ingest = tokio::spawn(async move { post_usage(&db, &auth, sent).await });
-    assert!(still_waiting(&ingest).await, "the batch did not wait");
+    let ingest = tokio::spawn(async move {
+        let res = otto_platform_server::router(db.clone(), otto_platform_server::Billing::Enabled)
+            .oneshot(
+                Request::post("/internal/usage")
+                    .header("authorization", auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "events": sent }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let retry_after = res.headers().get("retry-after").cloned();
+        let status = res.status();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        (status, retry_after, body)
+    });
+    assert!(waiting_on_a_lock(w.db.pool(), &ingest).await);
     rename.commit().await.unwrap();
 
-    let (status, body) = ingest.await.unwrap();
+    let (status, retry_after, body) = ingest.await.unwrap();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(retry_after.as_ref().map(|v| v.to_str().unwrap()), Some("5"));
     assert_eq!(body["error"], "temporarily_unavailable", "{body}");
     assert!(otto_resource::Error::Status {
         status: status.as_u16(),
@@ -3333,4 +3371,145 @@ async fn a_batch_in_flight_across_a_rename_is_refused_retriably_and_strands_noth
     assert_eq!(rejection_codes(&receipt), ["unknown_meter"]);
     assert_eq!(service_pool(&w.db, "otto-tower").await, Some((1, 1)));
     assert_eq!(service_pool(&w.db, "otto-factory").await, None);
+}
+
+/// A cancelled CONCURRENTLY build leaves `usage_events_meter` invalid, and
+/// 0025 never retries it; without it the rename's lookups are full scans run
+/// while all ingest waits, so it refuses until the index is repaired.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_rename_refuses_while_the_meter_index_is_invalid(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let set_valid = |valid: bool| {
+        let db = w.db.clone();
+        async move {
+            sqlx::query(
+                "UPDATE pg_index SET indisvalid = $1 \
+                 WHERE indexrelid = 'usage_events_meter'::regclass",
+            )
+            .bind(valid)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+    };
+    set_valid(false).await;
+    let err = run_resource_cmd(&w.db, &format!("rename-service {FACTORY} otto-tower"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("run REINDEX INDEX CONCURRENTLY usage_events_meter"),
+        "{err}"
+    );
+    assert_eq!(rows_with(&w.db, "meters", "key", JOBS).await, 1);
+
+    set_valid(true).await;
+    resources::rename_service(&w.db, FACTORY, "otto-tower")
+        .await
+        .unwrap();
+}
+
+/// With shipping not paused, an ingest transaction holding the pool table
+/// makes the rename give up after its short lock_timeout, saying so, rather
+/// than queue every ingest behind it.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_rename_gives_up_quickly_while_ingest_holds_the_tables(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let ingest = open_factory_ingest(&w, None).await;
+    let err = resources::rename_service(&w.db, FACTORY, "otto-tower")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("usage shipping is not paused"),
+        "{err}"
+    );
+    ingest.commit().await.unwrap();
+    assert_eq!(rows_with(&w.db, "meters", "key", JOBS).await, 1);
+    assert_eq!(service_pool(&w.db, "otto-factory").await, Some((1, 1)));
+}
+
+/// Stripe data for an old meter written while the rename runs (after its
+/// blocker count) fails the rename on the Stripe table's foreign key, which
+/// is reported as billing data appearing, with nothing changed.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn stripe_data_appearing_mid_rename_fails_it_cleanly(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let mut stripe = w.db.pool().begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO stripe_meters (meter, stripe_meter_id, event_name) \
+         VALUES ($1, 'mtr_1', 'otto_factory__jobs')",
+    )
+    .bind(JOBS)
+    .execute(&mut *stripe)
+    .await
+    .unwrap();
+    // The uncommitted row is invisible to the blocker count, and its key lock
+    // on the meter makes the rename's key update wait.
+    let db = w.db.clone();
+    let rename =
+        tokio::spawn(async move { resources::rename_service(&db, FACTORY, "otto-tower").await });
+    assert!(waiting_on_a_lock(w.db.pool(), &rename).await);
+    stripe.commit().await.unwrap();
+    let err = rename.await.unwrap().unwrap_err();
+    assert!(err.to_string().contains("billing data appeared"), "{err}");
+    assert_eq!(rows_with(&w.db, "meters", "key", JOBS).await, 1);
+    assert_eq!(
+        resources::get(&w.db, FACTORY)
+            .await
+            .unwrap()
+            .unwrap()
+            .service
+            .as_deref(),
+        Some("otto-factory")
+    );
+}
+
+/// `set-service` (allowed only before any meter is declared) carries the
+/// service's unmetered pools to the new slug, and refuses, saying why, when a
+/// pool an earlier service of the target name left behind is in the way.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn set_service_carries_pools_and_refuses_an_orphan_pool_in_the_way(pool: PgPool) {
+    let w = world(pool).await;
+    resources::set_service(&w.db, FACTORY, "otto-a")
+        .await
+        .unwrap();
+    unmetered_factory_usage(&w, w.org).await;
+
+    let out = run_resource_cmd(&w.db, &format!("set-service {FACTORY} otto-b"))
+        .await
+        .unwrap();
+    assert!(out.contains("service=otto-b"), "{out}");
+    assert_eq!(service_pool(&w.db, "otto-b").await, Some((1, 1)));
+    assert_eq!(service_pool(&w.db, "otto-a").await, None);
+
+    // A pool from before migration 0024's foreign keys, under a slug no
+    // resource server holds; the fixture skips the key as that row did.
+    let mut tx = w.db.pool().begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO org_service_period_usage (org_id, service, period_start) \
+         VALUES ($1, 'otto-c', date_trunc('month', now() AT TIME ZONE 'utc')::date)",
+    )
+    .bind(w.org.as_uuid())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let err = run_resource_cmd(&w.db, &format!("set-service {FACTORY} otto-c"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("usage pools from an earlier service"),
+        "{err}"
+    );
+    assert!(
+        !err.to_string().contains("another resource server"),
+        "{err}"
+    );
+    assert_eq!(service_pool(&w.db, "otto-b").await, Some((1, 1)));
 }
