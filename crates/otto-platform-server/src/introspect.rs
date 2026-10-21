@@ -50,7 +50,7 @@ struct IntrospectForm {
 
 async fn introspect(
     State(db): State<Db>,
-    CallingResourceServer(rs): CallingResourceServer,
+    caller: CallingResourceServer,
     Form(form): Form<IntrospectForm>,
 ) -> Result<Response, ApiError> {
     let token = form.token.as_deref().map(str::trim).unwrap_or_default();
@@ -58,9 +58,14 @@ async fn introspect(
         return Err(ApiError::BadRequest("`token` is required".into()));
     }
 
-    let body = match tokens::introspect(&db, token, &rs.resource_uri).await {
+    // Tokens are bound to the canonical URI (a rename rewrites them), so that
+    // is what the audience check compares. The answer speaks the caller's
+    // terms: `aud` is the URI it authenticated as, the old one for a server
+    // still configured with an alias, which is what its own audience check
+    // expects to see.
+    let body = match tokens::introspect(&db, token, &caller.server.resource_uri).await {
         Ok(p) => match db.active_member_role(p.org_id, p.user_id).await? {
-            Some(role) => active(&rs.resource_uri, p, role),
+            Some(role) => active(caller.audience.as_str(), p, role),
             None => IntrospectionResponse::inactive(),
         },
         // Unknown, revoked, expired, and wrong-audience are one answer.

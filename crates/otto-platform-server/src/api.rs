@@ -115,9 +115,37 @@ impl IntoResponse for ApiError {
 /// - `Authorization: Bearer <secret>`. The secret is unique and identifies the
 ///   server by itself.
 ///
+/// With Basic, the client id may also be a live alias of the server's
+/// canonical URI (`resource rename`), so a server still configured with its
+/// old URI keeps working until the alias's sunset.
+///
 /// Every failure is the same 401, so the endpoints cannot be used to learn
 /// which resource servers exist.
-pub struct CallingResourceServer(pub ResourceServer);
+pub struct CallingResourceServer {
+    /// The canonical row, whichever URI the caller named. Usage ingest, dedupe
+    /// and the token audience check key on `server.resource_uri`.
+    pub server: ResourceServer,
+    /// The URI the caller authenticated as. Introspection's `aud`, and
+    /// nothing else.
+    pub audience: AuthenticatedAudience,
+}
+
+/// The URI a resource server authenticated as: the Basic client id (its
+/// canonical URI or a live alias), or its canonical URI on the Bearer path,
+/// which names none.
+///
+/// **For introspection's `aud` only.** It may be an alias, so never store,
+/// key or compare anything by it; that is what `server.resource_uri` is for.
+/// A type of its own, built only here and readable only as a string, so it
+/// cannot be passed where a resource URI is expected by accident.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedAudience(String);
+
+impl AuthenticatedAudience {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 impl<S> FromRequestParts<S> for CallingResourceServer
 where
@@ -143,15 +171,25 @@ where
             let resource_uri = percent_decode_str(user)
                 .decode_utf8()
                 .map_err(|_| ApiError::Unauthorized)?;
-            resources::authenticate_introspection(db, &resource_uri, secret).await
+            resources::authenticate_introspection(db, &resource_uri, secret)
+                .await
+                .map(|r| Self {
+                    server: r.server,
+                    audience: AuthenticatedAudience(r.named_as),
+                })
         } else if scheme.eq_ignore_ascii_case("bearer") {
-            resources::authenticate_secret(db, rest).await
+            resources::authenticate_secret(db, rest)
+                .await
+                .map(|rs| Self {
+                    audience: AuthenticatedAudience(rs.resource_uri.clone()),
+                    server: rs,
+                })
         } else {
             return Err(ApiError::Unauthorized);
         };
 
         match result {
-            Ok(rs) => Ok(Self(rs)),
+            Ok(caller) => Ok(caller),
             Err(AuthError::InvalidClient(_)) => Err(ApiError::Unauthorized),
             Err(e) => Err(ApiError::internal(e)),
         }

@@ -186,7 +186,9 @@ struct TokenRow {
     org_id: OrgId,
     client_id: Option<String>,
     scopes: Vec<String>,
-    resource: String,
+    /// Whether the token's `resource` is `expected_resource` or an alias of it
+    /// ([`crate::resources::audience_matches_sql`]), decided in the same read.
+    audience_ok: bool,
     kind: TokenKind,
     expires_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
@@ -201,11 +203,14 @@ struct TokenRow {
 pub async fn introspect(db: &Db, presented: &str, expected_resource: &str) -> Result<Principal> {
     let hash = crypto::hash(presented.trim());
 
-    let row: Option<TokenRow> = sqlx::query_as(
-        "SELECT id, user_id, org_id, client_id, scopes, resource, kind, expires_at, revoked_at \
-         FROM access_tokens WHERE token_hash = $1",
-    )
+    let row: Option<TokenRow> = sqlx::query_as(&format!(
+        "SELECT t.id, t.user_id, t.org_id, t.client_id, t.scopes, t.kind, t.expires_at, \
+                t.revoked_at, {} AS audience_ok \
+         FROM access_tokens t WHERE t.token_hash = $1",
+        crate::resources::audience_matches_sql("t.resource", "$2")
+    ))
     .bind(&hash)
+    .bind(expected_resource)
     .fetch_optional(db.pool())
     .await?;
 
@@ -222,8 +227,10 @@ pub async fn introspect(db: &Db, presented: &str, expected_resource: &str) -> Re
     }
     // Audience check. Constant-time is unnecessary here (the resource is public
     // and not a secret), but exact match is essential — no prefix, no suffix,
-    // no "starts with our host".
-    if t.resource != expected_resource {
+    // no "starts with our host". Exact against the canonical URI, or against an
+    // alias of it: a token minted under the old URI by a transaction that
+    // raced a rename (which rewrites the rest) is still this server's.
+    if !t.audience_ok {
         return Err(AuthError::WrongAudience);
     }
 

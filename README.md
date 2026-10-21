@@ -160,9 +160,9 @@ On startup it will:
 Set `OTTO_RUN_MIGRATIONS=0` to skip step 2 (e.g. a deployment that migrates
 as a separate step ahead of a rolling restart).
 
-A resource server must be registered (`otto_auth::resources::register`, which
-each service calls at its own startup) before clients can authorize against
-it. The authorization server serves every registered one; a client names its
+A resource server must be registered by an operator
+(`otto-platform-server resource register`, below) before clients can authorize
+against it. The authorization server serves every registered one; a client names its
 target with the RFC 8707 `resource` parameter, which may be omitted only while
 exactly one is registered.
 
@@ -229,6 +229,92 @@ refused per meter in the receipt. A resource server with no slug gets
 releases a version that declares meters. Otherwise its declarations are
 refused, its metered events are rejected as unknown meters, and the shipper
 drops them: that usage is lost, not delayed.
+
+`set-service` refuses to change a slug once meters are declared under it.
+`rename-service` does that one change, while nothing under the old meters
+records money yet:
+
+```sh
+otto-platform-server resource rename-service https://otto-factory.example/mcp otto-tower
+```
+
+In one transaction it moves the service's meters (`otto-factory/<m>` becomes
+`otto-tower/<m>`), their price versions, and every org's usage pools, budgets
+and budget alerts to the new slug, and prints how many of each moved. It is
+refused, naming each blocker and its count, once any of the old meters has
+metered usage, a Stripe meter or price, or a queued Stripe meter event;
+unmetered usage does not block. **Pause the service's usage shipping first**:
+a batch in flight is refused with a retriable 503 rather than stranded, but
+on retry a metered event still naming an old meter key is rejected as an
+unknown meter. All usage ingest waits while the rename runs, and it gives up
+(changing nothing) if ingest holds the tables for more than two seconds.
+Renaming to the current slug is a no-op; a server with no slug yet gets one
+from `set-service`.
+
+### Moving a resource server to a new URI
+
+A resource server's URI is the audience every token for it carries, and the
+identity it authenticates to the platform with. `rename` moves it to a new
+canonical URI and keeps the old one working as a **time-boxed alias**.
+
+**Do not run `rename` in production until alias resolution in the OAuth
+flows (savvagent/otto-platform#89) is deployed:** until then a client that still
+sends the old URI as its `resource` is refused with `invalid_target` at
+authorize, token and refresh. **Pause the server's usage shipping first**, and
+run it at low traffic: all usage ingest waits while it runs, and it waits for
+ingest and token traffic on the server's rows. If they stay busy past its
+five-second lock timeout (or deadlock with it) it gives up, changing nothing,
+and says to run it again.
+
+```sh
+otto-platform-server resource rename https://otto-factory.example/mcp \
+  https://otto-tower.example/mcp --alias-until 2027-01-31T00:00:00Z --name otto-tower
+otto-platform-server resource list   # the alias is listed under its server
+```
+
+In one transaction it changes the canonical URI (webhook deliveries and older
+aliases follow), records the old URI as an alias live until the
+`--alias-until` sunset (RFC 3339, in the future), rewrites the `resource` of
+every still-usable access token, refresh token and authorization code (not
+revoked, consumed or expired) to the new URI, so issued tokens stay valid past
+the sunset, and rewrites the usage dedupe ledger, so an event shipped before
+the rename is still a duplicate after it, under either URI. `--name` also
+changes the name on the consent screen. A token still bound to the old URI
+(one minted by a request that raced the rename) introspects as the server's
+own all the same.
+
+Lifecycle webhook deliveries move with the server. Delivery is at least once
+anyway, and a delivery in flight while the rename commits may be sent again;
+receivers already dedupe on the event id.
+
+Until the sunset the server may authenticate (introspection and the internal
+API, HTTP Basic) as either URI. Introspection answers with `aud` set to the
+URI it authenticated as, so a server still configured with the old URI keeps
+working unchanged; with `Authorization: Bearer <secret>`, which names no URI,
+`aud` is the canonical one. Usage is always recorded and deduplicated under
+the canonical URI. Switch the server's own configuration to the new URI only
+once `resource list` shows the alias: before the rename the new URI
+authenticates nothing.
+
+`list` prints each alias indented under its server, with its sunset and state
+(`live`, `expired` or `dropped`); `describe` prints the server's aliases too.
+Past its sunset, or once dropped, an alias behaves exactly like a URI that was
+never registered:
+
+```sh
+otto-platform-server resource drop-alias https://otto-factory.example/mcp
+```
+
+Alias rows are never deleted. `register` and `rename` refuse any URI that is,
+or ever was, an alias (as well as another server's URI), so a retired URI can
+never be handed to a different server. The one exception is the rollback:
+renaming onto a **live** alias of the same server swaps the two URIs back,
+keeping the alias's sunset unless `--alias-until` gives a new one:
+
+```sh
+otto-platform-server resource rename https://otto-tower.example/mcp \
+  https://otto-factory.example/mcp
+```
 
 ### The price book
 

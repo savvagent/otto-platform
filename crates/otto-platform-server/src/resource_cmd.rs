@@ -8,6 +8,9 @@
 //!     [--service <slug>]
 //! otto-platform-server resource set-service <resource-uri> <slug>
 //! otto-platform-server resource rename-service <resource-uri> <new-slug>
+//! otto-platform-server resource rename <old-uri> <new-uri> \
+//!     --alias-until <RFC3339> [--name <name>]
+//! otto-platform-server resource drop-alias <alias-uri>
 //! otto-platform-server resource describe <resource-uri> \
 //!     [--scope-description a=text]... [--clear]
 //! otto-platform-server resource rotate-secret <resource-uri>
@@ -41,6 +44,19 @@
 //! batch in flight is refused (retriably) rather than stranded, and on retry a
 //! metered event under an old meter key is rejected as unknown.
 //!
+//! `rename` moves a resource server to a new canonical URI in one
+//! transaction: its tokens, authorization codes and usage dedupe ledger move
+//! with it, and the old URI becomes an alias that still authenticates the
+//! server at introspection until the `--alias-until` sunset (the server's
+//! `aud` is then the old URI, so a server not yet reconfigured keeps working).
+//! `--name` also changes the name on the consent screen. Renaming back onto a
+//! live alias of the same server (`rename <new> <old>`) swaps the two URIs:
+//! the rollback, keeping the alias's sunset unless `--alias-until` is given.
+//! `drop-alias` ends an alias before its sunset. An alias row is never
+//! deleted, and `register` and `rename` refuse any URI that is or was one, so
+//! a retired URI is never handed to another server. `list` shows each alias
+//! under its server with its sunset and state (`live`, `expired`, `dropped`).
+//!
 //! Secrets are printed once, on stdout, and cannot be read back: the
 //! introspection secret is stored hashed, the webhook secret sealed. Losing
 //! one means running the command again, which invalidates the old value.
@@ -49,7 +65,8 @@
 
 use std::io::Write;
 
-use otto_auth::resources::{self, ResourceServerSpec};
+use chrono::{DateTime, Utc};
+use otto_auth::resources::{self, ResourceAlias, ResourceServerSpec};
 use otto_tenant::crypto::Cipher;
 use otto_tenant::Db;
 
@@ -64,6 +81,11 @@ commands:
                                       move its meters, prices, pools and budgets to a new slug,
                                       while none of its usage is metered or in Stripe;
                                       pause the service's usage shipping first
+  rename <old-uri> <new-uri> --alias-until <RFC3339> [--name <name>]
+                                      move it to a new canonical URI, keeping the old one as
+                                      an alias until the sunset; renaming back onto a live
+                                      alias swaps the two (--alias-until optional then)
+  drop-alias <alias-uri>              end an alias before its sunset
   describe <resource-uri> [--scope-description a=text]... [--clear]
                                       replace the scope descriptions shown on the consent screen
   rotate-secret <resource-uri>        issue a new introspection credential
@@ -94,6 +116,17 @@ pub enum Command {
         resource_uri: String,
         service: String,
     },
+    Rename {
+        old_uri: String,
+        new_uri: String,
+        /// Required unless `new_uri` is a live alias (the swap); checked by
+        /// `resources::rename`, which knows.
+        alias_until: Option<DateTime<Utc>>,
+        name: Option<String>,
+    },
+    DropAlias {
+        alias_uri: String,
+    },
     /// Replace all scope descriptions; empty clears them.
     Describe {
         resource_uri: String,
@@ -122,7 +155,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut it = rest.iter().map(String::as_str);
     while let Some(a) = it.next() {
         match a {
-            "--name" | "--scopes" | "--default-scopes" | "--scope-description" | "--service" => {
+            "--name"
+            | "--scopes"
+            | "--default-scopes"
+            | "--scope-description"
+            | "--service"
+            | "--alias-until" => {
                 let v = it.next().ok_or_else(|| format!("{a} needs a value"))?;
                 flags.push((a, Some(v)));
             }
@@ -200,6 +238,39 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 service: slug(service)?,
             }),
             _ => Err("expected <resource-uri> <new-slug>, and no flags".into()),
+        },
+        "rename" => {
+            if let Some((stray, _)) = flags
+                .iter()
+                .find(|(f, _)| !matches!(*f, "--alias-until" | "--name"))
+            {
+                return Err(format!("rename takes no {stray}"));
+            }
+            let [old, new] = positional.as_slice() else {
+                return Err("expected <old-uri> <new-uri>".into());
+            };
+            let alias_until = flag("--alias-until")
+                .flatten()
+                .map(|v| {
+                    DateTime::parse_from_rfc3339(v)
+                        .map(|t| t.with_timezone(&Utc))
+                        .map_err(|_| {
+                            format!("--alias-until {v:?} is not an RFC 3339 timestamp, e.g. 2027-01-31T00:00:00Z")
+                        })
+                })
+                .transpose()?;
+            Ok(Command::Rename {
+                old_uri: (*old).to_owned(),
+                new_uri: (*new).to_owned(),
+                alias_until,
+                name: flag("--name").flatten().map(str::to_owned),
+            })
+        }
+        "drop-alias" => match positional.as_slice() {
+            [uri] if flags.is_empty() => Ok(Command::DropAlias {
+                alias_uri: (*uri).to_owned(),
+            }),
+            _ => Err("expected <alias-uri>, and no flags".into()),
         },
         "describe" => {
             let scope_descriptions = descriptions()?;
@@ -295,6 +366,43 @@ pub async fn execute(
                 rs.scope_descriptions.len()
             )?;
             writeln!(out, "service={}", rs.service.as_deref().unwrap_or("-"))?;
+            for alias in resources::aliases_of(db, &resource_uri).await? {
+                write_alias(out, &alias)?;
+            }
+        }
+        Command::Rename {
+            old_uri,
+            new_uri,
+            alias_until,
+            name,
+        } => {
+            let r = resources::rename(db, &old_uri, &new_uri, alias_until, name.as_deref()).await?;
+            let w = r.rewritten;
+            writeln!(
+                out,
+                "{} {} -> {} ({})",
+                if r.swapped { "swapped" } else { "renamed" },
+                r.previous_uri,
+                r.resource.resource_uri,
+                r.resource.name
+            )?;
+            write_alias(out, &r.alias)?;
+            writeln!(
+                out,
+                "rewritten: {} access token(s), {} refresh token(s), {} authorization code(s), \
+                 {} usage dedupe record(s)",
+                w.access_tokens, w.refresh_tokens, w.authorization_codes, w.usage_event_ids
+            )?;
+            writeln!(
+                out,
+                "the server may authenticate as either URI until the sunset; \
+                 `resource drop-alias {}` ends the alias sooner",
+                r.alias.alias_uri
+            )?;
+        }
+        Command::DropAlias { alias_uri } => {
+            let alias = resources::drop_alias(db, &alias_uri).await?;
+            write_alias(out, &alias)?;
         }
         Command::SetService {
             resource_uri,
@@ -372,6 +480,7 @@ pub async fn execute(
             )?;
         }
         Command::List => {
+            let aliases = resources::aliases(db).await?;
             for rs in resources::list(db).await? {
                 writeln!(
                     out,
@@ -382,10 +491,26 @@ pub async fn execute(
                     rs.webhook_url.as_deref().unwrap_or("-"),
                     rs.service.as_deref().unwrap_or("-"),
                 )?;
+                for alias in aliases.iter().filter(|a| a.resource_uri == rs.resource_uri) {
+                    write_alias(out, alias)?;
+                }
             }
         }
     }
     Ok(())
+}
+
+/// One alias, indented under its server: `  alias <uri> sunset=<RFC3339> <state>`.
+fn write_alias(out: &mut impl Write, alias: &ResourceAlias) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "  alias {}\tsunset={}\t{}",
+        alias.alias_uri,
+        alias
+            .sunset_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        alias.state(Utc::now()).as_str()
+    )
 }
 
 async fn describe(
@@ -495,6 +620,74 @@ mod tests {
             "rename-service https://x.example/mcp otto-tower --clear"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn parses_rename() {
+        assert_eq!(
+            parse(&args(
+                "rename https://a.example/mcp https://b.example/mcp \
+                 --alias-until 2027-01-31T00:00:00Z --name otto-tower"
+            ))
+            .unwrap(),
+            Command::Rename {
+                old_uri: "https://a.example/mcp".into(),
+                new_uri: "https://b.example/mcp".into(),
+                alias_until: Some("2027-01-31T00:00:00Z".parse().unwrap()),
+                name: Some("otto-tower".into()),
+            }
+        );
+        // An offset is normalized to UTC.
+        assert_eq!(
+            parse(&args(
+                "rename https://a.example/mcp https://b.example/mcp --alias-until 2027-01-31T02:00:00+02:00"
+            ))
+            .unwrap(),
+            Command::Rename {
+                old_uri: "https://a.example/mcp".into(),
+                new_uri: "https://b.example/mcp".into(),
+                alias_until: Some("2027-01-31T00:00:00Z".parse().unwrap()),
+                name: None,
+            }
+        );
+        // The swap back names no sunset; `resources::rename` decides whether
+        // it needs one.
+        assert_eq!(
+            parse(&args("rename https://b.example/mcp https://a.example/mcp")).unwrap(),
+            Command::Rename {
+                old_uri: "https://b.example/mcp".into(),
+                new_uri: "https://a.example/mcp".into(),
+                alias_until: None,
+                name: None,
+            }
+        );
+        for bad in [
+            "rename https://a.example/mcp",
+            "rename https://a.example/mcp https://b.example/mcp https://c.example/mcp",
+            "rename https://a.example/mcp https://b.example/mcp --alias-until 2027-01-31",
+            "rename https://a.example/mcp https://b.example/mcp --alias-until tomorrow",
+            "rename https://a.example/mcp https://b.example/mcp --alias-until",
+            "rename https://a.example/mcp https://b.example/mcp --clear",
+            "rename https://a.example/mcp https://b.example/mcp --service x",
+        ] {
+            assert!(parse(&args(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parses_drop_alias() {
+        assert_eq!(
+            parse(&args("drop-alias https://a.example/mcp")).unwrap(),
+            Command::DropAlias {
+                alias_uri: "https://a.example/mcp".into(),
+            }
+        );
+        assert!(parse(&args("drop-alias")).is_err());
+        assert!(parse(&args(
+            "drop-alias https://a.example/mcp https://b.example/mcp"
+        ))
+        .is_err());
+        assert!(parse(&args("drop-alias https://a.example/mcp --clear")).is_err());
     }
 
     #[test]

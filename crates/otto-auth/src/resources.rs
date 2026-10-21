@@ -14,6 +14,12 @@
 //! server, issuing its introspection credential, and assigning or renaming its
 //! service slug ([`set_service`], [`rename_service`]) are operator actions and
 //! are never touched by `register`.
+//!
+//! So is moving a server to a new canonical URI ([`rename`]). The old URI
+//! stays behind as a time-boxed alias (`resource_server_aliases`, migration
+//! 0026) that [`resolve`] and introspection authentication still accept until
+//! its sunset or [`drop_alias`]. Alias rows are tombstones: neither
+//! `register` nor `rename` ever hands out a URI that is, or was, an alias.
 
 use std::collections::BTreeMap;
 
@@ -148,6 +154,9 @@ impl ResourceServer {
 /// descriptions (see [`set_scope_descriptions`]), dropping only those of
 /// scopes the new list no longer contains, so a service that re-registers at
 /// startup does not erase what an operator wrote.
+///
+/// A URI that is an alias of a resource server, live, expired or dropped, is
+/// refused (see [`rename`]): a retired URI is never reused.
 pub async fn register(db: &Db, spec: ResourceServerSpec<'_>) -> Result<ResourceServer> {
     validate_resource_uri(spec.resource_uri)?;
     let name = spec.name.trim();
@@ -169,6 +178,13 @@ pub async fn register(db: &Db, spec: ResourceServerSpec<'_>) -> Result<ResourceS
         )));
     }
 
+    // A retired URI, in any state, is never given to a server again: not
+    // even to the one it names, which is registered under its canonical URI.
+    let mut tx = db.begin_unpinned().await?;
+    lock_uri_namespace(tx.conn()).await?;
+    if let Some((alias, _)) = alias_row(tx.conn(), spec.resource_uri).await? {
+        return Err(alias_taken(spec.resource_uri, &alias));
+    }
     let row = sqlx::query_as(&format!(
         "INSERT INTO resource_servers (resource_uri, name, scopes, default_scopes) \
          VALUES ($1, $2, $3, $4) \
@@ -187,8 +203,9 @@ pub async fn register(db: &Db, spec: ResourceServerSpec<'_>) -> Result<ResourceS
     .bind(name)
     .bind(&scopes)
     .bind(&default_scopes)
-    .fetch_one(db.pool())
+    .fetch_one(tx.conn())
     .await?;
+    tx.commit().await?;
     Ok(row)
 }
 
@@ -402,6 +419,524 @@ fn rename_error(e: sqlx::Error, service: &str) -> AuthError {
     }
 }
 
+/// A retired resource URI that still names its resource server until its
+/// sunset, unless dropped first (`resource_server_aliases`, migration 0026).
+/// Rows are tombstones: never deleted, so the URI is never reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceAlias {
+    pub alias_uri: String,
+    /// The canonical URI of the server it names.
+    pub resource_uri: String,
+    pub sunset_at: DateTime<Utc>,
+    pub dropped_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Whether an alias works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasState {
+    /// Names its server.
+    Live,
+    /// Past its sunset: behaves like an unknown URI.
+    Expired,
+    /// Ended by an operator: behaves like an unknown URI.
+    Dropped,
+}
+
+impl AliasState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AliasState::Live => "live",
+            AliasState::Expired => "expired",
+            AliasState::Dropped => "dropped",
+        }
+    }
+}
+
+impl ResourceAlias {
+    /// Its state at `now`. Dropped wins over expired.
+    pub fn state(&self, now: DateTime<Utc>) -> AliasState {
+        if self.dropped_at.is_some() {
+            AliasState::Dropped
+        } else if self.sunset_at <= now {
+            AliasState::Expired
+        } else {
+            AliasState::Live
+        }
+    }
+}
+
+const ALIAS_COLS: &str = "alias_uri, resource_uri, sunset_at, dropped_at, created_at";
+
+/// The live-alias condition, in SQL, matching [`AliasState::Live`].
+const LIVE_ALIAS: &str = "dropped_at IS NULL AND sunset_at > now()";
+
+/// SQL for "a token bound to `column` is good for the resource server whose
+/// canonical URI is `canonical`": an exact match, or `column` is an alias of
+/// that server. Any alias state counts: alias rows are tombstones that only
+/// ever name their own server, and the rename rewrites tokens bound to the
+/// old URI anyway; this covers one minted under the old URI by a transaction
+/// that raced the rename. Both arguments are SQL expressions (a column, a
+/// `$n` placeholder) and must never come from input.
+pub fn audience_matches_sql(column: &str, canonical: &str) -> String {
+    format!(
+        "({column} = {canonical} OR EXISTS (SELECT 1 FROM resource_server_aliases a_aud \
+          WHERE a_aud.alias_uri = {column} AND a_aud.resource_uri = {canonical}))"
+    )
+}
+
+/// A resource server found by a URI that names it: its canonical URI or a
+/// live alias.
+#[derive(Debug, Clone)]
+pub struct ResolvedResource {
+    /// The canonical row. Everything stored or compared (tokens, usage,
+    /// dedupe) uses `server.resource_uri`.
+    pub server: ResourceServer,
+    /// The URI it was named by, exactly as given: the canonical URI or the
+    /// alias. Never store or compare by it; only introspection answers with
+    /// it, as the `aud` of the server that authenticated as it.
+    pub named_as: String,
+    /// The alias it was named by, when it was not its canonical URI.
+    pub alias: Option<ResourceAlias>,
+}
+
+/// [`ResolvedResource`] plus the server's introspection credential hash, read
+/// in one statement so a concurrent rename cannot fall between the two.
+#[derive(sqlx::FromRow)]
+struct ResolvedRow {
+    #[sqlx(flatten)]
+    server: ResourceServer,
+    secret_hash: Option<Vec<u8>>,
+    alias_uri: Option<String>,
+    alias_sunset_at: Option<DateTime<Utc>>,
+    alias_dropped_at: Option<DateTime<Utc>>,
+    alias_created_at: Option<DateTime<Utc>>,
+}
+
+async fn resolve_row(db: &Db, uri: &str) -> Result<Option<(ResolvedResource, Option<Vec<u8>>)>> {
+    let rs_cols = COLS
+        .split(',')
+        .map(|c| format!("rs.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // At most one row: a URI is never both canonical and an alias.
+    let row: Option<ResolvedRow> = sqlx::query_as(&format!(
+        "SELECT {rs_cols}, rs.introspection_secret_hash AS secret_hash, \
+                NULL::text AS alias_uri, NULL::timestamptz AS alias_sunset_at, \
+                NULL::timestamptz AS alias_dropped_at, NULL::timestamptz AS alias_created_at \
+           FROM resource_servers rs WHERE rs.resource_uri = $1 \
+         UNION ALL \
+         SELECT {rs_cols}, rs.introspection_secret_hash, \
+                a.alias_uri, a.sunset_at, a.dropped_at, a.created_at \
+           FROM resource_server_aliases a \
+           JOIN resource_servers rs ON rs.resource_uri = a.resource_uri \
+          WHERE a.alias_uri = $1 AND a.dropped_at IS NULL AND a.sunset_at > now() \
+         LIMIT 1"
+    ))
+    .bind(uri)
+    .fetch_optional(db.pool())
+    .await?;
+    Ok(row.map(|r| {
+        let alias = match (r.alias_uri, r.alias_sunset_at, r.alias_created_at) {
+            (Some(alias_uri), Some(sunset_at), Some(created_at)) => Some(ResourceAlias {
+                alias_uri,
+                resource_uri: r.server.resource_uri.clone(),
+                sunset_at,
+                dropped_at: r.alias_dropped_at,
+                created_at,
+            }),
+            _ => None,
+        };
+        (
+            ResolvedResource {
+                server: r.server,
+                named_as: uri.to_owned(),
+                alias,
+            },
+            r.secret_hash,
+        )
+    }))
+}
+
+/// Find the resource server `uri` names: the one whose canonical URI it is,
+/// or the one it is a live alias of. An expired or dropped alias names
+/// nothing, exactly like a URI never registered. Disabled servers are
+/// returned; callers decide what that means.
+pub async fn resolve(db: &Db, uri: &str) -> Result<Option<ResolvedResource>> {
+    Ok(resolve_row(db, uri).await?.map(|(r, _)| r))
+}
+
+/// Every alias, live or not, by alias URI.
+pub async fn aliases(db: &Db) -> Result<Vec<ResourceAlias>> {
+    let rows = sqlx::query_as(&format!(
+        "SELECT {ALIAS_COLS} FROM resource_server_aliases ORDER BY alias_uri"
+    ))
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows)
+}
+
+/// The aliases of the resource server whose canonical URI is `resource_uri`,
+/// live or not, by alias URI.
+pub async fn aliases_of(db: &Db, resource_uri: &str) -> Result<Vec<ResourceAlias>> {
+    let rows = sqlx::query_as(&format!(
+        "SELECT {ALIAS_COLS} FROM resource_server_aliases WHERE resource_uri = $1 \
+         ORDER BY alias_uri"
+    ))
+    .bind(resource_uri)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows)
+}
+
+/// Serializes every change to the resource-URI namespace (`register`,
+/// [`rename`]) so the "not already a canonical URI or an alias" checks cannot
+/// race each other. Transaction-scoped.
+const URI_NAMESPACE_LOCK: i64 = 0x6f74_746f_5f75_7269; // "otto_uri"
+
+/// Taken shared by every usage dedupe claim (`claim_usage_event`, migration
+/// 0026, which spells the same number) and exclusively by [`rename`], so a
+/// rename's ledger rewrite and the claims never interleave. Transaction-scoped.
+pub const USAGE_LEDGER_LOCK: i64 = 0x6f74_746f_6c65_6467; // "ottoledg"
+
+async fn lock_uri_namespace(conn: &mut sqlx::PgConnection) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(URI_NAMESPACE_LOCK)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// The alias row for `uri`, whatever its state, locked, with whether it is
+/// live by the database's clock.
+async fn alias_row(
+    conn: &mut sqlx::PgConnection,
+    uri: &str,
+) -> Result<Option<(ResourceAlias, bool)>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        #[sqlx(flatten)]
+        alias: ResourceAlias,
+        live: bool,
+    }
+    let row: Option<Row> = sqlx::query_as(&format!(
+        "SELECT {ALIAS_COLS}, ({LIVE_ALIAS}) AS live FROM resource_server_aliases \
+         WHERE alias_uri = $1 FOR UPDATE"
+    ))
+    .bind(uri)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.map(|r| (r.alias, r.live)))
+}
+
+fn alias_taken(uri: &str, alias: &ResourceAlias) -> AuthError {
+    let state = match alias.state(Utc::now()) {
+        AliasState::Live => "a live",
+        AliasState::Expired => "an expired",
+        AliasState::Dropped => "a dropped",
+    };
+    AuthError::InvalidRequest(format!(
+        "{uri:?} is {state} alias of {:?}; a retired resource URI is never reused",
+        alias.resource_uri
+    ))
+}
+
+/// What [`rename`] did.
+#[derive(Debug, Clone)]
+pub struct ResourceRename {
+    /// The canonical URI it had.
+    pub previous_uri: String,
+    /// The resource server as it is now, under its new canonical URI.
+    pub resource: ResourceServer,
+    /// The alias the previous URI now is.
+    pub alias: ResourceAlias,
+    /// Whether this swapped the URI back from a live alias (the rollback).
+    pub swapped: bool,
+    pub rewritten: UriRewrites,
+}
+
+/// Rows [`rename`] moved from the previous URI to the new one, by table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UriRewrites {
+    pub access_tokens: u64,
+    pub refresh_tokens: u64,
+    pub authorization_codes: u64,
+    /// Usage dedupe ledger entries (`usage_event_ids`).
+    pub usage_event_ids: u64,
+}
+
+/// Move a resource server from its canonical URI `old_uri` to `new_uri`, and
+/// keep `old_uri` as an alias of it until `alias_until`, in one transaction:
+///
+/// - the canonical URI changes, and everything keyed by it follows (webhook
+///   deliveries and older aliases, by cascading foreign keys);
+/// - `old_uri` becomes an alias, live until `alias_until`;
+/// - `resource` on access tokens, refresh tokens and authorization codes is
+///   rewritten to `new_uri`, so issued tokens stay valid past the sunset;
+/// - the usage dedupe ledger is rewritten, so an event shipped before the
+///   rename is still a duplicate after it;
+/// - with `name`, the name shown on the consent screen changes too.
+///
+/// `new_uri` must not be in use: not a canonical URI, and not an alias in any
+/// state, so a retired URI is never given out again. The one exception is the
+/// rollback: when `new_uri` is a **live** alias of this same server, the two
+/// URIs swap. `old_uri` becomes the alias, keeping the sunset the alias had
+/// unless `alias_until` gives a new one. Otherwise `alias_until` is required
+/// and must be in the future.
+///
+/// Concurrency. The rename takes [`USAGE_LEDGER_LOCK`] exclusively before
+/// anything of the server's. Every usage claim holds it shared until its
+/// transaction ends (`claim_usage_event`, 0026), so the rename waits for
+/// claims in flight and its ledger rewrite sees them, and claims arriving
+/// later wait for the rename and then resolve the old URI to the new one.
+/// While it waits the rename holds only its URI-namespace lock, which no
+/// claimer takes, so they cannot deadlock. All usage ingest pauses while it
+/// runs. It gives up after a short lock timeout, or on a deadlock, with
+/// nothing changed and a message to run it again: pause the server's usage
+/// shipping first, and run it when traffic is low.
+pub async fn rename(
+    db: &Db,
+    old_uri: &str,
+    new_uri: &str,
+    alias_until: Option<DateTime<Utc>>,
+    name: Option<&str>,
+) -> Result<ResourceRename> {
+    validate_resource_uri(new_uri)?;
+    if old_uri == new_uri {
+        return Err(AuthError::InvalidRequest(format!(
+            "{old_uri:?} is already the resource's URI"
+        )));
+    }
+    let name = name.map(str::trim);
+    if name == Some("") {
+        return Err(AuthError::InvalidRequest(
+            "a resource server needs a name".into(),
+        ));
+    }
+    if let Some(until) = alias_until {
+        if until <= Utc::now() {
+            return Err(AuthError::InvalidRequest(format!(
+                "the alias sunset {} is not in the future",
+                until.to_rfc3339()
+            )));
+        }
+    }
+
+    // Unpinned: none of these tables is row-level secured, and the ledger is
+    // reachable only outside the tenant role.
+    let mut tx = db.begin_unpinned().await?;
+    let renamed = rename_in(tx.conn(), old_uri, new_uri, alias_until, name)
+        .await
+        .map_err(busy_error)?;
+    tx.commit().await?;
+    Ok(renamed)
+}
+
+/// A rename that lost a lock wait or a deadlock changed nothing, and running
+/// it again is the remedy.
+fn busy_error(e: AuthError) -> AuthError {
+    match &e {
+        AuthError::Db(sqlx::Error::Database(d))
+            if matches!(d.code().as_deref(), Some("55P03" | "40P01")) =>
+        {
+            AuthError::InvalidRequest(
+                "the resource server's rows were busy (usage ingest, token traffic or another \
+                 rename) and the rename gave up waiting; nothing changed. Pause its usage \
+                 shipping, then run it again"
+                    .into(),
+            )
+        }
+        _ => e,
+    }
+}
+
+async fn rename_in(
+    conn: &mut sqlx::PgConnection,
+    old_uri: &str,
+    new_uri: &str,
+    alias_until: Option<DateTime<Utc>>,
+    name: Option<&str>,
+) -> Result<ResourceRename> {
+    // Waiting long on a busy row would queue every claim and sign-in behind
+    // this; better to give up and be run again.
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *conn)
+        .await?;
+    lock_uri_namespace(&mut *conn).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(USAGE_LEDGER_LOCK)
+        .execute(&mut *conn)
+        .await?;
+
+    let found: Option<(String,)> = sqlx::query_as(
+        "SELECT resource_uri FROM resource_servers WHERE resource_uri = $1 FOR UPDATE",
+    )
+    .bind(old_uri)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if found.is_none() {
+        return Err(match alias_row(&mut *conn, old_uri).await? {
+            Some((a, _)) => AuthError::InvalidRequest(format!(
+                "{old_uri:?} is an alias of {:?}; rename the resource by its canonical URI",
+                a.resource_uri
+            )),
+            None => AuthError::InvalidTarget(format!("{old_uri:?} is not a registered resource")),
+        });
+    }
+    let taken: Option<(String,)> =
+        sqlx::query_as("SELECT resource_uri FROM resource_servers WHERE resource_uri = $1")
+            .bind(new_uri)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if taken.is_some() {
+        return Err(AuthError::InvalidRequest(format!(
+            "{new_uri:?} is another resource server's URI"
+        )));
+    }
+
+    // Live by the database's clock, the one every reader of aliases uses.
+    let existing = alias_row(&mut *conn, new_uri).await?;
+    let swap = match &existing {
+        None => None,
+        Some((a, true)) if a.resource_uri == old_uri => Some(a.sunset_at),
+        Some((a, _)) => return Err(alias_taken(new_uri, a)),
+    };
+    let sunset_at = match (alias_until, swap) {
+        (Some(until), _) => until,
+        (None, Some(kept)) => kept,
+        (None, None) => {
+            return Err(AuthError::InvalidRequest(
+                "--alias-until is required: when the old URI stops working".into(),
+            ))
+        }
+    };
+
+    // The canonical key first: its cascade carries every alias of the server,
+    // including the one being swapped back, to `new_uri`.
+    sqlx::query(
+        "UPDATE resource_servers SET resource_uri = $2, name = COALESCE($3, name), \
+                updated_at = now() \
+         WHERE resource_uri = $1",
+    )
+    .bind(old_uri)
+    .bind(new_uri)
+    .bind(name)
+    .execute(&mut *conn)
+    .await?;
+    let alias: ResourceAlias = if swap.is_some() {
+        // The alias row of `new_uri` becomes the alias row of `old_uri`, as
+        // of now: `created_at` is when this URI became an alias.
+        sqlx::query_as(&format!(
+            "UPDATE resource_server_aliases SET alias_uri = $2, sunset_at = $3, created_at = now() \
+             WHERE alias_uri = $1 RETURNING {ALIAS_COLS}"
+        ))
+        .bind(new_uri)
+        .bind(old_uri)
+        .bind(sunset_at)
+        .fetch_one(&mut *conn)
+        .await?
+    } else {
+        sqlx::query_as(&format!(
+            "INSERT INTO resource_server_aliases (alias_uri, resource_uri, sunset_at) \
+             VALUES ($1, $2, $3) RETURNING {ALIAS_COLS}"
+        ))
+        .bind(old_uri)
+        .bind(new_uri)
+        .bind(sunset_at)
+        .fetch_one(&mut *conn)
+        .await?
+    };
+
+    // Only rows that can still be used: rewriting (and so locking) every
+    // historical token would stall introspection and sign-in for longer. A
+    // row left under the old URI still matches the server's audience
+    // ([`audience_matches_sql`]).
+    let mut rewritten = UriRewrites::default();
+    for (table, usable, count) in [
+        (
+            "access_tokens",
+            "revoked_at IS NULL AND expires_at > now()",
+            &mut rewritten.access_tokens,
+        ),
+        (
+            "refresh_tokens",
+            "revoked_at IS NULL AND consumed_at IS NULL AND expires_at > now()",
+            &mut rewritten.refresh_tokens,
+        ),
+        (
+            "authorization_codes",
+            "consumed_at IS NULL AND expires_at > now()",
+            &mut rewritten.authorization_codes,
+        ),
+    ] {
+        *count = sqlx::query(&format!(
+            "UPDATE {table} SET resource = $2 WHERE resource = $1 AND {usable}"
+        ))
+        .bind(old_uri)
+        .bind(new_uri)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    }
+    // Claims in flight have committed by now (see the function's docs), and
+    // later ones file under `new_uri`, so every entry under `old_uri` moves.
+    // `new_uri` has none of its own: it was never canonical, or (the swap) its
+    // entries were moved off it when it last stopped being. The guard only
+    // keeps a stray duplicate from failing the whole rename on the primary
+    // key; the entry under `new_uri` is the one claims read.
+    rewritten.usage_event_ids = sqlx::query(
+        "UPDATE usage_event_ids u SET resource_uri = $2 \
+         WHERE u.resource_uri = $1 \
+           AND NOT EXISTS (SELECT 1 FROM usage_event_ids n \
+                            WHERE n.resource_uri = $2 AND n.event_id = u.event_id)",
+    )
+    .bind(old_uri)
+    .bind(new_uri)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+
+    let resource = sqlx::query_as(&format!(
+        "SELECT {COLS} FROM resource_servers WHERE resource_uri = $1"
+    ))
+    .bind(new_uri)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(ResourceRename {
+        previous_uri: old_uri.to_owned(),
+        resource,
+        alias,
+        swapped: swap.is_some(),
+        rewritten,
+    })
+}
+
+/// End an alias before its sunset. From then on it behaves like an unknown
+/// URI. The row stays, so the URI is never reused. Dropping one already
+/// dropped changes nothing and returns it as it is.
+pub async fn drop_alias(db: &Db, alias_uri: &str) -> Result<ResourceAlias> {
+    let dropped: Option<ResourceAlias> = sqlx::query_as(&format!(
+        "UPDATE resource_server_aliases SET dropped_at = now() \
+         WHERE alias_uri = $1 AND dropped_at IS NULL RETURNING {ALIAS_COLS}"
+    ))
+    .bind(alias_uri)
+    .fetch_optional(db.pool())
+    .await?;
+    if let Some(a) = dropped {
+        return Ok(a);
+    }
+    let existing: Option<ResourceAlias> = sqlx::query_as(&format!(
+        "SELECT {ALIAS_COLS} FROM resource_server_aliases WHERE alias_uri = $1"
+    ))
+    .bind(alias_uri)
+    .fetch_optional(db.pool())
+    .await?;
+    existing.ok_or_else(|| {
+        AuthError::InvalidTarget(format!("{alias_uri:?} is not a resource server alias"))
+    })
+}
+
 /// Look up a resource server that may currently be issued tokens.
 ///
 /// An unknown resource and a disabled one are both
@@ -479,39 +1014,39 @@ pub async fn rotate_introspection_secret(db: &Db, resource_uri: &str) -> Result<
     Ok(secret.into_plaintext())
 }
 
-/// Authenticate a resource server calling the introspection endpoint.
+/// Authenticate a resource server calling the introspection endpoint as
+/// `resource_uri`: its canonical URI or a live alias of it ([`resolve`]).
 ///
-/// Every failure, whether an unknown resource, no credential issued, a wrong
-/// credential, or a disabled server, is the same [`AuthError::InvalidClient`],
-/// so the endpoint cannot be used to probe which resources exist or hold a
-/// credential.
+/// The result keeps the canonical row and, apart from it, the URI the caller
+/// authenticated as, which is the `aud` introspection answers with. So a
+/// server still configured with its old URI keeps working through the alias
+/// until the sunset, and is told about tokens in the terms it expects.
+///
+/// Every failure, whether an unknown resource, an expired or dropped alias, no
+/// credential issued, a wrong credential, or a disabled server, is the same
+/// [`AuthError::InvalidClient`], so the endpoint cannot be used to probe which
+/// resources exist or hold a credential.
 pub async fn authenticate_introspection(
     db: &Db,
     resource_uri: &str,
     presented: &str,
-) -> Result<ResourceServer> {
+) -> Result<ResolvedResource> {
     let refused = || AuthError::InvalidClient("resource server authentication failed".into());
 
-    let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
-        "SELECT introspection_secret_hash FROM resource_servers WHERE resource_uri = $1",
-    )
-    .bind(resource_uri)
-    .fetch_optional(db.pool())
-    .await?;
-
     let presented_hash = crypto::hash(presented.trim());
-    let Some((Some(stored),)) = row else {
+    // The row and its credential in one read, so a rename committing in
+    // between cannot turn a good credential into a spurious refusal.
+    let (resolved, stored) = resolve_row(db, resource_uri).await?.ok_or_else(refused)?;
+    let Some(stored) = stored else {
         return Err(refused());
     };
     if !crypto::verify(&stored, &presented_hash) {
         return Err(refused());
     }
-
-    let rs = get(db, resource_uri).await?.ok_or_else(refused)?;
-    if rs.disabled {
+    if resolved.server.disabled {
         return Err(refused());
     }
-    Ok(rs)
+    Ok(resolved)
 }
 
 /// Authenticate a resource server by its credential alone, for callers that
