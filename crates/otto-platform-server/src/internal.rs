@@ -169,7 +169,7 @@ async fn live_org(db: &Db, org: Uuid) -> Result<Org, ApiError> {
 /// counts the org's events in billed order (period, then `occurred_at`).
 async fn ingest_usage(
     State(db): State<Db>,
-    CallingResourceServer(rs): CallingResourceServer,
+    CallingResourceServer { server: rs, .. }: CallingResourceServer,
     Json(batch): Json<UsageBatch>,
 ) -> Result<Json<UsageReceipt>, ApiError> {
     if batch.events.len() > MAX_USAGE_BATCH {
@@ -342,7 +342,7 @@ async fn declared_meters(
 /// declare into, and retrying will not help until an operator assigns one.
 async fn declare_meters(
     State(db): State<Db>,
-    CallingResourceServer(rs): CallingResourceServer,
+    CallingResourceServer { server: rs, .. }: CallingResourceServer,
     Json(batch): Json<MeterDeclarationBatch>,
 ) -> Result<Response, ApiError> {
     let Some(service) = rs.service.as_deref() else {
@@ -441,7 +441,7 @@ fn truncate(s: &str, max: usize) -> String {
 async fn usage_status(
     State(db): State<Db>,
     State(billing): State<Billing>,
-    CallingResourceServer(rs): CallingResourceServer,
+    CallingResourceServer { server: rs, .. }: CallingResourceServer,
     Path(org): Path<Uuid>,
 ) -> Result<Json<UsageStatus>, ApiError> {
     live_org(&db, org).await?;
@@ -594,7 +594,7 @@ async fn member_info(db: &Db, org: Uuid, user: Uuid) -> Result<MemberInfo, ApiEr
 
 async fn member(
     State(db): State<Db>,
-    CallingResourceServer(_rs): CallingResourceServer,
+    _caller: CallingResourceServer,
     Path((org, user)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<MemberInfo>, ApiError> {
     member_info(&db, org, user).await.map(Json)
@@ -607,7 +607,7 @@ struct ByEmail {
 
 async fn member_by_email(
     State(db): State<Db>,
-    CallingResourceServer(_rs): CallingResourceServer,
+    _caller: CallingResourceServer,
     Path(org): Path<Uuid>,
     Query(q): Query<ByEmail>,
 ) -> Result<Json<MemberInfo>, ApiError> {
@@ -639,7 +639,7 @@ fn team_info(t: Team) -> TeamInfo {
 /// database.
 async fn team(
     State(db): State<Db>,
-    CallingResourceServer(_rs): CallingResourceServer,
+    _caller: CallingResourceServer,
     Path((org, team)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<TeamInfo>, ApiError> {
     live_org(&db, org).await?;
@@ -651,7 +651,7 @@ async fn team(
 
 async fn team_by_slug(
     State(db): State<Db>,
-    CallingResourceServer(_rs): CallingResourceServer,
+    _caller: CallingResourceServer,
     Path((org, slug)): Path<(Uuid, String)>,
 ) -> Result<Json<TeamInfo>, ApiError> {
     live_org(&db, org).await?;
@@ -670,7 +670,7 @@ async fn team_by_slug(
 /// empty list.
 async fn member_teams(
     State(db): State<Db>,
-    CallingResourceServer(_rs): CallingResourceServer,
+    _caller: CallingResourceServer,
     Path((org, user)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<MemberTeams>, ApiError> {
     let org_row = live_org(&db, org).await?;

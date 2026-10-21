@@ -3513,3 +3513,287 @@ async fn set_service_carries_pools_and_refuses_an_orphan_pool_in_the_way(pool: P
     );
     assert_eq!(service_pool(&w.db, "otto-b").await, Some((1, 1)));
 }
+
+// ------------------------------------------------------ resource URI rename
+
+/// Where otto-factory moves to in these tests.
+const TOWER: &str = "https://otto-tower.example/mcp";
+
+fn alias_sunset() -> chrono::DateTime<Utc> {
+    Utc::now() + chrono::Duration::days(90)
+}
+
+/// Moves otto-factory to `TOWER`, leaving `FACTORY` a live alias.
+async fn rename_factory(w: &World) {
+    resources::rename(
+        &w.db,
+        FACTORY,
+        TOWER,
+        Some(alias_sunset()),
+        Some("otto-tower"),
+    )
+    .await
+    .unwrap();
+}
+
+async fn set_alias_sunset(db: &Db, alias: &str, sql_offset: &str) {
+    sqlx::query(&format!(
+        "UPDATE resource_server_aliases SET sunset_at = now() + interval '{sql_offset}' \
+         WHERE alias_uri = $1"
+    ))
+    .bind(alias)
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn after_a_rename_the_caller_gets_the_audience_it_authenticated_as(pool: PgPool) {
+    let w = world(pool).await;
+    let before = w.oauth_token(FACTORY, &["jobs:read"]).await;
+    rename_factory(&w).await;
+    let after = w.oauth_token(TOWER, &["jobs:read"]).await;
+
+    let bearer = format!("Bearer {}", w.factory_secret);
+    for (auth, aud) in [
+        // The running binary, still configured with the old URI.
+        (basic(FACTORY, &w.factory_secret), FACTORY),
+        // The binary after its env flips to the new URI.
+        (basic(TOWER, &w.factory_secret), TOWER),
+        // Bearer names no URI: canonical.
+        (bearer, TOWER),
+    ] {
+        for token in [&before, &after] {
+            let (status, body) = introspect(&w.db, Some(&auth), token).await;
+            assert_eq!(status, StatusCode::OK, "{aud}");
+            assert_eq!(body["active"], true, "{aud}: {body}");
+            assert_eq!(body["aud"], aud);
+            assert_eq!(body["sub"], w.user.to_string());
+        }
+    }
+
+    // The alias is not a way to read a sibling's tokens.
+    let flags_token = w.oauth_token(FLAGS, &["flags:read"]).await;
+    let (_, body) = introspect(&w.db, Some(&w.factory_basic()), &flags_token).await;
+    assert_eq!(body, json!({ "active": false }));
+    // Nor a way in with a sibling's credential.
+    let (status, _) = introspect(&w.db, Some(&basic(FACTORY, &w.flags_secret)), &before).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_old_binarys_client_keeps_working_through_the_alias(pool: PgPool) {
+    let w = world(pool).await;
+    let base = serve(&w.db).await;
+    let token = w.oauth_token(FACTORY, &["jobs:read"]).await;
+    rename_factory(&w).await;
+
+    // otto-resource checks `aud` against its own configured URI, so this is
+    // what the running otto-factory sees between the rename and its env flip.
+    let old = PlatformClient::new(ClientConfig::new(&base, FACTORY, &w.factory_secret)).unwrap();
+    let claims = old.introspect(&token).await.unwrap().expect("active");
+    assert_eq!(claims.resource, FACTORY);
+    let new = PlatformClient::new(ClientConfig::new(&base, TOWER, &w.factory_secret)).unwrap();
+    let claims = new.introspect(&token).await.unwrap().expect("active");
+    assert_eq!(claims.resource, TOWER);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_expired_or_dropped_alias_fails_authentication(pool: PgPool) {
+    let w = world(pool).await;
+    let token = w.oauth_token(FACTORY, &["jobs:read"]).await;
+    rename_factory(&w).await;
+    let usage_status = format!("/internal/orgs/{}/usage-status", w.org);
+    let tower = basic(TOWER, &w.factory_secret);
+
+    set_alias_sunset(&w.db, FACTORY, "-1 second").await;
+    let (status, body) = introspect(&w.db, Some(&w.factory_basic()), &token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "expired");
+    assert_eq!(body["error"], "invalid_client");
+    assert_eq!(
+        get(&w.db, &w.factory_basic(), &usage_status).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // The canonical URI is unaffected.
+    assert_eq!(
+        introspect(&w.db, Some(&tower), &token).await.1["active"],
+        true
+    );
+
+    set_alias_sunset(&w.db, FACTORY, "1 day").await;
+    assert_eq!(
+        introspect(&w.db, Some(&w.factory_basic()), &token).await.0,
+        StatusCode::OK
+    );
+    resources::drop_alias(&w.db, FACTORY).await.unwrap();
+    let (status, body) = introspect(&w.db, Some(&w.factory_basic()), &token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "dropped");
+    assert_eq!(body["error"], "invalid_client");
+    assert_eq!(
+        get(&w.db, &w.factory_basic(), &usage_status).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        introspect(&w.db, Some(&tower), &token).await.1["active"],
+        true
+    );
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn usage_through_the_alias_dedupes_against_the_canonical_uri(pool: PgPool) {
+    let w = world(pool).await;
+    let (shipped, fresh) = (Uuid::new_v4(), Uuid::new_v4());
+    let (_, r) = post_usage(
+        &w.db,
+        &w.factory_basic(),
+        vec![usage_event(w.org, None, shipped, true)],
+    )
+    .await;
+    assert_eq!(r["accepted"], 1);
+    rename_factory(&w).await;
+
+    // The old binary resends the batch (its response was lost) plus a new one.
+    let batch = vec![
+        usage_event(w.org, None, shipped, true),
+        usage_event(w.org, None, fresh, true),
+    ];
+    let (status, r) = post_usage(&w.db, &w.factory_basic(), batch.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r, json!({ "accepted": 1, "duplicates": 1, "rejected": [] }));
+    // After the env flip it resends again under the new URI.
+    let (_, r) = post_usage(&w.db, &basic(TOWER, &w.factory_secret), batch).await;
+    assert_eq!(r, json!({ "accepted": 0, "duplicates": 2, "rejected": [] }));
+
+    // Everything is keyed by the canonical URI.
+    assert_eq!(
+        rows_with(&w.db, "usage_event_ids", "resource_uri", FACTORY).await,
+        0
+    );
+    assert_eq!(
+        rows_with(&w.db, "usage_event_ids", "resource_uri", TOWER).await,
+        2
+    );
+    let shipped_under: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT resource_uri FROM usage_events ORDER BY created_at")
+            .fetch_all(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        shipped_under,
+        [Some(FACTORY.to_owned()), Some(TOWER.to_owned())],
+        "history keeps the URI it was shipped under; new usage is canonical"
+    );
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_operator_cli_renames_shows_and_drops_aliases(pool: PgPool) {
+    let w = world(pool).await;
+    let token = w.oauth_token(FACTORY, &["jobs:read"]).await;
+
+    // A sunset is required, and must be RFC 3339.
+    let err = run_resource_cmd(&w.db, &format!("rename {FACTORY} {TOWER}"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("--alias-until"), "{err}");
+    assert!(run_resource_cmd(
+        &w.db,
+        &format!("rename {FACTORY} {TOWER} --alias-until 2099-01-01")
+    )
+    .await
+    .is_err());
+    // Onto another server's URI.
+    assert!(run_resource_cmd(
+        &w.db,
+        &format!("rename {FACTORY} {FLAGS} --alias-until 2099-01-01T00:00:00Z")
+    )
+    .await
+    .is_err());
+
+    let out = run_resource_cmd(
+        &w.db,
+        &format!("rename {FACTORY} {TOWER} --alias-until 2099-01-01T00:00:00Z --name otto-tower"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        out.contains(&format!("renamed {FACTORY} -> {TOWER} (otto-tower)")),
+        "{out}"
+    );
+    let alias_line = format!("  alias {FACTORY}\tsunset=2099-01-01T00:00:00Z\tlive");
+    assert!(out.contains(&alias_line), "{out}");
+    assert!(out.contains("1 access token(s)"), "{out}");
+
+    // `list` shows the alias under its server, as the runbook checks.
+    let list = run_resource_cmd(&w.db, "list").await.unwrap();
+    let lines: Vec<&str> = list.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.starts_with(&format!("{TOWER}\totto-tower\tenabled")))
+        .unwrap_or_else(|| panic!("{list}"));
+    assert_eq!(lines[at + 1], alias_line, "{list}");
+    assert!(!list.lines().any(|l| l.starts_with(FACTORY)), "{list}");
+    let described = run_resource_cmd(
+        &w.db,
+        &format!("describe {TOWER} --scope-description jobs:read=Read"),
+    )
+    .await
+    .unwrap();
+    assert!(described.contains(&alias_line), "{described}");
+
+    // Registering the retired URI is refused.
+    let err = run_resource_cmd(
+        &w.db,
+        &format!("register {FACTORY} --name squatter --scopes x"),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("never reused"), "{err}");
+
+    // The rollback swaps the two back, then forward again.
+    let out = run_resource_cmd(
+        &w.db,
+        &format!("rename {TOWER} {FACTORY} --name otto-factory"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        out.contains(&format!("swapped {TOWER} -> {FACTORY}")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "  alias {TOWER}\tsunset=2099-01-01T00:00:00Z\tlive"
+        )),
+        "{out}"
+    );
+    assert_eq!(
+        introspect(&w.db, Some(&w.factory_basic()), &token).await.1["aud"],
+        FACTORY
+    );
+    run_resource_cmd(&w.db, &format!("rename {FACTORY} {TOWER}"))
+        .await
+        .unwrap();
+
+    let out = run_resource_cmd(&w.db, &format!("drop-alias {FACTORY}"))
+        .await
+        .unwrap();
+    assert!(
+        out.contains(&format!(
+            "  alias {FACTORY}\tsunset=2099-01-01T00:00:00Z\tdropped"
+        )),
+        "{out}"
+    );
+    assert!(run_resource_cmd(&w.db, "list")
+        .await
+        .unwrap()
+        .contains(&format!(
+            "  alias {FACTORY}\tsunset=2099-01-01T00:00:00Z\tdropped"
+        )));
+    assert_eq!(
+        introspect(&w.db, Some(&w.factory_basic()), &token).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(run_resource_cmd(&w.db, &format!("drop-alias {TOWER}"))
+        .await
+        .is_err());
+}
