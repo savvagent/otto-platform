@@ -125,8 +125,17 @@ pub struct IssueParams<'a> {
     pub with_refresh: bool,
 }
 
-/// Mint an access token, and optionally a refresh token.
+/// Mint an access token, and optionally a refresh token, in one transaction.
 pub async fn issue(db: &Db, p: IssueParams<'_>) -> Result<IssuedTokens> {
+    let mut tx = db.begin_unpinned().await?;
+    let issued = issue_on(tx.conn(), p).await?;
+    tx.commit().await?;
+    Ok(issued)
+}
+
+/// [`issue`] on a connection the caller holds a transaction on, so the pair
+/// commits or rolls back with the rest of it.
+async fn issue_on(conn: &mut sqlx::PgConnection, p: IssueParams<'_>) -> Result<IssuedTokens> {
     let access = crypto::generate(prefix::ACCESS);
     let expires_at = Utc::now() + Duration::minutes(ACCESS_TTL_MINUTES);
     let scopes: Vec<String> = p.scopes.to_vec();
@@ -143,7 +152,7 @@ pub async fn issue(db: &Db, p: IssueParams<'_>) -> Result<IssuedTokens> {
     .bind(&scopes)
     .bind(p.resource)
     .bind(expires_at)
-    .fetch_one(db.pool())
+    .fetch_one(&mut *conn)
     .await?;
 
     let refresh_plaintext = if p.with_refresh {
@@ -161,7 +170,7 @@ pub async fn issue(db: &Db, p: IssueParams<'_>) -> Result<IssuedTokens> {
         .bind(&scopes)
         .bind(p.resource)
         .bind(Utc::now() + Duration::days(REFRESH_TTL_DAYS))
-        .execute(db.pool())
+        .execute(&mut *conn)
         .await?;
         Some(refresh.into_plaintext())
     } else {
@@ -276,6 +285,14 @@ struct RefreshRow {
 /// and [`AuthError::InvalidGrant`] is returned. That is the correct response to
 /// a replay: either the client is buggy or the token leaked, and only one of
 /// those is safe to ignore, so we assume the other.
+///
+/// One transaction, which locks the presented token's row first (`FOR
+/// UPDATE`): a concurrent revocation (a member removal, an org deletion)
+/// either commits before the read, which then sees it and refuses, or waits
+/// for this refresh to commit, and the consume refuses a row revoked or
+/// consumed meanwhile. Any refusal rolls the successor back and leaves the
+/// presented token as it was. Lock order (`crate::resources`): this one
+/// refresh row, then new token rows; the resource server is only read.
 pub async fn redeem_refresh(
     db: &Db,
     presented: &str,
@@ -283,21 +300,24 @@ pub async fn redeem_refresh(
     requested_resource: Option<&str>,
 ) -> Result<(IssuedTokens, UserId, OrgId, bool)> {
     let hash = crypto::hash(presented.trim());
+    let mut tx = db.begin_unpinned().await?;
 
     let row: Option<RefreshRow> = sqlx::query_as(
         "SELECT id, user_id, org_id, client_id, scopes, resource, expires_at, consumed_at, revoked_at \
-         FROM refresh_tokens WHERE token_hash = $1",
+         FROM refresh_tokens WHERE token_hash = $1 FOR UPDATE",
     )
     .bind(&hash)
-    .fetch_optional(db.pool())
+    .fetch_optional(tx.conn())
     .await?;
 
     let r = row.ok_or_else(|| AuthError::InvalidGrant("unknown refresh token".into()))?;
 
     // Reuse: revoke the family before returning, so the attacker's stolen
-    // successor stops working too.
+    // successor stops working too. In this transaction, which holds one of
+    // the family's rows.
     if r.consumed_at.is_some() {
-        revoke_family(db, r.user_id, r.org_id, &r.client_id).await?;
+        revoke_family_on(tx.conn(), r.user_id, r.org_id, &r.client_id).await?;
+        tx.commit().await?;
         return Err(AuthError::InvalidGrant(
             "refresh token was already used; the token family has been revoked".into(),
         ));
@@ -333,8 +353,8 @@ pub async fn redeem_refresh(
         ));
     };
 
-    let issued = issue(
-        db,
+    let issued = issue_on(
+        tx.conn(),
         IssueParams {
             user_id: r.user_id,
             org_id: r.org_id,
@@ -346,12 +366,25 @@ pub async fn redeem_refresh(
     )
     .await?;
 
-    // Consume the presented token last, so a failure to mint the successor
-    // leaves the caller's existing token usable rather than stranding them.
-    sqlx::query("UPDATE refresh_tokens SET consumed_at = now() WHERE id = $1")
-        .bind(r.id)
-        .execute(db.pool())
-        .await?;
+    // Consume the presented token last, in the same transaction, so a
+    // failure to mint the successor leaves the caller's existing token usable
+    // rather than stranding them. Refused, rolling the successor back, if the
+    // row was revoked or consumed since it was read (the lock makes that a
+    // guard rather than a race).
+    let consumed = sqlx::query(
+        "UPDATE refresh_tokens SET consumed_at = now() \
+         WHERE id = $1 AND consumed_at IS NULL AND revoked_at IS NULL",
+    )
+    .bind(r.id)
+    .execute(tx.conn())
+    .await?
+    .rows_affected();
+    if consumed == 0 {
+        return Err(AuthError::InvalidGrant(
+            "refresh token was revoked or used while it was being redeemed".into(),
+        ));
+    }
+    tx.commit().await?;
 
     Ok((issued, r.user_id, r.org_id, false))
 }
@@ -365,7 +398,17 @@ pub async fn redeem_refresh(
 /// attacker holding a live credential.
 pub async fn revoke_family(db: &Db, user: UserId, org: OrgId, client_id: &str) -> Result<u64> {
     let mut tx = db.begin_unpinned().await?;
+    let revoked = revoke_family_on(tx.conn(), user, org, client_id).await?;
+    tx.commit().await?;
+    Ok(revoked)
+}
 
+async fn revoke_family_on(
+    conn: &mut sqlx::PgConnection,
+    user: UserId,
+    org: OrgId,
+    client_id: &str,
+) -> Result<u64> {
     let access = sqlx::query(
         "UPDATE access_tokens SET revoked_at = now() \
          WHERE user_id = $1 AND org_id = $2 AND client_id = $3 AND revoked_at IS NULL",
@@ -373,7 +416,7 @@ pub async fn revoke_family(db: &Db, user: UserId, org: OrgId, client_id: &str) -
     .bind(user)
     .bind(org)
     .bind(client_id)
-    .execute(tx.conn())
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
@@ -384,11 +427,10 @@ pub async fn revoke_family(db: &Db, user: UserId, org: OrgId, client_id: &str) -
     .bind(user)
     .bind(org)
     .bind(client_id)
-    .execute(tx.conn())
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
-    tx.commit().await?;
     Ok(access + refresh)
 }
 
@@ -569,6 +611,18 @@ async fn revoke_all_in_org_on(
     sqlx::query(
         "UPDATE refresh_tokens SET revoked_at = now() \
          WHERE user_id = $1 AND org_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(user)
+    .bind(org)
+    .execute(&mut *conn)
+    .await?;
+
+    // And codes not yet redeemed, which would otherwise mint a fresh pair:
+    // code redemption checks the org is live, not that the user is still in
+    // it.
+    sqlx::query(
+        "UPDATE authorization_codes SET consumed_at = now() \
+         WHERE user_id = $1 AND org_id = $2 AND consumed_at IS NULL",
     )
     .bind(user)
     .bind(org)
