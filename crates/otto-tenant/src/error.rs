@@ -58,3 +58,20 @@ impl Error {
         }
     }
 }
+
+/// Whether `e` is a statement that gave up waiting, so nothing it did stands
+/// and running the whole transaction again is the remedy: `lock_not_available`
+/// (55P03, a `lock_timeout`), `deadlock_detected` (40P01) or `query_canceled`
+/// (57014, a `statement_timeout` or a cancel).
+///
+/// The one classifier for the operator commands that report "busy, run it
+/// again" and for usage ingest's retriable 503, so they cannot disagree about
+/// which failures are worth a retry.
+pub fn is_retryable_lock_failure(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(d) => {
+            matches!(d.code().as_deref(), Some("55P03" | "40P01" | "57014"))
+        }
+        _ => false,
+    }
+}

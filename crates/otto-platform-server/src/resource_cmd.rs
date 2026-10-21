@@ -7,7 +7,7 @@
 //!     --scopes a,b,c [--default-scopes a] [--scope-description a=text]... \
 //!     [--service <slug>]
 //! otto-platform-server resource set-service <resource-uri> <slug>
-//! otto-platform-server resource rename-service <resource-uri> <new-slug>
+//! otto-platform-server resource rename-service <resource-uri> <new-slug> [--dry-run]
 //! otto-platform-server resource rename <old-uri> <new-uri> \
 //!     --alias-until <RFC3339> [--name <name>]
 //! otto-platform-server resource drop-alias <alias-uri>
@@ -17,8 +17,14 @@
 //! otto-platform-server resource set-webhook <resource-uri> <url>
 //! otto-platform-server resource set-webhook <resource-uri> --clear
 //! otto-platform-server resource enable|disable <resource-uri>
+//! otto-platform-server resource show <resource-uri>
 //! otto-platform-server resource list
 //! ```
+//!
+//! `show` and `list` are the read-only commands; every other one writes
+//! (`describe` included: it replaces the scope descriptions). `show` is the
+//! preflight for both renames: the server's service, its declared meters, its
+//! aliases with their state, and what would block `rename-service`.
 //!
 //! `--scope-description scope=text` (repeatable) sets the human-readable text
 //! the consent screen shows for a scope in place of its bare name. Text is
@@ -43,6 +49,8 @@
 //! queued Stripe meter event. Pause the service's usage shipping first: a
 //! batch in flight is refused (retriably) rather than stranded, and on retry a
 //! metered event under an old meter key is rejected as unknown.
+//! `rename-service --dry-run` runs the same checks in a transaction that is
+//! always rolled back, and prints what it would move or why it is refused.
 //!
 //! `rename` moves a resource server to a new canonical URI in one
 //! transaction: its tokens, authorization codes and usage dedupe ledger move
@@ -52,7 +60,8 @@
 //! `--name` also changes the name on the consent screen. Renaming back onto a
 //! live alias of the same server (`rename <new> <old>`) swaps the two URIs:
 //! the rollback, keeping the alias's sunset unless `--alias-until` is given.
-//! `drop-alias` ends an alias before its sunset. An alias row is never
+//! `drop-alias` ends an alias before its sunset, and revokes the grants still
+//! bound to it (ones a request racing the rename minted). An alias row is never
 //! deleted, and `register` and `rename` refuse any URI that is or was one, so
 //! a retired URI is never handed to another server. `list` shows each alias
 //! under its server with its sunset and state (`live`, `expired`, `dropped`).
@@ -77,15 +86,17 @@ commands:
   register <resource-uri> --name <name> --scopes a,b [--default-scopes a]
            [--scope-description a=text]... [--service <slug>]
   set-service <resource-uri> <slug>   assign the service slug its value meters are keyed by
-  rename-service <resource-uri> <new-slug>
+  rename-service <resource-uri> <new-slug> [--dry-run]
                                       move its meters, prices, pools and budgets to a new slug,
                                       while none of its usage is metered or in Stripe;
-                                      pause the service's usage shipping first
+                                      pause the service's usage shipping first. --dry-run
+                                      checks and rolls back, changing nothing
   rename <old-uri> <new-uri> --alias-until <RFC3339> [--name <name>]
                                       move it to a new canonical URI, keeping the old one as
                                       an alias until the sunset; renaming back onto a live
                                       alias swaps the two (--alias-until optional then)
-  drop-alias <alias-uri>              end an alias before its sunset
+  drop-alias <alias-uri>              end an alias before its sunset, revoking grants still
+                                      bound to it
   describe <resource-uri> [--scope-description a=text]... [--clear]
                                       replace the scope descriptions shown on the consent screen
   rotate-secret <resource-uri>        issue a new introspection credential
@@ -93,6 +104,7 @@ commands:
   set-webhook <resource-uri> --clear  remove the webhook
   enable <resource-uri>
   disable <resource-uri>
+  show <resource-uri>                 read-only: service, meters, aliases, rename-service blockers
   list
 ";
 
@@ -115,6 +127,8 @@ pub enum Command {
     RenameService {
         resource_uri: String,
         service: String,
+        /// Check and roll back, changing nothing.
+        dry_run: bool,
     },
     Rename {
         old_uri: String,
@@ -144,6 +158,10 @@ pub enum Command {
         resource_uri: String,
         disabled: bool,
     },
+    /// Read-only: everything an operator checks before a rename.
+    Show {
+        resource_uri: String,
+    },
     List,
 }
 
@@ -164,7 +182,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 let v = it.next().ok_or_else(|| format!("{a} needs a value"))?;
                 flags.push((a, Some(v)));
             }
-            "--clear" => flags.push((a, None)),
+            "--clear" | "--dry-run" => flags.push((a, None)),
             _ if a.starts_with("--") => return Err(format!("unknown flag {a}")),
             _ => positional.push(a),
         }
@@ -206,6 +224,14 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         _ => Err("expected exactly one <resource-uri>".to_owned()),
     };
 
+    // Every other command writes, so a --dry-run it ignored would be worse
+    // than a refusal.
+    if cmd != "rename-service" && flag("--dry-run").is_some() {
+        return Err(format!(
+            "{cmd} has no --dry-run; only rename-service does (`show` is the read-only preflight)"
+        ));
+    }
+
     match cmd.as_str() {
         "register" => Ok(Command::Register {
             resource_uri: one_uri(&positional)?,
@@ -230,14 +256,17 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             }),
             _ => Err("expected <resource-uri> <slug>".into()),
         },
-        // No flags: it moves money-adjacent data, so a stray one is a mistake
-        // to report rather than ignore.
+        // No flag but --dry-run: it moves money-adjacent data, so a stray one
+        // is a mistake to report rather than ignore.
         "rename-service" => match positional.as_slice() {
-            [uri, service] if flags.is_empty() => Ok(Command::RenameService {
-                resource_uri: (*uri).to_owned(),
-                service: slug(service)?,
-            }),
-            _ => Err("expected <resource-uri> <new-slug>, and no flags".into()),
+            [uri, service] if flags.iter().all(|(f, _)| *f == "--dry-run") => {
+                Ok(Command::RenameService {
+                    resource_uri: (*uri).to_owned(),
+                    service: slug(service)?,
+                    dry_run: !flags.is_empty(),
+                })
+            }
+            _ => Err("expected <resource-uri> <new-slug> [--dry-run], and no other flags".into()),
         },
         "rename" => {
             if let Some((stray, _)) = flags
@@ -304,7 +333,13 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             resource_uri: one_uri(&positional)?,
             disabled: cmd == "disable",
         }),
-        "list" if positional.is_empty() => Ok(Command::List),
+        "show" => match positional.as_slice() {
+            [uri] if flags.is_empty() => Ok(Command::Show {
+                resource_uri: (*uri).to_owned(),
+            }),
+            _ => Err("expected <resource-uri>, and no flags".into()),
+        },
+        "list" if positional.is_empty() && flags.is_empty() => Ok(Command::List),
         other => Err(format!("unknown command {other:?}")),
     }
 }
@@ -401,8 +436,15 @@ pub async fn execute(
             )?;
         }
         Command::DropAlias { alias_uri } => {
-            let alias = resources::drop_alias(db, &alias_uri).await?;
-            write_alias(out, &alias)?;
+            let dropped = resources::drop_alias(db, &alias_uri).await?;
+            write_alias(out, &dropped.alias)?;
+            let r = dropped.revoked;
+            writeln!(
+                out,
+                "revoked: {} access token(s), {} refresh token(s), {} authorization code(s) \
+                 still bound to the alias",
+                r.access_tokens, r.refresh_tokens, r.authorization_codes
+            )?;
         }
         Command::SetService {
             resource_uri,
@@ -422,26 +464,49 @@ pub async fn execute(
         Command::RenameService {
             resource_uri,
             service,
+            dry_run: false,
         } => {
             let r = resources::rename_service(db, &resource_uri, &service).await?;
-            let m = r.moved;
             writeln!(
                 out,
                 "{resource_uri} service={} (was {})",
                 r.resource.service.as_deref().unwrap_or("-"),
                 r.previous_service
             )?;
-            writeln!(
-                out,
-                "moved: {} meter(s), {} price version(s), {} usage pool(s), {} budget(s), \
-                 {} budget alert(s)",
-                m.meters, m.price_versions, m.service_pools, m.service_budgets, m.budget_alerts
-            )?;
+            writeln!(out, "moved: {}", moved_counts(&r.moved))?;
             writeln!(
                 out,
                 "its meters are now declared as {service}/<meter> (PUT /internal/meters)"
             )?;
         }
+        Command::RenameService {
+            resource_uri,
+            service,
+            dry_run: true,
+        } => {
+            // A refusal is the answer here, not a failure of the command.
+            match resources::rename_service_dry_run(db, &resource_uri, &service).await {
+                Ok(r) if r.previous_service == service => writeln!(
+                    out,
+                    "dry run: {resource_uri} already has service={service}; nothing would change"
+                )?,
+                Ok(r) => {
+                    writeln!(
+                        out,
+                        "dry run: would rename {resource_uri} service={} -> {service}",
+                        r.previous_service
+                    )?;
+                    writeln!(out, "would move: {}", moved_counts(&r.moved))?;
+                    writeln!(out, "nothing changed")?;
+                }
+                Err(e @ otto_auth::AuthError::InvalidRequest(_)) => {
+                    writeln!(out, "dry run: refused: {e}")?;
+                    writeln!(out, "nothing changed")?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Command::Show { resource_uri } => show(db, &resource_uri, out).await?,
         Command::RotateSecret { resource_uri } => {
             let secret = resources::rotate_introspection_secret(db, &resource_uri).await?;
             writeln!(out, "introspection secret for {resource_uri} (shown once):")?;
@@ -500,7 +565,76 @@ pub async fn execute(
     Ok(())
 }
 
-/// One alias, indented under its server: `  alias <uri> sunset=<RFC3339> <state>`.
+fn moved_counts(m: &resources::ServiceRenameCounts) -> String {
+    format!(
+        "{} meter(s), {} price version(s), {} usage pool(s), {} budget(s), {} budget alert(s)",
+        m.meters, m.price_versions, m.service_pools, m.service_budgets, m.budget_alerts
+    )
+}
+
+/// `resource show`: reads only.
+async fn show(db: &Db, resource_uri: &str, out: &mut impl Write) -> anyhow::Result<()> {
+    let rs = resources::get(db, resource_uri).await?.ok_or_else(|| {
+        let hint = "; `resource list` shows every server and its aliases";
+        anyhow::anyhow!("{resource_uri:?} is not a registered resource's canonical URI{hint}")
+    })?;
+    writeln!(
+        out,
+        "{}\t{}\t{}\twebhook={}\tservice={}",
+        rs.resource_uri,
+        rs.name,
+        if rs.disabled { "disabled" } else { "enabled" },
+        rs.webhook_url.as_deref().unwrap_or("-"),
+        rs.service.as_deref().unwrap_or("-"),
+    )?;
+    writeln!(out, "scopes: {}", rs.scopes.join(" "))?;
+    for alias in resources::aliases_of(db, resource_uri).await? {
+        write_alias(out, &alias)?;
+    }
+    let Some(service) = rs.service.as_deref() else {
+        writeln!(
+            out,
+            "meters: none (no service; assign one with set-service)"
+        )?;
+        return Ok(());
+    };
+    let meters = {
+        let mut tx = db.begin_unpinned().await?;
+        let meters = otto_billing::meters::list_meters(&mut tx, service).await?;
+        tx.rollback().await?;
+        meters
+    };
+    if meters.is_empty() {
+        writeln!(out, "meters: none declared")?;
+    }
+    for m in &meters {
+        writeln!(
+            out,
+            "  meter {}\t{}\tunit={}",
+            m.key, m.display_name, m.unit
+        )?;
+    }
+    let blockers = resources::service_blockers(db, service).await?;
+    let counts = blockers
+        .by_table()
+        .iter()
+        .map(|(table, n)| format!("{n} {table}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(
+        out,
+        "rename-service blockers: {counts} ({})",
+        if blockers.is_empty() {
+            "none: it may be renamed"
+        } else {
+            "it cannot be renamed"
+        }
+    )?;
+    Ok(())
+}
+
+/// One alias, indented under its server: `  alias <uri> sunset=<RFC3339> <state>`,
+/// its state by the database's clock.
 fn write_alias(out: &mut impl Write, alias: &ResourceAlias) -> std::io::Result<()> {
     writeln!(
         out,
@@ -509,7 +643,7 @@ fn write_alias(out: &mut impl Write, alias: &ResourceAlias) -> std::io::Result<(
         alias
             .sunset_at
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        alias.state(Utc::now()).as_str()
+        alias.state().as_str()
     )
 }
 
@@ -609,6 +743,18 @@ mod tests {
             Command::RenameService {
                 resource_uri: "https://x.example/mcp".into(),
                 service: "otto-tower".into(),
+                dry_run: false,
+            }
+        );
+        assert_eq!(
+            parse(&args(
+                "rename-service https://x.example/mcp otto-tower --dry-run"
+            ))
+            .unwrap(),
+            Command::RenameService {
+                resource_uri: "https://x.example/mcp".into(),
+                service: "otto-tower".into(),
+                dry_run: true,
             }
         );
         assert!(parse(&args("rename-service https://x.example/mcp")).is_err());
@@ -671,6 +817,41 @@ mod tests {
             "rename https://a.example/mcp https://b.example/mcp --service x",
         ] {
             assert!(parse(&args(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parses_show() {
+        assert_eq!(
+            parse(&args("show https://a.example/mcp")).unwrap(),
+            Command::Show {
+                resource_uri: "https://a.example/mcp".into(),
+            }
+        );
+        assert!(parse(&args("show")).is_err());
+        assert!(parse(&args("show https://a.example/mcp https://b.example/mcp")).is_err());
+        assert!(parse(&args("show https://a.example/mcp --clear")).is_err());
+        assert!(parse(&args("show https://a.example/mcp --dry-run")).is_err());
+    }
+
+    /// Only rename-service has a dry run; every other command would write
+    /// regardless, so the flag is refused rather than ignored.
+    #[test]
+    fn dry_run_is_refused_where_it_would_be_ignored() {
+        for line in [
+            "describe https://a.example/mcp --clear --dry-run",
+            "describe https://a.example/mcp --scope-description a=b --dry-run",
+            "register https://a.example/mcp --name A --scopes a --dry-run",
+            "set-service https://a.example/mcp otto-a --dry-run",
+            "rename https://a.example/mcp https://b.example/mcp --dry-run",
+            "drop-alias https://a.example/mcp --dry-run",
+            "set-webhook https://a.example/mcp --clear --dry-run",
+            "disable https://a.example/mcp --dry-run",
+            "rotate-secret https://a.example/mcp --dry-run",
+            "list --dry-run",
+        ] {
+            let err = parse(&args(line)).unwrap_err();
+            assert!(err.contains("--dry-run"), "{line}: {err}");
         }
     }
 

@@ -145,8 +145,16 @@ async fn live_org(db: &Db, org: Uuid) -> Result<Org, ApiError> {
 /// org rolls that org back whole. The caller gets a 500 and resends everything,
 /// which the dedupe makes harmless. A batch that raced a `resource
 /// rename-service` (it read the old slug, and the rename committed before it
-/// wrote) is refused the same way, as a 503 `temporarily_unavailable` rather
-/// than a 500; see [`renamed_mid_flight`].
+/// wrote), or that gave up waiting for a lock, is refused the same way, as a
+/// 503 `temporarily_unavailable` with `Retry-After` rather than a 500; see
+/// [`ingest_error`].
+///
+/// Each org's transaction waits at most [`INGEST_LOCK_TIMEOUT`] for any one
+/// lock: the org's ingest lock, the usage-ledger lock a `resource rename` of
+/// this server holds, or the tables a `rename-service` holds. Waiting longer
+/// would only hold a pooled connection while the shipper's request times out;
+/// the shipper resends after `Retry-After` instead. The lock order is in
+/// `otto_auth::resources`.
 ///
 /// An event the platform can never accept is reported in `rejected` instead
 /// of failing the batch, so one poison event cannot wedge the shipper's
@@ -226,7 +234,12 @@ async fn ingest_usage(
         }
 
         let mut tx = db.begin(OrgId::from(org)).await?;
-        usage::lock_org_ingest(&mut tx).await?;
+        sqlx::query(&format!("SET LOCAL lock_timeout = '{INGEST_LOCK_TIMEOUT}'"))
+            .execute(tx.conn())
+            .await?;
+        usage::lock_org_ingest(&mut tx)
+            .await
+            .map_err(|e| ingest_error(e.into()))?;
         // Stable, so events of one instant keep the batch's order.
         events.sort_by_key(|(ev, _)| {
             let at = period::billed_at(ev.occurred_at, now);
@@ -252,7 +265,7 @@ async fn ingest_usage(
                     &mut budgets,
                 )
                 .await
-                .map_err(renamed_mid_flight)?;
+                .map_err(ingest_error)?;
             match outcome {
                 IngestOutcome::Counted => accepted += 1,
                 IngestOutcome::Duplicate => duplicates += 1,
@@ -264,8 +277,8 @@ async fn ingest_usage(
         }
         // Budget alerts, once per service and period this batch touched. It
         // never fails the events (see `PendingBudgets::run`).
-        budgets.run(&mut tx).await?;
-        tx.commit().await?;
+        budgets.run(&mut tx).await.map_err(ingest_error)?;
+        tx.commit().await.map_err(|e| ingest_error(e.into()))?;
         receipt.accepted += accepted;
         receipt.duplicates += duplicates;
         receipt.rejected.extend(rejected);
@@ -283,31 +296,50 @@ const RENAMED_KEYS: &[&str] = &[
     "org_service_period_usage_service_registered",
 ];
 
-/// A batch that raced a service rename: retriable, not an internal error. The
-/// org's transaction is rolled back (its event ids unclaimed with it), orgs
-/// already committed come back as duplicates, and the resent batch is judged
-/// against the new slug, where a metered event under an old key is
-/// `unknown_meter` like any undeclared one.
-fn renamed_mid_flight(e: otto_core::Error) -> ApiError {
-    let raced = match &e {
-        otto_core::Error::Db(sqlx::Error::Database(d))
-        | otto_core::Error::Tenant(otto_tenant::Error::Db(sqlx::Error::Database(d))) => {
+/// How long an ingest transaction waits for any one lock before the batch is
+/// refused with a retriable 503.
+pub const INGEST_LOCK_TIMEOUT: &str = "5s";
+
+/// An ingest failure worth a retry is a 503, not an internal error: a batch
+/// that raced a service rename, or one that gave up waiting for a lock
+/// ([`otto_tenant::is_retryable_lock_failure`]: a lock timeout, a deadlock,
+/// a cancel). The org's transaction is rolled back (its event ids unclaimed
+/// with it), orgs already committed come back as duplicates, and the resent
+/// batch is judged afresh: after a service rename, against the new slug,
+/// where a metered event under an old key is `unknown_meter` like any
+/// undeclared one.
+fn ingest_error(e: otto_core::Error) -> ApiError {
+    let db = match &e {
+        otto_core::Error::Db(d) | otto_core::Error::Tenant(otto_tenant::Error::Db(d)) => Some(d),
+        _ => None,
+    };
+    let raced = db.is_some_and(|d| match d {
+        sqlx::Error::Database(d) => {
             d.is_foreign_key_violation()
                 && d.constraint().is_some_and(|c| RENAMED_KEYS.contains(&c))
         }
         _ => false,
-    };
+    });
     if raced {
         tracing::warn!(error = %e, "usage batch raced a service rename; asking for a retry");
-        ApiError::Unavailable(
+        return ApiError::Unavailable(
             "this resource server's service was renamed while the batch was being counted; \
              one org's events were not recorded, resend the whole batch (events already \
              recorded come back as duplicates)"
                 .into(),
-        )
-    } else {
-        ApiError::from(e)
+        );
     }
+    if db.is_some_and(otto_tenant::is_retryable_lock_failure) {
+        tracing::warn!(error = %e, "usage batch gave up waiting for a lock; asking for a retry");
+        return ApiError::Unavailable(
+            "the platform was busy with this resource server's usage (a rename, or another \
+             batch for the same org) and gave up waiting; one org's events were not \
+             recorded, resend the whole batch (events already recorded come back as \
+             duplicates)"
+                .into(),
+        );
+    }
+    ApiError::from(e)
 }
 
 /// The meter keys `service` has declared, read only when the batch names a

@@ -6,7 +6,13 @@
 -- foreign keys that name it follow by ON UPDATE CASCADE) and records `<old>`
 -- here, pointing at the server. Until `sunset_at`, and unless dropped, the old
 -- URI still authenticates the resource server at introspection; past either,
--- it behaves exactly like a URI that was never registered.
+-- a client or resource server naming it is refused exactly like a URI that
+-- was never registered. (A grant already stored under it still belongs to its
+-- server, see `otto_auth::resources::audience_matches_sql`, until
+-- `resource drop-alias` revokes it.)
+--
+-- Lock order: the canonical statement is the "Lock order" section of
+-- `otto_auth::resources`'s module docs; the functions below follow it.
 --
 -- Rows are tombstones and are never deleted (a trigger below refuses it).
 -- `register` and `rename` refuse any URI found here, live, expired or dropped,
@@ -66,31 +72,48 @@ EXCEPTION WHEN insufficient_privilege THEN
   RAISE NOTICE 'could not revoke otto_app''s access to resource_server_aliases';
 END $$;
 
+-- The revoke above only notices a failure, so prove the outcome: tenant code
+-- able to write aliases could point a retired URI at another server.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'otto_app')
+     AND has_table_privilege('otto_app', 'resource_server_aliases',
+                             'SELECT, INSERT, UPDATE, DELETE, TRUNCATE') THEN
+    RAISE EXCEPTION 'otto_app still has privileges on resource_server_aliases; revoke them before migrating';
+  END IF;
+END $$;
+
 -- Dedupe is keyed by the canonical URI, and a rename must not let one event
 -- be claimed under both URIs. The rename rewrites the ledger in its
 -- transaction; this function keeps claims from slipping past that rewrite.
 --
--- Every claim first takes the usage-ledger advisory lock (key
--- 8031172057417213031, `otto_auth::resources::USAGE_LEDGER_LOCK`) SHARED,
--- held until the claiming transaction ends. `resource rename` takes it
--- EXCLUSIVE before it reads or writes anything else of the server's, so:
+-- Every claim first takes the usage-ledger advisory lock of the URI it names
+-- SHARED: the two-key `(5574658, hashtext(uri))`, first key
+-- `otto_auth::resources::USAGE_LEDGER_LOCK_NAMESPACE` (0x00551002), apart from
+-- the org ingest lock's `0x00551001` (`otto_billing::usage`), held until the
+-- claiming transaction ends. `resource rename` takes it EXCLUSIVE for every
+-- URI of the server it moves (the old canonical URI, the new one, and every
+-- alias) before it touches the server's row, so:
 --
---   - it waits for every claim in flight to commit or abort, and its ledger
---     rewrite then sees what they wrote;
+--   - it waits for every claim in flight under any of them to commit or
+--     abort, and its ledger rewrite then sees what they wrote;
 --   - a claim arriving while the rename runs waits for it, and only then
 --     resolves its URI (next statement, fresh snapshot), finding the new
 --     alias and so the new canonical URI.
+--
+-- A claim names one of those URIs or none: ingest passes the canonical URI it
+-- read when the batch authenticated, which is the server's URI before or
+-- after any rename, and the alias set is fixed while the rename holds the URI
+-- namespace lock. Claims for every other server take other keys and never
+-- wait for it (two URIs whose hashes collide only wait for each other, which
+-- is harmless).
 --
 -- The URI is resolved through any alias, live or not (an alias only ever
 -- names its own server), so a batch authenticated before a rename, still
 -- carrying the old URI, files its later events under the new one.
 --
--- No deadlock: while it waits for the lock the rename holds only its other
--- advisory lock (the URI namespace), which no claimer takes, and claimers take
--- this lock before any row the rename will touch. `rename_service` (0024) does
--- not take it, so its lock order with ingest is unchanged.
---
--- Same signature, so 0009's grants stand.
+-- Same signature, so 0009's grants stand, and a binary from before this
+-- migration keeps working against it.
 CREATE OR REPLACE FUNCTION claim_usage_event(p_resource_uri text, p_event_id uuid, p_org_id uuid)
 RETURNS text
 LANGUAGE plpgsql
@@ -101,7 +124,7 @@ DECLARE
   v_uri text;
   existing uuid;
 BEGIN
-  PERFORM pg_advisory_xact_lock_shared(8031172057417213031);
+  PERFORM pg_advisory_xact_lock_shared(5574658, hashtext(p_resource_uri));
 
   SELECT a.resource_uri INTO v_uri
     FROM resource_server_aliases a
@@ -126,3 +149,32 @@ BEGIN
   RETURN 'org_mismatch';
 END
 $$;
+
+-- The canonical URI `p_uri` names: the server it is an alias of (live or
+-- not, by the same rule as the claim above), or `p_uri` itself. Ingest writes
+-- `usage_events.resource_uri` through it, in the statement after the claim,
+-- so an event claimed under the new URI by a batch authenticated before the
+-- rename is recorded under the new URI too. Rows written before a rename keep
+-- the URI they were written under. SECURITY DEFINER because `otto_app`, which
+-- ingest runs as, has no access to the alias table; it reveals only which
+-- server a URI names, which authorization already answers publicly.
+CREATE FUNCTION canonical_resource_uri(p_uri text)
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+  SELECT coalesce(
+    (SELECT a.resource_uri FROM resource_server_aliases a WHERE a.alias_uri = p_uri),
+    p_uri)
+$$;
+
+REVOKE ALL ON FUNCTION canonical_resource_uri(text) FROM PUBLIC;
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'otto_app') THEN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION canonical_resource_uri(text) TO otto_app';
+  END IF;
+END $$;

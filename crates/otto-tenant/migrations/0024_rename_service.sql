@@ -70,6 +70,17 @@
 -- paused nothing should hold these tables, so any wait means the precondition
 -- was not met.
 --
+-- Lock order. The canonical statement of every lock order these functions
+-- take part in (ingest, rename-service, rename, register, set-service, the
+-- user paths) is the "Lock order" section of `otto_auth::resources`'s module
+-- docs; keep this function and that section in step.
+--
+-- A statement timeout. A function's own `SET statement_timeout` does not bound
+-- the statement that calls it (Postgres arms the timer when that statement
+-- starts), so the callers do: `otto_auth::resources::rename_service` runs it
+-- under `SET LOCAL statement_timeout = '30s'`, and so should anyone calling it
+-- by hand.
+--
 -- A change to `set-service` too. The service foreign keys cascade, so a slug
 -- changed with `set-service` (only possible while the service has declared
 -- no meters, so it has no budgets) now carries the service's unmetered usage
@@ -121,6 +132,74 @@ BEGIN
   END LOOP;
 END $$;
 
+-- Counts the rows that record money under the meters of service `p_service`,
+-- by table: what makes `rename_service` refuse. Read-only, and the preflight
+-- `resource show` prints. SECURITY DEFINER for the same reason as
+-- `rename_service` (below): a plain operator transaction would see none of
+-- the row-level-secured rows and count nothing. It opens the
+-- `app.service_rename` policies for its own reads and puts the setting back as
+-- it found it, so `rename_service`, which calls it with them open, keeps them
+-- open.
+--
+-- Errors: 0A000 called from an org-pinned transaction.
+CREATE FUNCTION service_rename_blockers(p_service text)
+RETURNS TABLE (
+  usage_events bigint,
+  org_meter_period_usage bigint,
+  stripe_meters bigint,
+  stripe_prices bigint,
+  stripe_meter_outbox bigint
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_prev text := coalesce(current_setting('app.service_rename', true), '');
+  v_prefix text;
+  -- `otto_billing::stripe::meter_event_name` maps a key two ways (see
+  -- event_name.rs). These match exactly the names it gives a `<service>/`
+  -- meter: plain is `<service, - as _>__<meter with no __>`, and exists only
+  -- for a service with no `--` that does not end in `-`; escaped is
+  -- `<service, - as _h>___<meter, _ as _u>`. Matching the encoding rather
+  -- than the declared meters also catches a row for a key never declared.
+  v_plain text;
+  v_escaped text;
+  n_usage bigint;
+  n_meter_usage bigint;
+  n_stripe_meters bigint;
+  n_stripe_prices bigint;
+  n_outbox bigint;
+BEGIN
+  IF current_org() IS NOT NULL THEN
+    RAISE EXCEPTION 'service_rename_blockers must run in an unpinned transaction'
+      USING ERRCODE = '0A000';
+  END IF;
+  PERFORM set_config('app.service_rename', 'on', true);
+
+  -- A slug has no LIKE metacharacters (`_` is not allowed in one), so the
+  -- prefix needs no escaping.
+  v_prefix := p_service || '/';
+  SELECT count(*) INTO n_usage FROM usage_events e WHERE e.meter LIKE v_prefix || '%';
+  SELECT count(*) INTO n_meter_usage
+    FROM org_meter_period_usage u WHERE u.meter LIKE v_prefix || '%';
+  SELECT count(*) INTO n_stripe_meters FROM stripe_meters s WHERE s.meter LIKE v_prefix || '%';
+  SELECT count(*) INTO n_stripe_prices FROM stripe_prices s WHERE s.meter LIKE v_prefix || '%';
+
+  IF p_service !~ '--' AND p_service !~ '-$' THEN
+    v_plain := '^' || replace(p_service, '-', '_') || '__[a-z]([a-z0-9]|_[a-z0-9])*_?$';
+  END IF;
+  v_escaped := '^' || replace(p_service, '-', '_h') || '___[a-z]([a-z0-9]|_u)*$';
+  SELECT count(*) INTO n_outbox
+    FROM stripe_meter_outbox o
+   WHERE o.event_name ~ v_escaped
+      OR (v_plain IS NOT NULL AND o.event_name ~ v_plain);
+
+  PERFORM set_config('app.service_rename', v_prev, true);
+  RETURN QUERY SELECT n_usage, n_meter_usage, n_stripe_meters, n_stripe_prices, n_outbox;
+END
+$$;
+
 -- Re-keys the service of the resource server `p_resource_uri` to `p_new` and
 -- returns the slug it had and how many rows of each kind moved. Renaming to
 -- the slug it already has is a no-op that moves nothing.
@@ -154,14 +233,6 @@ AS $$
 DECLARE
   v_old text;
   v_prefix text;
-  -- `otto_billing::stripe::meter_event_name` maps a key two ways (see
-  -- event_name.rs). These match exactly the names it gives an `<old>/` meter:
-  -- plain is `<service, - as _>__<meter with no __>`, and exists only for a
-  -- service with no `--` that does not end in `-`; escaped is
-  -- `<service, - as _h>___<meter, _ as _u>`. Matching the encoding rather
-  -- than the declared meters also catches a row for a key never declared.
-  v_plain text;
-  v_escaped text;
   n_usage bigint;
   n_meter_usage bigint;
   n_stripe_meters bigint;
@@ -242,23 +313,11 @@ BEGIN
       USING ERRCODE = '23505';
   END IF;
 
-  -- A slug has no LIKE metacharacters (`_` is not allowed in one), so the
-  -- prefix needs no escaping.
   v_prefix := v_old || '/';
-  SELECT count(*) INTO n_usage FROM usage_events e WHERE e.meter LIKE v_prefix || '%';
-  SELECT count(*) INTO n_meter_usage
-    FROM org_meter_period_usage u WHERE u.meter LIKE v_prefix || '%';
-  SELECT count(*) INTO n_stripe_meters FROM stripe_meters s WHERE s.meter LIKE v_prefix || '%';
-  SELECT count(*) INTO n_stripe_prices FROM stripe_prices s WHERE s.meter LIKE v_prefix || '%';
-
-  IF v_old !~ '--' AND v_old !~ '-$' THEN
-    v_plain := '^' || replace(v_old, '-', '_') || '__[a-z]([a-z0-9]|_[a-z0-9])*_?$';
-  END IF;
-  v_escaped := '^' || replace(v_old, '-', '_h') || '___[a-z]([a-z0-9]|_u)*$';
-  SELECT count(*) INTO n_outbox
-    FROM stripe_meter_outbox o
-   WHERE o.event_name ~ v_escaped
-      OR (v_plain IS NOT NULL AND o.event_name ~ v_plain);
+  SELECT b.usage_events, b.org_meter_period_usage, b.stripe_meters, b.stripe_prices,
+         b.stripe_meter_outbox
+    INTO n_usage, n_meter_usage, n_stripe_meters, n_stripe_prices, n_outbox
+    FROM service_rename_blockers(v_old) b;
 
   IF n_usage > 0 THEN
     blockers := blockers || format('%s usage_events', n_usage);
@@ -327,13 +386,31 @@ $$;
 -- An operator action: the CLI calls it as the connecting role. Tenant code
 -- (otto_app) must never be able to move another service's meters, so it gets
 -- no EXECUTE, and 0004's blanket grant ran before this function existed.
+-- `service_rename_blockers` reads every org's billing rows, so likewise.
 REVOKE ALL ON FUNCTION rename_service(text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION service_rename_blockers(text) FROM PUBLIC;
 
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'otto_app') THEN
     EXECUTE 'REVOKE ALL ON FUNCTION rename_service(text, text) FROM otto_app';
+    EXECUTE 'REVOKE ALL ON FUNCTION service_rename_blockers(text) FROM otto_app';
   END IF;
 EXCEPTION WHEN insufficient_privilege THEN
   RAISE NOTICE 'could not revoke otto_app''s access to rename_service';
+END $$;
+
+-- The revoke above only notices a failure, so prove the outcome: a migration
+-- that left tenant code able to move every service's meters, or read every
+-- org's billing counts, must not boot.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'otto_app') THEN
+    IF has_function_privilege('otto_app', 'rename_service(text, text)', 'EXECUTE') THEN
+      RAISE EXCEPTION 'otto_app can still EXECUTE rename_service(text, text); revoke it (and from PUBLIC) before migrating';
+    END IF;
+    IF has_function_privilege('otto_app', 'service_rename_blockers(text)', 'EXECUTE') THEN
+      RAISE EXCEPTION 'otto_app can still EXECUTE service_rename_blockers(text); revoke it (and from PUBLIC) before migrating';
+    END IF;
+  END IF;
 END $$;

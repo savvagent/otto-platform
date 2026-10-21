@@ -140,7 +140,7 @@ async fn a_rename_moves_the_canonical_uri_and_everything_that_names_it(pool: PgP
     assert_eq!(r.alias.alias_uri, OLD);
     assert_eq!(r.alias.resource_uri, NEW);
     assert_eq!(r.alias.sunset_at.timestamp(), until.timestamp());
-    assert_eq!(r.alias.state(Utc::now()), AliasState::Live);
+    assert_eq!(r.alias.state(), AliasState::Live);
     assert_eq!(r.rewritten.access_tokens, 1);
     assert_eq!(r.rewritten.refresh_tokens, 1);
     assert_eq!(r.rewritten.authorization_codes, 1);
@@ -359,13 +359,13 @@ async fn drop_alias_marks_it_dropped_once(pool: PgPool) {
         .unwrap();
 
     let dropped = resources::drop_alias(&db, OLD).await.unwrap();
-    assert_eq!(dropped.state(Utc::now()), AliasState::Dropped);
-    let at = dropped.dropped_at.unwrap();
+    assert_eq!(dropped.alias.state(), AliasState::Dropped);
+    let at = dropped.alias.dropped_at.unwrap();
     assert!(resources::resolve(&db, OLD).await.unwrap().is_none());
 
     // Again is a no-op that keeps the first time.
     let again = resources::drop_alias(&db, OLD).await.unwrap();
-    assert_eq!(again.dropped_at, Some(at));
+    assert_eq!(again.alias.dropped_at, Some(at));
 
     // Not an alias at all.
     for uri in [NEW, "https://nobody.example/mcp"] {
@@ -376,6 +376,69 @@ async fn drop_alias_marks_it_dropped_once(pool: PgPool) {
         resources::aliases_of(&db, NEW).await.unwrap()[0].alias_uri,
         OLD
     );
+}
+
+/// Grants minted under the old URI by a request that raced the rename stay
+/// good for the server while the alias lives or merely expires; dropping it
+/// revokes them in the same transaction, so a dropped alias leaves no live
+/// credential bound to it. Grants under the canonical URI are untouched, and
+/// dropping again is safe.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn drop_alias_revokes_the_grants_still_bound_to_it(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    register(&db, OLD, "otto-factory").await;
+    let (user, org) = member(&db).await;
+    resources::rename(&db, OLD, NEW, Some(sunset()), None)
+        .await
+        .unwrap();
+    let raced = token(&db, user, org, OLD).await;
+    code(&db, user, org, OLD).await;
+    let canonical = token(&db, user, org, NEW).await;
+    code(&db, user, org, NEW).await;
+    assert!(tokens::introspect(&db, &raced, NEW).await.is_ok());
+
+    let dropped = resources::drop_alias(&db, OLD).await.unwrap();
+    assert_eq!(
+        dropped.revoked,
+        resources::GrantRevocations {
+            access_tokens: 1,
+            refresh_tokens: 1,
+            authorization_codes: 1,
+        }
+    );
+    assert!(tokens::introspect(&db, &raced, NEW).await.is_err());
+    assert!(tokens::introspect(&db, &canonical, NEW).await.is_ok());
+    let usable = |table: &'static str, cond: &'static str| {
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(&format!(
+                "SELECT count(*) FROM {table} WHERE resource = $1 AND {cond}"
+            ))
+            .bind(OLD)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(usable("access_tokens", "revoked_at IS NULL").await, 0);
+    assert_eq!(usable("refresh_tokens", "revoked_at IS NULL").await, 0);
+    assert_eq!(
+        usable("authorization_codes", "consumed_at IS NULL").await,
+        0
+    );
+    let live_canonical_codes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM authorization_codes WHERE resource = $1 AND consumed_at IS NULL",
+    )
+    .bind(NEW)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(live_canonical_codes, 1);
+
+    // Again: nothing left to revoke, the first drop time kept.
+    let again = resources::drop_alias(&db, OLD).await.unwrap();
+    assert_eq!(again.revoked, resources::GrantRevocations::default());
+    assert_eq!(again.alias.dropped_at, dropped.alias.dropped_at);
 }
 
 // ---- the swap rollback ----
@@ -534,13 +597,16 @@ async fn a_token_minted_under_the_old_uri_after_the_rename_is_still_good(pool: P
     let late = token(&db, user, org, OLD).await;
     assert_eq!(count(&db, "access_tokens", "resource", OLD).await, 1);
     assert!(tokens::introspect(&db, &late, NEW).await.is_ok());
-    // Still only for its own server, and even once the alias is dropped.
+    // Still only for its own server, and still good once the alias expires.
     assert!(matches!(
         tokens::introspect(&db, &late, FLAGS).await,
         Err(AuthError::WrongAudience)
     ));
-    resources::drop_alias(&db, OLD).await.unwrap();
+    expire(&db, OLD).await;
     assert!(tokens::introspect(&db, &late, NEW).await.is_ok());
+    // Dropping the alias revokes it (see `drop_alias_revokes_the_grants_still_bound_to_it`).
+    resources::drop_alias(&db, OLD).await.unwrap();
+    assert!(tokens::introspect(&db, &late, NEW).await.is_err());
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]

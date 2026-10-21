@@ -2993,6 +2993,42 @@ async fn tenant_pinned_code_cannot_rename_a_service(pool: PgPool) {
     assert!(err.to_string().contains("permission denied"), "{err}");
 }
 
+/// Tenant code gets none of the operator functions or the alias table, and
+/// the migrations prove it (they refuse to finish otherwise); ingest gets the
+/// canonical-URI lookup it writes usage through.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn tenant_code_holds_no_rename_privileges_after_migrating(pool: PgPool) {
+    let (rename, blockers, aliases, canonical): (bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT has_function_privilege('otto_app', 'rename_service(text, text)', 'EXECUTE'), \
+                has_function_privilege('otto_app', 'service_rename_blockers(text)', 'EXECUTE'), \
+                has_table_privilege('otto_app', 'resource_server_aliases', \
+                                    'SELECT, INSERT, UPDATE, DELETE, TRUNCATE'), \
+                has_function_privilege('otto_app', 'canonical_resource_uri(text)', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!rename, "otto_app may execute rename_service");
+    assert!(!blockers, "otto_app may execute service_rename_blockers");
+    assert!(
+        !aliases,
+        "otto_app has privileges on resource_server_aliases"
+    );
+    assert!(
+        canonical,
+        "ingest (otto_app) cannot resolve a canonical URI"
+    );
+
+    // And the blocker counts refuse a pinned transaction, as the rename does.
+    let w = metered_world(pool).await;
+    let mut tx = w.db.begin(w.org).await.unwrap();
+    let err = sqlx::query("SELECT * FROM service_rename_blockers('otto-factory')")
+        .fetch_all(tx.conn())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("permission denied"), "{err}");
+}
+
 /// The managed-Postgres shape, where neither the operator's role nor the
 /// function's owner is a superuser or BYPASSRLS, so every FORCE ROW LEVEL
 /// SECURITY table applies its policies to both. A plain query there sees no
@@ -3034,6 +3070,9 @@ async fn a_blocker_in_another_org_is_seen_without_an_rls_exemption(pool: PgPool)
              org_service_period_usage, service_budgets, budget_alerts TO {ROLE}"
         ),
         format!("ALTER FUNCTION rename_service(text, text) OWNER TO {ROLE}"),
+        // It counts the blockers through this one, which must not be the
+        // exempt superuser either.
+        format!("ALTER FUNCTION service_rename_blockers(text) OWNER TO {ROLE}"),
     ] {
         sqlx::query(&stmt).execute(db).await.unwrap();
     }
@@ -3873,13 +3912,17 @@ async fn a_claim_during_a_uri_rename_waits_and_files_under_the_new_uri(pool: PgP
     .await;
     assert_eq!(r["accepted"], 1);
 
-    // The rename's steps, held open.
+    // The rename's steps, held open: the ledger locks of both URIs, as
+    // `resources::rename` takes them, then its writes.
     let mut renaming = w.db.pool().begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(resources::USAGE_LEDGER_LOCK)
-        .execute(&mut *renaming)
-        .await
-        .unwrap();
+    for uri in [FACTORY, TOWER] {
+        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+            .bind(resources::USAGE_LEDGER_LOCK_NAMESPACE)
+            .bind(uri)
+            .execute(&mut *renaming)
+            .await
+            .unwrap();
+    }
     for (sql, binds) in [
         (
             "UPDATE resource_servers SET resource_uri = $2 WHERE resource_uri = $1",
@@ -3904,24 +3947,411 @@ async fn a_claim_during_a_uri_rename_waits_and_files_under_the_new_uri(pool: PgP
     }
 
     // The old binary resends the event under the old URI, which (as far as
-    // anything committed says) is still canonical.
+    // anything committed says) is still canonical, with a new one.
+    let fresh = Uuid::new_v4();
     let db = w.db.clone();
     let auth = w.factory_basic();
     let org = w.org;
     let resend = tokio::spawn(async move {
-        post_usage(&db, &auth, vec![usage_event(org, None, event, true)]).await
+        post_usage(
+            &db,
+            &auth,
+            vec![
+                usage_event(org, None, event, true),
+                usage_event(org, None, fresh, true),
+            ],
+        )
+        .await
     });
     assert!(waiting_on_a_lock(w.db.pool(), &resend).await);
     renaming.commit().await.unwrap();
     let (status, r) = resend.await.unwrap();
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(r, json!({ "accepted": 0, "duplicates": 1, "rejected": [] }));
+    assert_eq!(r, json!({ "accepted": 1, "duplicates": 1, "rejected": [] }));
     assert_eq!(
         rows_with(&w.db, "usage_event_ids", "resource_uri", FACTORY).await,
         0
     );
     assert_eq!(
         rows_with(&w.db, "usage_event_ids", "resource_uri", TOWER).await,
+        2
+    );
+    // The new event's usage row is canonical too, though its batch
+    // authenticated as the old URI; the one shipped before keeps its URI.
+    let shipped_under: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT resource_uri FROM usage_events ORDER BY created_at")
+            .fetch_all(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        shipped_under,
+        [Some(FACTORY.to_owned()), Some(TOWER.to_owned())]
+    );
+}
+
+// ------------------------------------------------ lock order (otto_auth::resources)
+
+/// An org deletion revokes the org's tokens, then enqueues its lifecycle
+/// event, which takes `FOR KEY SHARE` on every resource server row with a
+/// webhook. A URI rename started in between waits for the deletion's token
+/// rows without holding the server's row, so the deletion's event goes
+/// through and both commit. (Locking the server's row first deadlocked here.)
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_uri_rename_and_an_org_deletion_do_not_deadlock(pool: PgPool) {
+    use otto_core::lifecycle::{self, LifecycleEvent};
+
+    let w = world(pool).await;
+    resources::set_webhook(&w.db, &cipher(), FACTORY, Some("https://hooks.example/h"))
+        .await
+        .unwrap();
+    let token = w.oauth_token(FACTORY, &["jobs:read"]).await;
+
+    // `delete_org`'s steps, held open before its event.
+    let mut deleting = w.db.begin(w.org).await.unwrap();
+    sqlx::query("UPDATE orgs SET deleted_at = now() WHERE id = $1")
+        .bind(w.org)
+        .execute(deleting.conn())
+        .await
+        .unwrap();
+    for table in ["access_tokens", "refresh_tokens"] {
+        sqlx::query(&format!(
+            "UPDATE {table} SET revoked_at = now() WHERE org_id = $1 AND revoked_at IS NULL"
+        ))
+        .bind(w.org)
+        .execute(deleting.conn())
+        .await
+        .unwrap();
+    }
+
+    let db = w.db.clone();
+    let rename = tokio::spawn(async move {
+        resources::rename(&db, FACTORY, TOWER, Some(alias_sunset()), None).await
+    });
+    assert!(waiting_on_a_lock(w.db.pool(), &rename).await);
+
+    lifecycle::enqueue(deleting.conn(), &LifecycleEvent::OrgDeleted { org: w.org })
+        .await
+        .expect("the deletion's event must not wait on the rename");
+    deleting.commit().await.unwrap();
+    let renamed = rename
+        .await
+        .unwrap()
+        .expect("the rename finishes after the deletion");
+    // The token was revoked by then, so nothing usable was left to rewrite.
+    assert_eq!(renamed.rewritten.access_tokens, 0);
+    assert_eq!(
+        introspect(&w.db, Some(&basic(TOWER, &w.factory_secret)), &token)
+            .await
+            .1["active"],
+        false
+    );
+    // The deletion's delivery moved with the server.
+    assert_eq!(
+        rows_with(&w.db, "webhook_deliveries", "resource_uri", TOWER).await,
         1
     );
+}
+
+/// The member-removal route revokes the member's tokens before it enqueues
+/// the event, the same order, so it cannot deadlock with a rename either.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_uri_rename_and_a_member_removal_do_not_deadlock(pool: PgPool) {
+    use otto_core::lifecycle::{self, LifecycleEvent};
+
+    let w = world(pool).await;
+    resources::set_webhook(&w.db, &cipher(), FACTORY, Some("https://hooks.example/h"))
+        .await
+        .unwrap();
+    w.oauth_token(FACTORY, &["jobs:read"]).await;
+
+    let mut removing = w.db.begin(w.org).await.unwrap();
+    otto_auth::tokens::revoke_all_in_org_tx(removing.conn(), w.user, w.org)
+        .await
+        .unwrap();
+    let db = w.db.clone();
+    let rename = tokio::spawn(async move {
+        resources::rename(&db, FACTORY, TOWER, Some(alias_sunset()), None).await
+    });
+    assert!(waiting_on_a_lock(w.db.pool(), &rename).await);
+    lifecycle::enqueue(
+        removing.conn(),
+        &LifecycleEvent::MemberRemoved {
+            org: w.org,
+            user: w.user,
+        },
+    )
+    .await
+    .unwrap();
+    removing.commit().await.unwrap();
+    rename.await.unwrap().unwrap();
+}
+
+/// The usage-ledger lock is per URI: a rename queued behind one server's
+/// claim in flight holds up only that server. Another server's ingest goes
+/// straight through (with one global lock it queued behind the rename's
+/// exclusive request).
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_uri_rename_does_not_hold_up_another_servers_ingest(pool: PgPool) {
+    let w = world(pool).await;
+    assert_ne!(
+        resources::USAGE_LEDGER_LOCK_NAMESPACE,
+        otto_billing::usage::INGEST_LOCK_NAMESPACE,
+        "the two two-key advisory locks must not share a key space"
+    );
+    let ingest = open_unmetered_ingest(&w, FACTORY, Uuid::new_v4()).await;
+    let db = w.db.clone();
+    let rename = tokio::spawn(async move {
+        resources::rename(&db, FACTORY, TOWER, Some(alias_sunset()), None).await
+    });
+    assert!(waiting_on_a_lock(w.db.pool(), &rename).await);
+
+    // Another org, so the open ingest's org lock is not what it waits for.
+    let other = w.db.create_org("globex", "Globex").await.unwrap().id;
+    let (status, r) = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        post_usage(
+            &w.db,
+            &w.flags_basic(),
+            vec![usage_event(other, None, Uuid::new_v4(), true)],
+        ),
+    )
+    .await
+    .expect("otto-flags' ingest waited for otto-factory's rename");
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(r["accepted"], 1);
+
+    assert!(!rename.is_finished());
+    ingest.commit().await.unwrap();
+    rename.await.unwrap().unwrap();
+}
+
+/// An ingest that waits past its lock timeout (here for a rename's ledger
+/// lock held open) gives up with a retriable 503 rather than a 500, having
+/// recorded nothing, and the resend after the rename is counted once.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_ingest_that_waits_too_long_is_a_retriable_503(pool: PgPool) {
+    let w = world(pool).await;
+    let mut renaming = w.db.pool().begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(resources::USAGE_LEDGER_LOCK_NAMESPACE)
+        .bind(FACTORY)
+        .execute(&mut *renaming)
+        .await
+        .unwrap();
+
+    let event = usage_event(w.org, None, Uuid::new_v4(), true);
+    let (status, body) = post_usage(&w.db, &w.factory_basic(), vec![event.clone()]).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "temporarily_unavailable", "{body}");
+    assert_eq!(
+        rows_with(&w.db, "usage_event_ids", "resource_uri", FACTORY).await,
+        0
+    );
+
+    renaming.rollback().await.unwrap();
+    let (status, r) = post_usage(&w.db, &w.factory_basic(), vec![event]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r, json!({ "accepted": 1, "duplicates": 0, "rejected": [] }));
+}
+
+/// `set-service` takes the service tables before the server's row, as
+/// rename-service does: with a rename-service's table lock held, it waits on
+/// the table without holding the row, so the rename-service's next step (the
+/// row) goes through instead of deadlocking.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn set_service_and_rename_service_take_locks_in_one_order(pool: PgPool) {
+    let w = world(pool).await;
+    let mut renaming = w.db.pool().begin().await.unwrap();
+    sqlx::query(
+        "LOCK TABLE org_service_period_usage, service_budgets, budget_alerts \
+         IN SHARE ROW EXCLUSIVE MODE",
+    )
+    .execute(&mut *renaming)
+    .await
+    .unwrap();
+
+    let db = w.db.clone();
+    let set = tokio::spawn(async move { resources::set_service(&db, FACTORY, "otto-a").await });
+    assert!(waiting_on_a_lock(w.db.pool(), &set).await);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        sqlx::query("SELECT 1 FROM resource_servers WHERE resource_uri = $1 FOR UPDATE")
+            .bind(FACTORY)
+            .execute(&mut *renaming),
+    )
+    .await
+    .expect("set-service held the row while waiting for the tables")
+    .unwrap();
+    renaming.commit().await.unwrap();
+    let rs = set.await.unwrap().unwrap();
+    assert_eq!(rs.service.as_deref(), Some("otto-a"));
+}
+
+// ------------------------------------------------ read-only preflight
+
+/// `show` reads only: the service, its meters, its aliases and what blocks
+/// rename-service, and it changes nothing (unlike `describe`, which writes).
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_operator_cli_shows_a_resource_server_without_changing_it(pool: PgPool) {
+    let w = metered_world(pool).await;
+    resources::set_scope_descriptions(&w.db, FACTORY, &[("jobs:read", "Read jobs")])
+        .await
+        .unwrap();
+    let before = resources::get(&w.db, FACTORY).await.unwrap().unwrap();
+
+    let out = run_resource_cmd(&w.db, &format!("show {FACTORY}"))
+        .await
+        .unwrap();
+    assert!(
+        out.starts_with(&format!(
+            "{FACTORY}\totto-factory\tenabled\twebhook=-\tservice=otto-factory\n"
+        )),
+        "{out}"
+    );
+    assert!(out.contains("scopes: jobs:read admin"), "{out}");
+    assert!(
+        out.contains(&format!("  meter {JOBS}\tJobs completed\tunit=job")),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "rename-service blockers: 0 usage_events, 0 org_meter_period_usage, \
+             0 stripe_meters, 0 stripe_prices, 0 stripe_meter_outbox (none: it may be renamed)"
+        ),
+        "{out}"
+    );
+
+    // A metered event in another org is a blocker it counts.
+    let other = w.db.create_org("globex", "Globex").await.unwrap().id;
+    let (_, r) = post_usage(
+        &w.db,
+        &w.factory_basic(),
+        vec![metered(other, JOBS, Some(2))],
+    )
+    .await;
+    assert_eq!(r["accepted"], 1, "{r}");
+    let out = run_resource_cmd(&w.db, &format!("show {FACTORY}"))
+        .await
+        .unwrap();
+    assert!(
+        out.contains("blockers: 1 usage_events, 1 org_meter_period_usage"),
+        "{out}"
+    );
+    assert!(out.contains("(it cannot be renamed)"), "{out}");
+
+    // Aliases, with their state.
+    rename_factory(&w).await;
+    let out = run_resource_cmd(&w.db, &format!("show {TOWER}"))
+        .await
+        .unwrap();
+    assert!(
+        out.contains(&format!("  alias {FACTORY}\tsunset=")),
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with(&format!("  alias {FACTORY}")) && l.ends_with("\tlive")),
+        "{out}"
+    );
+    // By its canonical URI only.
+    assert!(run_resource_cmd(&w.db, &format!("show {FACTORY}"))
+        .await
+        .is_err());
+
+    // Nothing it read was written.
+    let after = resources::get(&w.db, TOWER).await.unwrap().unwrap();
+    assert_eq!(after.scope_descriptions, before.scope_descriptions);
+    assert_eq!(after.service, before.service);
+
+    // A server with no service says so.
+    resources::register(
+        &w.db,
+        ResourceServerSpec {
+            resource_uri: "https://bare.example/mcp",
+            name: "bare",
+            scopes: &["x"],
+            default_scopes: &[],
+        },
+    )
+    .await
+    .unwrap();
+    let out = run_resource_cmd(&w.db, "show https://bare.example/mcp")
+        .await
+        .unwrap();
+    assert!(out.contains("meters: none (no service"), "{out}");
+}
+
+/// `rename-service --dry-run` runs the real checks and always rolls back:
+/// it prints what would move, or why it is refused, and changes nothing.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn rename_service_dry_run_reports_and_changes_nothing(pool: PgPool) {
+    let w = metered_world(pool).await;
+    budget(&w.db, w.org, "otto-factory").await;
+    unmetered_factory_usage(&w, w.org).await;
+
+    let out = run_resource_cmd(
+        &w.db,
+        &format!("rename-service {FACTORY} otto-tower --dry-run"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        out.contains(&format!(
+            "dry run: would rename {FACTORY} service=otto-factory -> otto-tower"
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("would move: 1 meter(s), 0 price version(s), 1 usage pool(s), 1 budget(s)"),
+        "{out}"
+    );
+    assert!(out.contains("nothing changed"), "{out}");
+    assert_eq!(rows_with(&w.db, "meters", "key", JOBS).await, 1);
+    assert_eq!(rows_with(&w.db, "meters", "key", TOWER_JOBS).await, 0);
+    assert_eq!(
+        service_pool(&w.db, "otto-factory").await.map(|p| p.1),
+        Some(1)
+    );
+    assert_eq!(
+        resources::get(&w.db, FACTORY)
+            .await
+            .unwrap()
+            .unwrap()
+            .service
+            .as_deref(),
+        Some("otto-factory")
+    );
+
+    // The same slug, and a refusal, are answers too.
+    let out = run_resource_cmd(
+        &w.db,
+        &format!("rename-service {FACTORY} otto-factory --dry-run"),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("nothing would change"), "{out}");
+    let (_, r) = post_usage(
+        &w.db,
+        &w.factory_basic(),
+        vec![metered(w.org, JOBS, Some(1))],
+    )
+    .await;
+    assert_eq!(r["accepted"], 1, "{r}");
+    let out = run_resource_cmd(
+        &w.db,
+        &format!("rename-service {FACTORY} otto-tower --dry-run"),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("dry run: refused:"), "{out}");
+    assert!(out.contains("1 usage_events"), "{out}");
+    assert_eq!(rows_with(&w.db, "meters", "key", JOBS).await, 1);
+
+    // Not a registered resource is still an error.
+    assert!(run_resource_cmd(
+        &w.db,
+        "rename-service https://nope.example/mcp otto-nope --dry-run"
+    )
+    .await
+    .is_err());
 }
