@@ -412,3 +412,143 @@ async fn a_refused_code_redemption_burns_the_code_and_mints_nothing(pool: PgPool
     assert!(matches!(err, AuthError::InvalidGrant(_)), "{err:?}");
     assert_eq!(live_access_tokens(&db).await, 0);
 }
+
+/// An unredeemed code for the member with the test's PKCE verifier; returns
+/// the plaintext.
+async fn pkce_code(db: &Db, user: UserId, org: OrgId, client: &str) -> String {
+    let code = otto_auth::crypto::generate(otto_auth::crypto::prefix::AUTH_CODE);
+    sqlx::query(
+        "INSERT INTO authorization_codes \
+           (code_hash, client_id, user_id, org_id, redirect_uri, code_challenge, \
+            code_challenge_method, scopes, resource, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'S256', '{jobs:read}', $7, \
+                 now() + interval '5 minutes')",
+    )
+    .bind(&code.hash)
+    .bind(client)
+    .bind(user.as_uuid())
+    .bind(org.as_uuid())
+    .bind(REDIRECT)
+    .bind(URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes())))
+    .bind(RESOURCE)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    code.into_plaintext()
+}
+
+/// A pool smaller than the number of concurrent redemptions below, on the
+/// test's database, with a short acquire timeout so exhaustion shows as a
+/// failure rather than a hang.
+async fn small_pool(pool: &PgPool) -> Db {
+    let small = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    Db::from_pool(small)
+}
+
+const CONCURRENT: usize = 12;
+
+/// Every outcome of `CONCURRENT` redemptions of one grant: exactly one
+/// succeeds, the rest are `invalid_grant`, and all finish well within the
+/// pool's acquire timeout.
+fn one_wins<T>(outcomes: Vec<otto_auth::Result<T>>) {
+    let (won, lost): (Vec<_>, Vec<_>) = outcomes.into_iter().partition(|o| o.is_ok());
+    assert_eq!(won.len(), 1, "exactly one redemption succeeds");
+    for o in lost {
+        let err = o.err().unwrap();
+        assert!(matches!(err, AuthError::InvalidGrant(_)), "{err:?}");
+    }
+}
+
+/// More concurrent redemptions of one code than the pool has connections:
+/// each holds only its own connection while it waits for the code's row, so
+/// the pool is never exhausted and they all finish.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn concurrent_redemptions_of_one_code_do_not_exhaust_the_pool(pool: PgPool) {
+    let db = Db::from_pool(pool.clone());
+    let (user, org, client) = setup(&db).await;
+    let code = pkce_code(&db, user, org, &client).await;
+    let small = small_pool(&pool).await;
+
+    let tasks: Vec<_> = (0..CONCURRENT)
+        .map(|_| {
+            let (db, code, client) = (small.clone(), code.clone(), client.clone());
+            tokio::spawn(async move {
+                oauth::redeem_code(&db, &code, &client, REDIRECT, VERIFIER, None)
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .collect();
+    let outcomes = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        let mut out = Vec::new();
+        for t in tasks {
+            out.push(t.await.unwrap());
+        }
+        out
+    })
+    .await
+    .expect("the redemptions stalled: pool exhausted");
+    one_wins(outcomes);
+}
+
+/// The same for one refresh token.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn concurrent_refreshes_of_one_token_do_not_exhaust_the_pool(pool: PgPool) {
+    let db = Db::from_pool(pool.clone());
+    let (user, org, client) = setup(&db).await;
+    let refresh = refresh_token(&db, user, org, &client).await;
+    let small = small_pool(&pool).await;
+
+    let tasks: Vec<_> = (0..CONCURRENT)
+        .map(|_| {
+            let (db, refresh, client) = (small.clone(), refresh.clone(), client.clone());
+            tokio::spawn(async move {
+                tokens::redeem_refresh(&db, &refresh, &client, None)
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .collect();
+    let outcomes = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        let mut out = Vec::new();
+        for t in tasks {
+            out.push(t.await.unwrap());
+        }
+        out
+    })
+    .await
+    .expect("the refreshes stalled: pool exhausted");
+    one_wins(outcomes);
+}
+
+/// The real `redeem_code`, started while a member removal holds the code's
+/// row (it has revoked and consumed, not yet committed): it waits, then is
+/// refused, and mints nothing.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_code_redemption_racing_a_member_removal_is_refused(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let (user, org, client) = setup(&db).await;
+    let code = pkce_code(&db, user, org, &client).await;
+
+    let mut removing = db.begin_unpinned().await.unwrap();
+    tokens::revoke_all_in_org_tx(removing.conn(), user, org)
+        .await
+        .unwrap();
+
+    let (db2, client2) = (db.clone(), client.clone());
+    let redeem = tokio::spawn(async move {
+        oauth::redeem_code(&db2, &code, &client2, REDIRECT, VERIFIER, None).await
+    });
+    someone_waits_on_a_lock(db.pool()).await;
+    assert!(!redeem.is_finished());
+    removing.commit().await.unwrap();
+
+    let err = redeem.await.unwrap().unwrap_err();
+    assert!(matches!(err, AuthError::InvalidGrant(_)), "{err:?}");
+    assert_eq!(live_access_tokens(&db).await, 0, "a pair was minted");
+}

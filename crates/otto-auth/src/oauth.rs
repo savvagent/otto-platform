@@ -593,6 +593,11 @@ pub async fn redeem_code(
 ) -> Result<(IssuedTokens, UserId, OrgId)> {
     let hash = crypto::hash(code.trim());
     let mut tx = db.begin_unpinned().await?;
+    // One connection for the whole redemption, and a bounded wait on the
+    // code's row, as for refresh (`tokens::redeem_refresh`).
+    sqlx::query(tokens::REDEMPTION_LOCK_TIMEOUT)
+        .execute(tx.conn())
+        .await?;
 
     // Claim the code atomically. `consumed_at IS NULL` in the predicate means
     // the loser of a race gets zero rows and a clean invalid_grant.
@@ -622,7 +627,7 @@ pub async fn redeem_code(
     };
 
     let resource = match check_claimed_code(
-        db,
+        tx.conn(),
         &c,
         client_id,
         redirect_uri,
@@ -658,7 +663,7 @@ pub async fn redeem_code(
 
 /// The checks of a claimed code, returning the server its tokens are for.
 async fn check_claimed_code(
-    db: &Db,
+    conn: &mut sqlx::PgConnection,
     c: &CodeRow,
     client_id: &str,
     redirect_uri: &str,
@@ -692,7 +697,7 @@ async fn check_claimed_code(
     // server (an expired or dropped alias included) is `invalid_target`. Both
     // are decided in one statement, so a rename cannot fall between them.
     let resources::GrantResource::Bound(resource) =
-        resources::resolve_active_grant(db, &c.resource, requested_resource).await?
+        resources::resolve_active_grant(conn, &c.resource, requested_resource).await?
     else {
         return Err(AuthError::InvalidGrant(
             "authorization code was issued for a different resource".into(),

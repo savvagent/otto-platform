@@ -77,7 +77,11 @@
 //!   rename holds; a rename rewriting that refresh row waits for it.
 //! - **Code redemption** ([`crate::oauth::redeem_code`], one transaction):
 //!   the code's row (the claim); then the new token rows. Like refresh, it
-//!   reads `resource_servers` and waits on nothing else.
+//!   reads `resource_servers` and waits on nothing else. Both run entirely on
+//!   their transaction's connection (never a second pool connection under
+//!   the row lock, which lets concurrent redemptions of one grant exhaust the
+//!   pool), with a 5 s lock timeout that the token endpoint answers with a
+//!   retriable 503.
 //! - **Revocations** (member removal and replay detection in
 //!   [`crate::tokens`], org deletion, `drop-alias`): first the matching live
 //!   refresh rows, then the matching unredeemed code rows, `FOR UPDATE`;
@@ -1390,8 +1394,13 @@ pub enum GrantResource {
 /// - `requested` names no server (unknown, or an expired or dropped alias):
 ///   [`AuthError::InvalidTarget`];
 /// - `requested` names another server: [`GrantResource::OtherServer`].
+///
+/// It runs on `conn`, the redemption's own transaction connection: a
+/// redemption holds its grant's row lock while it calls this, and taking a
+/// second pool connection under that lock lets concurrent redemptions of one
+/// grant exhaust the pool.
 pub async fn resolve_active_grant(
-    db: &Db,
+    conn: &mut sqlx::PgConnection,
     stored: &str,
     requested: Option<&str>,
 ) -> Result<GrantResource> {
@@ -1421,7 +1430,7 @@ pub async fn resolve_active_grant(
     ))
     .bind(stored)
     .bind(requested)
-    .fetch_optional(db.pool())
+    .fetch_optional(conn)
     .await?;
     let row = row.ok_or_else(|| not_registered(stored))?;
     let server = active(row.server, stored)?;

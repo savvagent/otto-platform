@@ -994,6 +994,36 @@ impl From<AuthError> for OAuthError {
 
 impl IntoResponse for OAuthError {
     fn into_response(self) -> Response {
+        // A redemption that gave up waiting for its grant's row (another
+        // redemption of the same grant, a revocation, a rename rewriting it)
+        // changed nothing. RFC 6749 §5.2 defines no transient error for the
+        // token endpoint, and `invalid_grant` would make a client throw its
+        // refresh token away, so this is HTTP's own answer: 503 with
+        // `Retry-After`, coded `temporarily_unavailable` as the authorization
+        // endpoint's transient error is (§4.1.2.1).
+        if let AuthError::Db(e) = &self.0 {
+            if otto_tenant::is_retryable_lock_failure(e) {
+                tracing::warn!(error = %e, "token redemption gave up waiting for its grant");
+                let mut response = (
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "temporarily_unavailable",
+                        "error_description":
+                            "the grant is busy with another request; nothing changed, retry shortly",
+                    })),
+                )
+                    .into_response();
+                response.headers_mut().insert(
+                    http::header::RETRY_AFTER,
+                    http::HeaderValue::from_static("1"),
+                );
+                response.headers_mut().insert(
+                    http::header::CACHE_CONTROL,
+                    http::HeaderValue::from_static("no-store"),
+                );
+                return response;
+            }
+        }
         let status =
             http::StatusCode::from_u16(self.0.status()).unwrap_or(http::StatusCode::BAD_REQUEST);
         let code = self.0.oauth_code().unwrap_or("invalid_request");
@@ -1376,6 +1406,34 @@ impl CurrentUser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A redemption that gave up waiting for its grant's row is a retriable
+    /// 503, not a 500 or an `invalid_grant` that would make the client drop
+    /// its refresh token.
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn a_redemption_that_gave_up_waiting_is_a_retriable_503(pool: sqlx::PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL statement_timeout = '10ms'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let err = sqlx::query("SELECT pg_sleep(1)")
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+        let res = OAuthError(AuthError::Db(err)).into_response();
+        assert_eq!(res.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(res.headers().get(http::header::RETRY_AFTER).is_some());
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "temporarily_unavailable");
+
+        // Any other database failure is still the opaque error it was.
+        let res = OAuthError(AuthError::Db(sqlx::Error::RowNotFound)).into_response();
+        assert_eq!(res.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     #[test]
     fn html_escaping_neutralizes_a_client_name() {

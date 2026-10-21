@@ -264,6 +264,11 @@ pub async fn introspect(db: &Db, presented: &str, expected_resource: &str) -> Re
     })
 }
 
+/// How long a token redemption (refresh or code exchange) waits for its
+/// grant's row before giving up, as `SET LOCAL`. The token endpoint maps the
+/// lock timeout to a retriable 503 (`otto_tenant::is_retryable_lock_failure`).
+pub(crate) const REDEMPTION_LOCK_TIMEOUT: &str = "SET LOCAL lock_timeout = '5s'";
+
 /// A row from `refresh_tokens`.
 #[derive(sqlx::FromRow)]
 struct RefreshRow {
@@ -304,6 +309,13 @@ pub async fn redeem_refresh(
 ) -> Result<(IssuedTokens, UserId, OrgId, bool)> {
     let hash = crypto::hash(presented.trim());
     let mut tx = db.begin_unpinned().await?;
+    // Everything below runs on this one connection, never a second pool
+    // connection under the row lock. A wait on the row (another redemption,
+    // a revocation, a rename's rewrite) gives up after this; the token
+    // endpoint answers that with a retriable 503 and the token is untouched.
+    sqlx::query(REDEMPTION_LOCK_TIMEOUT)
+        .execute(tx.conn())
+        .await?;
 
     let row: Option<RefreshRow> = sqlx::query_as(
         "SELECT id, user_id, org_id, client_id, scopes, resource, expires_at, consumed_at, revoked_at \
@@ -349,7 +361,7 @@ pub async fn redeem_refresh(
     // decided in one statement, so a rename cannot fall between them. Every
     // refusal here leaves the token unconsumed.
     let crate::resources::GrantResource::Bound(resource) =
-        crate::resources::resolve_active_grant(db, &r.resource, requested_resource).await?
+        crate::resources::resolve_active_grant(tx.conn(), &r.resource, requested_resource).await?
     else {
         return Err(AuthError::InvalidGrant(
             "refresh token was issued for a different resource".into(),
