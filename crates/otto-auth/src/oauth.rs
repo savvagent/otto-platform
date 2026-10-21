@@ -629,16 +629,22 @@ pub async fn redeem_code(
             "redirect_uri does not match the one used to obtain the code".into(),
         ));
     }
-    // RFC 8707 §2.2: a token request may repeat `resource`, and if it does it
-    // must name the resource the code was issued for.
-    if requested_resource.is_some_and(|r| r != c.resource) {
-        return Err(AuthError::InvalidGrant(
-            "authorization code was issued for a different resource".into(),
-        ));
-    }
     // Still registered and enabled: disabling a resource server stops new
-    // tokens for it, including from codes issued before it was disabled.
-    resources::get_active(db, &c.resource).await?;
+    // tokens for it, including from codes issued before it was disabled. The
+    // code may be bound to an alias (a mint that raced a rename); it is still
+    // that server's, and the tokens are bound to its canonical URI.
+    let resource = resources::get_active_bound(db, &c.resource).await?;
+    // RFC 8707 §2.2: a token request may repeat `resource`, and if it does it
+    // must name the resource the code was issued for: its canonical URI or a
+    // live alias of it, compared canonical to canonical. A URI that names no
+    // server (an expired or dropped alias included) is `invalid_target`.
+    if let Some(requested) = requested_resource {
+        if resources::get_active(db, requested).await?.resource_uri != resource.resource_uri {
+            return Err(AuthError::InvalidGrant(
+                "authorization code was issued for a different resource".into(),
+            ));
+        }
+    }
 
     verify_pkce(&c.code_challenge, &c.code_challenge_method, code_verifier)?;
 
@@ -649,7 +655,7 @@ pub async fn redeem_code(
             org_id: c.org_id,
             client_id: Some(client_id),
             scopes: &c.scopes,
-            resource: &c.resource,
+            resource: &resource.resource_uri,
             with_refresh: true,
         },
     )

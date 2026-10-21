@@ -257,14 +257,11 @@ A resource server's URI is the audience every token for it carries, and the
 identity it authenticates to the platform with. `rename` moves it to a new
 canonical URI and keeps the old one working as a **time-boxed alias**.
 
-**Do not run `rename` in production until alias resolution in the OAuth
-flows (savvagent/otto-platform#89) is deployed:** until then a client that still
-sends the old URI as its `resource` is refused with `invalid_target` at
-authorize, token and refresh. **Pause the server's usage shipping first**, and
-run it at low traffic: all usage ingest waits while it runs, and it waits for
-ingest and token traffic on the server's rows. If they stay busy past its
-five-second lock timeout (or deadlock with it) it gives up, changing nothing,
-and says to run it again.
+**Pause the server's usage shipping first**, and run it at low traffic: all
+usage ingest waits while it runs, and it waits for ingest and token traffic on
+the server's rows. If they stay busy past its five-second lock timeout, a
+statement runs past 30 seconds, or it deadlocks with them, it gives up,
+changing nothing, and says to run it again.
 
 ```sh
 otto-platform-server resource rename https://otto-factory.example/mcp \
@@ -281,7 +278,13 @@ the sunset, and rewrites the usage dedupe ledger, so an event shipped before
 the rename is still a duplicate after it, under either URI. `--name` also
 changes the name on the consent screen. A token still bound to the old URI
 (one minted by a request that raced the rename) introspects as the server's
-own all the same.
+own all the same, and a refresh token or authorization code bound to it still
+redeems for the server.
+
+Until the sunset, OAuth clients configured with the old URI keep working
+unchanged: authorize, code redemption, refresh and PAT issuance accept the
+alias as the `resource`, resolve it to the server, and bind the consent, code
+and tokens to the canonical URI. A token request may repeat either URI.
 
 Lifecycle webhook deliveries move with the server. Delivery is at least once
 anyway, and a delivery in flight while the rename commits may be sent again;

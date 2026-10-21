@@ -478,8 +478,9 @@ const LIVE_ALIAS: &str = "dropped_at IS NULL AND sunset_at > now()";
 /// ever name their own server, and the rename rewrites tokens bound to the
 /// old URI anyway; this covers one minted under the old URI by a transaction
 /// that raced the rename. Both arguments are SQL expressions (a column, a
-/// `$n` placeholder) and must never come from input.
-pub fn audience_matches_sql(column: &str, canonical: &str) -> String {
+/// `$n` placeholder), `'static` so they are written in the source and never
+/// come from input.
+pub fn audience_matches_sql(column: &'static str, canonical: &'static str) -> String {
     format!(
         "({column} = {canonical} OR EXISTS (SELECT 1 FROM resource_server_aliases a_aud \
           WHERE a_aud.alias_uri = {column} AND a_aud.resource_uri = {canonical}))"
@@ -692,9 +693,10 @@ pub struct UriRewrites {
 /// later wait for the rename and then resolve the old URI to the new one.
 /// While it waits the rename holds only its URI-namespace lock, which no
 /// claimer takes, so they cannot deadlock. All usage ingest pauses while it
-/// runs. It gives up after a short lock timeout, or on a deadlock, with
-/// nothing changed and a message to run it again: pause the server's usage
-/// shipping first, and run it when traffic is low.
+/// runs. It gives up after a short lock timeout, a statement that runs past
+/// 30 seconds, or a deadlock, with nothing changed and a message to run it
+/// again: pause the server's usage shipping first, and run it when traffic is
+/// low.
 pub async fn rename(
     db: &Db,
     old_uri: &str,
@@ -738,7 +740,9 @@ pub async fn rename(
 fn busy_error(e: AuthError) -> AuthError {
     match &e {
         AuthError::Db(sqlx::Error::Database(d))
-            if matches!(d.code().as_deref(), Some("55P03" | "40P01")) =>
+            // lock_not_available, deadlock_detected, query_canceled (the
+            // statement timeout).
+            if matches!(d.code().as_deref(), Some("55P03" | "40P01" | "57014")) =>
         {
             AuthError::InvalidRequest(
                 "the resource server's rows were busy (usage ingest, token traffic or another \
@@ -759,8 +763,13 @@ async fn rename_in(
     name: Option<&str>,
 ) -> Result<ResourceRename> {
     // Waiting long on a busy row would queue every claim and sign-in behind
-    // this; better to give up and be run again.
+    // this; better to give up and be run again. The statement timeout bounds
+    // the rewrites too: each holds every claim (through the ledger lock) for
+    // as long as it runs.
     sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '30s'")
         .execute(&mut *conn)
         .await?;
     lock_uri_namespace(&mut *conn).await?;
@@ -937,20 +946,53 @@ pub async fn drop_alias(db: &Db, alias_uri: &str) -> Result<ResourceAlias> {
     })
 }
 
-/// Look up a resource server that may currently be issued tokens.
+/// Look up a resource server that may currently be issued tokens, by a URI
+/// a client named: its canonical URI or a live alias ([`resolve`]). The
+/// canonical row is returned, so everything the caller stores or compares
+/// uses the canonical URI.
 ///
 /// An unknown resource and a disabled one are both
 /// [`AuthError::InvalidTarget`] (RFC 8707 §2), and say which, because the
 /// resource indicator is public and a client integrating against the AS needs
-/// to know which mistake it made.
+/// to know which mistake it made. An expired or dropped alias is refused
+/// exactly like an unknown URI.
 pub async fn get_active(db: &Db, resource_uri: &str) -> Result<ResourceServer> {
-    let rs = get(db, resource_uri).await?.ok_or_else(|| {
-        AuthError::InvalidTarget(format!("{resource_uri:?} is not a registered resource"))
-    })?;
+    let rs = resolve(db, resource_uri)
+        .await?
+        .ok_or_else(|| not_registered(resource_uri))?
+        .server;
+    active(rs, resource_uri)
+}
+
+/// Look up the resource server a stored grant (an authorization code or a
+/// refresh token) is bound to, when it may currently be issued tokens. The
+/// canonical row is returned.
+///
+/// `stored` is the grant's `resource`, never a URI a client just named: a
+/// client-named URI goes through [`get_active`]. It is normally canonical,
+/// since the rename rewrites usable grants, but one minted under the old URI
+/// by a transaction that raced the rename is bound to an alias. Such a grant
+/// still belongs to its server whatever state the alias is in, by the same
+/// rule as [`audience_matches_sql`]: alias rows are tombstones that only ever
+/// name their own server.
+pub async fn get_active_bound(db: &Db, stored: &str) -> Result<ResourceServer> {
+    let rs: Option<ResourceServer> = sqlx::query_as(&format!(
+        "SELECT {COLS} FROM resource_servers WHERE {}",
+        audience_matches_sql("$1", "resource_servers.resource_uri")
+    ))
+    .bind(stored)
+    .fetch_optional(db.pool())
+    .await?;
+    active(rs.ok_or_else(|| not_registered(stored))?, stored)
+}
+
+fn not_registered(uri: &str) -> AuthError {
+    AuthError::InvalidTarget(format!("{uri:?} is not a registered resource"))
+}
+
+fn active(rs: ResourceServer, named: &str) -> Result<ResourceServer> {
     if rs.disabled {
-        return Err(AuthError::InvalidTarget(format!(
-            "{resource_uri:?} is disabled"
-        )));
+        return Err(AuthError::InvalidTarget(format!("{named:?} is disabled")));
     }
     Ok(rs)
 }
@@ -1244,6 +1286,26 @@ fn validate_scope_list(field: &str, scopes: &[&str]) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rename cut off by its statement timeout changed nothing, and is
+    /// reported as busy like a lost lock wait, with the "run it again" remedy.
+    #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+    async fn a_statement_timeout_is_reported_as_busy(pool: sqlx::PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL statement_timeout = '10ms'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let err = sqlx::query("SELECT pg_sleep(1)")
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+        let mapped = busy_error(AuthError::Db(err));
+        assert!(
+            matches!(&mapped, AuthError::InvalidRequest(m) if m.contains("nothing changed") && m.contains("run it again")),
+            "{mapped:?}"
+        );
+    }
 
     fn rs(scopes: &[&str], defaults: &[&str]) -> ResourceServer {
         ResourceServer {

@@ -1266,6 +1266,48 @@ async fn a_pat_is_shown_once_audienced_for_its_resource_and_revocable(pool: PgPo
     );
 }
 
+/// A PAT requested for a renamed server's old URI, a live alias, is bound to
+/// the canonical URI (savvagent/otto-platform#89); once the alias is dropped
+/// the old URI is unknown, `invalid_target`.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_pat_for_a_live_alias_is_bound_to_the_canonical_uri(pool: PgPool) {
+    const RENAMED: &str = "https://things-v2.otto.test/mcp";
+    let h = harness(pool).await;
+    otto_auth::resources::rename(
+        &h.db,
+        common::RESOURCE,
+        RENAMED,
+        Some(chrono::Utc::now() + chrono::Duration::days(90)),
+        None,
+    )
+    .await
+    .unwrap();
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+
+    let minted = Call::post("/api/orgs/acme/tokens")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "name": "laptop", "resource": common::RESOURCE }))
+        .send(&h.router)
+        .await;
+    minted.expect(StatusCode::CREATED);
+    assert_eq!(minted.body["resource"], RENAMED);
+    otto_auth::tokens::introspect(&h.db, minted.body["token"].as_str().unwrap(), RENAMED)
+        .await
+        .expect("a PAT minted through the alias works at the renamed server");
+
+    otto_auth::resources::drop_alias(&h.db, common::RESOURCE)
+        .await
+        .unwrap();
+    let refused = Call::post("/api/orgs/acme/tokens")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "name": "laptop", "resource": common::RESOURCE }))
+        .send(&h.router)
+        .await;
+    refused.expect(StatusCode::BAD_REQUEST);
+    assert_eq!(refused.error_code(), Some("invalid_target"));
+}
+
 /// With several resource servers registered the audience must be named: guessing
 /// between them would mint a token for a service the human never chose. Naming
 /// one audiences the token for it and validates scopes against *its* registry

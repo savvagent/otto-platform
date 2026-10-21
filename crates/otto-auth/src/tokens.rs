@@ -315,15 +315,25 @@ pub async fn redeem_refresh(
             "refresh token was issued to a different client".into(),
         ));
     }
-    // RFC 8707 §2.2: a refresh request may name a resource, and if it does it
-    // must be the one the token was issued for.
-    if requested_resource.is_some_and(|res| res != r.resource) {
-        return Err(AuthError::InvalidGrant(
-            "refresh token was issued for a different resource".into(),
-        ));
-    }
     // A disabled resource server gets no new tokens, refreshed ones included.
-    crate::resources::get_active(db, &r.resource).await?;
+    // The token may be bound to an alias (a mint that raced a rename); it is
+    // still that server's, and its successor is bound to the canonical URI.
+    let resource = crate::resources::get_active_bound(db, &r.resource).await?;
+    // RFC 8707 §2.2: a refresh request may name a resource, and if it does it
+    // must be the one the token was issued for: its canonical URI or a live
+    // alias of it, compared canonical to canonical. A URI that names no server
+    // (an expired or dropped alias included) is `invalid_target`.
+    if let Some(requested) = requested_resource {
+        if crate::resources::get_active(db, requested)
+            .await?
+            .resource_uri
+            != resource.resource_uri
+        {
+            return Err(AuthError::InvalidGrant(
+                "refresh token was issued for a different resource".into(),
+            ));
+        }
+    }
 
     let issued = issue(
         db,
@@ -332,7 +342,7 @@ pub async fn redeem_refresh(
             org_id: r.org_id,
             client_id: Some(client_id),
             scopes: &r.scopes,
-            resource: &r.resource,
+            resource: &resource.resource_uri,
             with_refresh: true,
         },
     )
