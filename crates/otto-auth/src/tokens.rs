@@ -315,15 +315,23 @@ pub async fn redeem_refresh(
             "refresh token was issued to a different client".into(),
         ));
     }
+    // A disabled resource server gets no new tokens, refreshed ones included.
+    // The token may be bound to an alias (a mint that raced a rename); it is
+    // still that server's, and its successor is bound to the canonical URI.
+    //
     // RFC 8707 §2.2: a refresh request may name a resource, and if it does it
-    // must be the one the token was issued for.
-    if requested_resource.is_some_and(|res| res != r.resource) {
+    // must be the one the token was issued for: its canonical URI or a live
+    // alias of it, compared canonical to canonical. A URI that names no server
+    // (an expired or dropped alias included) is `invalid_target`. Both are
+    // decided in one statement, so a rename cannot fall between them. Every
+    // refusal here leaves the token unconsumed.
+    let crate::resources::GrantResource::Bound(resource) =
+        crate::resources::resolve_active_grant(db, &r.resource, requested_resource).await?
+    else {
         return Err(AuthError::InvalidGrant(
             "refresh token was issued for a different resource".into(),
         ));
-    }
-    // A disabled resource server gets no new tokens, refreshed ones included.
-    crate::resources::get_active(db, &r.resource).await?;
+    };
 
     let issued = issue(
         db,
@@ -332,7 +340,7 @@ pub async fn redeem_refresh(
             org_id: r.org_id,
             client_id: Some(client_id),
             scopes: &r.scopes,
-            resource: &r.resource,
+            resource: &resource.resource_uri,
             with_refresh: true,
         },
     )
@@ -431,7 +439,7 @@ pub async fn mint_pat(
     }
     // Same registry checks as the OAuth path: a PAT must not be a way around
     // an unregistered or disabled resource, or a scope its server never defined.
-    let rs = crate::resources::get_active(db, resource).await?;
+    let rs = crate::resources::resolve_active(db, resource).await?;
     let scopes = rs.grant_scopes(scopes)?;
     // `grant_scopes` returns an empty list only when nothing was asked for and
     // the resource has no defaults. Refused rather than stored as a token that

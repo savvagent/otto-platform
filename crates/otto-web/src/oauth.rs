@@ -173,9 +173,13 @@ pub(crate) const ADMIN_SCOPE: &str = "org:admin";
 
 /// The resource server a request is for.
 ///
-/// `requested` is the client's RFC 8707 `resource` parameter. Absent, the
-/// request is resolved only when that is unambiguous: exactly one enabled
-/// resource server is registered. Clients that predate RFC 8707 then keep
+/// `requested` is the client's RFC 8707 `resource` parameter: a canonical
+/// URI, or a live alias of a renamed server, which resolves to that server
+/// (see [`resources::resolve_active`]). Either way the canonical row comes back,
+/// so the consent seal, the code and the tokens all carry the canonical URI.
+///
+/// Absent, the request is resolved only when that is unambiguous: exactly one
+/// enabled resource server is registered. Clients that predate RFC 8707 then keep
 /// working while the platform serves a single product, and are refused with a
 /// message naming the missing parameter the moment a second one registers —
 /// guessing between audiences would mint a token for a service the user never
@@ -185,7 +189,7 @@ pub(crate) async fn resolve_resource(
     requested: Option<&str>,
 ) -> Result<resources::ResourceServer, AuthError> {
     if let Some(uri) = requested {
-        return resources::get_active(db, uri).await;
+        return resources::resolve_active(db, uri).await;
     }
     let mut enabled: Vec<_> = resources::list(db)
         .await?

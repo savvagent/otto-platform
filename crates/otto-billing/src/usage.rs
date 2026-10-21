@@ -486,6 +486,18 @@ pub trait UsageExt {
     /// batch's events are counted, before committing. Take
     /// [`lock_org_ingest`] first, and feed a batch's events in billed order
     /// (period, then `occurred_at`).
+    ///
+    /// Lock order. The event's dedupe claim (`claim_usage_event`) takes the
+    /// usage-ledger advisory lock shared (`otto_auth::resources::USAGE_LEDGER_LOCK`),
+    /// and a resource rename takes it exclusively before it locks the
+    /// `resource_servers` row it moves. So in an ingest transaction the first
+    /// claim must come before any write that references `resource_servers`:
+    /// such a write (a row with a foreign key to it, such as a service's pool,
+    /// budget or alert rows, or a `FOR SHARE`/`FOR UPDATE` read of it) holds a
+    /// lock on that row, and waiting for the ledger lock while holding it
+    /// deadlocks against a rename waiting for the row. This method claims
+    /// before it writes anything; a caller that adds writes of its own to the
+    /// transaction makes them after its first call.
     fn ingest_usage_deferred(
         &mut self,
         resource_uri: &str,
