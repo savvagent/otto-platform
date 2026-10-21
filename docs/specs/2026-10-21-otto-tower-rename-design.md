@@ -114,7 +114,9 @@ MCP `initialize` instructions over a legacy host open with a deprecation paragra
 
 **The host only selects; it never authorizes.** The host picks which configured value is used for notices, discovery and redirects. Token validation (`into_claims`) stays bound to `OF_RESOURCE_URI` alone. The rule that the audience is configuration and never derived from the Host still holds, and a test pins it.
 
-**Console redirect in the Worker.** The Worker answers SPA (non-origin) paths and `/auth/login` on a legacy host with a 308 to the canonical host. Every origin prefix is still proxied: `/mcp`, `/.well-known`, `/api`, `/auth/*` (except login), `/platform/webhooks`, `/webhooks`, `/oauth`. Webhook deliveries never get redirected.
+**Amended during integration review.** Production is not fronted by the Cloudflare Worker: `otto-factory.savvagent.com` resolves straight to Fly. So of-server itself answers a legacy host's console pages and `/auth/login` with the 308. The Worker keeps the same rule for a Worker-fronted deployment.
+
+**Console redirect.** On a legacy host, the console redirect answers SPA (non-origin) paths and `/auth/login` on a legacy host with a 308 to the canonical host. Every origin prefix is still proxied: `/mcp`, `/.well-known`, `/api`, `/auth/*` (except login), `/platform/webhooks`, `/webhooks`, `/oauth`. Webhook deliveries never get redirected.
 
 ### D4. Cutover is human-run and comes after the code ships
 
