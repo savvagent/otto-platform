@@ -84,7 +84,13 @@ The error names each blocker and its count.
 - `budget_alerts`
 - `resource_servers.service`
 
-**Unchanged:** `set-service` behaves as before.
+**Amended during #86.** `set-service` still refuses once meters are declared. However, a service's unmetered pool, budget and alert rows now follow any slug change by `ON UPDATE CASCADE`, where before they were left stranded under the old slug.
+
+**Closing the ingest race.** A usage batch could be in flight while a rename commits. To stop it stranding rows under the old slug, new rows are tied to the declared meters and services by NOT VALID foreign keys:
+- `usage_events.meter` and `org_meter_period_usage.meter` reference `meters(key)`.
+- The pool, budget and alert tables reference `resource_servers(service)` with `ON UPDATE CASCADE`.
+
+`rename_service` takes a table lock and then the row lock before it counts. A batch caught mid-rename gets a retriable 503. The ingest cost of these keys is tracked in #90.
 
 **Plan catalog.** `GET /api/plans` then lists `otto-tower/jobs_completed`.
 
