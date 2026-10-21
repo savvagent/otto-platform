@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/savvagent/otto-platform/compare/v0.11.0...v0.11.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* **web:** move otto-tower links to the new host ([#93](https://github.com/savvagent/otto-platform/issues/93)) ([2434244](https://github.com/savvagent/otto-platform/commit/24342440d67a413bc1c065171602922bf33b61cb)), closes [#81](https://github.com/savvagent/otto-platform/issues/81)
+
 ## [0.11.0](https://github.com/savvagent/otto-platform/compare/v0.10.0...v0.11.0) (2026-10-21)
 
 
