@@ -486,7 +486,7 @@ pub async fn validate_authorize(db: &Db, req: &AuthorizeRequest) -> Result<Autho
     // RFC 8707: the client must say which resource the token is for, and it
     // must be one we issue tokens for. Without this the AS would happily mint
     // tokens audienced for somewhere else.
-    let resource = resources::get_active(db, &req.resource).await?;
+    let resource = resources::resolve_active(db, &req.resource).await?;
     let scopes = resource.grant_scopes(&req.scopes)?;
     // A non-empty request either fails above or resolves to something, so
     // empty here means nothing was asked for and there are no defaults to
@@ -530,7 +530,7 @@ pub async fn issue_authorization_code(
             "an authorization code needs at least one granted scope".into(),
         ));
     }
-    let resource = resources::get_active(db, &req.resource).await?;
+    let resource = resources::resolve_active(db, &req.resource).await?;
     let scopes = resource.grant_scopes(&req.scopes)?;
     let code = crypto::generate(prefix::AUTH_CODE);
 
@@ -633,18 +633,19 @@ pub async fn redeem_code(
     // tokens for it, including from codes issued before it was disabled. The
     // code may be bound to an alias (a mint that raced a rename); it is still
     // that server's, and the tokens are bound to its canonical URI.
-    let resource = resources::get_active_bound(db, &c.resource).await?;
+    //
     // RFC 8707 §2.2: a token request may repeat `resource`, and if it does it
     // must name the resource the code was issued for: its canonical URI or a
     // live alias of it, compared canonical to canonical. A URI that names no
-    // server (an expired or dropped alias included) is `invalid_target`.
-    if let Some(requested) = requested_resource {
-        if resources::get_active(db, requested).await?.resource_uri != resource.resource_uri {
-            return Err(AuthError::InvalidGrant(
-                "authorization code was issued for a different resource".into(),
-            ));
-        }
-    }
+    // server (an expired or dropped alias included) is `invalid_target`. Both
+    // are decided in one statement, so a rename cannot fall between them.
+    let resources::GrantResource::Bound(resource) =
+        resources::resolve_active_grant(db, &c.resource, requested_resource).await?
+    else {
+        return Err(AuthError::InvalidGrant(
+            "authorization code was issued for a different resource".into(),
+        ));
+    };
 
     verify_pkce(&c.code_challenge, &c.code_challenge_method, code_verifier)?;
 

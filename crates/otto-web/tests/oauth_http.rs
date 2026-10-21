@@ -1409,6 +1409,20 @@ async fn an_ended_alias_is_refused_at_authorize_and_token(pool: PgPool) {
     .await;
     tokens.expect(StatusCode::OK);
     let refresh = tokens.body["refresh_token"].as_str().unwrap().to_string();
+    // A second code, granted while the alias was live and redeemed after.
+    let page = common::consent_page(
+        &h,
+        &rob.session,
+        &alias_authorize_url(&client_id, &challenge),
+    )
+    .await;
+    let granted = common::submit_consent(
+        &h,
+        &rob.session,
+        &page.submission(&org_id.to_string(), "allow"),
+    )
+    .await;
+    let late_code = query_param(&location(&granted), "code").expect("no code in the callback");
 
     sqlx::query(
         "UPDATE resource_server_aliases SET sunset_at = now() - interval '1 second' \
@@ -1437,6 +1451,21 @@ async fn an_ended_alias_is_refused_at_authorize_and_token(pool: PgPool) {
             ("grant_type", "refresh_token"),
             ("refresh_token", &refresh),
             ("client_id", &client_id),
+            ("resource", RESOURCE),
+        ],
+    )
+    .await;
+    refused.expect(StatusCode::BAD_REQUEST);
+    assert_eq!(refused.body["error"], "invalid_target");
+
+    let refused = exchange(
+        &h,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &late_code),
+            ("client_id", &client_id),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", &verifier),
             ("resource", RESOURCE),
         ],
     )

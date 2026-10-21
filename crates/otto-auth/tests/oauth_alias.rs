@@ -440,6 +440,95 @@ async fn a_grant_stored_under_an_alias_of_a_disabled_server_is_refused(pool: PgP
         .await
         .unwrap_err();
     assert!(invalid_target(&err), "{err:?}");
+
+    // The refused refresh token was not consumed: once the server is enabled
+    // again it refreshes.
+    resources::set_disabled(&db, NEW, false).await.unwrap();
+    let (rotated, ..) = tokens::redeem_refresh(&db, &refresh, &client_id, Some(OLD))
+        .await
+        .unwrap();
+    tokens::introspect(&db, &rotated.access_token, NEW)
+        .await
+        .unwrap();
+}
+
+// ---- requested resources that name nothing, or another server ----
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_requested_resource_never_registered_is_invalid_target(pool: PgPool) {
+    const UNKNOWN: &str = "https://nobody.example/mcp";
+    let db = Db::from_pool(pool);
+    renamed(&db).await;
+    let (user, org) = member(&db).await;
+    let client_id = client(&db).await;
+
+    for code in [
+        oauth::issue_authorization_code(&db, &authorize_req(&client_id, NEW), user, org)
+            .await
+            .unwrap(),
+        raced_code(&db, user, org, &client_id).await,
+    ] {
+        let err = oauth::redeem_code(&db, &code, &client_id, REDIRECT, VERIFIER, Some(UNKNOWN))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AuthError::InvalidTarget(m) if m.contains("nobody.example")),
+            "{err:?}"
+        );
+    }
+    let refresh = raced_refresh(&db, user, org, &client_id).await;
+    let err = tokens::redeem_refresh(&db, &refresh, &client_id, Some(UNKNOWN))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AuthError::InvalidTarget(m) if m.contains("nobody.example")),
+        "{err:?}"
+    );
+    // Not consumed by the refusal.
+    tokens::redeem_refresh(&db, &refresh, &client_id, None)
+        .await
+        .unwrap();
+}
+
+/// A grant for another server, redeemed naming the renamed server's live
+/// alias, is refused: the alias is the renamed server's, not the grant's.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_grant_for_another_server_redeemed_with_an_alias_is_invalid_grant(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    renamed(&db).await;
+    let (user, org) = member(&db).await;
+    let client_id = client(&db).await;
+    let flags_req = AuthorizeRequest {
+        scopes: vec!["flags:read".into()],
+        ..authorize_req(&client_id, FLAGS)
+    };
+    let code = oauth::issue_authorization_code(&db, &flags_req, user, org)
+        .await
+        .unwrap();
+    let err = oauth::redeem_code(&db, &code, &client_id, REDIRECT, VERIFIER, Some(OLD))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidGrant(_)), "{err:?}");
+
+    let code = oauth::issue_authorization_code(&db, &flags_req, user, org)
+        .await
+        .unwrap();
+    let (issued, ..) = oauth::redeem_code(&db, &code, &client_id, REDIRECT, VERIFIER, Some(FLAGS))
+        .await
+        .unwrap();
+    let refresh = issued.refresh_token.unwrap();
+    for named in [OLD, NEW] {
+        let err = tokens::redeem_refresh(&db, &refresh, &client_id, Some(named))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidGrant(_)),
+            "{named}: {err:?}"
+        );
+    }
+    tokens::redeem_refresh(&db, &refresh, &client_id, Some(FLAGS))
+        .await
+        .unwrap();
 }
 
 // ---- PATs ----

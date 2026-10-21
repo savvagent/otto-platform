@@ -175,7 +175,7 @@ pub(crate) const ADMIN_SCOPE: &str = "org:admin";
 ///
 /// `requested` is the client's RFC 8707 `resource` parameter: a canonical
 /// URI, or a live alias of a renamed server, which resolves to that server
-/// (see [`resources::get_active`]). Either way the canonical row comes back,
+/// (see [`resources::resolve_active`]). Either way the canonical row comes back,
 /// so the consent seal, the code and the tokens all carry the canonical URI.
 ///
 /// Absent, the request is resolved only when that is unambiguous: exactly one
@@ -189,7 +189,7 @@ pub(crate) async fn resolve_resource(
     requested: Option<&str>,
 ) -> Result<resources::ResourceServer, AuthError> {
     if let Some(uri) = requested {
-        return resources::get_active(db, uri).await;
+        return resources::resolve_active(db, uri).await;
     }
     let mut enabled: Vec<_> = resources::list(db)
         .await?

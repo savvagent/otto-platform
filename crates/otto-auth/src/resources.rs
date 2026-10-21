@@ -740,8 +740,8 @@ pub async fn rename(
 fn busy_error(e: AuthError) -> AuthError {
     match &e {
         AuthError::Db(sqlx::Error::Database(d))
-            // lock_not_available, deadlock_detected, query_canceled (the
-            // statement timeout).
+            // lock_not_available, deadlock_detected, query_canceled
+            // (statement timeout or cancel).
             if matches!(d.code().as_deref(), Some("55P03" | "40P01" | "57014")) =>
         {
             AuthError::InvalidRequest(
@@ -949,14 +949,14 @@ pub async fn drop_alias(db: &Db, alias_uri: &str) -> Result<ResourceAlias> {
 /// Look up a resource server that may currently be issued tokens, by a URI
 /// a client named: its canonical URI or a live alias ([`resolve`]). The
 /// canonical row is returned, so everything the caller stores or compares
-/// uses the canonical URI.
+/// uses the canonical URI. For an exact canonical match only, see [`get`].
 ///
 /// An unknown resource and a disabled one are both
 /// [`AuthError::InvalidTarget`] (RFC 8707 §2), and say which, because the
 /// resource indicator is public and a client integrating against the AS needs
 /// to know which mistake it made. An expired or dropped alias is refused
 /// exactly like an unknown URI.
-pub async fn get_active(db: &Db, resource_uri: &str) -> Result<ResourceServer> {
+pub async fn resolve_active(db: &Db, resource_uri: &str) -> Result<ResourceServer> {
     let rs = resolve(db, resource_uri)
         .await?
         .ok_or_else(|| not_registered(resource_uri))?
@@ -964,26 +964,83 @@ pub async fn get_active(db: &Db, resource_uri: &str) -> Result<ResourceServer> {
     active(rs, resource_uri)
 }
 
+/// What [`resolve_active_grant`] found.
+#[derive(Debug, Clone)]
+pub enum GrantResource {
+    /// The active server the grant is bound to (the canonical row), which
+    /// the requested resource, if any, also names.
+    Bound(ResourceServer),
+    /// The requested resource names a different server than the grant's:
+    /// the caller refuses with `invalid_grant`.
+    OtherServer,
+}
+
 /// Look up the resource server a stored grant (an authorization code or a
-/// refresh token) is bound to, when it may currently be issued tokens. The
-/// canonical row is returned.
+/// refresh token) is bound to, when it may currently be issued tokens, and
+/// check the `resource` the client repeated in the token request against it
+/// (RFC 8707 §2.2), in one statement, so a rename committing alongside cannot
+/// fall between the two lookups.
 ///
-/// `stored` is the grant's `resource`, never a URI a client just named: a
-/// client-named URI goes through [`get_active`]. It is normally canonical,
-/// since the rename rewrites usable grants, but one minted under the old URI
-/// by a transaction that raced the rename is bound to an alias. Such a grant
-/// still belongs to its server whatever state the alias is in, by the same
-/// rule as [`audience_matches_sql`]: alias rows are tombstones that only ever
-/// name their own server.
-pub async fn get_active_bound(db: &Db, stored: &str) -> Result<ResourceServer> {
-    let rs: Option<ResourceServer> = sqlx::query_as(&format!(
-        "SELECT {COLS} FROM resource_servers WHERE {}",
-        audience_matches_sql("$1", "resource_servers.resource_uri")
+/// `stored` is the grant's `resource`. It is normally canonical, since the
+/// rename rewrites usable grants, but one minted under the old URI by a
+/// transaction that raced the rename is bound to an alias. Such a grant still
+/// belongs to its server whatever state the alias is in, by the same rule as
+/// [`audience_matches_sql`]: alias rows are tombstones that only ever name
+/// their own server.
+///
+/// `requested` is client-named, so it resolves like [`resolve_active`]: the
+/// canonical URI or a live alias of the grant's server is that server, and
+/// the comparison is canonical to canonical. Refusals:
+///
+/// - the grant's server is gone or disabled: [`AuthError::InvalidTarget`];
+/// - `requested` names no server (unknown, or an expired or dropped alias):
+///   [`AuthError::InvalidTarget`];
+/// - `requested` names another server: [`GrantResource::OtherServer`].
+pub async fn resolve_active_grant(
+    db: &Db,
+    stored: &str,
+    requested: Option<&str>,
+) -> Result<GrantResource> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        #[sqlx(flatten)]
+        server: ResourceServer,
+        /// `same`, `other` or `none`: what `requested` names.
+        requested: String,
+    }
+    let rs_cols = COLS
+        .split(',')
+        .map(|c| format!("rs.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let row: Option<Row> = sqlx::query_as(&format!(
+        "SELECT {rs_cols}, \
+                CASE WHEN $2::text IS NULL OR $2::text = rs.resource_uri \
+                       OR EXISTS (SELECT 1 FROM resource_server_aliases a \
+                                   WHERE a.alias_uri = $2::text \
+                                     AND a.resource_uri = rs.resource_uri AND a.dropped_at IS NULL AND a.sunset_at > now()) \
+                     THEN 'same' \
+                     WHEN EXISTS (SELECT 1 FROM resource_servers o \
+                                   WHERE o.resource_uri = $2::text) \
+                       OR EXISTS (SELECT 1 FROM resource_server_aliases a \
+                                   WHERE a.alias_uri = $2::text AND a.dropped_at IS NULL AND a.sunset_at > now()) \
+                     THEN 'other' \
+                     ELSE 'none' END AS requested \
+           FROM resource_servers rs WHERE {}",
+        audience_matches_sql("$1", "rs.resource_uri")
     ))
     .bind(stored)
+    .bind(requested)
     .fetch_optional(db.pool())
     .await?;
-    active(rs.ok_or_else(|| not_registered(stored))?, stored)
+    let row = row.ok_or_else(|| not_registered(stored))?;
+    let server = active(row.server, stored)?;
+    match (row.requested.as_str(), requested) {
+        ("same", _) => Ok(GrantResource::Bound(server)),
+        ("other", _) => Ok(GrantResource::OtherServer),
+        // `none`: only ever with a requested URI, since an absent one is `same`.
+        (_, named) => Err(not_registered(named.unwrap_or(stored))),
+    }
 }
 
 fn not_registered(uri: &str) -> AuthError {
@@ -997,7 +1054,8 @@ fn active(rs: ResourceServer, named: &str) -> Result<ResourceServer> {
     Ok(rs)
 }
 
-/// Look up a resource server, enabled or not.
+/// Look up a resource server, enabled or not, by exact canonical match: an
+/// alias finds nothing. Client-named URIs go through [`resolve_active`].
 pub async fn get(db: &Db, resource_uri: &str) -> Result<Option<ResourceServer>> {
     let row = sqlx::query_as(&format!(
         "SELECT {COLS} FROM resource_servers WHERE resource_uri = $1"
@@ -1287,10 +1345,11 @@ fn validate_scope_list(field: &str, scopes: &[&str]) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
-    /// A rename cut off by its statement timeout changed nothing, and is
-    /// reported as busy like a lost lock wait, with the "run it again" remedy.
+    /// `busy_error` maps `query_canceled` (what a statement timeout raises)
+    /// to the busy message with the "run it again" remedy, like a lost lock
+    /// wait. It does not drive a rename into its own timeout.
     #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
-    async fn a_statement_timeout_is_reported_as_busy(pool: sqlx::PgPool) {
+    async fn busy_error_maps_query_canceled(pool: sqlx::PgPool) {
         let mut tx = pool.begin().await.unwrap();
         sqlx::query("SET LOCAL statement_timeout = '10ms'")
             .execute(&mut *tx)
