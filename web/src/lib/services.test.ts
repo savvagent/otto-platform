@@ -40,7 +40,7 @@ describe('the services list', () => {
       ['cxp', 'Otto CXP']
     ]);
     for (const service of SERVICES) {
-      expect(service.mcpUrl).toBe(`https://${expectedHost(service.slug)}/mcp`);
+      expect(service.mcpUrl).toBe(`https://otto-${service.slug}.savvagent.com/mcp`);
     }
   });
 
@@ -51,7 +51,7 @@ describe('the services list', () => {
    */
   it('gives a web console to Otto Tower only', () => {
     expect(SERVICES.map((s) => [s.slug, s.consoleUrl])).toEqual([
-      ['tower', 'https://otto-factory.savvagent.com'],
+      ['tower', 'https://otto-tower.savvagent.com'],
       ['flags', undefined],
       ['cxp', undefined]
     ]);
@@ -153,7 +153,7 @@ describe('where a link to a service goes', () => {
     const tower = serviceBySlug('tower')!;
     expect(serviceLink(tower, 'en')).toEqual({
       kind: 'console',
-      href: 'https://otto-factory.savvagent.com'
+      href: 'https://otto-tower.savvagent.com'
     });
   });
 
@@ -173,20 +173,11 @@ describe('where a link to a service goes', () => {
   });
 });
 
-/**
- * Every service is served from `otto-<slug>.savvagent.com`, except Otto Tower,
- * which stays on its old host until the otto-tower cutover. Reverting the
- * commit that added this exception is the URL flip.
- */
-function expectedHost(slug: string): string {
-  return slug === 'tower' ? 'otto-factory.savvagent.com' : `otto-${slug}.savvagent.com`;
-}
-
 describe('the Claude Code command', () => {
   it("names each server after its host, so it matches the service's own docs", () => {
     expect(SERVICES.map(connectorName)).toEqual(['otto-tower', 'otto-flags', 'otto-cxp']);
     for (const service of SERVICES) {
-      expect(new URL(service.mcpUrl!).hostname).toBe(expectedHost(service.slug));
+      expect(new URL(service.mcpUrl!).hostname.split('.')[0]).toBe(connectorName(service));
     }
   });
 
