@@ -67,7 +67,7 @@ export interface Service {
   name: string;
   /**
    * The origin of the service's own web console, with no trailing slash, e.g.
-   * `https://otto-tower.savvagent.com` — or absent for a service that has
+   * `https://otto-factory.savvagent.com` — or absent for a service that has
    * none. Absent is not "unknown": it is what makes every link to the service
    * point at its connect card, so set it only for an origin that answers a
    * browser with a page. An external origin, so a link to it is a full
@@ -86,10 +86,13 @@ const CONFIGURED: readonly Service[] = [
   {
     slug: 'tower',
     name: 'Otto Tower',
-    consoleUrl: 'https://otto-tower.savvagent.com',
+    // Still the old host: otto-tower.savvagent.com does not resolve until the
+    // cutover (docs/specs/2026-10-21-otto-tower-rename-design.md, D4), and the
+    // old host keeps serving until its sunset. Reverting this commit is the flip.
+    consoleUrl: 'https://otto-factory.savvagent.com',
     // `OF_RESOURCE_URI` in the service's `fly.toml`: the MCP endpoint is
     // `/mcp` on the service's own origin.
-    mcpUrl: 'https://otto-tower.savvagent.com/mcp',
+    mcpUrl: 'https://otto-factory.savvagent.com/mcp',
     copy: {
       title: () => m.product_tower_title(),
       description: () => m.product_tower_description(),

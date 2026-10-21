@@ -50,7 +50,7 @@ describe('the console header', () => {
       a.getAttribute('aria-label') ?? a.textContent?.trim()
     ]);
     expect(links).toEqual([
-      ['https://otto-tower.savvagent.com', 'Otto Tower'],
+      ['https://otto-factory.savvagent.com', 'Otto Tower'],
       ['/products/flags#connect', 'Otto Flags, connector'],
       ['/products/cxp#connect', 'Otto CXP, connector']
     ]);

@@ -4,7 +4,7 @@
 `otto-platform-server` serves everything: the API, the OAuth authorization server, and the
 `web/` bundle, which is the prerendered marketing pages and the console (`web/build`, baked
 into the image at `/srv/console`). There is no edge in front,
-which is also how `otto-tower.savvagent.com` runs. An optional Cloudflare Worker
+which is also how `otto-factory.savvagent.com` runs. An optional Cloudflare Worker
 alternative is in [`cloudflare.md`](cloudflare.md).
 
 One origin matters here for two reasons. The session is a `__Host-` cookie, which the

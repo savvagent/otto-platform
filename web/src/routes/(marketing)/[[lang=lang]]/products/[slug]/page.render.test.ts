@@ -72,7 +72,7 @@ describe('the product page', () => {
     );
     expect(card).toBeDefined();
     expect(headings[0]?.textContent).toContain('Otto Tower');
-    expect(container.textContent).toContain('https://otto-tower.savvagent.com/mcp');
+    expect(container.textContent).toContain('https://otto-factory.savvagent.com/mcp');
 
     // The page title is the name and the product's own title phrase, with no
     // closing full stop; the description is the short SEO one, not the summary.
@@ -91,7 +91,7 @@ describe('the product page', () => {
 
     // The service's own console names its destination; the arrow marking it
     // as off-site is decoration, so it is not part of the accessible name.
-    const open = container.querySelector('a[href="https://otto-tower.savvagent.com"]');
+    const open = container.querySelector('a[href="https://otto-factory.savvagent.com"]');
     expect(open?.textContent).toContain('Open the Otto Tower console');
     expect(open?.querySelector('[aria-hidden="true"]')?.textContent).toBe('↗');
 
@@ -140,7 +140,7 @@ describe('the product page', () => {
   it("keeps the way into a product's own web console when it has one", () => {
     const instance = mountProduct('tower');
 
-    expect(linkText('https://otto-tower.savvagent.com')).toContain('Open the Otto Tower console');
+    expect(linkText('https://otto-factory.savvagent.com')).toContain('Open the Otto Tower console');
     expect(container.querySelector('a[href="#connect"]')).toBeNull();
     expect(container.textContent).not.toContain('has no web console of its own');
 
@@ -208,12 +208,14 @@ describe('the product page', () => {
 
       const text = connect?.textContent ?? '';
       expect(text).toContain('Connector address');
-      expect(text).toContain(`https://otto-${slug}.savvagent.com/mcp`);
+      // Otto Tower stays on its old host until the otto-tower cutover.
+      const host = slug === 'tower' ? 'otto-factory' : `otto-${slug}`;
+      expect(text).toContain(`https://${host}.savvagent.com/mcp`);
       expect(text).toContain('Add custom connector');
       expect(text).toContain('ChatGPT');
       expect(text).toContain('developer mode');
       expect(text).toContain(
-        `claude mcp add --transport http otto-${slug} https://otto-${slug}.savvagent.com/mcp`
+        `claude mcp add --transport http otto-${slug} https://${host}.savvagent.com/mcp`
       );
       expect(text).toContain('/mcp');
       expectNoSkips(headingLevels(container));

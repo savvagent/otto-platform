@@ -101,7 +101,7 @@ describe('the organization overview', () => {
 
     // Otto Tower has a web console to leave for; Flags and CXP do not, so
     // they go to their connect cards, badged as connectors.
-    const tower = container.querySelector('a[href="https://otto-tower.savvagent.com"]');
+    const tower = container.querySelector('a[href="https://otto-factory.savvagent.com"]');
     expect(tower?.textContent?.trim()).toBe('Otto Tower');
     for (const [slug, name] of [
       ['flags', 'Otto Flags'],
