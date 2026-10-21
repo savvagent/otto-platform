@@ -577,6 +577,12 @@ struct CodeRow {
 /// Single-use, enforced by a conditional UPDATE rather than a read-then-write:
 /// two concurrent redemptions of the same stolen code must not both succeed,
 /// and only the database can arbitrate that.
+///
+/// One transaction: the claim locks the code's row, and the pair is minted
+/// and committed under that lock, so a revocation (member removal, org
+/// deletion), which locks the member's codes first, waits for the pair and
+/// then revokes it. A refusal after the claim commits the claim alone: the
+/// code is burned, as before, and nothing is minted.
 pub async fn redeem_code(
     db: &Db,
     code: &str,
@@ -586,6 +592,7 @@ pub async fn redeem_code(
     requested_resource: Option<&str>,
 ) -> Result<(IssuedTokens, UserId, OrgId)> {
     let hash = crypto::hash(code.trim());
+    let mut tx = db.begin_unpinned().await?;
 
     // Claim the code atomically. `consumed_at IS NULL` in the predicate means
     // the loser of a race gets zero rows and a clean invalid_grant.
@@ -598,10 +605,11 @@ pub async fn redeem_code(
                    code_challenge_method, scopes, resource, expires_at",
     )
     .bind(&hash)
-    .fetch_optional(db.pool())
+    .fetch_optional(tx.conn())
     .await?;
 
     let Some(c) = row else {
+        drop(tx);
         // Either unknown or already consumed. A replayed code is a strong theft
         // signal, so revoke anything already issued from it where we can tell.
         if let Some((user, org, client)) = consumed_code_owner(db, &hash).await? {
@@ -613,6 +621,50 @@ pub async fn redeem_code(
         return Err(AuthError::InvalidGrant("unknown authorization code".into()));
     };
 
+    let resource = match check_claimed_code(
+        db,
+        &c,
+        client_id,
+        redirect_uri,
+        code_verifier,
+        requested_resource,
+    )
+    .await
+    {
+        Ok(resource) => resource,
+        Err(e) => {
+            // The claim stands: a refused code is burned.
+            tx.commit().await?;
+            return Err(e);
+        }
+    };
+
+    let issued = tokens::issue_on(
+        tx.conn(),
+        IssueParams {
+            user_id: c.user_id,
+            org_id: c.org_id,
+            client_id: Some(client_id),
+            scopes: &c.scopes,
+            resource: &resource.resource_uri,
+            with_refresh: true,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok((issued, c.user_id, c.org_id))
+}
+
+/// The checks of a claimed code, returning the server its tokens are for.
+async fn check_claimed_code(
+    db: &Db,
+    c: &CodeRow,
+    client_id: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+    requested_resource: Option<&str>,
+) -> Result<resources::ResourceServer> {
     if c.expires_at <= Utc::now() {
         return Err(AuthError::InvalidGrant("authorization code expired".into()));
     }
@@ -648,21 +700,7 @@ pub async fn redeem_code(
     };
 
     verify_pkce(&c.code_challenge, &c.code_challenge_method, code_verifier)?;
-
-    let issued = tokens::issue(
-        db,
-        IssueParams {
-            user_id: c.user_id,
-            org_id: c.org_id,
-            client_id: Some(client_id),
-            scopes: &c.scopes,
-            resource: &resource.resource_uri,
-            with_refresh: true,
-        },
-    )
-    .await?;
-
-    Ok((issued, c.user_id, c.org_id))
+    Ok(resource)
 }
 
 async fn consumed_code_owner(db: &Db, hash: &[u8]) -> Result<Option<(UserId, OrgId, String)>> {

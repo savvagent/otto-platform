@@ -75,6 +75,19 @@
 //!   the presented refresh token's row, `FOR UPDATE`; then the new token rows
 //!   it inserts. It only reads `resource_servers`, so it waits on nothing a
 //!   rename holds; a rename rewriting that refresh row waits for it.
+//! - **Code redemption** ([`crate::oauth::redeem_code`], one transaction):
+//!   the code's row (the claim); then the new token rows. Like refresh, it
+//!   reads `resource_servers` and waits on nothing else.
+//! - **Revocations** (member removal and replay detection in
+//!   [`crate::tokens`], org deletion, `drop-alias`): first the matching live
+//!   refresh rows, then the matching unredeemed code rows, `FOR UPDATE`;
+//!   then the updates of access tokens, refresh tokens and codes. The locks
+//!   make a revocation wait for any refresh or code redemption in flight, so
+//!   its updates (each a fresh snapshot) see and revoke the pair it minted.
+//!   A redemption holds one row and waits for nothing, so this cannot cycle
+//!   with it. Two revocations of overlapping rows (two replay detections in
+//!   one family, a removal and a deletion) can deadlock at the row level;
+//!   Postgres detects it and fails one.
 //!
 //! Why none of them deadlock:
 //!
@@ -1285,6 +1298,19 @@ async fn drop_alias_in(conn: &mut sqlx::PgConnection, alias_uri: &str) -> Result
     let alias = alias.ok_or_else(|| {
         AuthError::InvalidTarget(format!("{alias_uri:?} is not a resource server alias"))
     })?;
+
+    // Wait for a refresh or code redemption of an alias-bound grant in
+    // flight, so its grant is revoked or consumed consistently. (Its
+    // successor is bound to the canonical URI and stays, exactly as if the
+    // refresh had finished before the drop.)
+    for sql in [
+        "SELECT 1 FROM refresh_tokens WHERE resource = $1 AND revoked_at IS NULL \
+         AND consumed_at IS NULL FOR UPDATE",
+        "SELECT 1 FROM authorization_codes WHERE resource = $1 AND consumed_at IS NULL \
+         FOR UPDATE",
+    ] {
+        sqlx::query(sql).bind(alias_uri).execute(&mut *conn).await?;
+    }
 
     let mut revoked = GrantRevocations::default();
     for (sql, count) in [

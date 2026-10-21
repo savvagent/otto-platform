@@ -135,7 +135,10 @@ pub async fn issue(db: &Db, p: IssueParams<'_>) -> Result<IssuedTokens> {
 
 /// [`issue`] on a connection the caller holds a transaction on, so the pair
 /// commits or rolls back with the rest of it.
-async fn issue_on(conn: &mut sqlx::PgConnection, p: IssueParams<'_>) -> Result<IssuedTokens> {
+pub(crate) async fn issue_on(
+    conn: &mut sqlx::PgConnection,
+    p: IssueParams<'_>,
+) -> Result<IssuedTokens> {
     let access = crypto::generate(prefix::ACCESS);
     let expires_at = Utc::now() + Duration::minutes(ACCESS_TTL_MINUTES);
     let scopes: Vec<String> = p.scopes.to_vec();
@@ -409,6 +412,18 @@ async fn revoke_family_on(
     org: OrgId,
     client_id: &str,
 ) -> Result<u64> {
+    // Wait for a refresh of the family in flight (see `revoke_all_in_org_on`).
+    sqlx::query(
+        "SELECT 1 FROM refresh_tokens \
+         WHERE user_id = $1 AND org_id = $2 AND client_id = $3 AND revoked_at IS NULL \
+         FOR UPDATE",
+    )
+    .bind(user)
+    .bind(org)
+    .bind(client_id)
+    .execute(&mut *conn)
+    .await?;
+
     let access = sqlx::query(
         "UPDATE access_tokens SET revoked_at = now() \
          WHERE user_id = $1 AND org_id = $2 AND client_id = $3 AND revoked_at IS NULL",
@@ -596,6 +611,15 @@ async fn revoke_all_in_org_on(
     user: UserId,
     org: OrgId,
 ) -> Result<u64> {
+    // First wait for any refresh or code redemption of the member's in
+    // flight. Each holds its grant's row (the refresh token, the code) until
+    // it commits the pair it minted, which no statement here can see before
+    // then. Locking those rows waits for it, and the updates below, each with
+    // a fresh snapshot, then see the new pair and revoke it too. Without the
+    // wait the access-token update could run before the pair commits and the
+    // refresh-token update's snapshot predate it, leaving both alive.
+    lock_grants_in_flight(conn, user, org).await?;
+
     let access = sqlx::query(
         "UPDATE access_tokens SET revoked_at = now() \
          WHERE user_id = $1 AND org_id = $2 AND revoked_at IS NULL",
@@ -630,6 +654,34 @@ async fn revoke_all_in_org_on(
     .await?;
 
     Ok(access)
+}
+
+/// Lock a member's live refresh tokens and unredeemed codes in `org`, so the
+/// caller waits for every redemption of one in flight to commit. The lock
+/// order of a revocation (`crate::resources`): refresh rows, then code rows,
+/// then the updates.
+async fn lock_grants_in_flight(
+    conn: &mut sqlx::PgConnection,
+    user: UserId,
+    org: OrgId,
+) -> Result<()> {
+    sqlx::query(
+        "SELECT 1 FROM refresh_tokens \
+         WHERE user_id = $1 AND org_id = $2 AND revoked_at IS NULL FOR UPDATE",
+    )
+    .bind(user)
+    .bind(org)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "SELECT 1 FROM authorization_codes \
+         WHERE user_id = $1 AND org_id = $2 AND consumed_at IS NULL FOR UPDATE",
+    )
+    .bind(user)
+    .bind(org)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// Revoke one token by id, scoped to its owner so a user cannot revoke another's.

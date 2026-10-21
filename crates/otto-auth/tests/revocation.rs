@@ -187,3 +187,228 @@ async fn removing_a_member_consumes_their_unredeemed_codes(pool: PgPool) {
     assert!(matches!(err, AuthError::InvalidGrant(_)), "{err:?}");
     assert_eq!(live_access_tokens(&db).await, 0);
 }
+
+/// A pair minted by a redemption in flight, written as `redeem_refresh` and
+/// `redeem_code` write theirs: the plaintext access and refresh tokens.
+async fn mint_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: UserId,
+    org: OrgId,
+    client: &str,
+) -> (String, String) {
+    use otto_auth::crypto::{self, prefix};
+    let access = crypto::generate(prefix::ACCESS);
+    let refresh = crypto::generate(prefix::REFRESH);
+    let access_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO access_tokens \
+           (token_hash, kind, user_id, org_id, client_id, scopes, resource, expires_at) \
+         VALUES ($1, 'oauth', $2, $3, $4, '{jobs:read}', $5, now() + interval '1 hour') \
+         RETURNING id",
+    )
+    .bind(&access.hash)
+    .bind(user.as_uuid())
+    .bind(org.as_uuid())
+    .bind(client)
+    .bind(RESOURCE)
+    .fetch_one(&mut **tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO refresh_tokens \
+           (token_hash, access_token_id, user_id, org_id, client_id, scopes, resource, \
+            expires_at) \
+         VALUES ($1, $2, $3, $4, $5, '{jobs:read}', $6, now() + interval '30 days')",
+    )
+    .bind(&refresh.hash)
+    .bind(access_id)
+    .bind(user.as_uuid())
+    .bind(org.as_uuid())
+    .bind(client)
+    .bind(RESOURCE)
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+    (access.into_plaintext(), refresh.into_plaintext())
+}
+
+/// How a member loses access.
+#[derive(Clone, Copy, Debug)]
+enum Revocation {
+    MemberRemoval,
+    OrgDeletion,
+}
+
+async fn revoke(db: Db, how: Revocation, user: UserId, org: OrgId) {
+    match how {
+        Revocation::MemberRemoval => {
+            tokens::revoke_all_in_org(&db, user, org).await.unwrap();
+        }
+        Revocation::OrgDeletion => db.delete_org(org).await.unwrap(),
+    }
+}
+
+/// After the in-flight redemption committed and the revocation finished,
+/// the pair it minted is dead.
+async fn assert_pair_revoked(db: &Db, client: &str, access: &str, refresh: &str) {
+    assert!(
+        tokens::introspect(db, access, RESOURCE).await.is_err(),
+        "the in-flight access token survived the revocation"
+    );
+    let err = tokens::redeem_refresh(db, refresh, client, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidGrant(_)), "{err:?}");
+    assert_eq!(live_access_tokens(db).await, 0);
+}
+
+/// A refresh that has locked its token and minted its successor, not yet
+/// committed, when a revocation starts: the revocation waits for it, then
+/// revokes the successor too.
+async fn refresh_in_flight_then_revocation(pool: PgPool, how: Revocation) {
+    let db = Db::from_pool(pool);
+    let (user, org, client) = setup(&db).await;
+    let presented = refresh_token(&db, user, org, &client).await;
+    // The presented pair's access token is revoked by the revocation anyway;
+    // count only what the redemption mints.
+    sqlx::query("UPDATE access_tokens SET revoked_at = now()")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // `redeem_refresh`'s steps, held open before its commit.
+    let mut refreshing = db.pool().begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM refresh_tokens WHERE token_hash = $1 FOR UPDATE")
+        .bind(otto_auth::crypto::hash(&presented))
+        .execute(&mut *refreshing)
+        .await
+        .unwrap();
+    let (access, refresh) = mint_in(&mut refreshing, user, org, &client).await;
+    sqlx::query(
+        "UPDATE refresh_tokens SET consumed_at = now() \
+         WHERE token_hash = $1 AND consumed_at IS NULL AND revoked_at IS NULL",
+    )
+    .bind(otto_auth::crypto::hash(&presented))
+    .execute(&mut *refreshing)
+    .await
+    .unwrap();
+
+    let revoking = tokio::spawn(revoke(db.clone(), how, user, org));
+    someone_waits_on_a_lock(db.pool()).await;
+    assert!(
+        !revoking.is_finished(),
+        "{how:?} did not wait for the refresh"
+    );
+    refreshing.commit().await.unwrap();
+    revoking.await.unwrap();
+
+    assert_pair_revoked(&db, &client, &access, &refresh).await;
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_member_removal_waits_for_a_refresh_in_flight_and_revokes_its_pair(pool: PgPool) {
+    refresh_in_flight_then_revocation(pool, Revocation::MemberRemoval).await;
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_org_deletion_waits_for_a_refresh_in_flight_and_revokes_its_pair(pool: PgPool) {
+    refresh_in_flight_then_revocation(pool, Revocation::OrgDeletion).await;
+}
+
+/// The same for a code redemption that has claimed its code and minted.
+async fn code_in_flight_then_revocation(pool: PgPool, how: Revocation) {
+    let db = Db::from_pool(pool);
+    let (user, org, client) = setup(&db).await;
+    let code = otto_auth::crypto::generate(otto_auth::crypto::prefix::AUTH_CODE);
+    sqlx::query(
+        "INSERT INTO authorization_codes \
+           (code_hash, client_id, user_id, org_id, redirect_uri, code_challenge, \
+            code_challenge_method, scopes, resource, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, 'challenge', 'S256', '{jobs:read}', $6, \
+                 now() + interval '5 minutes')",
+    )
+    .bind(&code.hash)
+    .bind(&client)
+    .bind(user.as_uuid())
+    .bind(org.as_uuid())
+    .bind(REDIRECT)
+    .bind(RESOURCE)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    // `redeem_code`'s steps, held open before its commit: the claim, then
+    // the pair.
+    let mut redeeming = db.pool().begin().await.unwrap();
+    let claimed = sqlx::query(
+        "UPDATE authorization_codes SET consumed_at = now() \
+         WHERE code_hash = $1 AND consumed_at IS NULL",
+    )
+    .bind(&code.hash)
+    .execute(&mut *redeeming)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(claimed, 1);
+    let (access, refresh) = mint_in(&mut redeeming, user, org, &client).await;
+
+    let revoking = tokio::spawn(revoke(db.clone(), how, user, org));
+    someone_waits_on_a_lock(db.pool()).await;
+    assert!(
+        !revoking.is_finished(),
+        "{how:?} did not wait for the redemption"
+    );
+    redeeming.commit().await.unwrap();
+    revoking.await.unwrap();
+
+    assert_pair_revoked(&db, &client, &access, &refresh).await;
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_member_removal_waits_for_a_code_redemption_in_flight_and_revokes_its_pair(pool: PgPool) {
+    code_in_flight_then_revocation(pool, Revocation::MemberRemoval).await;
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_org_deletion_waits_for_a_code_redemption_in_flight_and_revokes_its_pair(pool: PgPool) {
+    code_in_flight_then_revocation(pool, Revocation::OrgDeletion).await;
+}
+
+/// `redeem_code` itself holds the claim and the pair in one transaction: a
+/// redemption refused after the claim (wrong verifier) still burns the code
+/// and mints nothing.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_refused_code_redemption_burns_the_code_and_mints_nothing(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let (user, org, client) = setup(&db).await;
+    let code = otto_auth::crypto::generate(otto_auth::crypto::prefix::AUTH_CODE);
+    sqlx::query(
+        "INSERT INTO authorization_codes \
+           (code_hash, client_id, user_id, org_id, redirect_uri, code_challenge, \
+            code_challenge_method, scopes, resource, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'S256', '{jobs:read}', $7, \
+                 now() + interval '5 minutes')",
+    )
+    .bind(&code.hash)
+    .bind(&client)
+    .bind(user.as_uuid())
+    .bind(org.as_uuid())
+    .bind(REDIRECT)
+    .bind(URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes())))
+    .bind(RESOURCE)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let plaintext = code.into_plaintext();
+    let wrong = "x".repeat(VERIFIER.len());
+    assert!(
+        oauth::redeem_code(&db, &plaintext, &client, REDIRECT, &wrong, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(live_access_tokens(&db).await, 0);
+    let err = oauth::redeem_code(&db, &plaintext, &client, REDIRECT, VERIFIER, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidGrant(_)), "{err:?}");
+    assert_eq!(live_access_tokens(&db).await, 0);
+}
