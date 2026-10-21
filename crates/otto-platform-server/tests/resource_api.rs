@@ -2537,6 +2537,16 @@ async fn run_resource_cmd(db: &Db, line: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8(out).unwrap())
 }
 
+/// [`run_resource_cmd`], keeping what the command printed when it fails.
+async fn run_resource_cmd_output(db: &Db, line: &str) -> (String, Option<anyhow::Error>) {
+    use otto_platform_server::resource_cmd::{execute, parse};
+    let args: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+    let cmd = parse(&args).unwrap();
+    let mut out = Vec::new();
+    let err = execute(db, None, cmd, &mut out).await.err();
+    (String::from_utf8(out).unwrap(), err)
+}
+
 /// A price for `meter` in effect from this month, written as the test pool's
 /// superuser (`otto_app` cannot write the price book). Returns its version id.
 async fn price(db: &Db, meter: &str) -> Uuid {
@@ -3002,7 +3012,7 @@ async fn tenant_code_holds_no_rename_privileges_after_migrating(pool: PgPool) {
         "SELECT has_function_privilege('otto_app', 'rename_service(text, text)', 'EXECUTE'), \
                 has_function_privilege('otto_app', 'service_rename_blockers(text)', 'EXECUTE'), \
                 has_table_privilege('otto_app', 'resource_server_aliases', \
-                                    'SELECT, INSERT, UPDATE, DELETE, TRUNCATE'), \
+                                    'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'), \
                 has_function_privilege('otto_app', 'canonical_resource_uri(text)', 'EXECUTE')",
     )
     .fetch_one(&pool)
@@ -4154,6 +4164,48 @@ async fn an_ingest_that_waits_too_long_is_a_retriable_503(pool: PgPool) {
     assert_eq!(r, json!({ "accepted": 1, "duplicates": 0, "rejected": [] }));
 }
 
+/// An open ingest transaction that updated an existing pool row and then
+/// writes a new period's pool row (which takes `FOR KEY SHARE` on the server's
+/// row) cannot deadlock with `set-service`: set-service waits for the ingest's
+/// table lock before it touches the server's row, then carries both pools.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn set_service_and_an_open_ingest_do_not_deadlock(pool: PgPool) {
+    let w = world(pool).await;
+    resources::set_service(&w.db, FACTORY, "otto-factory")
+        .await
+        .unwrap();
+    // This month's pool, then an ingest that updates it, held open.
+    open_factory_ingest(&w, None).await.commit().await.unwrap();
+    let mut ingest = open_factory_ingest(&w, None).await;
+
+    let db = w.db.clone();
+    let set = tokio::spawn(async move { resources::set_service(&db, FACTORY, "otto-b").await });
+    assert!(waiting_on_a_lock(w.db.pool(), &set).await);
+
+    // A new period's pool row, as an event of another month writes one.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        sqlx::query(
+            "INSERT INTO org_service_period_usage \
+               (org_id, service, period_start, billable_count, total_count) \
+             VALUES ($1, 'otto-factory', DATE '2000-01-01', 1, 1)",
+        )
+        .bind(w.org)
+        .execute(ingest.conn()),
+    )
+    .await
+    .expect("the ingest waited on set-service")
+    .unwrap();
+    ingest.commit().await.unwrap();
+
+    let rs = set.await.unwrap().unwrap();
+    assert_eq!(rs.service.as_deref(), Some("otto-b"));
+    assert_eq!(
+        rows_with(&w.db, "org_service_period_usage", "service", "otto-b").await,
+        2
+    );
+}
+
 /// `set-service` takes the service tables before the server's row, as
 /// rename-service does: with a rename-service's table lock held, it waits on
 /// the table without holding the row, so the rename-service's next step (the
@@ -4337,15 +4389,37 @@ async fn rename_service_dry_run_reports_and_changes_nothing(pool: PgPool) {
     )
     .await;
     assert_eq!(r["accepted"], 1, "{r}");
-    let out = run_resource_cmd(
+    // A refusal prints why and fails the command (a non-zero exit).
+    let (out, err) = run_resource_cmd_output(
         &w.db,
         &format!("rename-service {FACTORY} otto-tower --dry-run"),
     )
-    .await
-    .unwrap();
-    assert!(out.contains("dry run: refused:"), "{out}");
+    .await;
+    assert!(err.is_some(), "{out}");
+    assert!(out.contains("dry run: refused by its data:"), "{out}");
     assert!(out.contains("1 usage_events"), "{out}");
     assert_eq!(rows_with(&w.db, "meters", "key", JOBS).await, 1);
+
+    // A lost lock wait is told apart from a refusal: an ingest holding the
+    // service tables makes the dry run give up after its 2 s lock timeout.
+    sqlx::query("DELETE FROM usage_events WHERE meter IS NOT NULL")
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM org_meter_period_usage")
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    let ingest = open_factory_ingest(&w, None).await;
+    let (out, err) = run_resource_cmd_output(
+        &w.db,
+        &format!("rename-service {FACTORY} otto-tower --dry-run"),
+    )
+    .await;
+    ingest.commit().await.unwrap();
+    assert!(err.is_some(), "{out}");
+    assert!(out.contains("dry run: busy, gave up waiting"), "{out}");
+    assert!(!out.contains("refused"), "{out}");
 
     // Not a registered resource is still an error.
     assert!(run_resource_cmd(

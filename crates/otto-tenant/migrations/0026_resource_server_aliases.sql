@@ -78,7 +78,7 @@ DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'otto_app')
      AND has_table_privilege('otto_app', 'resource_server_aliases',
-                             'SELECT, INSERT, UPDATE, DELETE, TRUNCATE') THEN
+                             'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') THEN
     RAISE EXCEPTION 'otto_app still has privileges on resource_server_aliases; revoke them before migrating';
   END IF;
 END $$;

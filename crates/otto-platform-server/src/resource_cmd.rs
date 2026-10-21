@@ -484,13 +484,15 @@ pub async fn execute(
             service,
             dry_run: true,
         } => {
-            // A refusal is the answer here, not a failure of the command.
-            match resources::rename_service_dry_run(db, &resource_uri, &service).await {
-                Ok(r) if r.previous_service == service => writeln!(
+            // The answer is printed either way; a refusal or a lost wait also
+            // fails the command, so a script running the preflight stops.
+            use resources::ServiceRenameDryRun as DryRun;
+            match resources::rename_service_dry_run(db, &resource_uri, &service).await? {
+                DryRun::WouldRename(r) if r.previous_service == service => writeln!(
                     out,
                     "dry run: {resource_uri} already has service={service}; nothing would change"
                 )?,
-                Ok(r) => {
+                DryRun::WouldRename(r) => {
                     writeln!(
                         out,
                         "dry run: would rename {resource_uri} service={} -> {service}",
@@ -499,11 +501,16 @@ pub async fn execute(
                     writeln!(out, "would move: {}", moved_counts(&r.moved))?;
                     writeln!(out, "nothing changed")?;
                 }
-                Err(e @ otto_auth::AuthError::InvalidRequest(_)) => {
-                    writeln!(out, "dry run: refused: {e}")?;
+                DryRun::Refused(e) => {
+                    writeln!(out, "dry run: refused by its data: {e}")?;
                     writeln!(out, "nothing changed")?;
+                    anyhow::bail!("rename-service {resource_uri} {service} would be refused");
                 }
-                Err(e) => return Err(e.into()),
+                DryRun::Busy(e) => {
+                    writeln!(out, "dry run: busy, gave up waiting: {e}")?;
+                    writeln!(out, "nothing changed; run the dry run again")?;
+                    anyhow::bail!("the rename-service dry run was busy; run it again");
+                }
             }
         }
         Command::Show { resource_uri } => show(db, &resource_uri, out).await?,

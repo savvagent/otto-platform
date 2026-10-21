@@ -232,14 +232,13 @@ drops them: that usage is lost, not delayed.
 
 `set-service` refuses to change a slug once meters are declared under it.
 `rename-service` does that one change, while nothing under the old meters
-records money yet:
-
-Preflight with the two commands that change nothing: `show` reads (the
-service, its declared meters, its aliases with their state, and the count of
-each kind of billing data that would block the rename), and `--dry-run` runs
-the rename itself in a transaction that is always rolled back, printing what
-it would move or the refusal. (`describe` is not a preflight: it replaces the
-scope descriptions.)
+records money yet. Preflight it with the two commands that change nothing:
+`show` reads (the service, its declared meters, its aliases with their state,
+and the count of each kind of billing data that would block the rename), and
+`--dry-run` runs the rename itself in a transaction that is always rolled
+back, printing what it would move, or the refusal and exiting non-zero.
+(`describe` is not a preflight: it replaces the scope descriptions.) Then run
+it:
 
 ```sh
 otto-platform-server resource show https://otto-factory.example/mcp

@@ -46,12 +46,15 @@
 //!   and `budget_alerts`; then the server's row, `FOR UPDATE`; then its meters
 //!   and price versions, and the cascades into the three tables. 2 s lock
 //!   timeout, 30 s statement timeout.
-//! - **`set-service`** ([`set_service`]): `ROW EXCLUSIVE` on the same three
-//!   tables (which waits for a running rename-service, but not for ingest);
-//!   then the server's row (the update); then the cascades into the tables.
-//! - **`rename`** ([`rename`]): the URI-namespace advisory lock; then the rows
-//!   of the server's usable access tokens, refresh tokens and authorization
-//!   codes (the rewrites); then the usage-ledger lock of every URI of the
+//! - **`set-service`** ([`set_service`]): `SHARE ROW EXCLUSIVE` on the same
+//!   three tables, as rename-service takes them (so it waits for every open
+//!   ingest transaction that has written one, and for a running
+//!   rename-service); then the server's row (the update); then the cascades
+//!   into the tables. 5 s lock timeout.
+//! - **`rename`** ([`rename`]): the URI-namespace advisory lock; then the
+//!   alias row of the new URI, if any, `FOR UPDATE` (the swap check); then the
+//!   rows of the server's usable access tokens, refresh tokens and
+//!   authorization codes (the rewrites); then the usage-ledger lock of every URI of the
 //!   server (old, new and each alias), exclusive, in key order; then the
 //!   server's row (the key update, whose cascades take its webhook deliveries
 //!   and alias rows); then its usage dedupe entries. 5 s lock timeout, 30 s
@@ -61,25 +64,42 @@
 //!   key and so does not conflict with `FOR KEY SHARE`).
 //! - **`drop-alias`** ([`drop_alias`]): the URI-namespace lock; then the alias
 //!   row; then the token and code rows still bound to the alias.
-//! - **User paths** (org deletion and member removal in `otto_core::orgs` and
-//!   `otto-web`, team deletion): token and code rows first (the revocations);
-//!   then `FOR KEY SHARE` on every resource server row with a webhook, through
+//! - **User paths** (org deletion in `otto_core::orgs`, member removal in
+//!   `otto-web`): token and code rows first (the revocations); then `FOR KEY
+//!   SHARE` on every resource server row with a webhook, through
 //!   `otto_core::lifecycle::enqueue`'s insert into `webhook_deliveries`. A
 //!   path that revokes tokens and enqueues an event does it in that order.
+//!   Team deletion revokes nothing and takes only the enqueue's `FOR KEY
+//!   SHARE`.
+//! - **Token refresh** ([`crate::tokens::redeem_refresh`], one transaction):
+//!   the presented refresh token's row, `FOR UPDATE`; then the new token rows
+//!   it inserts. It only reads `resource_servers`, so it waits on nothing a
+//!   rename holds; a rename rewriting that refresh row waits for it.
 //!
 //! Why none of them deadlock:
 //!
 //! - `rename` and the user paths both take token rows before resource server
 //!   rows. (Taking the server's row first deadlocks against an org deletion
-//!   that holds the org's token rows and waits to enqueue its event.)
+//!   that holds the org's token rows and waits to enqueue its event.) Inside
+//!   one token table they can still deadlock at the row level: the rename's
+//!   rewrite and an org deletion's revocation lock overlapping sets of rows in
+//!   no agreed order. Postgres detects it and aborts one; the rename reports
+//!   that as busy, run it again, and the user path may surface a server
+//!   error. It needs a rename and a revocation of the same tokens in the same
+//!   instant, so it is rare.
 //! - `rename` and ingest both take the ledger lock before the server's row.
 //!   While `rename` waits for a ledger lock it holds only the namespace lock
 //!   and token rows, which ingest never takes. Ingest of every other server
 //!   takes other ledger keys and never waits for it.
-//! - `rename-service`, `set-service` and ingest each take the table locks
-//!   before the server's row (ingest's statement locks its tables before any
-//!   row). `rename-service` and `set-service` conflict on the tables, so one
-//!   waits for the other before touching the row.
+//! - `rename-service` and `set-service` take `SHARE ROW EXCLUSIVE` on the
+//!   service tables before the server's row. That conflicts with ingest's
+//!   `ROW EXCLUSIVE`, so they wait, holding no row, until every ingest that
+//!   has written the tables commits, and ingest arriving later waits for
+//!   them. (A weaker lock deadlocks: an ingest holding an existing pool row
+//!   then needs `FOR KEY SHARE` on the server's row for a new period's pool,
+//!   while `set-service` holds that row and its cascade waits for the pool
+//!   row.) The two conflict with each other too, so one waits for the other
+//!   before touching the row.
 //! - `register`, `rename` and `drop-alias` are serialized by the namespace
 //!   lock, and `drop-alias` takes no resource server row.
 
@@ -327,10 +347,11 @@ pub async fn set_scope_descriptions(
 /// old slug. A pool an earlier service of the target name left behind would
 /// collide with a moved one, and that is refused too.
 ///
-/// It takes the service tables before the server's row, the order
-/// [`rename_service`] takes them in (see the module's lock order), so the two
-/// cannot deadlock. A lost lock wait or a deadlock all the same changes
-/// nothing and says to run it again.
+/// It locks the service tables against writes before it touches the server's
+/// row, as [`rename_service`] does (see the module's lock order), so neither
+/// that nor usage ingest can deadlock with it; usage ingest waits for it. A
+/// lost lock wait (5 s) or a deadlock all the same changes nothing and says
+/// to run it again.
 pub async fn set_service(db: &Db, resource_uri: &str, service: &str) -> Result<ResourceServer> {
     if !is_service_slug(service) {
         return Err(AuthError::InvalidRequest(format!(
@@ -342,12 +363,12 @@ pub async fn set_service(db: &Db, resource_uri: &str, service: &str) -> Result<R
     sqlx::query("SET LOCAL lock_timeout = '5s'")
         .execute(tx.conn())
         .await?;
-    // ROW EXCLUSIVE is what the cascade below takes anyway; taking it first
-    // only moves it ahead of the row lock. It conflicts with rename-service's
-    // SHARE ROW EXCLUSIVE and not with ingest's writes.
+    // SHARE ROW EXCLUSIVE, as rename-service takes it: it waits for every
+    // ingest that has written these tables, so none can hold a pool row this
+    // cascade needs while waiting for the server row this update holds.
     sqlx::query(
         "LOCK TABLE org_service_period_usage, service_budgets, budget_alerts \
-         IN ROW EXCLUSIVE MODE",
+         IN SHARE ROW EXCLUSIVE MODE",
     )
     .execute(tx.conn())
     .await
@@ -447,19 +468,61 @@ pub struct ServiceRenameCounts {
 /// Renaming to the slug it already has is a no-op. A resource server with no
 /// slug yet is refused: [`set_service`] assigns the first one.
 pub async fn rename_service(db: &Db, resource_uri: &str, service: &str) -> Result<ServiceRename> {
-    rename_service_tx(db, resource_uri, service, Finish::Commit).await
+    rename_service_tx(db, resource_uri, service, Finish::Commit)
+        .await
+        .map_err(|f| f.error)
+}
+
+/// What [`rename_service_dry_run`] found.
+#[derive(Debug)]
+pub enum ServiceRenameDryRun {
+    /// It would succeed, moving this much.
+    WouldRename(Box<ServiceRename>),
+    /// The data refuses it (billing data under the meters, the slug taken, no
+    /// service yet); the error says what. Running it again changes nothing.
+    Refused(AuthError),
+    /// It gave up waiting for a lock or ran past its statement timeout:
+    /// usage ingest was writing. Run it again once shipping is paused.
+    Busy(AuthError),
 }
 
 /// [`rename_service`] in a transaction that is always rolled back: the same
 /// checks and the same refusals, and on success the counts it would move,
 /// with nothing changed. It takes the same locks for as long as it runs, so
 /// usage ingest waits for it as it would for the rename.
+///
+/// An unknown resource server or a malformed slug is an `Err`, as for the
+/// rename; what the rename's own checks decide is an `Ok` answer.
 pub async fn rename_service_dry_run(
     db: &Db,
     resource_uri: &str,
     service: &str,
-) -> Result<ServiceRename> {
-    rename_service_tx(db, resource_uri, service, Finish::RollBack).await
+) -> Result<ServiceRenameDryRun> {
+    match rename_service_tx(db, resource_uri, service, Finish::RollBack).await {
+        Ok(r) => Ok(ServiceRenameDryRun::WouldRename(Box::new(r))),
+        Err(RenameServiceFailure { busy: true, error }) => Ok(ServiceRenameDryRun::Busy(error)),
+        Err(RenameServiceFailure {
+            error: error @ AuthError::InvalidRequest(_),
+            ..
+        }) if is_service_slug(service) => Ok(ServiceRenameDryRun::Refused(error)),
+        Err(f) => Err(f.error),
+    }
+}
+
+/// A failed rename-service, and whether it was a lost lock wait or a
+/// statement timeout rather than a refusal.
+struct RenameServiceFailure {
+    busy: bool,
+    error: AuthError,
+}
+
+impl<E: Into<AuthError>> From<E> for RenameServiceFailure {
+    fn from(e: E) -> Self {
+        Self {
+            busy: false,
+            error: e.into(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -473,12 +536,13 @@ async fn rename_service_tx(
     resource_uri: &str,
     service: &str,
     finish: Finish,
-) -> Result<ServiceRename> {
+) -> std::result::Result<ServiceRename, RenameServiceFailure> {
     if !is_service_slug(service) {
         return Err(AuthError::InvalidRequest(format!(
             "service {service:?} must be a lower-case slug: a letter, then up to 62 \
              letters, digits or hyphens"
-        )));
+        ))
+        .into());
     }
     // Unpinned on purpose: the function refuses an org-pinned transaction,
     // where the tenant policy would show it one org's rows.
@@ -497,7 +561,10 @@ async fn rename_service_tx(
     .bind(service)
     .fetch_one(tx.conn())
     .await
-    .map_err(|e| rename_error(e, service))?;
+    .map_err(|e| RenameServiceFailure {
+        busy: otto_tenant::is_retryable_lock_failure(&e),
+        error: rename_error(e, service),
+    })?;
     let resource = sqlx::query_as(&format!(
         "SELECT {COLS} FROM resource_servers WHERE resource_uri = $1"
     ))
