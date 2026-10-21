@@ -618,7 +618,9 @@ pub async fn redeem_code(
         // Either unknown or already consumed. A replayed code is a strong theft
         // signal, so revoke anything already issued from it where we can tell.
         if let Some((user, org, client)) = consumed_code_owner(db, &hash).await? {
-            tokens::revoke_family(db, user, org, &client).await?;
+            // The theft response: revoked before the refusal, and never a
+            // retriable failure while the family is live.
+            tokens::revoke_family_after_theft(db, user, org, &client).await?;
             return Err(AuthError::InvalidGrant(
                 "authorization code was already used; issued tokens have been revoked".into(),
             ));

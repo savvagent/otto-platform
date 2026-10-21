@@ -328,11 +328,13 @@ pub async fn redeem_refresh(
     let r = row.ok_or_else(|| AuthError::InvalidGrant("unknown refresh token".into()))?;
 
     // Reuse: revoke the family before returning, so the attacker's stolen
-    // successor stops working too. In this transaction, which holds one of
-    // the family's rows.
+    // successor stops working too. Not in this transaction, whose short lock
+    // timeout would turn a busy family row into a retriable refusal with the
+    // family still live: end it first (it has written nothing), so no second
+    // connection is taken under its lock, and revoke until that succeeds.
     if r.consumed_at.is_some() {
-        revoke_family_on(tx.conn(), r.user_id, r.org_id, &r.client_id).await?;
-        tx.commit().await?;
+        tx.rollback().await?;
+        revoke_family_after_theft(db, r.user_id, r.org_id, &r.client_id).await?;
         return Err(AuthError::InvalidGrant(
             "refresh token was already used; the token family has been revoked".into(),
         ));
@@ -459,6 +461,66 @@ async fn revoke_family_on(
     .rows_affected();
 
     Ok(access + refresh)
+}
+
+/// How many times [`revoke_family_after_theft`] tries, and how long each try
+/// may wait for a lock.
+const THEFT_REVOCATION_ATTEMPTS: u32 = 5;
+const THEFT_REVOCATION_LOCK_TIMEOUT: &str = "SET LOCAL lock_timeout = '30s'";
+
+/// The theft response of a replayed refresh token or authorization code:
+/// revoke the family, in its own transaction, waiting as long as it takes
+/// for a busy row (each try up to 30 s, retried after a lock timeout or a
+/// deadlock, a bounded number of times). Only once it has committed does the
+/// caller refuse the replay with `invalid_grant`.
+///
+/// It must never fail open. If every try fails, the error is logged and
+/// returned as an internal error (500), never as the retriable lock failure
+/// the token endpoint answers with a 503: a retry must not be invited while
+/// the family is still live.
+pub(crate) async fn revoke_family_after_theft(
+    db: &Db,
+    user: UserId,
+    org: OrgId,
+    client_id: &str,
+) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let tried: std::result::Result<(), AuthError> = async {
+            let mut tx = db.begin_unpinned().await?;
+            sqlx::query(THEFT_REVOCATION_LOCK_TIMEOUT)
+                .execute(tx.conn())
+                .await?;
+            revoke_family_on(tx.conn(), user, org, client_id).await?;
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
+        let err = match tried {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let retryable =
+            matches!(&err, AuthError::Db(d) if otto_tenant::is_retryable_lock_failure(d));
+        if retryable && attempt < THEFT_REVOCATION_ATTEMPTS {
+            tracing::warn!(error = %err, attempt, "token family revocation after reuse was busy; retrying");
+            tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt))).await;
+            continue;
+        }
+        tracing::error!(
+            error = %err,
+            %user,
+            %org,
+            "could not revoke a token family after its refresh token or code was replayed"
+        );
+        // Re-wrapped so it is a plain internal error at the token endpoint,
+        // not the retriable 503 a bare lock failure maps to.
+        return Err(match err {
+            AuthError::Db(d) => AuthError::Tenant(otto_tenant::Error::Db(d)),
+            other => other,
+        });
+    }
 }
 
 /// Revoke one token by its presented value (RFC 7009). Idempotent and silent:

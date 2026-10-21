@@ -552,3 +552,50 @@ async fn a_code_redemption_racing_a_member_removal_is_refused(pool: PgPool) {
     assert!(matches!(err, AuthError::InvalidGrant(_)), "{err:?}");
     assert_eq!(live_access_tokens(&db).await, 0, "a pair was minted");
 }
+
+/// A replayed refresh token while another transaction holds a row of its
+/// family for longer than a redemption's 5 s lock timeout: the theft
+/// response still revokes the family (the request waits for the row), and
+/// only then refuses with `invalid_grant`, never a retriable failure with the
+/// family still live.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_replay_revokes_the_family_even_while_a_row_of_it_is_busy(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let (user, org, client) = setup(&db).await;
+    let stolen = refresh_token(&db, user, org, &client).await;
+    let (rotated, ..) = tokens::redeem_refresh(&db, &stolen, &client, None)
+        .await
+        .unwrap();
+    let successor = rotated.refresh_token.unwrap();
+
+    // Something holds the successor's row (a refresh of it in flight, say).
+    let mut busy = db.pool().begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM refresh_tokens WHERE token_hash = $1 FOR UPDATE")
+        .bind(otto_auth::crypto::hash(&successor))
+        .execute(&mut *busy)
+        .await
+        .unwrap();
+
+    let (db2, client2) = (db.clone(), client.clone());
+    let replay =
+        tokio::spawn(async move { tokens::redeem_refresh(&db2, &stolen, &client2, None).await });
+    // Past the redemption's own lock timeout.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    assert!(
+        !replay.is_finished(),
+        "the replay gave up instead of waiting"
+    );
+    busy.commit().await.unwrap();
+
+    let err = replay.await.unwrap().unwrap_err();
+    assert!(matches!(err, AuthError::InvalidGrant(_)), "{err:?}");
+    assert!(tokens::introspect(&db, &rotated.access_token, RESOURCE)
+        .await
+        .is_err());
+    let live_refresh: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM refresh_tokens WHERE revoked_at IS NULL")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(live_refresh, 0, "the family is still live");
+}
