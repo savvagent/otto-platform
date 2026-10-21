@@ -7,6 +7,7 @@
 //!     --scopes a,b,c [--default-scopes a] [--scope-description a=text]... \
 //!     [--service <slug>]
 //! otto-platform-server resource set-service <resource-uri> <slug>
+//! otto-platform-server resource rename-service <resource-uri> <new-slug>
 //! otto-platform-server resource describe <resource-uri> \
 //!     [--scope-description a=text]... [--clear]
 //! otto-platform-server resource rotate-secret <resource-uri>
@@ -32,6 +33,12 @@
 //! service has declared meters under it. Re-registering without `--service`
 //! leaves the slug alone.
 //!
+//! `rename-service` changes the slug after meters are declared, moving the
+//! meters, their prices, and every org's usage pools and budgets to the new
+//! name. It is refused, naming each blocker and its count, once anything under
+//! the old meters records money: metered usage, a Stripe meter or price, or a
+//! queued Stripe meter event.
+//!
 //! Secrets are printed once, on stdout, and cannot be read back: the
 //! introspection secret is stored hashed, the webhook secret sealed. Losing
 //! one means running the command again, which invalidates the old value.
@@ -51,6 +58,9 @@ commands:
   register <resource-uri> --name <name> --scopes a,b [--default-scopes a]
            [--scope-description a=text]... [--service <slug>]
   set-service <resource-uri> <slug>   assign the service slug its value meters are keyed by
+  rename-service <resource-uri> <new-slug>
+                                      move its meters, prices, pools and budgets to a new slug,
+                                      while none of its usage is metered or in Stripe
   describe <resource-uri> [--scope-description a=text]... [--clear]
                                       replace the scope descriptions shown on the consent screen
   rotate-secret <resource-uri>        issue a new introspection credential
@@ -74,6 +84,10 @@ pub enum Command {
         service: Option<String>,
     },
     SetService {
+        resource_uri: String,
+        service: String,
+    },
+    RenameService {
         resource_uri: String,
         service: String,
     },
@@ -174,6 +188,15 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 service: slug(service)?,
             }),
             _ => Err("expected <resource-uri> <slug>".into()),
+        },
+        // No flags: it moves money-adjacent data, so a stray one is a mistake
+        // to report rather than ignore.
+        "rename-service" => match positional.as_slice() {
+            [uri, service] if flags.is_empty() => Ok(Command::RenameService {
+                resource_uri: (*uri).to_owned(),
+                service: slug(service)?,
+            }),
+            _ => Err("expected <resource-uri> <new-slug>, and no flags".into()),
         },
         "describe" => {
             let scope_descriptions = descriptions()?;
@@ -283,6 +306,29 @@ pub async fn execute(
             writeln!(
                 out,
                 "its meters are declared as {service}/<meter> (PUT /internal/meters)"
+            )?;
+        }
+        Command::RenameService {
+            resource_uri,
+            service,
+        } => {
+            let r = resources::rename_service(db, &resource_uri, &service).await?;
+            let m = r.moved;
+            writeln!(
+                out,
+                "{resource_uri} service={} (was {})",
+                r.resource.service.as_deref().unwrap_or("-"),
+                r.previous_service
+            )?;
+            writeln!(
+                out,
+                "moved: {} meter(s), {} price version(s), {} usage pool(s), {} budget(s), \
+                 {} budget alert(s)",
+                m.meters, m.price_versions, m.service_pools, m.service_budgets, m.budget_alerts
+            )?;
+            writeln!(
+                out,
+                "its meters are now declared as {service}/<meter> (PUT /internal/meters)"
             )?;
         }
         Command::RotateSecret { resource_uri } => {
@@ -426,6 +472,26 @@ mod tests {
         assert!(parse(&args("set-service https://x.example/mcp")).is_err());
         assert!(parse(&args("set-service https://x.example/mcp Otto-X")).is_err());
         assert!(parse(&args("set-service https://x.example/mcp a b")).is_err());
+    }
+
+    #[test]
+    fn parses_rename_service() {
+        assert_eq!(
+            parse(&args("rename-service https://x.example/mcp otto-tower")).unwrap(),
+            Command::RenameService {
+                resource_uri: "https://x.example/mcp".into(),
+                service: "otto-tower".into(),
+            }
+        );
+        assert!(parse(&args("rename-service https://x.example/mcp")).is_err());
+        assert!(parse(&args("rename-service")).is_err());
+        assert!(parse(&args("rename-service https://x.example/mcp Otto-Tower")).is_err());
+        assert!(parse(&args("rename-service https://x.example/mcp otto_tower")).is_err());
+        assert!(parse(&args("rename-service https://x.example/mcp a b")).is_err());
+        assert!(parse(&args(
+            "rename-service https://x.example/mcp otto-tower --clear"
+        ))
+        .is_err());
     }
 
     #[test]

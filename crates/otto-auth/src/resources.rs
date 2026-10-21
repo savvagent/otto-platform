@@ -11,9 +11,9 @@
 //!
 //! A service registers itself with [`register`], an idempotent upsert of its
 //! name and scopes that it can run at every startup. Disabling a resource
-//! server, issuing its introspection credential, and assigning its service
-//! slug ([`set_service`]) are operator actions and are never touched by
-//! `register`.
+//! server, issuing its introspection credential, and assigning or renaming its
+//! service slug ([`set_service`], [`rename_service`]) are operator actions and
+//! are never touched by `register`.
 
 use std::collections::BTreeMap;
 
@@ -263,6 +263,105 @@ pub async fn set_service(db: &Db, resource_uri: &str, service: &str) -> Result<R
     row.ok_or_else(|| {
         AuthError::InvalidTarget(format!("{resource_uri:?} is not a registered resource"))
     })
+}
+
+/// What [`rename_service`] did.
+#[derive(Debug, Clone)]
+pub struct ServiceRename {
+    /// The slug the resource server had.
+    pub previous_service: String,
+    /// The resource server as it is now.
+    pub resource: ResourceServer,
+    /// How many rows of each kind moved to the new slug.
+    pub moved: ServiceRenameCounts,
+}
+
+/// Rows [`rename_service`] re-keyed, by kind. All zero when the slug did not
+/// change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServiceRenameCounts {
+    pub meters: i64,
+    pub price_versions: i64,
+    /// `org_service_period_usage` rows, every org's.
+    pub service_pools: i64,
+    pub service_budgets: i64,
+    pub budget_alerts: i64,
+}
+
+/// Rename a resource server's service slug after it has declared meters: the
+/// one change [`set_service`] refuses. Its meters (`<old>/<m>` becomes
+/// `<new>/<m>`), their price versions, and every org's service pools, budgets
+/// and budget alerts move to the new slug in one transaction.
+///
+/// Allowed only while nothing under the old meters records money: no metered
+/// usage events or per-meter totals, no Stripe meter or price, no queued Stripe
+/// meter event. Otherwise it is refused with every blocker and its count
+/// named. Unmetered usage does not block; its pool moves.
+///
+/// The checks and the re-keys run in the `rename_service` SQL function
+/// (migration 0024), a SECURITY DEFINER that sees every org's rows. A plain
+/// transaction on a role that is neither superuser nor BYPASSRLS would see
+/// none of the row-level-secured ones, find no blockers and move nothing.
+///
+/// Renaming to the slug it already has is a no-op. A resource server with no
+/// slug yet is refused: [`set_service`] assigns the first one.
+pub async fn rename_service(db: &Db, resource_uri: &str, service: &str) -> Result<ServiceRename> {
+    if !is_service_slug(service) {
+        return Err(AuthError::InvalidRequest(format!(
+            "service {service:?} must be a lower-case slug: a letter, then up to 62 \
+             letters, digits or hyphens"
+        )));
+    }
+    // Unpinned on purpose: the function refuses an org-pinned transaction,
+    // where the tenant policy would show it one org's rows.
+    let mut tx = db.begin_unpinned().await?;
+    let row: (String, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT previous_service, meters, price_versions, service_pools, service_budgets, \
+                budget_alerts \
+         FROM rename_service($1, $2)",
+    )
+    .bind(resource_uri)
+    .bind(service)
+    .fetch_one(tx.conn())
+    .await
+    .map_err(rename_error)?;
+    let resource = sqlx::query_as(&format!(
+        "SELECT {COLS} FROM resource_servers WHERE resource_uri = $1"
+    ))
+    .bind(resource_uri)
+    .fetch_one(tx.conn())
+    .await?;
+    tx.commit().await?;
+    let (previous_service, meters, price_versions, service_pools, service_budgets, budget_alerts) =
+        row;
+    Ok(ServiceRename {
+        previous_service,
+        resource,
+        moved: ServiceRenameCounts {
+            meters,
+            price_versions,
+            service_pools,
+            service_budgets,
+            budget_alerts,
+        },
+    })
+}
+
+/// The `rename_service` function reports each refusal under its own SQLSTATE
+/// (see migration 0024) with an operator-readable message, passed on as is.
+fn rename_error(e: sqlx::Error) -> AuthError {
+    let refusal = match &e {
+        sqlx::Error::Database(d) => d.code().map(|c| (c.into_owned(), d.message().to_owned())),
+        _ => None,
+    };
+    match refusal {
+        Some((code, msg)) if code == "P0002" => AuthError::InvalidTarget(msg),
+        // Not a slug; no service yet, or billing data blocks it; slug taken.
+        Some((code, msg)) if ["22023", "55000", "23505"].contains(&code.as_str()) => {
+            AuthError::InvalidRequest(msg)
+        }
+        _ => AuthError::Db(e),
+    }
 }
 
 /// Look up a resource server that may currently be issued tokens.
