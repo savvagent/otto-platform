@@ -103,6 +103,12 @@ describe('serviceName', () => {
     expect(serviceName('otto-factory')).toBe('Otto Tower');
     expect(serviceName('otto-new')).toBe('otto-new');
   });
+
+  it('never names a slug after an inherited object property', () => {
+    for (const slug of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+      expect(serviceName(slug)).toBe(slug);
+    }
+  });
 });
 
 describe('budgetAlerts', () => {

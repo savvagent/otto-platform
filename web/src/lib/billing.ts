@@ -84,9 +84,7 @@ export function dollarsInput(cents: number): string {
  * Service slugs that were renamed. Usage and budget rows written before the
  * rename still carry the old slug, and must keep a display name.
  */
-const LEGACY_SERVICE_NAMES: Readonly<Record<string, string>> = {
-  'otto-factory': 'Otto Tower'
-};
+const LEGACY_SERVICE_NAMES: ReadonlyMap<string, string> = new Map([['otto-factory', 'Otto Tower']]);
 
 /**
  * The name a service slug (`otto-flags`) goes by in the header and on the
@@ -95,7 +93,7 @@ const LEGACY_SERVICE_NAMES: Readonly<Record<string, string>> = {
  */
 export function serviceName(slug: string): string {
   return (
-    SERVICES.find((s) => connectorName(s) === slug)?.name ?? LEGACY_SERVICE_NAMES[slug] ?? slug
+    SERVICES.find((s) => connectorName(s) === slug)?.name ?? LEGACY_SERVICE_NAMES.get(slug) ?? slug
   );
 }
 
