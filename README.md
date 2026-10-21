@@ -20,7 +20,7 @@ short:
 - One physical **identity database** (this repo's Postgres) holds `orgs`,
   `users`, `org_members`, auth, and billing. It is the single source of truth
   for "who is this org" and "what can they do."
-- Each otto-* service keeps its **own domain database** (otto-factory's
+- Each otto-* service keeps its **own domain database** (otto-tower's
   jobs/repos/leases; otto-flags' flags/environments/targeting). They share no
   tables, only the same `org_id` UUID namespace — no cross-database foreign
   keys, application-level referential integrity only.
