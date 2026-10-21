@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/savvagent/otto-platform/compare/v0.9.2...v0.10.0) (2026-10-20)
+
+
+### Features
+
+* bill each otto service by its own value meters, with spend budgets ([#84](https://github.com/savvagent/otto-platform/issues/84)) ([919e01d](https://github.com/savvagent/otto-platform/commit/919e01d29e53f526c037ae69a093f2547eeed34f)), closes [#55](https://github.com/savvagent/otto-platform/issues/55) [#56](https://github.com/savvagent/otto-platform/issues/56) [#57](https://github.com/savvagent/otto-platform/issues/57) [#58](https://github.com/savvagent/otto-platform/issues/58) [#59](https://github.com/savvagent/otto-platform/issues/59) [#60](https://github.com/savvagent/otto-platform/issues/60) [#61](https://github.com/savvagent/otto-platform/issues/61) [#62](https://github.com/savvagent/otto-platform/issues/62) [#63](https://github.com/savvagent/otto-platform/issues/63) [#64](https://github.com/savvagent/otto-platform/issues/64) [#65](https://github.com/savvagent/otto-platform/issues/65) [#74](https://github.com/savvagent/otto-platform/issues/74)
+
 ## [0.9.2](https://github.com/savvagent/otto-platform/compare/v0.9.1...v0.9.2) (2026-10-15)
 
 
