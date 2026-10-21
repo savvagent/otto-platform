@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/savvagent/otto-platform/compare/v0.10.0...v0.11.0) (2026-10-21)
+
+
+### Features
+
+* rename otto-factory to otto-tower with guarded service and resource renames ([#92](https://github.com/savvagent/otto-platform/issues/92)) ([6726ce8](https://github.com/savvagent/otto-platform/commit/6726ce8c06a7123162dfb9f7857a1f013a6d8e73))
+
 ## [0.10.0](https://github.com/savvagent/otto-platform/compare/v0.9.2...v0.10.0) (2026-10-20)
 
 
