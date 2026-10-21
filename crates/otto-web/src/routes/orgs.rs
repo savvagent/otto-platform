@@ -241,9 +241,13 @@ pub async fn remove_member(
     if current == Role::Owner {
         guard_last_owner_locked(&mut tx, &ctx).await?;
     }
+    // Tokens before the membership removal, which enqueues the member-removed
+    // event and so locks resource server rows: the platform-wide lock order
+    // (token rows, then resource server rows; `otto_auth::resources`) that a
+    // concurrent `resource rename` relies on not to deadlock with this.
+    let revoked = otto_auth::tokens::revoke_all_in_org_tx(tx.conn(), target, ctx.org.id).await?;
     tx.remove_from_all_teams(target).await?;
     tx.remove_member(target).await?;
-    let revoked = otto_auth::tokens::revoke_all_in_org_tx(tx.conn(), target, ctx.org.id).await?;
     tx.audit(
         Entry::new(action::MEMBER_REMOVED)
             .actor(ctx.user.id)
