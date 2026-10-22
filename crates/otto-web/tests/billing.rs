@@ -1232,3 +1232,125 @@ async fn a_cycle_invoice_is_held_as_a_draft_through_the_webhook(pool: PgPool) {
     );
     assert!(billing::HANDLED_EVENT_TYPES.contains(&"invoice.created"));
 }
+
+// ------------------------------------------------- meter error reports (#76)
+
+/// A `sent` outbox row of the org, as the shipper leaves one Stripe accepted.
+async fn sent_row(s: &Setup, identifier: &str, value: i64) {
+    sqlx::query(
+        "INSERT INTO stripe_meter_outbox \
+           (org_id, identifier, event_name, stripe_customer_id, value, bucket_start, \
+            status, attempts, finished_at) \
+         VALUES ($1, $2, 'otto_flags__evaluations', $3, $4, \
+                 date_trunc('hour', now() - interval '2 hours'), 'sent', 1, now())",
+    )
+    .bind(s.org)
+    .bind(identifier)
+    .bind(&s.customer)
+    .bind(value)
+    .execute(&s.pool)
+    .await
+    .unwrap();
+}
+
+async fn row_state(s: &Setup, identifier: &str) -> (String, Option<String>) {
+    sqlx::query_as("SELECT status, last_error FROM stripe_meter_outbox WHERE identifier = $1")
+        .bind(identifier)
+        .fetch_one(&s.pool)
+        .await
+        .unwrap()
+}
+
+/// A meter error report in the shape of Stripe's `billing.meter_error_report`.
+fn meter_error_report(samples: &[(&str, &str)], error_count: i64) -> Value {
+    let sampled: Vec<Value> = samples
+        .iter()
+        .map(|(identifier, message)| {
+            json!({ "error_message": message, "request": { "identifier": identifier } })
+        })
+        .collect();
+    json!({
+        "id": "mtr_err_1", "object": "billing.meter_error_report",
+        "reason": { "error_count": error_count, "error_types": [
+            { "code": "no_meter", "error_count": error_count, "sample_errors": sampled }
+        ] },
+    })
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_meter_error_report_marks_the_sent_rows_it_names_lost(pool: PgPool) {
+    let s = started(pool).await;
+    sent_row(&s, "agg:reported", 40).await;
+    sent_row(&s, "agg:fine", 9).await;
+
+    let report = meter_error_report(&[("agg:reported", "No meter found")], 1);
+    deliver_event(
+        &s,
+        "evt_err",
+        "billing.meter.error_report_triggered",
+        Utc::now().timestamp(),
+        report.clone(),
+    )
+    .await
+    .expect(StatusCode::OK);
+
+    let (status, error) = row_state(&s, "agg:reported").await;
+    assert_eq!(status, "rejected");
+    let error = error.unwrap();
+    assert!(
+        error.contains("no_meter") && error.contains("No meter found"),
+        "{error}"
+    );
+    assert!(error.contains("mtr_err_1"), "{error}");
+    assert_eq!(row_state(&s, "agg:fine").await.0, "sent");
+
+    // It counts as lost revenue in `stripe outbox`.
+    let summary = otto_billing::stripe_outbox::outbox_summary(&Db::from_pool(s.pool.clone()))
+        .await
+        .unwrap();
+    assert_eq!(summary.lost(), 1);
+
+    // A redelivery is a duplicate; a fresh report of the same row changes nothing.
+    deliver_event(
+        &s,
+        "evt_err",
+        "billing.meter.error_report_triggered",
+        Utc::now().timestamp(),
+        report.clone(),
+    )
+    .await
+    .expect(StatusCode::OK);
+    deliver_event(
+        &s,
+        "evt_err_2",
+        "billing.meter.error_report_triggered",
+        Utc::now().timestamp(),
+        report,
+    )
+    .await
+    .expect(StatusCode::OK);
+    assert_eq!(row_state(&s, "agg:reported").await.0, "rejected");
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_meter_error_report_naming_nothing_of_ours_is_acknowledged(pool: PgPool) {
+    let s = started(pool).await;
+    sent_row(&s, "agg:ours", 5).await;
+    // An identifier that is not ours, and a report with no samples at all.
+    for (id, report) in [
+        ("evt_a", meter_error_report(&[("someone-elses-id", "x")], 1)),
+        ("evt_b", meter_error_report(&[], 12)),
+    ] {
+        deliver_event(
+            &s,
+            id,
+            "billing.meter.error_report_triggered",
+            Utc::now().timestamp(),
+            report,
+        )
+        .await
+        .expect(StatusCode::OK);
+    }
+    assert_eq!(row_state(&s, "agg:ours").await.0, "sent");
+    assert!(billing::HANDLED_EVENT_TYPES.contains(&"billing.meter.error_report_triggered"));
+}

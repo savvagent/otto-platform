@@ -125,9 +125,12 @@ of them is done by CI or by the server.
 3. **Webhook endpoint.** Dashboard → Developers → Webhooks → Add endpoint:
    - URL: `https://otto.savvagent.com/api/stripe/webhook`
    - API version: `2025-03-31.basil` (the version the client is pinned to)
-   - Events, exactly these seven: `checkout.session.completed`,
+   - Events, exactly these eight: `checkout.session.completed`,
      `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.created`,
-     `invoice.paid`, `invoice.payment_failed`, `payment_method.detached`
+     `invoice.paid`, `invoice.payment_failed`, `payment_method.detached`,
+     `billing.meter.error_report_triggered` (the snapshot event, not the thin
+     `v1.billing.meter.error_report_triggered`: the endpoint reads the report from
+     `data.object`)
 
    Copy the endpoint's signing secret (`whsec_...`). Without `invoice.created` nothing is
    held: Stripe finalizes each invoice about an hour after it makes it, and usage that
@@ -303,10 +306,17 @@ customer:
   lacks *Billing Meter Events: write*) is retried, backing off to one pass every 5
   minutes; fix the key and nothing is lost.
 - Stripe accepts meter events for processing and validates them asynchronously (an
-  unknown customer, an archived meter); `sent` means accepted. Failures appear only as
-  the meters' **error reports** (Dashboard → Billing → Meters → a meter → Error reports)
-  and `v1.billing.meter.error_report_triggered` events, which the platform does not read
-  yet (#76). Check them after a deploy that adds meters, and weekly.
+  unknown customer, an archived meter); `sent` means accepted. Failures appear as the
+  meters' **error reports** (Dashboard → Billing → Meters → a meter → Error reports) and
+  as `billing.meter.error_report_triggered` events, which the platform reads: each sampled
+  event identifier that is one of our outbox rows (`agg:...`) is moved from `sent` to
+  `rejected` with Stripe's error code and message in `last_error`, logged at error level
+  ("Stripe accepted a meter event and then reported it unprocessable"), and counted as
+  lost by `stripe outbox`. Stripe aggregates the report and samples only a few
+  identifiers per error type, so errors it counted but did not sample cannot be tied to
+  a row; the platform logs those at error level ("counted errors it gave no identifier
+  for") and the Dashboard report is the place to find them. Still check the Dashboard
+  reports after a deploy that adds meters.
 
 ### Verify in test mode
 
