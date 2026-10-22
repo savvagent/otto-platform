@@ -27,6 +27,9 @@ const GLOBAL_TABLES: &[&str] = &[
     // Which org a Stripe customer belongs to (0021): webhook handling resolves
     // it before an org can be pinned. `otto_app` has no access.
     "stripe_customers",
+    // Which resource servers an org has ever authorized (0027): usage ingest
+    // asks `org_authorized_resource`. `otto_app` has no access to the table.
+    "org_resource_grants",
 ];
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
@@ -73,6 +76,7 @@ async fn tenant_pinned_code_cannot_read_the_cross_tenant_tables(pool: PgPool) {
         "lifecycle_events",
         "webhook_deliveries",
         "usage_event_ids",
+        "org_resource_grants",
         "stripe_customers",
         "stripe_events",
         "stripe_sync_lease",

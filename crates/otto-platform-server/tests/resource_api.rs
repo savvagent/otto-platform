@@ -63,6 +63,12 @@ async fn world(pool: PgPool) -> World {
         .await
         .unwrap();
     db.add_member(org.id, user.id, Role::Admin).await.unwrap();
+    // The org has authorized both resource servers, which usage ingest needs
+    // (`not_authorized` otherwise, savvagent/otto-platform#79). The tokens
+    // themselves are not used.
+    for uri in [FACTORY, FLAGS] {
+        authorize(&db, org.id, user.id, uri).await;
+    }
     World {
         db,
         flags_secret: secrets.pop().unwrap(),
@@ -70,6 +76,45 @@ async fn world(pool: PgPool) -> World {
         org: org.id,
         user: user.id,
     }
+}
+
+/// Have `org` authorize the resource server `resource`, as issuing it a token
+/// does (`org_resource_grants`, recorded by a trigger), without leaving a
+/// token behind for the tests that count them.
+async fn authorize(db: &Db, org: OrgId, _user: UserId, resource: &str) {
+    sqlx::query(
+        "INSERT INTO org_resource_grants (org_id, resource_uri) VALUES ($1, $2) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(org)
+    .bind(resource)
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+/// Both resource servers, for an org a test makes besides the world's.
+async fn authorize_both(db: &Db, org: OrgId) {
+    for uri in [FACTORY, FLAGS] {
+        authorize(db, org, UserId::new(), uri).await;
+    }
+}
+
+/// Have `org` authorize `resource` the real way: issue a token for it.
+async fn authorize_with_token(db: &Db, org: OrgId, user: UserId, resource: &str) {
+    tokens::issue(
+        db,
+        IssueParams {
+            user_id: user,
+            org_id: org,
+            client_id: Some("agent"),
+            scopes: &["admin".to_string()],
+            resource,
+            with_refresh: false,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 impl World {
@@ -597,6 +642,7 @@ async fn team_lookups_require_the_team_to_be_in_the_org(pool: PgPool) {
     let w = world(pool).await;
     let auth = w.factory_basic();
     let other = w.db.create_org("other", "Other").await.unwrap();
+    authorize_both(&w.db, other.id).await;
 
     let mut tx = w.db.begin(w.org).await.unwrap();
     let team = tx.create_team("platform", "Platform").await.unwrap();
@@ -641,6 +687,7 @@ async fn member_teams_lists_only_this_orgs_teams_for_a_member(pool: PgPool) {
     let w = world(pool).await;
     let auth = w.factory_basic();
     let other = w.db.create_org("other", "Other").await.unwrap();
+    authorize_both(&w.db, other.id).await;
     w.db.add_member(other.id, w.user, Role::Member)
         .await
         .unwrap();
@@ -1484,6 +1531,7 @@ async fn an_event_id_replayed_under_another_org_is_rejected(pool: PgPool) {
     let w = world(pool).await;
     let auth = w.factory_basic();
     let other = w.db.create_org("other", "Other").await.unwrap();
+    authorize_both(&w.db, other.id).await;
     let id = Uuid::new_v4();
 
     let (_, first) = post_usage(&w.db, &auth, vec![usage_event(w.org, None, id, true)]).await;
@@ -1589,6 +1637,7 @@ async fn resource_server_calls_are_not_subject_to_the_browser_csrf_guard(pool: P
         log_format: otto_platform_server::LogFormat::Text,
         email: None,
         stripe: None,
+        usage_hold_threshold: otto_billing::usage::DEFAULT_HOLD_THRESHOLD,
     };
     let app = || otto_platform_server::app(w.db.clone(), &config).unwrap();
     let token = w.oauth_token(FACTORY, &["jobs:read"]).await;
@@ -2247,9 +2296,12 @@ async fn quantities_are_bounded_per_event(pool: PgPool) {
     let mut negative = metered(w.org, EVALS, None);
     negative["quantity"] = json!(-1);
 
-    let (status, receipt) = post_usage(
+    // The review threshold is raised past the largest event, which the
+    // default would hold.
+    let (status, receipt) = post_usage_held_at(
         &w.db,
         &w.flags_basic(),
+        10_000_000_000,
         vec![
             metered(w.org, EVALS, Some(0)),
             metered(w.org, EVALS, Some(1_000_000_001)),
@@ -2503,6 +2555,7 @@ async fn usage_from_one_service_never_changes_anothers_status(pool: PgPool) {
 async fn meter_usage_is_counted_per_org(pool: PgPool) {
     let w = metered_world(pool).await;
     let other = w.db.create_org("globex", "Globex").await.unwrap();
+    authorize_both(&w.db, other.id).await;
     let (_, r) = post_usage(
         &w.db,
         &w.flags_basic(),
@@ -2521,6 +2574,184 @@ async fn meter_usage_is_counted_per_org(pool: PgPool) {
     )
     .await;
     assert_eq!(theirs["meters"][0]["quantity"], 11);
+}
+
+// --------------------------------------- authorization and the sanity limit
+
+/// `POST /internal/usage` through a router with the review threshold set.
+async fn post_usage_held_at(
+    db: &Db,
+    auth: &str,
+    threshold: i64,
+    events: Vec<Value>,
+) -> (StatusCode, Value) {
+    let res = otto_platform_server::internal::router_with_hold_threshold(
+        db.clone(),
+        otto_platform_server::Billing::Enabled,
+        threshold,
+    )
+    .oneshot(
+        Request::post("/internal/usage")
+            .header("authorization", auth)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "events": events }).to_string()))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let status = res.status();
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn usage_for_an_org_that_never_authorized_the_caller_is_rejected_per_event(pool: PgPool) {
+    let w = metered_world(pool).await;
+    // An org that authorized otto-flags only, and one that authorized nothing.
+    let flags_only = w.db.create_org("flags-only", "Flags only").await.unwrap();
+    w.db.add_member(flags_only.id, w.user, Role::Admin)
+        .await
+        .unwrap();
+    authorize(&w.db, flags_only.id, w.user, FLAGS).await;
+    let nobody = w.db.create_org("nobody", "Nobody").await.unwrap();
+
+    let mine = metered(w.org, JOBS, Some(3));
+    let theirs = metered(flags_only.id, JOBS, Some(5));
+    let stranger = metered(nobody.id, JOBS, Some(7));
+    let (status, r) = post_usage(
+        &w.db,
+        &w.factory_basic(),
+        vec![mine.clone(), theirs.clone(), stranger.clone()],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(r["accepted"], 1, "{r}");
+    assert_eq!(
+        rejection_codes(&r),
+        ["not_authorized", "not_authorized"],
+        "{r}"
+    );
+    let ids: Vec<_> = r["rejected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["event_id"].clone())
+        .collect();
+    for rejected in [&theirs, &stranger] {
+        assert!(ids.contains(&rejected["event_id"]), "{ids:?}");
+    }
+
+    // Nothing was billed to either, and the refused events were not claimed:
+    // the same ids are accepted once the org has authorized the caller.
+    for org in [flags_only.id, nobody.id] {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_events WHERE org_id = $1")
+            .bind(org)
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+    authorize(&w.db, flags_only.id, w.user, FACTORY).await;
+    let (_, r) = post_usage(&w.db, &w.factory_basic(), vec![theirs]).await;
+    assert_eq!(r["accepted"], 1, "{r}");
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_revoked_expired_or_swept_grant_still_authorizes_usage_already_earned(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let org = w.db.create_org("late", "Late").await.unwrap();
+    w.db.add_member(org.id, w.user, Role::Admin).await.unwrap();
+    authorize_with_token(&w.db, org.id, w.user, FACTORY).await;
+    // Revoked and expired, then swept away by `tokens::sweep`: the grant is
+    // remembered anyway.
+    sqlx::query("UPDATE access_tokens SET revoked_at = now(), expires_at = now() - interval '8 days' WHERE org_id = $1")
+        .bind(org.id)
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    assert!(tokens::sweep(&w.db).await.unwrap() >= 1);
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM access_tokens WHERE org_id = $1")
+        .bind(org.id)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+    let (_, r) = post_usage(
+        &w.db,
+        &w.factory_basic(),
+        vec![metered(org.id, JOBS, Some(1))],
+    )
+    .await;
+    assert_eq!(r["accepted"], 1, "{r}");
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn usage_past_the_sanity_limit_is_held_not_billed_and_listed_for_the_operator(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let auth = w.factory_basic();
+    let first = metered(w.org, JOBS, Some(6));
+    let over = metered(w.org, JOBS, Some(5));
+    let small = metered(w.org, JOBS, Some(4));
+    // 6 fits a limit of 10; 6 + 5 does not; 6 + 4 does.
+    let (status, r) = post_usage_held_at(&w.db, &auth, 10, vec![first, over.clone(), small]).await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(r["accepted"], 2, "{r}");
+    assert_eq!(rejection_codes(&r), ["held_for_review"], "{r}");
+    assert_eq!(r["rejected"][0]["event_id"], over["event_id"]);
+    assert_eq!(meter_quantity(&w.db, JOBS).await, Some(10));
+
+    // A resend is a duplicate and is not held a second time.
+    let (_, r) = post_usage_held_at(&w.db, &auth, 10, vec![over.clone()]).await;
+    assert_eq!(r["duplicates"], 1, "{r}");
+    let (_, r) = post_usage_held_at(&w.db, &auth, 1_000, vec![over.clone()]).await;
+    assert_eq!(r["duplicates"], 1, "{r}");
+
+    // Held: no usage row, no billing, one row for the operator.
+    let events: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_events WHERE org_id = $1")
+        .bind(w.org)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(events, 2);
+    let mut out = Vec::new();
+    otto_platform_server::usage_cmd::execute(
+        &w.db,
+        otto_platform_server::usage_cmd::Command::Held,
+        &mut out,
+    )
+    .await
+    .unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains(&over["event_id"].as_str().unwrap().to_string()),
+        "{out}"
+    );
+    assert!(out.contains("quantity=5"), "{out}");
+    assert!(out.contains("held_for_review"), "{out}");
+    assert!(out.contains("1 usage event(s) held"), "{out}");
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_sanity_limit_is_per_org_and_per_meter(pool: PgPool) {
+    let w = metered_world(pool).await;
+    let other = w.db.create_org("other", "Other").await.unwrap();
+    authorize_both(&w.db, other.id).await;
+    w.db.add_member(other.id, w.user, Role::Admin)
+        .await
+        .unwrap();
+    authorize(&w.db, other.id, w.user, FACTORY).await;
+    let auth = w.factory_basic();
+    // Each org may use the limit in full: one org's total never holds another's.
+    let batch = vec![
+        metered(w.org, JOBS, Some(10)),
+        metered(other.id, JOBS, Some(10)),
+        // An unmetered event never counts toward the limit.
+        usage_event(w.org, None, Uuid::new_v4(), true),
+    ];
+    let (_, r) = post_usage_held_at(&w.db, &auth, 10, batch).await;
+    assert_eq!(r["accepted"], 3, "{r}");
+    let (_, r) = post_usage_held_at(&w.db, &auth, 10, vec![metered(other.id, JOBS, Some(1))]).await;
+    assert_eq!(rejection_codes(&r), ["held_for_review"], "{r}");
 }
 
 // ---------------------------------------------------------- service rename
@@ -2630,6 +2861,7 @@ async fn catalog_meters(db: &Db) -> Vec<String> {
         log_format: otto_platform_server::LogFormat::Text,
         email: None,
         stripe: None,
+        usage_hold_threshold: otto_billing::usage::DEFAULT_HOLD_THRESHOLD,
     };
     let res = otto_platform_server::app(db.clone(), &config)
         .unwrap()
@@ -2661,6 +2893,7 @@ async fn catalog_meters(db: &Db) -> Vec<String> {
 async fn rename_service_moves_everything_keyed_by_the_old_slug(pool: PgPool) {
     let w = metered_world(pool).await;
     let other = w.db.create_org("globex", "Globex").await.unwrap().id;
+    authorize_both(&w.db, other).await;
     let jobs_price = price(&w.db, JOBS).await;
     price(&w.db, EVALS).await;
     for org in [w.org, other] {
@@ -3051,6 +3284,7 @@ async fn a_blocker_in_another_org_is_seen_without_an_rls_exemption(pool: PgPool)
     let w = metered_world(pool).await;
     let db = w.db.pool();
     let other = w.db.create_org("globex", "Globex").await.unwrap().id;
+    authorize_both(&w.db, other).await;
     for org in [w.org, other] {
         budget(&w.db, org, "otto-factory").await;
         unmetered_factory_usage(&w, org).await;
@@ -4117,6 +4351,7 @@ async fn a_uri_rename_does_not_hold_up_another_servers_ingest(pool: PgPool) {
 
     // Another org, so the open ingest's org lock is not what it waits for.
     let other = w.db.create_org("globex", "Globex").await.unwrap().id;
+    authorize_both(&w.db, other).await;
     let (status, r) = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         post_usage(
@@ -4275,6 +4510,7 @@ async fn the_operator_cli_shows_a_resource_server_without_changing_it(pool: PgPo
 
     // A metered event in another org is a blocker it counts.
     let other = w.db.create_org("globex", "Globex").await.unwrap().id;
+    authorize_both(&w.db, other).await;
     let (_, r) = post_usage(
         &w.db,
         &w.factory_basic(),

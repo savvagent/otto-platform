@@ -20,6 +20,7 @@ fn config() -> Config {
         log_format: otto_platform_server::LogFormat::Text,
         email: None,
         stripe: None,
+        usage_hold_threshold: otto_billing::usage::DEFAULT_HOLD_THRESHOLD,
     }
 }
 

@@ -139,6 +139,13 @@ fn hours_ago(n: u32) -> String {
 impl World {
     async fn org(&self, slug: &str, billing: Billing<'_>) -> OrgId {
         let org = self.db.create_org(slug, slug).await.unwrap().id;
+        // It has authorized otto-flags, as usage ingest requires.
+        sqlx::query("INSERT INTO org_resource_grants (org_id, resource_uri) VALUES ($1, $2)")
+            .bind(org)
+            .bind(FLAGS)
+            .execute(&self.pool)
+            .await
+            .unwrap();
         self.bill(org, slug, billing).await;
         org
     }

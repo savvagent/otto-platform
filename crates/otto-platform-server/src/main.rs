@@ -43,10 +43,13 @@ async fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("stripe") {
         return run_stripe_command(&args[1..]).await;
     }
+    if args.first().map(String::as_str) == Some("usage") {
+        return run_usage_command(&args[1..]).await;
+    }
     if !args.is_empty() {
         anyhow::bail!(
             "unknown arguments {args:?}; run with none to serve, or `resource ...` / \
-             `client ...` / `pricebook ...` / `stripe ...`"
+             `client ...` / `pricebook ...` / `stripe ...` / `usage ...`"
         );
     }
 
@@ -240,6 +243,17 @@ async fn run_pricebook_command(args: &[String]) -> Result<()> {
         .await
         .context("could not connect to DATABASE_URL")?;
     pricebook_cmd::execute(&db, cmd, &mut std::io::stdout()).await
+}
+
+async fn run_usage_command(args: &[String]) -> Result<()> {
+    use otto_platform_server::usage_cmd;
+
+    let cmd = usage_cmd::parse(args).map_err(|e| anyhow::anyhow!("{e}\n\n{}", usage_cmd::USAGE))?;
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+    let db = Db::connect(&database_url)
+        .await
+        .context("could not connect to DATABASE_URL")?;
+    usage_cmd::execute(&db, cmd, &mut std::io::stdout()).await
 }
 
 async fn run_stripe_command(args: &[String]) -> Result<()> {

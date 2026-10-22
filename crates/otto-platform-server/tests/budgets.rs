@@ -84,6 +84,10 @@ async fn world(pool: PgPool) -> World {
         .await
         .unwrap();
     db.add_member(org.id, admin.id, Role::Admin).await.unwrap();
+    // The org has authorized both services, as usage ingest requires.
+    for uri in [FACTORY, FLAGS] {
+        authorize(&db, org.id, admin.id, uri).await;
+    }
     let flags_secret = secrets.pop().unwrap();
     let factory_secret = secrets.pop().unwrap();
     World {
@@ -95,6 +99,23 @@ async fn world(pool: PgPool) -> World {
         org: org.id,
         admin: admin.id,
     }
+}
+
+/// Have `org` authorize `resource`: a token issued for it.
+async fn authorize(db: &Db, org: OrgId, user: UserId, resource: &str) {
+    otto_auth::tokens::issue(
+        db,
+        otto_auth::tokens::IssueParams {
+            user_id: user,
+            org_id: org,
+            client_id: Some("agent"),
+            scopes: &["read".to_string()],
+            resource,
+            with_refresh: false,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 /// A price for `meter` from `months_from_now` (0 is this month), written

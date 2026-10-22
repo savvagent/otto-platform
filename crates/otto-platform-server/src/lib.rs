@@ -49,6 +49,7 @@ pub mod pricebook_cmd;
 pub mod resource_cmd;
 pub mod stripe_cmd;
 pub mod stripe_shipper;
+pub mod usage_cmd;
 pub mod webhooks;
 
 use std::convert::Infallible;
@@ -87,7 +88,14 @@ pub fn router(db: Db, billing: Billing) -> Router {
 pub fn app(db: Db, config: &Config) -> Result<Router> {
     let web = otto_web::router(web_state(db.clone(), config)?);
 
-    let app = router(db, internal::billing_of(config)).merge(web);
+    let app = health::router(db.clone())
+        .merge(introspect::router(db.clone()))
+        .merge(internal::router_with_hold_threshold(
+            db,
+            internal::billing_of(config),
+            config.usage_hold_threshold,
+        ))
+        .merge(web);
     // Either way an unmatched API-shaped or undecodable path answers JSON: a
     // client that guessed a route needs something it can parse. The exception
     // is a miss under the bundle that is not a page route, such as a missing
