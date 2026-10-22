@@ -82,10 +82,30 @@
 //!   the row lock, which lets concurrent redemptions of one grant exhaust the
 //!   pool), with a 5 s lock timeout that the token endpoint answers with a
 //!   retriable 503.
+//! - **PAT minting** ([`crate::tokens::mint_pat`]) and **code issuance at
+//!   consent** ([`crate::oauth::issue_authorization_code`]), one transaction
+//!   each, 5 s lock timeout: the org's row, `FOR SHARE` (refused if deleted);
+//!   then the user's `org_members` row in it, `FOR SHARE` (refused if not a
+//!   member); then the insert, held until commit. A member removal takes the
+//!   member row `FOR UPDATE` first thing and an org deletion updates the org's
+//!   row, so each waits for a mint in flight and then revokes what it
+//!   inserted, and one that commits first is seen by the mint's checks. Both
+//!   write only credential rows after the two locks, and no revocation takes
+//!   an org or member row after a token row, so they cannot cycle.
+//! - **RFC 7009 revocation** ([`crate::tokens::revoke_presented`]): the
+//!   presented refresh row `FOR UPDATE` (waiting for a refresh in flight),
+//!   then each successor along `rotated_to`, `FOR UPDATE` in chain order,
+//!   updating each row's refresh and access token as it goes; then the access
+//!   token it was presented as, if it is one.
 //! - **Revocations** (member removal and replay detection in
-//!   [`crate::tokens`], org deletion, `drop-alias`): first the matching live
-//!   refresh rows, then the matching unredeemed code rows, `FOR UPDATE`;
-//!   then the updates of access tokens, refresh tokens and codes. The locks
+//!   [`crate::tokens`], org deletion, `drop-alias`): member removal first
+//!   takes the member's `org_members` row `FOR UPDATE` (see above); then the
+//!   matching live refresh rows, then the matching unredeemed code rows,
+//!   `FOR UPDATE` (replay detection locks the family's codes too: those of
+//!   the user, org and client of the replayed token, so a code redemption of
+//!   the same family in flight is waited for and its pair revoked, while a
+//!   code of another client is not its business); then the updates of access
+//!   tokens, refresh tokens and codes. The locks
 //!   make a revocation wait for any refresh or code redemption in flight, so
 //!   its updates (each a fresh snapshot) see and revoke the pair it minted.
 //!   A redemption holds one row and waits for nothing, so this cannot cycle

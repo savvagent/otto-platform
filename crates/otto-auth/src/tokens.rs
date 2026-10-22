@@ -139,6 +139,15 @@ pub(crate) async fn issue_on(
     conn: &mut sqlx::PgConnection,
     p: IssueParams<'_>,
 ) -> Result<IssuedTokens> {
+    Ok(issue_on_ids(conn, p).await?.0)
+}
+
+/// [`issue_on`], also returning the id of the refresh token row it inserted
+/// (`None` without `with_refresh`), so a rotation can record `rotated_to`.
+pub(crate) async fn issue_on_ids(
+    conn: &mut sqlx::PgConnection,
+    p: IssueParams<'_>,
+) -> Result<(IssuedTokens, Option<Uuid>)> {
     let access = crypto::generate(prefix::ACCESS);
     let expires_at = Utc::now() + Duration::minutes(ACCESS_TTL_MINUTES);
     let scopes: Vec<String> = p.scopes.to_vec();
@@ -158,12 +167,12 @@ pub(crate) async fn issue_on(
     .fetch_one(&mut *conn)
     .await?;
 
-    let refresh_plaintext = if p.with_refresh {
+    let (refresh_plaintext, refresh_id) = if p.with_refresh {
         let refresh = crypto::generate(prefix::REFRESH);
-        sqlx::query(
+        let id: Uuid = sqlx::query_scalar(
             "INSERT INTO refresh_tokens \
                (token_hash, access_token_id, user_id, org_id, client_id, scopes, resource, expires_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
         )
         .bind(&refresh.hash)
         .bind(access_id)
@@ -173,19 +182,22 @@ pub(crate) async fn issue_on(
         .bind(&scopes)
         .bind(p.resource)
         .bind(Utc::now() + Duration::days(REFRESH_TTL_DAYS))
-        .execute(&mut *conn)
+        .fetch_one(&mut *conn)
         .await?;
-        Some(refresh.into_plaintext())
+        (Some(refresh.into_plaintext()), Some(id))
     } else {
-        None
+        (None, None)
     };
 
-    Ok(IssuedTokens {
-        access_token: access.into_plaintext(),
-        refresh_token: refresh_plaintext,
-        expires_in: ACCESS_TTL_MINUTES * 60,
-        scopes,
-    })
+    Ok((
+        IssuedTokens {
+            access_token: access.into_plaintext(),
+            refresh_token: refresh_plaintext,
+            expires_in: ACCESS_TTL_MINUTES * 60,
+            scopes,
+        },
+        refresh_id,
+    ))
 }
 
 /// A row from `access_tokens`. Named rather than a tuple so the field order
@@ -370,7 +382,7 @@ pub async fn redeem_refresh(
         ));
     };
 
-    let issued = issue_on(
+    let (issued, successor) = issue_on_ids(
         tx.conn(),
         IssueParams {
             user_id: r.user_id,
@@ -389,10 +401,11 @@ pub async fn redeem_refresh(
     // row was revoked or consumed since it was read (the lock makes that a
     // guard rather than a race).
     let consumed = sqlx::query(
-        "UPDATE refresh_tokens SET consumed_at = now() \
+        "UPDATE refresh_tokens SET consumed_at = now(), rotated_to = $2 \
          WHERE id = $1 AND consumed_at IS NULL AND revoked_at IS NULL",
     )
     .bind(r.id)
+    .bind(successor)
     .execute(tx.conn())
     .await?
     .rows_affected();
@@ -430,6 +443,20 @@ async fn revoke_family_on(
     sqlx::query(
         "SELECT 1 FROM refresh_tokens \
          WHERE user_id = $1 AND org_id = $2 AND client_id = $3 AND revoked_at IS NULL \
+         FOR UPDATE",
+    )
+    .bind(user)
+    .bind(org)
+    .bind(client_id)
+    .execute(&mut *conn)
+    .await?;
+    // And for a code redemption of the family in flight, which holds its
+    // code's row until it commits the pair it minted: the updates below, each
+    // a fresh snapshot, then see that pair and revoke it too. After the
+    // refresh rows, as every revocation orders them (`crate::resources`).
+    sqlx::query(
+        "SELECT 1 FROM authorization_codes \
+         WHERE user_id = $1 AND org_id = $2 AND client_id = $3 AND consumed_at IS NULL \
          FOR UPDATE",
     )
     .bind(user)
@@ -523,25 +550,126 @@ pub(crate) async fn revoke_family_after_theft(
     }
 }
 
+/// The longest `rotated_to` chain [`revoke_presented`] follows. A chain is one
+/// link per refresh of a session (a bounded number: a 90-day refresh lifetime
+/// at one refresh a minute); the bound only stops a corrupted cycle.
+const MAX_ROTATION_CHAIN: usize = 200_000;
+
 /// Revoke one token by its presented value (RFC 7009). Idempotent and silent:
 /// the RFC requires a 200 even for an unknown token, so this never reports
 /// whether the token existed.
+///
+/// Revoking a refresh token revokes everything the grant went on to mint from
+/// it: the token itself, its access token, and the chain of successors it was
+/// rotated into (`rotated_to`) with their access tokens. A refresh in flight
+/// holds its token's row until it commits the successor it minted, and this
+/// takes that row first (`FOR UPDATE`), so it waits for the refresh, then
+/// reads the successor it recorded and revokes it as well. Without that the
+/// consumed token alone would be marked revoked and the successor pair would
+/// outlive the revocation. Lock order (`crate::resources`): refresh rows, in
+/// chain order, then the access token updates.
 pub async fn revoke_presented(db: &Db, presented: &str) -> Result<()> {
     let hash = crypto::hash(presented.trim());
+    let mut tx = db.begin_unpinned().await?;
+    sqlx::query(THEFT_REVOCATION_LOCK_TIMEOUT)
+        .execute(tx.conn())
+        .await?;
+
+    let mut next: Option<Uuid> = None;
+    let mut first = true;
+    for _ in 0..MAX_ROTATION_CHAIN {
+        let row: Option<(Uuid, Option<Uuid>, Option<Uuid>)> = if first {
+            sqlx::query_as(
+                "SELECT id, access_token_id, rotated_to FROM refresh_tokens \
+                 WHERE token_hash = $1 FOR UPDATE",
+            )
+            .bind(&hash)
+            .fetch_optional(tx.conn())
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, access_token_id, rotated_to FROM refresh_tokens \
+                 WHERE id = $1 FOR UPDATE",
+            )
+            .bind(next)
+            .fetch_optional(tx.conn())
+            .await?
+        };
+        first = false;
+        let Some((id, access_id, rotated_to)) = row else {
+            break;
+        };
+        sqlx::query(
+            "UPDATE refresh_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id)
+        .execute(tx.conn())
+        .await?;
+        if let Some(access_id) = access_id {
+            sqlx::query(
+                "UPDATE access_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+            )
+            .bind(access_id)
+            .execute(tx.conn())
+            .await?;
+        }
+        match rotated_to {
+            Some(successor) => next = Some(successor),
+            None => break,
+        }
+    }
+
     sqlx::query("UPDATE access_tokens SET revoked_at = now() WHERE token_hash = $1")
         .bind(&hash)
-        .execute(db.pool())
+        .execute(tx.conn())
         .await?;
-    sqlx::query("UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = $1")
-        .bind(&hash)
-        .execute(db.pool())
-        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Personal access tokens
 // ---------------------------------------------------------------------------
+
+/// How long a credential mint waits for the org or member row lock before
+/// giving up (a removal or deletion that is itself waiting on something).
+pub(crate) const MINT_LOCK_TIMEOUT: &str = "SET LOCAL lock_timeout = '5s'";
+
+/// Take the org's row and the user's membership row in it `FOR SHARE` on
+/// `conn`'s transaction, refusing a deleted org or a user who is not a member.
+/// A credential must be inserted after this in the same transaction (see
+/// [`mint_pat`]). A member removal or org deletion needs these rows exclusively
+/// and so waits for the transaction, then revokes what it inserted.
+pub(crate) async fn lock_live_member_shared(
+    conn: &mut sqlx::PgConnection,
+    user: UserId,
+    org: OrgId,
+) -> Result<()> {
+    // A deleted org must not gain new credentials.
+    let live: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM orgs WHERE id = $1 AND deleted_at IS NULL FOR SHARE")
+            .bind(org)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if live.is_none() {
+        return Err(AuthError::InvalidRequest(
+            "that org no longer exists".into(),
+        ));
+    }
+    let member: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM org_members WHERE org_id = $1 AND user_id = $2 FOR SHARE",
+    )
+    .bind(org)
+    .bind(user)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if member.is_none() {
+        return Err(AuthError::InvalidRequest(
+            "that user is not a member of the org".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Mint a PAT.
 ///
@@ -579,21 +707,20 @@ pub async fn mint_pat(
         return Err(rs.no_scope_requested());
     }
 
-    // A deleted org must not gain new credentials.
-    let live: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM orgs WHERE id = $1 AND deleted_at IS NULL)",
-    )
-    .bind(org)
-    .fetch_one(db.pool())
-    .await?;
-    if !live {
-        return Err(AuthError::InvalidRequest(
-            "that org no longer exists".into(),
-        ));
-    }
-
     let token = crypto::generate(prefix::PAT);
     let ttl = ttl_days.unwrap_or(PAT_TTL_DAYS).clamp(1, 365);
+
+    // The org must be live and the user still a member, and both are held
+    // (`FOR SHARE`, until the insert commits) so that an org deletion or a
+    // member removal serializes with this mint: one that commits first is
+    // seen here, and one that starts later waits for the mint and then
+    // revokes the PAT with the rest (`revoke_all_in_org_on` takes the member row first). A check
+    // without the lock would let a mint that passed it just before the removal
+    // insert after the revocation's snapshot, and the PAT would survive.
+    // Lock order (`crate::resources`): the org row, then the member row.
+    let mut tx = db.begin_unpinned().await?;
+    sqlx::query(MINT_LOCK_TIMEOUT).execute(tx.conn()).await?;
+    lock_live_member_shared(tx.conn(), user, org).await?;
 
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO access_tokens \
@@ -610,8 +737,9 @@ pub async fn mint_pat(
     // `days` is an integer parameter of make_interval; `secs` is the double
     // one. Binding an f64 here fails at runtime with a no-such-function error.
     .bind(ttl as i32)
-    .fetch_one(db.pool())
+    .fetch_one(tx.conn())
     .await?;
+    tx.commit().await?;
 
     Ok((token.into_plaintext(), id))
 }
@@ -685,7 +813,19 @@ async fn revoke_all_in_org_on(
     user: UserId,
     org: OrgId,
 ) -> Result<u64> {
-    // First wait for any refresh or code redemption of the member's in
+    // Before anything else, take the member's row exclusively: a PAT mint or
+    // code issuance for the member holds it `FOR SHARE` from its membership
+    // check to its insert (`lock_live_member_shared`), so this waits for one
+    // in flight and the updates below see the credential it inserted, and one
+    // that starts after this is refused or waits for the removal. For a
+    // removal the caller deletes the row afterwards in the same transaction.
+    sqlx::query("SELECT 1 FROM org_members WHERE org_id = $1 AND user_id = $2 FOR UPDATE")
+        .bind(org)
+        .bind(user)
+        .execute(&mut *conn)
+        .await?;
+
+    // Then wait for any refresh or code redemption of the member's in
     // flight. Each holds its grant's row (the refresh token, the code) until
     // it commits the pair it minted, which no statement here can see before
     // then. Locking those rows waits for it, and the updates below, each with

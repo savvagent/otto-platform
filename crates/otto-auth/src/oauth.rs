@@ -534,6 +534,15 @@ pub async fn issue_authorization_code(
     let scopes = resource.grant_scopes(&req.scopes)?;
     let code = crypto::generate(prefix::AUTH_CODE);
 
+    // The org live and the user a member, held until the insert commits, so a
+    // member removal or org deletion serializes with the issuance and
+    // consumes the code if it started later (`tokens::lock_live_member_shared`).
+    let mut tx = db.begin_unpinned().await?;
+    sqlx::query(tokens::MINT_LOCK_TIMEOUT)
+        .execute(tx.conn())
+        .await?;
+    tokens::lock_live_member_shared(tx.conn(), user, org).await?;
+
     sqlx::query(
         "INSERT INTO authorization_codes \
            (code_hash, client_id, user_id, org_id, redirect_uri, code_challenge, \
@@ -550,8 +559,9 @@ pub async fn issue_authorization_code(
     .bind(&scopes)
     .bind(&resource.resource_uri)
     .bind(AUTH_CODE_TTL_SECONDS as f64)
-    .execute(db.pool())
+    .execute(tx.conn())
     .await?;
+    tx.commit().await?;
 
     Ok(code.into_plaintext())
 }
