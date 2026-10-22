@@ -14,9 +14,11 @@
 //! [`MAX_WAIT_FOR_USAGE`] stops waiting, because rows that can never ship (a
 //! meter Stripe does not know) must not keep a card on the hook. The Stripe
 //! customer is kept, so its invoices stay readable, and its card is detached.
-//! A cycle invoice that was held as a draft before the deletion is not
-//! released by this: an operator finalizes or voids it (docs/deploy/fly.md,
-//! "Deleting an org with a subscription").
+//! A cycle invoice that was held as a draft before the deletion is deleted
+//! in Stripe (and released as `deleted`, so sync does not look for it): its
+//! automatic collection is off, so it would otherwise stay a draft forever.
+//! What the draft billed is forgone; the cancel's own final invoice covers
+//! only usage not yet invoiced.
 //!
 //! **Exactly once.** Before canceling, the subscription is retrieved: one
 //! already `canceled`, or gone (404), is `done` with no call. Otherwise the
@@ -26,10 +28,11 @@
 
 use std::time::Duration;
 
+use otto_tenant::ids::OrgId;
 use otto_tenant::Db;
 use uuid::Uuid;
 
-use super::Result;
+use super::{invoices, Result};
 use crate::stripe::{Client, IdempotencyKey, StripeError};
 use crate::stripe_outbox::{self, Verdict};
 
@@ -200,6 +203,19 @@ pub async fn run_pass(db: &Db, client: &Client) -> Result<CancelReport> {
     for row in &due {
         match cancel_in_stripe(client, row).await {
             Ok(outcome) => {
+                // Drafts first: a failure here retries the row, which finds
+                // the subscription already canceled and comes back to this.
+                if let Err(e) =
+                    invoices::delete_held_for_org(db, client, OrgId::from(row.org_id)).await
+                {
+                    report.retrying += 1;
+                    tracing::warn!(
+                        org = %row.org_id, error = %e,
+                        "could not delete a deleted org's held draft invoice; will retry"
+                    );
+                    mark_retry(db, row, &e.to_string()).await?;
+                    continue;
+                }
                 // The card goes with the subscription. A failure here is
                 // logged and not retried: the subscription is what bills.
                 if let Some(pm) = &row.stripe_payment_method_id {

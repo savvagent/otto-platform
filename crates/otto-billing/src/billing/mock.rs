@@ -1048,6 +1048,17 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
             }
             None => missing("No such invoice"),
         },
+        ("DELETE", ["v1", "invoices", id]) => match inner.invoices.get(*id) {
+            Some(i) if i["status"] == json!("draft") => {
+                inner.invoices.remove(*id);
+                (
+                    StatusCode::OK,
+                    json!({ "id": id, "object": "invoice", "deleted": true }),
+                )
+            }
+            Some(_) => invalid("You can only delete draft invoices."),
+            None => missing("No such invoice"),
+        },
         ("POST", ["v1", "invoices", id, "finalize"]) => match inner.invoices.get_mut(*id) {
             Some(i) if i["status"] == json!("draft") => {
                 i["status"] = json!("open");

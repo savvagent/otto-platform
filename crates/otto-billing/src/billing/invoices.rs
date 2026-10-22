@@ -77,6 +77,8 @@ pub mod outcomes {
     pub const FINALIZED_LATE: &str = "finalized_late";
     /// No longer a draft when sync came to it: left alone.
     pub const NOT_DRAFT: &str = "not_draft";
+    /// Deleted in Stripe because its org was deleted (#73).
+    pub const DELETED: &str = "deleted";
 }
 
 /// The month an invoice bills: the one holding the instant before its
@@ -363,6 +365,57 @@ pub(super) async fn release_held(
         lease.release(db).await;
     }
     Ok(())
+}
+
+/// Delete the held draft invoices of a deleted org in Stripe, and release them
+/// so sync does not look for them again. A held invoice that is no longer a
+/// draft (or is gone) is left as it is and recorded `not_draft`. Returns how
+/// many drafts were deleted.
+pub(super) async fn delete_held_for_org(db: &Db, client: &Client, org: OrgId) -> Result<usize> {
+    let mut tx = db.begin(org).await?;
+    let held: Vec<Held> = sqlx::query_as(
+        "SELECT stripe_invoice_id, stripe_customer_id, period_month, held_at \
+           FROM stripe_held_invoices \
+         WHERE released_at IS NULL ORDER BY held_at, stripe_invoice_id",
+    )
+    .fetch_all(tx.conn())
+    .await?;
+    tx.commit().await?;
+    if held.is_empty() {
+        return Ok(0);
+    }
+    let lease = OrgLease::acquire(db, org, ORG_WAIT).await?;
+    let result = delete_held(db, client, &lease, org, &held).await;
+    lease.release(db).await;
+    result
+}
+
+async fn delete_held(
+    db: &Db,
+    client: &Client,
+    lease: &OrgLease,
+    org: OrgId,
+    held: &[Held],
+) -> Result<usize> {
+    let mut deleted = 0;
+    for h in held {
+        let id = h.stripe_invoice_id.as_str();
+        lease.renew(db).await?;
+        let outcome = match client.retrieve_invoice(id).await {
+            Ok(invoice) if invoice.status.as_deref() == Some("draft") => {
+                client
+                    .delete_draft_invoice(id, &idem("invoice-delete", &id)?)
+                    .await?;
+                deleted += 1;
+                outcomes::DELETED
+            }
+            Ok(_) => outcomes::NOT_DRAFT,
+            Err(e) if e.api().is_some_and(|a| a.status == 404) => outcomes::NOT_DRAFT,
+            Err(e) => return Err(e.into()),
+        };
+        record_release(db, lease, org, id, h.month(), outcome, SYNC_ACTOR).await?;
+    }
+    Ok(deleted)
 }
 
 async fn release_one(

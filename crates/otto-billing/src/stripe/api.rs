@@ -801,6 +801,22 @@ impl Client {
             .await
     }
 
+    /// `DELETE /v1/invoices/{id}`: delete a draft invoice. Stripe refuses any
+    /// invoice that is not a draft.
+    pub async fn delete_draft_invoice(
+        &self,
+        id: &str,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<serde_json::Value, StripeError> {
+        check_id("invoice", id)?;
+        self.delete(
+            &format!("/v1/invoices/{id}"),
+            Form::default(),
+            idempotency_key,
+        )
+        .await
+    }
+
     /// `POST /v1/invoices/{id}/finalize`: turn a draft into an open invoice,
     /// with `auto_advance` deciding whether Stripe then collects it on its
     /// own.

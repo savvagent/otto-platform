@@ -155,9 +155,7 @@
 //!
 //! Shipping metered usage to Stripe meter events is #64; it needs only
 //! [`live_subscription`]. Canceling a deleted org's subscription is
-//! [`cancel`] (#73). A held draft invoice of a deleted org is not released by
-//! sync, though: an operator finalizes or voids it in the dashboard
-//! (docs/deploy/fly.md, "Deleting an org with a subscription").
+//! [`cancel`] (#73), which also deletes a deleted org's held draft invoices.
 
 pub mod cancel;
 pub mod gate;

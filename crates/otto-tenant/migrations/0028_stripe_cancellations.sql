@@ -65,3 +65,10 @@ BEGIN
 EXCEPTION WHEN insufficient_privilege THEN
   RAISE NOTICE 'could not adjust otto_app privileges on stripe_cancellations';
 END $$;
+
+-- A deleted org's held draft invoice is deleted in Stripe by the cancellation
+-- (it would otherwise stay a draft forever, with automatic collection off),
+-- and recorded released as `deleted`.
+ALTER TABLE stripe_held_invoices DROP CONSTRAINT stripe_held_invoices_outcome;
+ALTER TABLE stripe_held_invoices ADD CONSTRAINT stripe_held_invoices_outcome
+  CHECK (outcome IN ('finalized', 'finalized_late', 'not_draft', 'deleted'));

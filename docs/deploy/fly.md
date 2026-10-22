@@ -298,12 +298,12 @@ an hour. With billing disabled the rows wait until it is enabled.
   error level, kept with `last_error`, and the card keeps being invoiced until you cancel
   the subscription in the dashboard.
 
-What it does **not** do: a draft invoice that was held (`stripe_held_invoices`) before the
-deletion is not released, and sync never touches the customer again. In the dashboard
-(Invoices → Drafts, filtered to the customer; automatic collection shows as off), finalize
-a held draft that should be collected (turn automatic collection back on, or collect it by
-hand) or void one that should not. Without that a draft with automatic collection off
-stays a draft forever.
+- **Held drafts are deleted.** A cycle invoice that was held as a draft
+  (`stripe_held_invoices`) before the deletion is deleted in Stripe and recorded released
+  as `deleted`; its automatic collection is off, so it would otherwise stay a draft forever.
+  One that someone already finalized or voided is left alone (`not_draft`). Deleting
+  it forgoes whatever it billed (the previous period's metered usage): the cancel's own
+  final invoice covers only usage not yet invoiced. If deleting fails, the row retries.
 
 ### Monitoring
 
