@@ -599,3 +599,359 @@ async fn a_replay_revokes_the_family_even_while_a_row_of_it_is_busy(pool: PgPool
             .unwrap();
     assert_eq!(live_refresh, 0, "the family is still live");
 }
+
+// --------------------------------------------- credentials minted concurrently
+
+/// Hold what `mint_pat` and `issue_authorization_code` hold between their
+/// membership check and their insert: the org's row and the member's row,
+/// `FOR SHARE`, then a credential inserted, not yet committed.
+async fn minting_pat_in_flight(
+    db: &Db,
+    user: UserId,
+    org: OrgId,
+) -> (sqlx::Transaction<'static, sqlx::Postgres>, String) {
+    use otto_auth::crypto::{self, prefix};
+    let mut tx = db.pool().begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM orgs WHERE id = $1 AND deleted_at IS NULL FOR SHARE")
+        .bind(org.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT 1 FROM org_members WHERE org_id = $1 AND user_id = $2 FOR SHARE")
+        .bind(org.as_uuid())
+        .bind(user.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let pat = crypto::generate(prefix::PAT);
+    sqlx::query(
+        "INSERT INTO access_tokens \
+           (token_hash, kind, name, user_id, org_id, scopes, resource, expires_at) \
+         VALUES ($1, 'pat', 'ci', $2, $3, '{jobs:read}', $4, now() + interval '30 days')",
+    )
+    .bind(&pat.hash)
+    .bind(user.as_uuid())
+    .bind(org.as_uuid())
+    .bind(RESOURCE)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    (tx, pat.into_plaintext())
+}
+
+/// A member removal as the console runs it: revoke, then delete the row.
+async fn remove_member(db: Db, user: UserId, org: OrgId) {
+    let mut tx = db.begin_unpinned().await.unwrap();
+    tokens::revoke_all_in_org_tx(tx.conn(), user, org)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
+        .bind(org.as_uuid())
+        .bind(user.as_uuid())
+        .execute(tx.conn())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+async fn live_pats(db: &Db) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM access_tokens WHERE kind = 'pat' AND revoked_at IS NULL",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+async fn unconsumed_codes(db: &Db) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM authorization_codes WHERE consumed_at IS NULL")
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+/// A PAT mint that has passed its checks and inserted, not yet committed, when
+/// a removal or deletion starts: the revocation waits, then revokes the PAT.
+async fn pat_in_flight_then_revocation(pool: PgPool, how: Revocation) {
+    let db = Db::from_pool(pool);
+    let (user, org, _client) = setup(&db).await;
+    let (minting, pat) = minting_pat_in_flight(&db, user, org).await;
+
+    let revoking = match how {
+        Revocation::MemberRemoval => tokio::spawn(remove_member(db.clone(), user, org)),
+        Revocation::OrgDeletion => tokio::spawn(revoke(db.clone(), how, user, org)),
+    };
+    someone_waits_on_a_lock(db.pool()).await;
+    assert!(
+        !revoking.is_finished(),
+        "{how:?} did not wait for the PAT mint"
+    );
+    minting.commit().await.unwrap();
+    revoking.await.unwrap();
+
+    assert!(
+        tokens::introspect(&db, &pat, RESOURCE).await.is_err(),
+        "the PAT survived {how:?}"
+    );
+    assert_eq!(live_pats(&db).await, 0);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_member_removal_waits_for_a_pat_mint_in_flight_and_revokes_it(pool: PgPool) {
+    pat_in_flight_then_revocation(pool, Revocation::MemberRemoval).await;
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_org_deletion_waits_for_a_pat_mint_in_flight_and_revokes_it(pool: PgPool) {
+    pat_in_flight_then_revocation(pool, Revocation::OrgDeletion).await;
+}
+
+/// The other order: the removal or deletion holds its locks (revoked, not yet
+/// committed) when the mint starts. The mint waits, then is refused.
+async fn revocation_in_flight_then_mint(pool: PgPool, how: Revocation) {
+    let db = Db::from_pool(pool);
+    let (user, org, client) = setup(&db).await;
+
+    let mut revoking = db.begin_unpinned().await.unwrap();
+    match how {
+        Revocation::MemberRemoval => {
+            tokens::revoke_all_in_org_tx(revoking.conn(), user, org)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
+                .bind(org.as_uuid())
+                .bind(user.as_uuid())
+                .execute(revoking.conn())
+                .await
+                .unwrap();
+        }
+        Revocation::OrgDeletion => {
+            sqlx::query("UPDATE orgs SET deleted_at = now() WHERE id = $1")
+                .bind(org.as_uuid())
+                .execute(revoking.conn())
+                .await
+                .unwrap();
+        }
+    }
+
+    let db2 = db.clone();
+    let pat =
+        tokio::spawn(
+            async move { tokens::mint_pat(&db2, user, org, "ci", &[], RESOURCE, None).await },
+        );
+    let (db3, client3) = (db.clone(), client.clone());
+    let code = tokio::spawn(async move {
+        oauth::issue_authorization_code(&db3, &code_req(&client3), user, org).await
+    });
+    someone_waits_on_a_lock(db.pool()).await;
+    assert!(!pat.is_finished(), "the mint did not wait for {how:?}");
+    revoking.commit().await.unwrap();
+
+    let err = pat.await.unwrap().unwrap_err();
+    assert!(matches!(err, AuthError::InvalidRequest(_)), "{err:?}");
+    assert_eq!(live_pats(&db).await, 0);
+    let err = code.await.unwrap().unwrap_err();
+    assert!(matches!(err, AuthError::InvalidRequest(_)), "{err:?}");
+    assert_eq!(unconsumed_codes(&db).await, 0);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_pat_mint_and_a_code_issuance_racing_a_member_removal_are_refused(pool: PgPool) {
+    revocation_in_flight_then_mint(pool, Revocation::MemberRemoval).await;
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_pat_mint_and_a_code_issuance_racing_an_org_deletion_are_refused(pool: PgPool) {
+    revocation_in_flight_then_mint(pool, Revocation::OrgDeletion).await;
+}
+
+fn code_req(client: &str) -> oauth::AuthorizeRequest {
+    oauth::AuthorizeRequest {
+        client_id: client.into(),
+        redirect_uri: REDIRECT.into(),
+        code_challenge: URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes())),
+        code_challenge_method: "S256".into(),
+        scopes: vec!["jobs:read".into()],
+        resource: RESOURCE.into(),
+        state: None,
+    }
+}
+
+/// A code issuance that has passed its checks and inserted, not yet
+/// committed, when a removal starts: the removal waits, then consumes the
+/// code, so it can never redeem (and certainly not after a re-add).
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_member_removal_waits_for_a_code_issuance_in_flight_and_consumes_the_code(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let (user, org, client) = setup(&db).await;
+
+    let mut issuing = db.pool().begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM orgs WHERE id = $1 AND deleted_at IS NULL FOR SHARE")
+        .bind(org.as_uuid())
+        .execute(&mut *issuing)
+        .await
+        .unwrap();
+    sqlx::query("SELECT 1 FROM org_members WHERE org_id = $1 AND user_id = $2 FOR SHARE")
+        .bind(org.as_uuid())
+        .bind(user.as_uuid())
+        .execute(&mut *issuing)
+        .await
+        .unwrap();
+    let code = otto_auth::crypto::generate(otto_auth::crypto::prefix::AUTH_CODE);
+    sqlx::query(
+        "INSERT INTO authorization_codes \
+           (code_hash, client_id, user_id, org_id, redirect_uri, code_challenge, \
+            code_challenge_method, scopes, resource, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'S256', '{jobs:read}', $7, \
+                 now() + interval '5 minutes')",
+    )
+    .bind(&code.hash)
+    .bind(&client)
+    .bind(user.as_uuid())
+    .bind(org.as_uuid())
+    .bind(REDIRECT)
+    .bind(URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes())))
+    .bind(RESOURCE)
+    .execute(&mut *issuing)
+    .await
+    .unwrap();
+
+    let removing = tokio::spawn(remove_member(db.clone(), user, org));
+    someone_waits_on_a_lock(db.pool()).await;
+    assert!(!removing.is_finished(), "the removal did not wait");
+    issuing.commit().await.unwrap();
+    removing.await.unwrap();
+
+    assert_eq!(unconsumed_codes(&db).await, 0);
+    // Re-added later, the stale code still redeems nothing.
+    db.add_member(org, user, Role::Member).await.unwrap();
+    let err = oauth::redeem_code(
+        &db,
+        &code.into_plaintext(),
+        &client,
+        REDIRECT,
+        VERIFIER,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidGrant(_)), "{err:?}");
+    assert_eq!(live_access_tokens(&db).await, 0);
+}
+
+/// RFC 7009 revocation of a refresh token that is mid-refresh: the consumed
+/// token is revoked and so is the successor pair the refresh minted.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn revoking_a_refresh_token_mid_refresh_leaves_no_valid_successor(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let (user, org, client) = setup(&db).await;
+    let presented = refresh_token(&db, user, org, &client).await;
+    sqlx::query("UPDATE access_tokens SET revoked_at = now()")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // `redeem_refresh`'s steps, held open before its commit.
+    let mut refreshing = db.pool().begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM refresh_tokens WHERE token_hash = $1 FOR UPDATE")
+        .bind(otto_auth::crypto::hash(&presented))
+        .execute(&mut *refreshing)
+        .await
+        .unwrap();
+    let (access, refresh) = mint_in(&mut refreshing, user, org, &client).await;
+    sqlx::query(
+        "UPDATE refresh_tokens SET consumed_at = now(), \
+                rotated_to = (SELECT id FROM refresh_tokens WHERE token_hash = $2) \
+         WHERE token_hash = $1",
+    )
+    .bind(otto_auth::crypto::hash(&presented))
+    .bind(otto_auth::crypto::hash(&refresh))
+    .execute(&mut *refreshing)
+    .await
+    .unwrap();
+
+    let (db2, presented2) = (db.clone(), presented.clone());
+    let revoking = tokio::spawn(async move { tokens::revoke_presented(&db2, &presented2).await });
+    someone_waits_on_a_lock(db.pool()).await;
+    assert!(!revoking.is_finished(), "the revocation did not wait");
+    refreshing.commit().await.unwrap();
+    revoking.await.unwrap().unwrap();
+
+    assert_pair_revoked(&db, &client, &access, &refresh).await;
+}
+
+/// Revoking a stale (already rotated) refresh token revokes what the grant
+/// went on to mint, however many rotations ago, and no other grant's tokens.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn revoking_a_rotated_refresh_token_revokes_its_successors_only(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let (user, org, client) = setup(&db).await;
+    let first = refresh_token(&db, user, org, &client).await;
+    let other = refresh_token(&db, user, org, &client).await;
+    let (second, ..) = tokens::redeem_refresh(&db, &first, &client, None)
+        .await
+        .unwrap();
+    let (third, ..) = tokens::redeem_refresh(&db, &second.refresh_token.unwrap(), &client, None)
+        .await
+        .unwrap();
+
+    tokens::revoke_presented(&db, &first).await.unwrap();
+
+    assert!(tokens::introspect(&db, &third.access_token, RESOURCE)
+        .await
+        .is_err());
+    let err = tokens::redeem_refresh(&db, &third.refresh_token.unwrap(), &client, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidGrant(_)), "{err:?}");
+    // The other grant of the same client is untouched.
+    tokens::redeem_refresh(&db, &other, &client, None)
+        .await
+        .unwrap();
+}
+
+/// Replay detection waits for a code redemption of the same family in flight
+/// and revokes the pair it minted.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_replay_detection_waits_for_a_code_redemption_in_flight_and_revokes_its_pair(
+    pool: PgPool,
+) {
+    let db = Db::from_pool(pool);
+    let (user, org, client) = setup(&db).await;
+    let code = otto_auth::crypto::generate(otto_auth::crypto::prefix::AUTH_CODE);
+    sqlx::query(
+        "INSERT INTO authorization_codes \
+           (code_hash, client_id, user_id, org_id, redirect_uri, code_challenge, \
+            code_challenge_method, scopes, resource, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, 'challenge', 'S256', '{jobs:read}', $6, \
+                 now() + interval '5 minutes')",
+    )
+    .bind(&code.hash)
+    .bind(&client)
+    .bind(user.as_uuid())
+    .bind(org.as_uuid())
+    .bind(REDIRECT)
+    .bind(RESOURCE)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let mut redeeming = db.pool().begin().await.unwrap();
+    sqlx::query(
+        "UPDATE authorization_codes SET consumed_at = now() \
+         WHERE code_hash = $1 AND consumed_at IS NULL",
+    )
+    .bind(&code.hash)
+    .execute(&mut *redeeming)
+    .await
+    .unwrap();
+    let (access, refresh) = mint_in(&mut redeeming, user, org, &client).await;
+
+    let (db2, client2) = (db.clone(), client.clone());
+    let replay =
+        tokio::spawn(async move { tokens::revoke_family(&db2, user, org, &client2).await });
+    someone_waits_on_a_lock(db.pool()).await;
+    assert!(!replay.is_finished(), "the family revocation did not wait");
+    redeeming.commit().await.unwrap();
+    replay.await.unwrap().unwrap();
+    assert_pair_revoked(&db, &client, &access, &refresh).await;
+}
