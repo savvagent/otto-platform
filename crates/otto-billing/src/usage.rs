@@ -402,6 +402,69 @@ pub enum IngestOutcome {
     Duplicate,
     /// Refused, with nothing recorded. Retrying unchanged will fail again.
     Rejected(&'static str),
+    /// Not counted: it would take the org's total of its meter past the
+    /// sanity threshold, so it waits in `usage_held_events` for an operator.
+    /// Carries the reason, which starts with `held_for_review`.
+    Held(String),
+}
+
+/// The default sanity threshold of [`UsageExt::ingest_usage_held`]: the most
+/// of one meter an org may accrue in one billing month before further events
+/// are held for operator review. A thousand times one event's own cap
+/// ([`MAX_METER_QUANTITY`]): above any plausible month of any meter, so only a
+/// runaway or hostile shipper reaches it, and still a bound, where without it
+/// a shipper could bill 500 events of 1e9 per request without end. Operators
+/// tune it down to their meters with `OTTO_USAGE_HOLD_THRESHOLD`.
+pub const DEFAULT_HOLD_THRESHOLD: i64 = 1_000_000_000_000;
+
+/// Whether `org` (the transaction's) has authorized the resource server whose
+/// canonical URI is `resource_uri`: a token of any kind was ever issued in the
+/// org for it (`org_resource_grants`, migration 0027, which also follows the
+/// server's aliases). "Ever" and not "active" on purpose: usage is shipped
+/// from an outbox, possibly long after the work, so the token that did the
+/// work has often expired or been revoked by the time the event arrives, and
+/// that usage is still owed.
+pub async fn org_authorized_resource(
+    tx: &mut Tx<'_>,
+    resource_uri: &str,
+) -> std::result::Result<bool, sqlx::Error> {
+    let org = tx.org();
+    sqlx::query_scalar("SELECT org_authorized_resource($1, $2)")
+        .bind(org)
+        .bind(resource_uri)
+        .fetch_one(tx.conn())
+        .await
+}
+
+/// One event held for review (`usage_held_events`).
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct HeldEvent {
+    pub org_id: Uuid,
+    pub resource_uri: String,
+    pub event_id: Uuid,
+    pub meter: String,
+    pub quantity: i64,
+    pub period_start: chrono::NaiveDate,
+    pub occurred_at: DateTime<Utc>,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Every org's held events, oldest first, for the operator.
+pub async fn list_held(db: &otto_tenant::Db) -> Result<Vec<HeldEvent>> {
+    let mut tx = db.begin_unpinned().await?;
+    sqlx::query("SELECT set_config('app.usage_held_review', 'on', true)")
+        .execute(tx.conn())
+        .await?;
+    let rows = sqlx::query_as(
+        "SELECT org_id, resource_uri, event_id, meter, quantity, period_start, \
+                occurred_at, reason, created_at \
+         FROM usage_held_events ORDER BY created_at, id",
+    )
+    .fetch_all(tx.conn())
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
 }
 
 /// The statement that counts one usage event (see
@@ -525,6 +588,33 @@ pub trait UsageExt {
         now: DateTime<Utc>,
     ) -> impl std::future::Future<Output = Result<IngestOutcome>> + Send;
 
+    /// [`ingest_usage_deferred`](Self::ingest_usage_deferred) with the sanity
+    /// limit of savvagent/otto-platform#79: a metered event that would take the
+    /// org's total of its meter in its billing month past `threshold` is not
+    /// counted but kept in `usage_held_events` for an operator
+    /// ([`IngestOutcome::Held`]). Its dedupe claim is kept, so a resend is a
+    /// duplicate and it is held once. Only `POST /internal/usage` passes a
+    /// threshold; the others count whatever they are given.
+    fn ingest_usage_held(
+        &mut self,
+        resource_uri: &str,
+        event: &ShippedUsage<'_>,
+        budgets: &mut PendingBudgets,
+        threshold: i64,
+    ) -> impl std::future::Future<Output = Result<IngestOutcome>> + Send;
+
+    /// [`ingest_usage_held`](Self::ingest_usage_held) as if the platform's
+    /// clock read `now`. For tests of period boundaries only.
+    #[doc(hidden)]
+    fn ingest_usage_held_at(
+        &mut self,
+        resource_uri: &str,
+        event: &ShippedUsage<'_>,
+        budgets: &mut PendingBudgets,
+        now: DateTime<Utc>,
+        threshold: Option<i64>,
+    ) -> impl std::future::Future<Output = Result<IngestOutcome>> + Send;
+
     fn current_usage(&mut self) -> impl std::future::Future<Output = Result<PeriodUsage>> + Send;
 
     /// This month's quantity of every meter `service` has declared, by key,
@@ -605,6 +695,29 @@ impl UsageExt for Tx<'_> {
         budgets: &mut PendingBudgets,
         now: DateTime<Utc>,
     ) -> Result<IngestOutcome> {
+        self.ingest_usage_held_at(resource_uri, event, budgets, now, None)
+            .await
+    }
+
+    async fn ingest_usage_held(
+        &mut self,
+        resource_uri: &str,
+        event: &ShippedUsage<'_>,
+        budgets: &mut PendingBudgets,
+        threshold: i64,
+    ) -> Result<IngestOutcome> {
+        self.ingest_usage_held_at(resource_uri, event, budgets, Utc::now(), Some(threshold))
+            .await
+    }
+
+    async fn ingest_usage_held_at(
+        &mut self,
+        resource_uri: &str,
+        event: &ShippedUsage<'_>,
+        budgets: &mut PendingBudgets,
+        now: DateTime<Utc>,
+        threshold: Option<i64>,
+    ) -> Result<IngestOutcome> {
         let org = self.org();
         // Checked before the claim so a rejected event leaves no trace and can
         // be corrected and resent under the same id.
@@ -630,6 +743,57 @@ impl UsageExt for Tx<'_> {
                 return Ok(IngestOutcome::Rejected(
                     "event_id was already used for a different org",
                 ))
+            }
+        }
+
+        // The sanity limit, after the claim so that a resend of an event that
+        // was already counted (a duplicate, above) is never held, and a held
+        // event stays claimed (a resend is a duplicate too). Judged against
+        // the counters this transaction has written so far, so a batch is
+        // cumulative; events arrive in billed order.
+        if let (Some(threshold), Some(m)) = (threshold, event.metered) {
+            let at = period::billed_at(event.occurred_at, now);
+            let period_start = Month::of(at).first_day();
+            let current: i64 = sqlx::query_scalar(
+                "SELECT COALESCE((SELECT quantity FROM org_meter_period_usage \
+                   WHERE org_id = $1 AND meter = $2 AND period_start = $3), 0)",
+            )
+            .bind(org)
+            .bind(m.meter)
+            .bind(period_start)
+            .fetch_one(self.conn())
+            .await?;
+            let total = current.saturating_add(m.quantity);
+            if total > threshold {
+                let reason = format!(
+                    "held_for_review: {total} of {} in the month starting {period_start} \
+                     would pass the review threshold of {threshold}",
+                    m.meter
+                );
+                sqlx::query(
+                    "INSERT INTO usage_held_events \
+                       (org_id, resource_uri, event_id, user_id, tool, billable, \
+                        occurred_at, service, meter, quantity, period_start, reason) \
+                     VALUES ($1, canonical_resource_uri($2::text), $3, \
+                             (SELECT id FROM users WHERE id = $4), $5, $6, $7, $8, $9, \
+                             $10, $11, $12) \
+                     ON CONFLICT (resource_uri, event_id) DO NOTHING",
+                )
+                .bind(org)
+                .bind(resource_uri)
+                .bind(event.event_id)
+                .bind(event.user)
+                .bind(event.tool)
+                .bind(event.billable)
+                .bind(event.occurred_at)
+                .bind(event.service)
+                .bind(m.meter)
+                .bind(m.quantity)
+                .bind(period_start)
+                .bind(&reason)
+                .execute(self.conn())
+                .await?;
+                return Ok(IngestOutcome::Held(reason));
             }
         }
 

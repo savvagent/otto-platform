@@ -88,6 +88,20 @@ pub fn billing_of(config: &crate::Config) -> Billing {
 pub struct InternalState {
     pub db: Db,
     pub billing: Billing,
+    /// The most of one meter an org may accrue in a billing month before
+    /// usage ingest holds further events for review
+    /// ([`usage::DEFAULT_HOLD_THRESHOLD`]).
+    pub hold_threshold: i64,
+}
+
+/// The threshold a handler reads from [`InternalState`].
+#[derive(Debug, Clone, Copy)]
+struct HoldThreshold(i64);
+
+impl FromRef<InternalState> for HoldThreshold {
+    fn from_ref(state: &InternalState) -> Self {
+        HoldThreshold(state.hold_threshold)
+    }
 }
 
 impl FromRef<InternalState> for Db {
@@ -103,6 +117,11 @@ impl FromRef<InternalState> for Billing {
 }
 
 pub fn router(db: Db, billing: Billing) -> Router {
+    router_with_hold_threshold(db, billing, usage::DEFAULT_HOLD_THRESHOLD)
+}
+
+/// [`router`] with the usage review threshold set (`OTTO_USAGE_HOLD_THRESHOLD`).
+pub fn router_with_hold_threshold(db: Db, billing: Billing, hold_threshold: i64) -> Router {
     Router::new()
         .route("/internal/usage", post(ingest_usage))
         .route(
@@ -124,7 +143,11 @@ pub fn router(db: Db, billing: Billing) -> Router {
             get(team_by_slug),
         )
         .route("/internal/orgs/{org}/teams/{team}", get(team))
-        .with_state(InternalState { db, billing })
+        .with_state(InternalState {
+            db,
+            billing,
+            hold_threshold,
+        })
 }
 
 /// An org that exists and has not been deleted, or 404.
@@ -164,6 +187,15 @@ async fn live_org(db: &Db, org: Uuid) -> Result<Org, ApiError> {
 /// [`usage::check_metering`] (`unknown_meter`, `service_mismatch`,
 /// `invalid_quantity`), whose reason starts with that code.
 ///
+/// An event for an org that has not authorized the calling resource server
+/// (it holds no access or refresh token bound to it, see
+/// [`usage::org_authorized_resource`]) is rejected, reason `not_authorized`.
+/// A metered event that would take the org's total of its meter in its
+/// billing month past the review threshold is not counted either: it is
+/// kept in `usage_held_events`, listed by `otto-platform-server usage held`,
+/// and reported rejected with a reason starting `held_for_review` (the
+/// shipper then drops it, and a resend is a duplicate).
+///
 /// Every event counts in the caller's own per-service pool, keyed by the
 /// caller's service slug and never by anything the event says. The caller's
 /// declared meters are read once per request, not once per event.
@@ -177,6 +209,7 @@ async fn live_org(db: &Db, org: Uuid) -> Result<Org, ApiError> {
 /// counts the org's events in billed order (period, then `occurred_at`).
 async fn ingest_usage(
     State(db): State<Db>,
+    State(HoldThreshold(hold_threshold)): State<HoldThreshold>,
     CallingResourceServer { server: rs, .. }: CallingResourceServer,
     Json(batch): Json<UsageBatch>,
 ) -> Result<Json<UsageReceipt>, ApiError> {
@@ -240,6 +273,30 @@ async fn ingest_usage(
         usage::lock_org_ingest(&mut tx)
             .await
             .map_err(|e| ingest_error(e.into()))?;
+        // The caller may only bill orgs that authorized it. Judged per org
+        // under the ingest lock, before anything is claimed, so a refused
+        // event leaves no trace and can be resent once the org has.
+        if !usage::org_authorized_resource(&mut tx, &rs.resource_uri)
+            .await
+            .map_err(|e| ingest_error(e.into()))?
+        {
+            tx.rollback().await?;
+            tracing::warn!(
+                org = %org,
+                resource = %rs.resource_uri,
+                events = events.len(),
+                "usage refused: the org never authorized this resource server"
+            );
+            receipt
+                .rejected
+                .extend(events.iter().map(|(ev, _)| RejectedEvent {
+                    event_id: ev.event_id,
+                    reason: format!(
+                        "not_authorized: org {org} has not authorized this resource server"
+                    ),
+                }));
+            continue;
+        }
         // Stable, so events of one instant keep the batch's order.
         events.sort_by_key(|(ev, _)| {
             let at = period::billed_at(ev.occurred_at, now);
@@ -251,7 +308,7 @@ async fn ingest_usage(
         let mut rejected = Vec::new();
         for (ev, metered) in events {
             let outcome = tx
-                .ingest_usage_deferred(
+                .ingest_usage_held(
                     &rs.resource_uri,
                     &ShippedUsage {
                         event_id: ev.event_id,
@@ -263,6 +320,7 @@ async fn ingest_usage(
                         metered,
                     },
                     &mut budgets,
+                    hold_threshold,
                 )
                 .await
                 .map_err(ingest_error)?;
@@ -273,6 +331,19 @@ async fn ingest_usage(
                     event_id: ev.event_id,
                     reason: reason.to_owned(),
                 }),
+                IngestOutcome::Held(reason) => {
+                    tracing::error!(
+                        org = %org,
+                        event = %ev.event_id,
+                        resource = %rs.resource_uri,
+                        %reason,
+                        "usage held for operator review, not billed"
+                    );
+                    rejected.push(RejectedEvent {
+                        event_id: ev.event_id,
+                        reason,
+                    });
+                }
             }
         }
         // Budget alerts, once per service and period this batch touched. It

@@ -80,6 +80,12 @@ pub struct Config {
     /// `billingEnabled: false`, and the setup route and the Stripe webhook
     /// answer `503 billing_disabled`. Production boots either way.
     pub stripe: Option<StripeConfig>,
+
+    /// `OTTO_USAGE_HOLD_THRESHOLD`: the most of one meter an org may accrue in
+    /// a billing month before usage ingest holds further events for operator
+    /// review instead of billing them (`otto-platform-server usage held`).
+    /// Default [`otto_billing::usage::DEFAULT_HOLD_THRESHOLD`].
+    pub usage_hold_threshold: i64,
 }
 
 /// The Stripe secrets. Both types redact themselves, so `Debug` shows
@@ -153,6 +159,14 @@ impl Config {
             stripe: parse_stripe(
                 optional("STRIPE_SECRET_KEY"),
                 optional("STRIPE_WEBHOOK_SECRET"),
+            )?,
+            usage_hold_threshold: parse_var(
+                "OTTO_USAGE_HOLD_THRESHOLD",
+                &otto_billing::usage::DEFAULT_HOLD_THRESHOLD.to_string(),
+                |v| match v.parse::<i64>() {
+                    Ok(n) if n >= 1 => Ok(n),
+                    _ => Err(anyhow!("expected a whole number of at least 1")),
+                },
             )?,
             public_url,
         })
@@ -366,6 +380,7 @@ impl Config {
             log_format: LogFormat::Text,
             email: None,
             stripe: None,
+            usage_hold_threshold: otto_billing::usage::DEFAULT_HOLD_THRESHOLD,
         }
     }
 }

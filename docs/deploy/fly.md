@@ -305,6 +305,16 @@ customer:
   middle of", and the shipper's rejected/expired rows and 401/403s. A 401/403 (the key
   lacks *Billing Meter Events: write*) is retried, backing off to one pass every 5
   minutes; fix the key and nothing is lost.
+- `fly ssh console -a otto-platform -C "otto-platform-server usage held"`: usage events
+  held for review instead of billed, because they would take an org's total of one meter
+  in one billing month past `OTTO_USAGE_HOLD_THRESHOLD` (default 1,000,000,000,000). Each is
+  logged at error level when held ("usage held for operator review"), has been refused to
+  its shipper (reason `held_for_review`) and is neither counted nor billed. An empty list
+  is normal. A held event means a runaway or compromised resource server, or a real org
+  that outgrew the threshold; in the second case raise the threshold and ask the
+  resource server to resend the work. Events for an org that never authorized the
+  calling resource server are refused outright (reason `not_authorized`, logged at warn
+  level) and are not held.
 - Stripe accepts meter events for processing and validates them asynchronously (an
   unknown customer, an archived meter); `sent` means accepted. Failures appear as the
   meters' **error reports** (Dashboard → Billing → Meters → a meter → Error reports) and
@@ -544,3 +554,20 @@ still serving.
   Do not roll back across a month boundary; if you must, run `stripe sync` and
   check `stripe outbox` after rolling forward, and expect that window's usage
   to be missing from invoices.
+
+### Usage ingest authorization and review (#79, migration 0027)
+
+- `POST /internal/usage` accepts an event only for an org that has authorized the calling
+  resource server, meaning a token of any kind was ever issued in the org for it (recorded
+  in `org_resource_grants` by a trigger on `access_tokens` and `refresh_tokens`, and
+  backfilled from the tokens that exist at migration time). "Ever", not "active", because
+  usage is shipped from an outbox after the work. An org that has authorized nothing is
+  refused per event with `not_authorized`. Tokens swept more than a week after expiry
+  before this release are not in the backfill: an org that has used a resource server
+  only through such tokens and still has usage to ship is refused, and is fixed by one new
+  token (or by inserting its row into `org_resource_grants`).
+- A metered event that would take an org's total of one meter in one UTC billing month past
+  `OTTO_USAGE_HOLD_THRESHOLD` is held in `usage_held_events` (`otto-platform-server usage
+  held`), not counted and not billed, and reported to its shipper as rejected with a reason
+  starting `held_for_review`. There is no release command yet: counting a held event is a
+  manual operator step.
