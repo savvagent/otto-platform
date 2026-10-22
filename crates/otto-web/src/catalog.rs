@@ -789,8 +789,9 @@ pub fn catalog() -> Vec<Endpoint> {
                  verify); the body is capped at 64 KiB (`413`). Idempotent by event id. \
                  Acts on `checkout.session.completed` (setup mode), \
                  `customer.subscription.updated`, `customer.subscription.deleted`, \
-                 `invoice.paid`, `invoice.payment_failed` and `payment_method.detached`, \
-                 and acknowledges \
+                 `invoice.created`, `invoice.paid`, `invoice.payment_failed`, \
+                 `payment_method.detached` and `billing.meter.error_report_triggered` \
+                 (which marks the reported meter events' outbox rows lost), and acknowledges \
                  every other verified event with no action. `500` asks Stripe to retry; \
                  `503 billing_disabled` when this deployment has no Stripe configuration.",
             ),

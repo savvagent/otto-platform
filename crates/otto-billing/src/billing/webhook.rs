@@ -50,7 +50,7 @@ pub(super) fn ignored(why: impl Into<String>) -> EventOutcome {
 
 /// The event types [`handle_event`] acts on. Register the webhook endpoint for
 /// exactly these.
-pub const HANDLED_EVENT_TYPES: [&str; 7] = [
+pub const HANDLED_EVENT_TYPES: [&str; 8] = [
     "checkout.session.completed",
     "customer.subscription.updated",
     "customer.subscription.deleted",
@@ -58,6 +58,7 @@ pub const HANDLED_EVENT_TYPES: [&str; 7] = [
     "invoice.paid",
     "invoice.payment_failed",
     "payment_method.detached",
+    "billing.meter.error_report_triggered",
 ];
 
 /// A string field of a Stripe object, or the `id` of an expanded one.
@@ -111,7 +112,7 @@ pub async fn handle_event(
     let object = &event.data.object;
     let kind = Kind::of(&event.event_type);
     let customer = match kind {
-        Kind::Unhandled => None,
+        Kind::Unhandled | Kind::MeterErrorReport => None,
         Kind::Detached => id_field(object, "customer").map(str::to_owned).or_else(|| {
             serde_json::from_slice::<Value>(payload).ok().and_then(|v| {
                 id_field(v.get("data")?.get("previous_attributes")?, "customer").map(str::to_owned)
@@ -122,6 +123,8 @@ pub async fn handle_event(
 
     let outcome = match (kind, customer) {
         (Kind::Unhandled, _) => ignored("an event type billing does not handle"),
+        // Names no customer: it is about meter events by identifier.
+        (Kind::MeterErrorReport, _) => meter_error_report(db, object).await?,
         (_, None) => ignored("the event names no customer"),
         (kind, Some(customer)) => match org_of_customer(db, &customer).await? {
             None => ignored("not one of our customers"),
@@ -145,7 +148,7 @@ pub async fn handle_event(
                         invoice_settled(db, &lease, org, object, created, false).await
                     }
                     Kind::Detached => card_detached(db, &lease, org, object, created).await,
-                    Kind::Unhandled => unreachable!("matched above"),
+                    Kind::Unhandled | Kind::MeterErrorReport => unreachable!("handled above"),
                 };
                 lease.release(db).await;
                 result?
@@ -164,6 +167,7 @@ enum Kind {
     InvoicePaid,
     InvoiceFailed,
     Detached,
+    MeterErrorReport,
     Unhandled,
 }
 
@@ -176,6 +180,7 @@ impl Kind {
             "invoice.paid" => Self::InvoicePaid,
             "invoice.payment_failed" => Self::InvoiceFailed,
             "payment_method.detached" => Self::Detached,
+            "billing.meter.error_report_triggered" => Self::MeterErrorReport,
             _ => Self::Unhandled,
         }
     }
@@ -205,6 +210,83 @@ async fn record_event(db: &Db, event: &WebhookEvent, created: DateTime<Utc>) -> 
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// `billing.meter.error_report_triggered`: Stripe validates a meter event
+/// after accepting it and reports the ones it could not process in a meter
+/// error report, so a row the shipper marked `sent` may never be invoiced
+/// (savvagent/otto-platform#76).
+///
+/// The report (`data.object`, a `billing.meter_error_report`) is aggregated:
+/// `reason.error_types[]` each carry a `code`, an `error_count` and up to a few
+/// `sample_errors[]`, each naming the failed request's `identifier`. Every
+/// sampled identifier that is one of our outbox rows (`agg:...`) is marked lost
+/// with the error's code and message ([`stripe_outbox::mark_reported_lost`]),
+/// logged at error level like other lost revenue, and counted by `stripe
+/// outbox`. Errors Stripe counted but did not sample cannot be attributed to a
+/// row: they are logged at error level, with the report's id, for an operator
+/// to look up in the Dashboard (Billing, Meters, Error reports).
+async fn meter_error_report(db: &Db, report: &Value) -> Result<EventOutcome> {
+    let report_id = report.get("id").and_then(Value::as_str).unwrap_or("?");
+    let reason = report.get("reason");
+    let reported = reason
+        .and_then(|r| r.get("error_count"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let mut marked = 0_i64;
+    let mut sampled = 0_i64;
+    let types = reason
+        .and_then(|r| r.get("error_types"))
+        .and_then(Value::as_array);
+    for error_type in types.into_iter().flatten() {
+        let code = error_type
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let samples = error_type.get("sample_errors").and_then(Value::as_array);
+        for sample in samples.into_iter().flatten() {
+            let Some(identifier) = sample
+                .get("request")
+                .and_then(|r| r.get("identifier"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            sampled += 1;
+            let message = sample
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let why = format!("stripe meter error report {report_id}: {code}: {message}");
+            if let Some(row) = stripe_outbox::mark_reported_lost(db, identifier, &why).await? {
+                marked += 1;
+                tracing::error!(
+                    org = %row.org_id,
+                    event_name = %row.event_name,
+                    value = row.value,
+                    identifier,
+                    report = report_id,
+                    code,
+                    "Stripe accepted a meter event and then reported it unprocessable; \
+                     its usage will not be invoiced"
+                );
+            }
+        }
+    }
+    if reported > sampled {
+        tracing::error!(
+            report = report_id,
+            reported,
+            sampled,
+            "a Stripe meter error report counted errors it gave no identifier for; \
+             check Billing, Meters, Error reports in the Dashboard"
+        );
+    }
+    Ok(if marked > 0 {
+        EventOutcome::Handled
+    } else {
+        ignored("the meter error report names no sent row of ours")
+    })
 }
 
 /// How long [`sweep_events`] should keep a handled event in the ledger. Stripe

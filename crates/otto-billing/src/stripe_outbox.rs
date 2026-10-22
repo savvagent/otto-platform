@@ -680,6 +680,47 @@ pub async fn mark_terminal(
     Ok(written)
 }
 
+/// A `sent` row that Stripe's meter error report later said it could not
+/// process, as [`mark_reported_lost`] recorded it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ReportedLost {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub event_name: String,
+    /// The usage that will not be invoiced.
+    pub value: i64,
+}
+
+/// Record that Stripe accepted the meter event `identifier` but then reported
+/// it unprocessable (a meter error report, `billing.meter.error_report_triggered`):
+/// an unknown customer, a missing or archived meter, and so on. `sent` means
+/// only that Stripe accepted the request, so such a row is moved to
+/// [`OutboxStatus::Rejected`] with `reason` as its `last_error`, where
+/// `otto-platform-server stripe outbox` counts it as lost.
+///
+/// Returns the row, or `None` when none was changed: no row has this
+/// identifier (not ours, or already swept), or it is not `sent` (a report for
+/// a row already lost is a repeat; a pending row cannot have been reported).
+pub async fn mark_reported_lost(
+    db: &Db,
+    identifier: &str,
+    reason: &str,
+) -> Result<Option<ReportedLost>> {
+    let mut tx = delivery_tx(db).await?;
+    let row = sqlx::query_as(
+        "UPDATE stripe_meter_outbox \
+            SET status = 'rejected', finished_at = now(), last_error = $2 \
+          WHERE identifier = $1 AND status = 'sent' \
+          RETURNING id, org_id, event_name, value",
+    )
+    .bind(identifier)
+    .bind(truncate(reason))
+    .fetch_optional(tx.conn())
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
 /// Expire every pending row whose hour has grown older than [`MAX_EVENT_AGE`]
 /// without being claimed (its meter never synced, say, or billing disabled),
 /// and return them, for the shipper to report as lost. Rows under a live
