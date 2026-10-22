@@ -143,6 +143,12 @@ pub async fn run(db: Db, client: Client, mut shutdown: watch::Receiver<bool>) {
             last_expire = Some(Instant::now());
             expire_stale(&db).await;
         }
+        // Deleted orgs' subscriptions (#73). Its own errors are logged and
+        // never hold up the meter events.
+        tokio::select! {
+            () = cancel_deleted_orgs(&db, &client) => {}
+            _ = shutdown.changed() => break,
+        }
         let report = tokio::select! {
             r = ship_due_with_deadline(&db, &client, SEND_DEADLINE) => r,
             _ = shutdown.changed() => break,
@@ -173,6 +179,16 @@ pub async fn run(db: Db, client: Client, mut shutdown: watch::Receiver<bool>) {
         }
     }
     tracing::info!("stripe meter event shipper stopping");
+}
+
+/// One pass of [`otto_billing::billing::cancel`]: cancel the Stripe
+/// subscriptions of orgs that were deleted.
+pub async fn cancel_deleted_orgs(db: &Db, client: &Client) {
+    match otto_billing::billing::cancel::run_pass(db, client).await {
+        Ok(report) if report.claimed == 0 => {}
+        Ok(report) => tracing::debug!(?report, "deleted orgs' subscription cancellations"),
+        Err(e) => tracing::warn!(error = %e, "canceling deleted orgs' subscriptions failed"),
+    }
 }
 
 /// Expire rows grown too old to send without ever being claimed, and report
@@ -493,6 +509,9 @@ pub async fn write_counts(db: &Db, out: &mut impl Write) -> anyhow::Result<()> {
             age.num_minutes() % 60
         )?,
         None => writeln!(out, "oldest pending: none")?,
+    }
+    for (status, n) in otto_billing::billing::cancel::summary(db).await? {
+        writeln!(out, "org-deletion cancellations {status:<8} {n}")?;
     }
     let lost = summary.lost();
     if lost > 0 {

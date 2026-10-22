@@ -592,6 +592,22 @@ impl Client {
         self.get(&format!("/v1/subscriptions/{id}")).await
     }
 
+    /// `DELETE /v1/subscriptions/{id}` with `invoice_now=true` and
+    /// `prorate=false`: cancel the subscription now and invoice its unbilled
+    /// usage at once, without prorating credits.
+    pub async fn cancel_subscription_invoice_now(
+        &self,
+        id: &str,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Subscription, StripeError> {
+        check_id("subscription", id)?;
+        let mut form = Form::default();
+        form.push("invoice_now", "true");
+        form.push("prorate", "false");
+        self.delete(&format!("/v1/subscriptions/{id}"), form, idempotency_key)
+            .await
+    }
+
     /// `GET /v1/subscriptions?customer=...&status=all`: every subscription of
     /// one customer, whatever its status (one page of up to 100).
     pub async fn list_subscriptions(

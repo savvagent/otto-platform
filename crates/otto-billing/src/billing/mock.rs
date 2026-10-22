@@ -850,6 +850,16 @@ fn route(inner: &mut Inner, req: &Seen) -> (StatusCode, Value) {
                 missing("No such subscription")
             }
         }
+        // Cancel now. Like Stripe, a subscription that is already canceled is
+        // an error, not a no-op.
+        ("DELETE", ["v1", "subscriptions", id]) => match inner.subscriptions.get_mut(*id) {
+            Some(s) if s["status"] == json!("canceled") => missing("No such subscription"),
+            Some(s) => {
+                s["status"] = json!("canceled");
+                (StatusCode::OK, inner.subscription_json(id))
+            }
+            None => missing("No such subscription"),
+        },
         ("POST", ["v1", "subscriptions"]) => {
             let prices: Vec<String> = req
                 .fields_starting("items[")

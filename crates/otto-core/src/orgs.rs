@@ -426,6 +426,25 @@ impl OrgsExt for Db {
             .execute(tx.conn())
             .await?;
 
+        // Stripe keeps invoicing an org's card until its subscription is
+        // canceled, and nothing else will ever do it once the org is gone.
+        // Queued here, in this transaction, for the Stripe shipper to carry
+        // out (`otto_billing::billing::cancel`): a Stripe outage can neither
+        // block nor undo the deletion. At most one row per subscription.
+        sqlx::query(
+            "INSERT INTO stripe_cancellations \
+               (org_id, stripe_customer_id, stripe_subscription_id, stripe_payment_method_id) \
+             SELECT org_id, stripe_customer_id, stripe_subscription_id, \
+                    stripe_payment_method_id \
+             FROM subscriptions \
+             WHERE org_id = $1 AND stripe_customer_id IS NOT NULL \
+               AND stripe_subscription_id IS NOT NULL \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .execute(tx.conn())
+        .await?;
+
         lifecycle::enqueue(tx.conn(), &LifecycleEvent::OrgDeleted { org: id }).await?;
         tx.commit().await?;
         Ok(())

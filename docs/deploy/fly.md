@@ -270,27 +270,40 @@ Notes:
 - With billing disabled, `GET /api/orgs/{org}/billing` says so, nothing is invoiced, and
   usage-status never answers `payment_required` (nobody can put a card on file); usage is
   still metered and kept, and budgets still apply.
-- Deleting an org does not yet cancel its Stripe subscription, or release its held
-  invoices (#73); see [Deleting an org with a subscription](#deleting-an-org-with-a-subscription).
-- Deleting an org deletes its queued meter events with it: usage it had not yet shipped
-  to Stripe is not invoiced.
+- Deleting an org cancels its Stripe subscription (#73) but does not release its held
+  draft invoices; see [Deleting an org with a subscription](#deleting-an-org-with-a-subscription).
 - The webhook ledger (`stripe_events`) is swept about once an hour of events handled more
   than 90 days ago.
 
 ### Deleting an org with a subscription
 
-Until #73, deleting an org leaves its Stripe side as it was, and deletes the platform's
-record of it (the customer map, the subscription row, the held invoices, the queued meter
-events). Sync never touches that customer again. So, in the dashboard, for the org's
-customer:
+Deleting an org queues the cancellation of its Stripe subscription in the same transaction
+(`stripe_cancellations`, only for an org that has a subscription), so a Stripe outage can
+neither block nor undo the deletion. The Stripe shipper (it runs on every machine when
+billing is enabled) carries it out, and retries until it has, backing off from a minute to
+an hour. With billing disabled the rows wait until it is enabled.
 
-1. **Cancel its subscription**, or Stripe keeps invoicing it every month.
-2. **Finalize or void its held draft invoices** (Invoices → Drafts, filtered to the
-   customer; automatic collection shows as off). The platform turned their automatic
-   advance off and would have finalized them; with the org deleted nothing will, and a
-   draft with automatic collection off stays a draft forever. Finalize one that should
-   be collected (turn automatic collection back on, or collect it by hand); void one
-   that should not.
+- **Final usage is billed.** The subscription is canceled with `invoice_now` and no
+  proration, so the usage accrued up to the deletion is invoiced at once. A row waits until
+  the org has no queued meter event left to send (they go out when their hour ends, so
+  expect up to a couple of hours), and stops waiting after three days so rows that can
+  never ship cannot keep a card on the hook.
+- **Exactly once.** A subscription already canceled in Stripe (or gone) is marked done with
+  no call; the cancel carries an idempotency key derived from the row, and a subscription
+  is queued at most once.
+- **The customer is kept** so its invoices stay readable in Stripe, but its card is
+  detached.
+- `stripe outbox` prints the cancellations by status (`pending`, `done`, `failed`). A
+  `failed` row is a refusal that will not change (Stripe answered 4xx); it is logged at
+  error level, kept with `last_error`, and the card keeps being invoiced until you cancel
+  the subscription in the dashboard.
+
+What it does **not** do: a draft invoice that was held (`stripe_held_invoices`) before the
+deletion is not released, and sync never touches the customer again. In the dashboard
+(Invoices → Drafts, filtered to the customer; automatic collection shows as off), finalize
+a held draft that should be collected (turn automatic collection back on, or collect it by
+hand) or void one that should not. Without that a draft with automatic collection off
+stays a draft forever.
 
 ### Monitoring
 
@@ -571,3 +584,13 @@ still serving.
   held`), not counted and not billed, and reported to its shipper as rejected with a reason
   starting `held_for_review`. There is no release command yet: counting a held event is a
   manual operator step.
+
+### Cancelling a deleted org's subscription (#73, migration 0028)
+
+- Deleting an org now queues `stripe_cancellations` (cross-tenant, `otto_app` may only
+  append) and the Stripe shipper cancels the subscription with `invoice_now`; see
+  [Deleting an org with a subscription](#deleting-an-org-with-a-subscription). Orgs deleted
+  before this release are not queued: cancel their subscriptions in the dashboard.
+- Stripe credentials: canceling needs *Subscriptions: write* and detaching the card
+  *PaymentMethods: write* on the restricted key (the same permissions `stripe sync`
+  already uses).

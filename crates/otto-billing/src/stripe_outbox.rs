@@ -483,7 +483,7 @@ pub fn truncate(s: &str) -> String {
 /// An unpinned transaction opted in to the outbox's delivery policies
 /// (migration 0023), which is what lets the shipper reach every org's rows
 /// where the connecting role is subject to row-level security.
-async fn delivery_tx(db: &Db) -> Result<Unpinned> {
+pub(crate) async fn delivery_tx(db: &Db) -> Result<Unpinned> {
     let mut tx = db.begin_unpinned().await?;
     sqlx::query("SELECT set_config('app.stripe_meter_delivery', 'on', true)")
         .execute(tx.conn())
