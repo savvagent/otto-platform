@@ -7,6 +7,8 @@ members = [
   "crates/otto-auth",
   "crates/otto-web",
   "crates/otto-resource",
+  "crates/otto-client",
+  "crates/otto-cli",
   "crates/otto-platform-server",
 ]
 
@@ -23,6 +25,7 @@ otto-billing = { path = "crates/otto-billing" }
 otto-auth = { path = "crates/otto-auth" }
 otto-web = { path = "crates/otto-web" }
 otto-resource = { path = "crates/otto-resource" }
+otto-client = { path = "crates/otto-client" }
 
 sqlx = { version = "0.8", default-features = false, features = [
   "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "macros", "migrate", "json",

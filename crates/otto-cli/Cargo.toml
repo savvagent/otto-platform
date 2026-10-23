@@ -1,0 +1,18 @@
+[package]
+name = "otto-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The `otto` command: sign in to an otto deployment and run `otto-<app>` subcommands, so a developer can receive an app secret without a model in the path."
+
+[[bin]]
+name = "otto"
+path = "src/main.rs"
+
+[dependencies]
+otto-client.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
