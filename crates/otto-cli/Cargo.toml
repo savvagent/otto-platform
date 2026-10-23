@@ -3,7 +3,8 @@ name = "otto-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+# Follows otto-client.
+rust-version = "1.89"
 description = "The `otto` command: sign in to an otto deployment and run `otto-<app>` subcommands, so a developer can receive an app secret without a model in the path."
 
 [[bin]]

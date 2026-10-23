@@ -3,7 +3,8 @@ name = "otto-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+# std::fs::File::lock / try_lock, stable since 1.89.
+rust-version = "1.89"
 description = "Client side of otto-auth for terminal tools: MCP-style OAuth login (dynamic registration, PKCE S256, loopback redirect), a per-resource token cache, and secret output that never reaches logs. No database dependency."
 
 [dependencies]
@@ -15,7 +16,7 @@ base64.workspace = true
 rand.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "time", "rt", "sync", "macros"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

@@ -67,3 +67,30 @@ fn login_requires_a_resource() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--resource"));
 }
+
+#[test]
+fn a_relative_or_empty_path_entry_is_not_searched() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("bin")).unwrap();
+    install(&dir.path().join("bin"), "otto-rel", "#!/bin/sh\nexit 0\n");
+    install(dir.path(), "otto-rel", "#!/bin/sh\nexit 0\n");
+    let out = Command::new(env!("CARGO_BIN_EXE_otto"))
+        .current_dir(dir.path())
+        // A relative entry and an empty one (the current directory, to a shell).
+        .env("PATH", "bin::")
+        .env("OTTO_CONFIG_DIR", dir.path().join("cfg"))
+        .arg("rel")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(127));
+}
+
+#[test]
+fn the_app_replaces_otto_so_a_signal_reaches_the_caller_as_the_apps() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempfile::tempdir().unwrap();
+    install(dir.path(), "otto-sig", "#!/bin/sh\nkill -TERM $$\n");
+    let out = otto(dir.path()).arg("sig").output().unwrap();
+    // exec'd, so the process the caller waits on is the one that was killed.
+    assert_eq!(out.status.signal(), Some(15));
+}

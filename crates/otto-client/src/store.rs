@@ -4,14 +4,26 @@
 //!
 //! Location: `$OTTO_CONFIG_DIR`, else `$XDG_CONFIG_HOME/otto`, else
 //! `$HOME/.config/otto`, file `credentials.json`. Linux and macOS only.
+//!
+//! Every change happens under an exclusive lock on `credentials.lock`, held
+//! across the whole read-modify-write, so two `otto` processes never lose each
+//! other's writes. Refresh holds it across the token request too: otto-auth
+//! treats a refresh token presented twice as a replay and revokes every token
+//! the client holds, so two processes must never refresh the same grant.
+//! Reads take no lock; the file is only ever replaced by an atomic rename.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::secret::write_private;
+use crate::secret::replace_private;
+
+/// How long to wait for another `otto` process to finish with the store.
+const LOCK_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Grant {
@@ -72,6 +84,11 @@ impl Store {
         self.dir.join("credentials.json")
     }
 
+    /// The grant for `resource`, if any. Takes no lock.
+    pub fn grant(&self, resource: &str) -> Result<Option<Grant>> {
+        Ok(self.load()?.grants.remove(resource))
+    }
+
     fn load(&self) -> Result<Doc> {
         match std::fs::read(self.file()) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
@@ -85,58 +102,103 @@ impl Store {
         }
     }
 
-    fn save(&self, doc: &Doc) -> Result<()> {
-        std::fs::create_dir_all(&self.dir).map_err(|e| Error::io("creating config dir", &e))?;
+    /// Create the directory owner-only if it is missing. An existing directory
+    /// is left as it is: it may be one the user chose, such as `$HOME`, and the
+    /// files in it are owner-only either way.
+    fn ensure_dir(&self) -> Result<()> {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| Error::io("securing config dir", &e))?;
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
-        let bytes = serde_json::to_vec_pretty(doc)
+        builder
+            .create(&self.dir)
+            .map_err(|e| Error::io("creating config dir", &e))
+    }
+
+    fn lock_file(&self) -> Result<File> {
+        self.ensure_dir()?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(self.dir.join("credentials.lock"))
+            .map_err(|e| Error::io("opening the credentials lock", &e))
+    }
+
+    /// Take the store's lock without blocking the async runtime: poll with
+    /// `try_lock`, so a second `otto` process (or a second client in this one)
+    /// waits instead of stalling a worker thread.
+    pub(crate) async fn lock(&self) -> Result<Locked<'_>> {
+        let file = self.lock_file()?;
+        let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(Error::Store(
+                        "another otto process is holding the credentials lock".into(),
+                    ))
+                }
+                Err(TryLockError::Error(e)) => {
+                    return Err(Error::io("locking credentials", &e));
+                }
+            }
+        }
+        Ok(Locked {
+            store: self,
+            doc: self.load()?,
+            _lock: file,
+        })
+    }
+}
+
+/// The store, locked and loaded. Changes are made to the in-memory document
+/// and written by [`Locked::save`]; the lock is released when this drops.
+pub(crate) struct Locked<'a> {
+    store: &'a Store,
+    doc: Doc,
+    _lock: File,
+}
+
+impl Locked<'_> {
+    pub(crate) fn grant(&self, resource: &str) -> Option<&Grant> {
+        self.doc.grants.get(resource)
+    }
+
+    pub(crate) fn put_grant(&mut self, resource: &str, grant: Grant) {
+        self.doc.grants.insert(resource.to_owned(), grant);
+    }
+
+    pub(crate) fn remove_grant(&mut self, resource: &str) {
+        self.doc.grants.remove(resource);
+    }
+
+    pub(crate) fn client_id(&self, issuer: &str) -> Option<&str> {
+        self.doc.clients.get(issuer).map(String::as_str)
+    }
+
+    pub(crate) fn put_client(&mut self, issuer: &str, client_id: &str) {
+        self.doc
+            .clients
+            .insert(issuer.to_owned(), client_id.to_owned());
+    }
+
+    pub(crate) fn remove_client(&mut self, issuer: &str) {
+        self.doc.clients.remove(issuer);
+    }
+
+    pub(crate) fn save(&self) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(&self.doc)
             .map_err(|_| Error::Store("could not encode credentials".into()))?;
-        // Write beside the target and rename, so a crash never leaves a
-        // half-written credentials file.
-        let tmp = self
-            .dir
-            .join(format!("credentials.json.tmp{}", std::process::id()));
-        write_private(&tmp, &bytes)?;
-        std::fs::rename(&tmp, self.file()).map_err(|e| Error::io("replacing credentials", &e))
-    }
-
-    pub fn grant(&self, resource: &str) -> Result<Option<Grant>> {
-        Ok(self.load()?.grants.remove(resource))
-    }
-
-    pub fn put_grant(&self, resource: &str, grant: Grant) -> Result<()> {
-        let mut doc = self.load()?;
-        doc.grants.insert(resource.to_owned(), grant);
-        self.save(&doc)
-    }
-
-    pub fn remove_grant(&self, resource: &str) -> Result<()> {
-        let mut doc = self.load()?;
-        if doc.grants.remove(resource).is_some() {
-            self.save(&doc)?;
-        }
-        Ok(())
-    }
-
-    pub fn client_id(&self, issuer: &str) -> Result<Option<String>> {
-        Ok(self.load()?.clients.remove(issuer))
-    }
-
-    pub fn put_client(&self, issuer: &str, client_id: &str) -> Result<()> {
-        let mut doc = self.load()?;
-        doc.clients.insert(issuer.to_owned(), client_id.to_owned());
-        self.save(&doc)
-    }
-
-    pub fn remove_client(&self, issuer: &str) -> Result<()> {
-        let mut doc = self.load()?;
-        if doc.clients.remove(issuer).is_some() {
-            self.save(&doc)?;
-        }
-        Ok(())
+        replace_private(&self.store.file(), &bytes)
     }
 }

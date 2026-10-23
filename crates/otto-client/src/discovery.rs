@@ -5,7 +5,7 @@
 use serde::Deserialize;
 use url::Url;
 
-use crate::error::{Error, Result};
+use crate::error::{server_text, Error, Result};
 
 pub struct Discovered {
     pub issuer: String,
@@ -23,6 +23,7 @@ struct ResourceMeta {
 
 #[derive(Deserialize)]
 struct ServerMeta {
+    issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
     registration_endpoint: Option<String>,
@@ -53,7 +54,7 @@ pub async fn discover(http: &reqwest::Client, resource: &str) -> Result<Discover
     if meta.resource != resource {
         return Err(Error::Discovery(format!(
             "{resource} describes itself as {}, which is a different resource",
-            meta.resource
+            server_text(&meta.resource)
         )));
     }
     let issuer = meta
@@ -67,6 +68,14 @@ pub async fn discover(http: &reqwest::Client, resource: &str) -> Result<Discover
 
     let well_known = join_well_known(&issuer_url, "oauth-authorization-server")?;
     let server: ServerMeta = get_json(http, &well_known).await?;
+    // RFC 8414 §3.3: the metadata must name the issuer it was fetched for, or
+    // it may be another server's document.
+    if server.issuer.trim_end_matches('/') != issuer.trim_end_matches('/') {
+        return Err(Error::Discovery(format!(
+            "{well_known} names issuer {}, not {issuer}",
+            server_text(&server.issuer)
+        )));
+    }
     let endpoint = |name: &str, value: &str| -> Result<Url> {
         let u = Url::parse(value)
             .map_err(|_| Error::Discovery(format!("{name} {value:?} is not a URL")))?;

@@ -5,7 +5,7 @@
 //!
 //! - [`Client::login`]: discovery, dynamic registration (RFC 7591), authorization
 //!   code with PKCE S256, loopback redirect. One grant per resource, because a
-//!   token has one audience.
+//!   token has one audience. A usable grant is reused unless `force` is set.
 //! - [`Client::token`]: the cached token, refreshed when it is near expiry; a
 //!   resource with no grant yet goes through login; a revoked grant is
 //!   [`Error::LoginRequired`].
@@ -22,6 +22,15 @@ mod store;
 pub use error::{Error, Result};
 pub use secret::{Secret, Sink};
 pub use store::{Grant, Store};
+
+/// What [`Client::login`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginOutcome {
+    /// A usable grant covering the requested scopes was already cached.
+    AlreadySignedIn,
+    /// The browser flow ran and a new grant was stored.
+    SignedIn,
+}
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -83,14 +92,22 @@ impl Client {
         Self::new(Store::open_default()?, Box::new(SystemOpener))
     }
 
-    /// Sign in to `resource`, replacing any grant it already has.
-    pub async fn login(&self, resource: &str, scopes: &[String]) -> Result<()> {
+    /// Sign in to `resource`. A cached grant that is usable (refreshing it if
+    /// needed) and already covers `scopes` is kept, and no browser opens;
+    /// `force` always runs the browser flow and replaces it.
+    pub async fn login(
+        &self,
+        resource: &str,
+        scopes: &[String],
+        force: bool,
+    ) -> Result<LoginOutcome> {
         flow::login(
             &self.http,
             &self.store,
             self.opener.as_ref(),
             resource,
             scopes,
+            force,
         )
         .await
     }
@@ -101,7 +118,7 @@ impl Client {
         match flow::fresh_grant(&self.http, &self.store, resource).await? {
             Some(g) => Ok(Secret::new(g.access_token)),
             None => {
-                self.login(resource, &[]).await?;
+                self.login(resource, &[], false).await?;
                 flow::fresh_grant(&self.http, &self.store, resource)
                     .await?
                     .map(|g| Secret::new(g.access_token))

@@ -6,18 +6,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use url::Url;
 
 use crate::discovery::{self, Discovered};
-use crate::error::{Error, Result};
+use crate::error::{server_error, Error, Result};
 use crate::pkce::{random_token, Pkce};
 use crate::store::{Grant, Store};
-use crate::Opener;
+use crate::{LoginOutcome, Opener};
 
 /// How long to wait for the person to finish in the browser.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long one connection to the loopback listener may take, start to end.
+/// Connections are handled concurrently, so a slow one never delays another.
+const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
 /// A token this close to expiry is refreshed rather than handed out.
 const EXPIRY_SKEW_SECS: u64 = 30;
+/// Assumed lifetime when a token response omits `expires_in`, and the most a
+/// server-sent lifetime is trusted for.
+const DEFAULT_LIFETIME_SECS: u64 = 300;
+const MAX_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 
 pub(crate) fn now() -> u64 {
     SystemTime::now()
@@ -43,14 +51,28 @@ struct OAuthError {
     error_description: Option<String>,
 }
 
-/// The server's OAuth error, reduced to its `error` code and description. The
+/// The server's OAuth error code and description, cleaned for printing. The
 /// body is never echoed as-is.
 async fn oauth_error(resp: reqwest::Response) -> (String, String) {
     let status = resp.status();
     match resp.json::<OAuthError>().await {
-        Ok(e) => (e.error, e.error_description.unwrap_or_default()),
+        Ok(e) => {
+            let message = server_error(&e.error, e.error_description.as_deref().unwrap_or(""));
+            (e.error, message)
+        }
         Err(_) => (String::new(), format!("server returned {status}")),
     }
+}
+
+fn usable(grant: &Grant) -> bool {
+    grant.expires_at > now().saturating_add(EXPIRY_SKEW_SECS)
+}
+
+/// Whether `grant` was given every scope in `wanted`.
+fn covers(grant: &Grant, wanted: &[String]) -> bool {
+    wanted
+        .iter()
+        .all(|w| grant.scope.split_whitespace().any(|g| g == w))
 }
 
 pub(crate) async fn login(
@@ -59,7 +81,18 @@ pub(crate) async fn login(
     opener: &dyn Opener,
     resource: &str,
     scopes: &[String],
-) -> Result<()> {
+    force: bool,
+) -> Result<LoginOutcome> {
+    if !force {
+        // A usable grant that already covers what is asked for needs no new
+        // consent. A revoked one falls through to a fresh login.
+        match fresh_grant(http, store, resource).await {
+            Ok(Some(g)) if covers(&g, scopes) => return Ok(LoginOutcome::AlreadySignedIn),
+            Ok(_) | Err(Error::LoginRequired { .. }) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
     let meta = discovery::discover(http, resource).await?;
     let client_id = client_id(http, store, &meta).await?;
 
@@ -97,7 +130,13 @@ pub(crate) async fn login(
 
     let code = tokio::time::timeout(CALLBACK_TIMEOUT, wait_for_code(&listener, &state))
         .await
-        .map_err(|_| Error::Authorization("timed out waiting for the browser".into()))??;
+        .map_err(|_| {
+            Error::Authorization(
+                "timed out waiting for the browser; if it showed an error, try `otto login \
+                 --force` again"
+                    .into(),
+            )
+        })??;
 
     let resp = http
         .post(meta.token_endpoint.clone())
@@ -113,21 +152,25 @@ pub(crate) async fn login(
         .await
         .map_err(|_| Error::Network(meta.token_endpoint.to_string()))?;
     if !resp.status().is_success() {
-        let (code, desc) = oauth_error(resp).await;
-        return Err(Error::Authorization(
-            format!("{code} {desc}").trim().to_owned(),
-        ));
+        let (_, message) = oauth_error(resp).await;
+        return Err(Error::Authorization(message));
     }
     let token: TokenResponse = resp.json().await.map_err(|_| {
         Error::Authorization("the token endpoint sent an unreadable response".into())
     })?;
 
-    store.put_grant(resource, grant_from(token, &meta.issuer, &client_id, None))
+    let mut locked = store.lock().await?;
+    locked.put_grant(resource, grant_from(token, &meta.issuer, &client_id, None));
+    locked.save()?;
+    Ok(LoginOutcome::SignedIn)
 }
 
+/// The registered client id for this issuer, registering one if there is
+/// none. Held under the store lock so two first logins register only once.
 async fn client_id(http: &reqwest::Client, store: &Store, meta: &Discovered) -> Result<String> {
-    if let Some(id) = store.client_id(&meta.issuer)? {
-        return Ok(id);
+    let mut locked = store.lock().await?;
+    if let Some(id) = locked.client_id(&meta.issuer) {
+        return Ok(id.to_owned());
     }
     #[derive(Deserialize)]
     struct Registered {
@@ -146,18 +189,17 @@ async fn client_id(http: &reqwest::Client, store: &Store, meta: &Discovered) -> 
         .await
         .map_err(|_| Error::Network(meta.registration_endpoint.to_string()))?;
     if !resp.status().is_success() {
-        let (code, desc) = oauth_error(resp).await;
-        return Err(Error::Authorization(
-            format!("registration refused: {code} {desc}")
-                .trim()
-                .to_owned(),
-        ));
+        let (_, message) = oauth_error(resp).await;
+        return Err(Error::Authorization(format!(
+            "registration refused: {message}"
+        )));
     }
     let registered: Registered = resp
         .json()
         .await
         .map_err(|_| Error::Authorization("registration sent an unreadable response".into()))?;
-    store.put_client(&meta.issuer, &registered.client_id)?;
+    locked.put_client(&meta.issuer, &registered.client_id);
+    locked.save()?;
     Ok(registered.client_id)
 }
 
@@ -167,87 +209,115 @@ fn grant_from(
     client_id: &str,
     prior_refresh: Option<String>,
 ) -> Grant {
+    let lifetime = t
+        .expires_in
+        .unwrap_or(DEFAULT_LIFETIME_SECS)
+        .min(MAX_LIFETIME_SECS);
     Grant {
         issuer: issuer.to_owned(),
         client_id: client_id.to_owned(),
         access_token: t.access_token,
         // A refresh response may omit the refresh token, meaning keep the old one.
         refresh_token: t.refresh_token.or(prior_refresh),
-        expires_at: now() + t.expires_in.unwrap_or(0),
+        expires_at: now().saturating_add(lifetime),
         scope: t.scope.unwrap_or_default(),
     }
 }
 
+enum Callback {
+    Code(String),
+    Denied(String),
+}
+
 /// Accept connections until one carries the callback for this login's `state`.
-/// Anything else (a favicon request, a probe, a wrong state) is answered and
-/// ignored, so a stray local process cannot cancel the login.
+/// Each connection is handled in its own task under [`CONNECTION_DEADLINE`],
+/// so a local process that connects and stalls cannot hold up the browser's
+/// callback. Anything else (a favicon request, a probe, a wrong state) is
+/// answered and ignored, so a stray process cannot cancel the login either.
 async fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
+    let (tx, mut rx) = mpsc::channel::<Callback>(1);
     loop {
-        let (mut sock, _) = listener
-            .accept()
-            .await
-            .map_err(|e| Error::io("accepting the browser callback", &e))?;
-        let Some(target) = read_request_target(&mut sock).await else {
-            continue;
-        };
-        let Ok(url) = Url::parse(&format!("http://127.0.0.1{target}")) else {
-            respond(&mut sock, "400 Bad Request", "Bad request.").await;
-            continue;
-        };
-        if url.path() != "/callback" {
-            respond(&mut sock, "404 Not Found", "Not found.").await;
-            continue;
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (sock, _) =
+                    accepted.map_err(|e| Error::io("accepting the browser callback", &e))?;
+                let (tx, state) = (tx.clone(), state.to_owned());
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(
+                        CONNECTION_DEADLINE,
+                        handle_connection(sock, &state, &tx),
+                    )
+                    .await;
+                });
+            }
+            // `tx` is held here, so the channel never closes while looping.
+            Some(callback) = rx.recv() => {
+                return match callback {
+                    Callback::Code(code) => Ok(code),
+                    Callback::Denied(message) => Err(Error::Authorization(message)),
+                };
+            }
         }
-        let param = |k: &str| {
-            url.query_pairs()
-                .find(|(n, _)| n == k)
-                .map(|(_, v)| v.into_owned())
-        };
-        if param("state").as_deref() != Some(state) {
-            respond(
-                &mut sock,
-                "400 Bad Request",
-                "This sign-in link is not for this session.",
-            )
-            .await;
-            continue;
-        }
-        if let Some(err) = param("error") {
-            respond(
-                &mut sock,
-                "200 OK",
-                "Sign-in was not completed. You can close this tab.",
-            )
-            .await;
-            let desc = param("error_description").unwrap_or_default();
-            return Err(Error::Authorization(
-                format!("{err} {desc}").trim().to_owned(),
-            ));
-        }
-        let Some(code) = param("code") else {
-            respond(&mut sock, "400 Bad Request", "No authorization code.").await;
-            continue;
-        };
+    }
+}
+
+async fn handle_connection(mut sock: TcpStream, state: &str, tx: &mpsc::Sender<Callback>) {
+    let Some(target) = read_request_target(&mut sock).await else {
+        return;
+    };
+    let Ok(url) = Url::parse(&format!("http://127.0.0.1{target}")) else {
+        respond(&mut sock, "400 Bad Request", "Bad request.").await;
+        return;
+    };
+    if url.path() != "/callback" {
+        respond(&mut sock, "404 Not Found", "Not found.").await;
+        return;
+    }
+    let param = |k: &str| {
+        url.query_pairs()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.into_owned())
+    };
+    if param("state").as_deref() != Some(state) {
+        respond(
+            &mut sock,
+            "400 Bad Request",
+            "This sign-in link is not for this session.",
+        )
+        .await;
+        return;
+    }
+    if let Some(err) = param("error") {
         respond(
             &mut sock,
             "200 OK",
-            "Signed in. You can close this tab and return to the terminal.",
+            "Sign-in was not completed. You can close this tab.",
         )
         .await;
-        return Ok(code);
+        let desc = param("error_description").unwrap_or_default();
+        let _ = tx.send(Callback::Denied(server_error(&err, &desc))).await;
+        return;
     }
+    let Some(code) = param("code") else {
+        respond(&mut sock, "400 Bad Request", "No authorization code.").await;
+        return;
+    };
+    respond(
+        &mut sock,
+        "200 OK",
+        "Signed in. You can close this tab and return to the terminal.",
+    )
+    .await;
+    let _ = tx.send(Callback::Code(code)).await;
 }
 
 async fn read_request_target(sock: &mut TcpStream) -> Option<String> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
-    // The request line is all that is needed, and a hostile or broken client
-    // gets a bounded read.
+    // The request line is all that is needed; the read is bounded in size
+    // here and in time by the caller's deadline.
     while buf.len() < 8192 && !buf.windows(2).any(|w| w == b"\r\n") {
-        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut chunk))
-            .await
-            .ok()?
-            .ok()?;
+        let n = sock.read(&mut chunk).await.ok()?;
         if n == 0 {
             break;
         }
@@ -272,22 +342,37 @@ async fn respond(sock: &mut TcpStream, status: &str, body: &str) {
 /// A usable access token for `resource`: the cached one if it has time left,
 /// else a refreshed one. A grant that cannot be refreshed is dropped and the
 /// person is told to log in again.
+///
+/// Refresh runs under the store lock, and the grant is re-read once the lock
+/// is held: if another process refreshed it meanwhile, its result is used and
+/// the already-consumed refresh token is never presented again (otto-auth
+/// would take that as a replay and revoke every token this client holds).
+/// For the same reason, the grant that is deleted on `invalid_grant` is
+/// always the one whose refresh token was just refused.
 pub(crate) async fn fresh_grant(
     http: &reqwest::Client,
     store: &Store,
     resource: &str,
 ) -> Result<Option<Grant>> {
-    let Some(grant) = store.grant(resource)? else {
+    match store.grant(resource)? {
+        None => return Ok(None),
+        Some(g) if usable(&g) => return Ok(Some(g)),
+        Some(_) => {}
+    }
+
+    let mut locked = store.lock().await?;
+    let Some(grant) = locked.grant(resource).cloned() else {
         return Ok(None);
     };
-    if grant.expires_at > now() + EXPIRY_SKEW_SECS {
+    if usable(&grant) {
         return Ok(Some(grant));
     }
     let login_required = || Error::LoginRequired {
         resource: resource.to_owned(),
     };
     let Some(refresh) = grant.refresh_token.clone() else {
-        store.remove_grant(resource)?;
+        locked.remove_grant(resource);
+        locked.save()?;
         return Err(login_required());
     };
     let meta = discovery::discover(http, resource).await?;
@@ -303,24 +388,24 @@ pub(crate) async fn fresh_grant(
         .await
         .map_err(|_| Error::Network(meta.token_endpoint.to_string()))?;
     if !resp.status().is_success() {
-        let (code, desc) = oauth_error(resp).await;
+        let (code, message) = oauth_error(resp).await;
         // The grant was revoked or expired, or the client is unknown: nothing
         // to retry. Anything else (a 5xx, rate limiting) leaves it in place.
         if matches!(code.as_str(), "invalid_grant" | "invalid_client") {
-            store.remove_grant(resource)?;
+            locked.remove_grant(resource);
             if code == "invalid_client" {
-                store.remove_client(&meta.issuer)?;
+                locked.remove_client(&meta.issuer);
             }
+            locked.save()?;
             return Err(login_required());
         }
-        return Err(Error::Authorization(
-            format!("{code} {desc}").trim().to_owned(),
-        ));
+        return Err(Error::Authorization(message));
     }
     let token: TokenResponse = resp.json().await.map_err(|_| {
         Error::Authorization("the token endpoint sent an unreadable response".into())
     })?;
     let renewed = grant_from(token, &grant.issuer, &grant.client_id, Some(refresh));
-    store.put_grant(resource, renewed.clone())?;
+    locked.put_grant(resource, renewed.clone());
+    locked.save()?;
     Ok(Some(renewed))
 }

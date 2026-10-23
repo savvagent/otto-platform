@@ -1,17 +1,22 @@
 //! `otto`: sign in to an otto deployment, and run `otto-<app>` subcommands.
 //!
 //! `otto <app> <args>` runs the `otto-<app>` binary found on PATH with the
-//! same arguments and exits with its status, the way git and cargo dispatch.
+//! same arguments, the way git and cargo dispatch. On Unix it replaces this
+//! process (`exec`), so signals, Ctrl-C and the exit status are the app's own.
 //! Each app ships its own verbs without changing this binary; it links
 //! `otto-client` to get a token for its own resource.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use otto_client::LoginOutcome;
+
 const USAGE: &str = "\
 usage:
-  otto login --resource <uri> [--scope <scope>]...   sign in to a resource
-  otto <app> [args...]                               run the `otto-<app>` binary on PATH
+  otto login --resource <uri> [--scope <scope>]... [--force]
+                                 sign in to a resource; --force signs in again
+                                 even if a usable login is cached
+  otto <app> [args...]           run the `otto-<app>` binary on PATH
   otto help
 
 `otto login` opens your browser to sign in. The token is cached per resource
@@ -39,11 +44,22 @@ async fn main() -> ExitCode {
 async fn login(args: &[String]) -> ExitCode {
     let mut resource = None;
     let mut scopes = Vec::new();
+    let mut force = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        match (a.as_str(), it.next()) {
-            ("--resource", Some(v)) => resource = Some(v.clone()),
-            ("--scope", Some(v)) => scopes.push(v.clone()),
+        match a.as_str() {
+            "--force" => force = true,
+            "--resource" | "--scope" => {
+                let Some(v) = it.next() else {
+                    eprintln!("otto login: {a} needs a value\n\n{USAGE}");
+                    return ExitCode::from(2);
+                };
+                if a == "--resource" {
+                    resource = Some(v.clone());
+                } else {
+                    scopes.push(v.clone());
+                }
+            }
             _ => {
                 eprintln!("otto login: unexpected argument {a:?}\n\n{USAGE}");
                 return ExitCode::from(2);
@@ -58,8 +74,12 @@ async fn login(args: &[String]) -> ExitCode {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
-    match client.login(&resource, &scopes).await {
-        Ok(()) => {
+    match client.login(&resource, &scopes, force).await {
+        Ok(LoginOutcome::AlreadySignedIn) => {
+            eprintln!("Already signed in to {resource}. Use --force to sign in again.");
+            ExitCode::SUCCESS
+        }
+        Ok(LoginOutcome::SignedIn) => {
             eprintln!("Signed in to {resource}.");
             ExitCode::SUCCESS
         }
@@ -88,8 +108,27 @@ fn dispatch(app: &str, args: &[String]) -> ExitCode {
         eprintln!("otto: no `{binary}` found on PATH, so `otto {app}` has nothing to run");
         return ExitCode::from(127);
     };
-    match Command::new(&path).args(args).status() {
-        Ok(status) => exit_code(status),
+    // `path` is absolute (see `find_on_path`), so `Command` runs exactly the
+    // file found rather than searching PATH again.
+    let mut cmd = Command::new(&path);
+    cmd.args(args);
+    run(cmd, &path)
+}
+
+#[cfg(unix)]
+fn run(mut cmd: Command, path: &Path) -> ExitCode {
+    use std::os::unix::process::CommandExt;
+    // Only returns on failure.
+    let e = cmd.exec();
+    eprintln!("otto: could not run {}: {}", path.display(), e.kind());
+    ExitCode::from(126)
+}
+
+#[cfg(not(unix))]
+fn run(mut cmd: Command, path: &Path) -> ExitCode {
+    match cmd.status() {
+        // `process::exit` passes the full status, where `ExitCode` holds a u8.
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(e) => {
             eprintln!("otto: could not run {}: {}", path.display(), e.kind());
             ExitCode::from(126)
@@ -97,24 +136,12 @@ fn dispatch(app: &str, args: &[String]) -> ExitCode {
     }
 }
 
-#[cfg(unix)]
-fn exit_code(status: std::process::ExitStatus) -> ExitCode {
-    use std::os::unix::process::ExitStatusExt;
-    match (status.code(), status.signal()) {
-        (Some(c), _) => ExitCode::from(c as u8),
-        // The shell convention for death by signal.
-        (None, Some(s)) => ExitCode::from(128u8.wrapping_add(s as u8)),
-        (None, None) => ExitCode::FAILURE,
-    }
-}
-
-#[cfg(not(unix))]
-fn exit_code(status: std::process::ExitStatus) -> ExitCode {
-    ExitCode::from(status.code().unwrap_or(1) as u8)
-}
-
+/// The first executable `binary` in an absolute PATH entry. Empty and
+/// relative entries are skipped: they resolve against whatever the current
+/// directory happens to be.
 fn find_on_path(binary: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     std::env::split_paths(path_var?)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(binary))
         .find(|candidate| is_executable(candidate))
 }
