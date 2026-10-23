@@ -189,6 +189,8 @@ jobs:
             otto-auth
             otto-web
             otto-resource
+            otto-client
+            otto-cli
             otto-platform-server
             web
             docs
