@@ -1,13 +1,12 @@
 //! The OAuth flows: browser login (authorization code + PKCE S256 on a
 //! loopback redirect) and refresh.
 
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use url::Url;
 
 use crate::discovery::{self, Discovered};
@@ -20,9 +19,9 @@ use crate::{LoginOutcome, Opener};
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long one connection to the loopback listener may take, start to end.
 /// Connections are handled concurrently, so a slow one never delays another.
-const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
-/// How many connections to the loopback listener are handled at once.
-const MAX_CONNECTIONS: usize = 32;
+/// A browser sends its request line at once; this only bounds a slow or
+/// stalled client.
+const CONNECTION_DEADLINE: Duration = Duration::from_secs(2);
 /// A token this close to expiry is refreshed rather than handed out.
 const EXPIRY_SKEW_SECS: u64 = 30;
 /// Assumed lifetime when a token response omits `expires_in`, and the most a
@@ -241,7 +240,6 @@ enum Callback {
 /// answered and ignored, so a stray process cannot cancel the login either.
 async fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
     let (tx, mut rx) = mpsc::channel::<Callback>(1);
-    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -252,11 +250,11 @@ async fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 };
-                // At most MAX_CONNECTIONS in flight; past that, a connection
-                // is closed unread.
-                let Ok(slot) = slots.clone().try_acquire_owned() else {
-                    continue;
-                };
+                // No cap on connections in flight: a cap is a set of slots a
+                // local process can fill and keep refilling, so the browser's
+                // connection would be closed unread. Each task is cheap and
+                // ends at CONNECTION_DEADLINE, so starving the browser means
+                // exhausting this process's file descriptors.
                 let (tx, state) = (tx.clone(), state.to_owned());
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(
@@ -264,7 +262,6 @@ async fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
                         handle_connection(sock, &state, &tx),
                     )
                     .await;
-                    drop(slot);
                 });
             }
             // `tx` is held here, so the channel never closes while looping.

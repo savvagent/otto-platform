@@ -205,9 +205,11 @@ impl Opener for FakeBrowser {
     }
 }
 
-/// A local process that connects to the callback port first and sends
-/// nothing, then the real browser.
+/// A local process that opens many connections to the callback port first
+/// and sends nothing on any of them, then the real browser.
 struct StallThenBrowser;
+
+const STALLED_CONNECTIONS: usize = 64;
 
 impl Opener for StallThenBrowser {
     fn open(&self, url: &Url) -> Result<()> {
@@ -219,9 +221,14 @@ impl Opener for StallThenBrowser {
             .unwrap();
         let port = redirect.port().unwrap();
         tokio::spawn(async move {
-            let stalled = tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .unwrap();
+            let mut stalled = Vec::new();
+            for _ in 0..STALLED_CONNECTIONS {
+                stalled.push(
+                    tokio::net::TcpStream::connect(("127.0.0.1", port))
+                        .await
+                        .unwrap(),
+                );
+            }
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 drop(stalled);
