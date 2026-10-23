@@ -72,7 +72,7 @@ pub async fn discover(http: &reqwest::Client, resource: &str) -> Result<Discover
     // it may be another server's document.
     if server.issuer.trim_end_matches('/') != issuer.trim_end_matches('/') {
         return Err(Error::Discovery(format!(
-            "{well_known} names issuer {}, not {issuer}",
+            "{well_known} names issuer {}, not {issuer_url}",
             server_text(&server.issuer)
         )));
     }
@@ -84,7 +84,7 @@ pub async fn discover(http: &reqwest::Client, resource: &str) -> Result<Discover
     };
     let registration = server.registration_endpoint.ok_or_else(|| {
         Error::Discovery(format!(
-            "{issuer} does not support dynamic client registration"
+            "{issuer_url} does not support dynamic client registration"
         ))
     })?;
     Ok(Discovered {

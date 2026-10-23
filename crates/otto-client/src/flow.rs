@@ -1,12 +1,13 @@
 //! The OAuth flows: browser login (authorization code + PKCE S256 on a
 //! loopback redirect) and refresh.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use url::Url;
 
 use crate::discovery::{self, Discovered};
@@ -20,6 +21,8 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long one connection to the loopback listener may take, start to end.
 /// Connections are handled concurrently, so a slow one never delays another.
 const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
+/// How many connections to the loopback listener are handled at once.
+const MAX_CONNECTIONS: usize = 32;
 /// A token this close to expiry is refreshed rather than handed out.
 const EXPIRY_SKEW_SECS: u64 = 30;
 /// Assumed lifetime when a token response omits `expires_in`, and the most a
@@ -85,11 +88,13 @@ pub(crate) async fn login(
 ) -> Result<LoginOutcome> {
     if !force {
         // A usable grant that already covers what is asked for needs no new
-        // consent. A revoked one falls through to a fresh login.
-        match fresh_grant(http, store, resource).await {
-            Ok(Some(g)) if covers(&g, scopes) => return Ok(LoginOutcome::AlreadySignedIn),
-            Ok(_) | Err(Error::LoginRequired { .. }) => {}
-            Err(e) => return Err(e),
+        // consent. Anything else, including a grant that could not be
+        // refreshed for any reason, falls through to a fresh login: that is
+        // what the person is trying to fix.
+        if let Ok(Some(g)) = fresh_grant(http, store, resource).await {
+            if covers(&g, scopes) {
+                return Ok(LoginOutcome::AlreadySignedIn);
+            }
         }
     }
 
@@ -236,11 +241,22 @@ enum Callback {
 /// answered and ignored, so a stray process cannot cancel the login either.
 async fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
     let (tx, mut rx) = mpsc::channel::<Callback>(1);
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (sock, _) =
-                    accepted.map_err(|e| Error::io("accepting the browser callback", &e))?;
+                // A failed accept (a connection reset before it was taken, or
+                // too many open files while something floods the port) is
+                // not a reason to abandon the login; back off and keep going.
+                let Ok((sock, _)) = accepted else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                // At most MAX_CONNECTIONS in flight; past that, a connection
+                // is closed unread.
+                let Ok(slot) = slots.clone().try_acquire_owned() else {
+                    continue;
+                };
                 let (tx, state) = (tx.clone(), state.to_owned());
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(
@@ -248,6 +264,7 @@ async fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
                         handle_connection(sock, &state, &tx),
                     )
                     .await;
+                    drop(slot);
                 });
             }
             // `tx` is held here, so the channel never closes while looping.
@@ -348,7 +365,15 @@ async fn respond(sock: &mut TcpStream, status: &str, body: &str) {
 /// the already-consumed refresh token is never presented again (otto-auth
 /// would take that as a replay and revoke every token this client holds).
 /// For the same reason, the grant that is deleted on `invalid_grant` is
-/// always the one whose refresh token was just refused.
+/// always the one whose refresh token was just refused. Discovery happens
+/// before the lock is taken, so the lock is held for one token request
+/// (bounded by the HTTP timeout, well under the lock wait) and a save.
+///
+/// One window cannot be closed from the client: the server consumes the old
+/// refresh token when it answers, so if this process dies, or the response or
+/// the save is lost, after that point, the stored grant keeps a consumed token
+/// and the next refresh is treated as a replay. The new grant is saved
+/// immediately after the response to keep that window as small as possible.
 pub(crate) async fn fresh_grant(
     http: &reqwest::Client,
     store: &Store,
@@ -360,6 +385,7 @@ pub(crate) async fn fresh_grant(
         Some(_) => {}
     }
 
+    let meta = discovery::discover(http, resource).await?;
     let mut locked = store.lock().await?;
     let Some(grant) = locked.grant(resource).cloned() else {
         return Ok(None);
@@ -375,7 +401,6 @@ pub(crate) async fn fresh_grant(
         locked.save()?;
         return Err(login_required());
     };
-    let meta = discovery::discover(http, resource).await?;
     let resp = http
         .post(meta.token_endpoint.clone())
         .form(&[

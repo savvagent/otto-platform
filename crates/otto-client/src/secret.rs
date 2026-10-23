@@ -60,15 +60,7 @@ impl Secret {
                 if *overwrite {
                     replace_private(path, bytes.as_bytes())?;
                 } else {
-                    write_new_private(path, bytes.as_bytes()).map_err(|e| match e {
-                        Error::Io(_) if path.exists() || path.is_symlink() => {
-                            Error::Refused(format!(
-                                "{} already exists; choose another file or allow overwriting",
-                                path.display()
-                            ))
-                        }
-                        other => other,
-                    })?;
+                    write_new_private(path, bytes.as_bytes())?;
                 }
                 writeln!(status, "secret written to {}", path.display())
                     .map_err(|e| Error::io("writing to terminal", &e))
@@ -115,12 +107,27 @@ fn create_private(path: &Path) -> std::io::Result<File> {
     opts.open(path)
 }
 
+/// Write `bytes` to a new owner-only file at `path`. An existing entry is
+/// refused; a write that fails part-way removes the file it created, so no
+/// truncated copy of a secret is left behind.
 fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file =
-        create_private(path).map_err(|e| Error::io(&format!("creating {}", path.display()), &e))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| Error::io(&format!("writing {}", path.display()), &e))
+    let mut file = create_private(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            Error::Refused(format!(
+                "{} already exists; choose another file or allow overwriting",
+                path.display()
+            ))
+        } else {
+            Error::io(&format!("creating {}", path.display()), &e)
+        }
+    })?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    if let Err(e) = written {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(Error::io(&format!("writing {}", path.display()), &e));
+    }
+    Ok(())
 }
 
 /// Replace `path` with `bytes`, owner-only: write a new file beside it, then
