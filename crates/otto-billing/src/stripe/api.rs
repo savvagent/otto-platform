@@ -592,6 +592,22 @@ impl Client {
         self.get(&format!("/v1/subscriptions/{id}")).await
     }
 
+    /// `DELETE /v1/subscriptions/{id}` with `invoice_now=true` and
+    /// `prorate=false`: cancel the subscription now and invoice its unbilled
+    /// usage at once, without prorating credits.
+    pub async fn cancel_subscription_invoice_now(
+        &self,
+        id: &str,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Subscription, StripeError> {
+        check_id("subscription", id)?;
+        let mut form = Form::default();
+        form.push("invoice_now", "true");
+        form.push("prorate", "false");
+        self.delete(&format!("/v1/subscriptions/{id}"), form, idempotency_key)
+            .await
+    }
+
     /// `GET /v1/subscriptions?customer=...&status=all`: every subscription of
     /// one customer, whatever its status (one page of up to 100).
     pub async fn list_subscriptions(
@@ -783,6 +799,22 @@ impl Client {
         form.push("auto_advance", auto_advance.to_string());
         self.post(&format!("/v1/invoices/{id}"), form, idempotency_key)
             .await
+    }
+
+    /// `DELETE /v1/invoices/{id}`: delete a draft invoice. Stripe refuses any
+    /// invoice that is not a draft.
+    pub async fn delete_draft_invoice(
+        &self,
+        id: &str,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<serde_json::Value, StripeError> {
+        check_id("invoice", id)?;
+        self.delete(
+            &format!("/v1/invoices/{id}"),
+            Form::default(),
+            idempotency_key,
+        )
+        .await
     }
 
     /// `POST /v1/invoices/{id}/finalize`: turn a draft into an open invoice,

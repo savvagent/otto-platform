@@ -111,6 +111,27 @@ impl Client {
         self.send(req).await
     }
 
+    /// DELETE `path` (which starts with `/v1/`) with a form body.
+    pub(super) async fn delete<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        form: Form,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<T, StripeError> {
+        let body = form.encode()?;
+        let idem = HeaderValue::from_str(idempotency_key.as_str()).map_err(|_| {
+            StripeError::InvalidRequest("idempotency key is not header-safe".into())
+        })?;
+        let req = self
+            .http
+            .delete(format!("{}{path}", self.base))
+            .headers(self.headers()?)
+            .header("Idempotency-Key", idem)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body);
+        self.send(req).await
+    }
+
     /// GET `path` (which starts with `/v1/`).
     pub(super) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, StripeError> {
         let req = self

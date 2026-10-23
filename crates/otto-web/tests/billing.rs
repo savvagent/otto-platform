@@ -1354,3 +1354,240 @@ async fn a_meter_error_report_naming_nothing_of_ours_is_acknowledged(pool: PgPoo
     assert_eq!(row_state(&s, "agg:ours").await.0, "sent");
     assert!(billing::HANDLED_EVENT_TYPES.contains(&"billing.meter.error_report_triggered"));
 }
+
+// ------------------------------------- canceling a deleted org's billing (#73)
+
+use otto_core::orgs::OrgsExt;
+
+async fn cancellation_row(s: &Setup) -> (String, i32, Option<String>) {
+    sqlx::query_as(
+        "SELECT status, attempts, last_error FROM stripe_cancellations WHERE org_id = $1",
+    )
+    .bind(s.org)
+    .fetch_one(&s.pool)
+    .await
+    .unwrap()
+}
+
+fn cancel_calls(s: &Setup, sub: &str) -> Vec<otto_billing::billing::mock::Seen> {
+    s.mock
+        .requests("DELETE", &format!("/v1/subscriptions/{sub}"))
+}
+
+async fn make_due(s: &Setup) {
+    sqlx::query("UPDATE stripe_cancellations SET next_attempt_at = now()")
+        .execute(&s.pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn deleting_an_org_cancels_its_subscription_once_with_final_usage_invoiced(pool: PgPool) {
+    let s = started(pool).await;
+    complete(&s, "evt_done", Utc::now().timestamp())
+        .await
+        .expect(StatusCode::OK);
+    let sub = current_subscription(&s).await;
+    s.h.db.delete_org(s.org).await.unwrap();
+
+    // Queued by the deletion itself; nothing has called Stripe yet.
+    assert_eq!(cancellation_row(&s).await.0, "pending");
+    assert!(cancel_calls(&s, &sub).is_empty());
+
+    let report = billing::cancel::run_pass(&s.h.db, &s.mock.client())
+        .await
+        .unwrap();
+    assert_eq!((report.claimed, report.canceled), (1, 1), "{report:?}");
+    let calls = cancel_calls(&s, &sub);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].field("invoice_now"), Some("true"));
+    assert_eq!(calls[0].field("prorate"), Some("false"));
+    assert_eq!(s.mock.subscription(&sub).unwrap()["status"], "canceled");
+    assert_eq!(s.mock.detached(), ["pm_card_1"]);
+    assert_eq!(cancellation_row(&s).await.0, "done");
+
+    // Nothing is left to do, and a second pass cancels nothing again.
+    let again = billing::cancel::run_pass(&s.h.db, &s.mock.client())
+        .await
+        .unwrap();
+    assert_eq!(again.claimed, 0);
+    assert_eq!(cancel_calls(&s, &sub).len(), 1);
+}
+
+/// Hold a cycle invoice through the webhook, as Stripe's `invoice.created` does.
+async fn hold_cycle_invoice(s: &Setup, sub: &str) {
+    let invoice = s
+        .mock
+        .add_invoice("in_cycle", &s.customer, sub, next_first(&s.pool).await);
+    deliver_event(
+        s,
+        "evt_inv",
+        "invoice.created",
+        Utc::now().timestamp(),
+        invoice,
+    )
+    .await
+    .expect(StatusCode::OK);
+    assert_eq!(s.mock.invoice("in_cycle").unwrap()["auto_advance"], false);
+}
+
+async fn held_outcome(s: &Setup) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT outcome FROM stripe_held_invoices WHERE stripe_invoice_id = 'in_cycle'",
+    )
+    .fetch_one(&s.pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn deleting_an_org_deletes_its_held_draft_invoice(pool: PgPool) {
+    let s = started(pool).await;
+    complete(&s, "evt_done", Utc::now().timestamp())
+        .await
+        .expect(StatusCode::OK);
+    let sub = current_subscription(&s).await;
+    hold_cycle_invoice(&s, &sub).await;
+    s.h.db.delete_org(s.org).await.unwrap();
+
+    let report = billing::cancel::run_pass(&s.h.db, &s.mock.client())
+        .await
+        .unwrap();
+    assert_eq!(report.canceled, 1, "{report:?}");
+    assert!(s.mock.invoice("in_cycle").is_none(), "the draft survived");
+    assert_eq!(held_outcome(&s).await.as_deref(), Some("deleted"));
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_held_invoice_finalized_before_the_deletion_is_left_alone(pool: PgPool) {
+    let s = started(pool).await;
+    complete(&s, "evt_done", Utc::now().timestamp())
+        .await
+        .expect(StatusCode::OK);
+    let sub = current_subscription(&s).await;
+    hold_cycle_invoice(&s, &sub).await;
+    s.mock.set_invoice_status("in_cycle", "open");
+    s.h.db.delete_org(s.org).await.unwrap();
+
+    billing::cancel::run_pass(&s.h.db, &s.mock.client())
+        .await
+        .unwrap();
+    assert_eq!(s.mock.invoice("in_cycle").unwrap()["status"], "open");
+    assert_eq!(held_outcome(&s).await.as_deref(), Some("not_draft"));
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_stripe_outage_neither_blocks_the_deletion_nor_loses_the_cancellation(pool: PgPool) {
+    let s = started(pool).await;
+    complete(&s, "evt_done", Utc::now().timestamp())
+        .await
+        .expect(StatusCode::OK);
+    let sub = current_subscription(&s).await;
+    s.mock.fail("/v1/subscriptions", 500);
+
+    // The deletion does not touch Stripe at all.
+    s.h.db.delete_org(s.org).await.unwrap();
+    assert!(s.h.db.get_active_org(s.org).await.unwrap().is_none());
+
+    let report = billing::cancel::run_pass(&s.h.db, &s.mock.client())
+        .await
+        .unwrap();
+    assert_eq!(report.retrying, 1, "{report:?}");
+    let (status, attempts, error) = cancellation_row(&s).await;
+    assert_eq!((status.as_str(), attempts), ("pending", 1));
+    assert!(error.is_some());
+    // Backed off: not due again at once.
+    assert_eq!(
+        billing::cancel::run_pass(&s.h.db, &s.mock.client())
+            .await
+            .unwrap()
+            .claimed,
+        0
+    );
+
+    s.mock.clear_failures();
+    make_due(&s).await;
+    let report = billing::cancel::run_pass(&s.h.db, &s.mock.client())
+        .await
+        .unwrap();
+    assert_eq!(report.canceled, 1, "{report:?}");
+    assert_eq!(s.mock.subscription(&sub).unwrap()["status"], "canceled");
+    assert_eq!(cancellation_row(&s).await.0, "done");
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_cancellation_waits_for_the_orgs_queued_meter_events_to_ship(pool: PgPool) {
+    let s = started(pool).await;
+    complete(&s, "evt_done", Utc::now().timestamp())
+        .await
+        .expect(StatusCode::OK);
+    let sub = current_subscription(&s).await;
+    sent_row(&s, "agg:waiting", 7).await;
+    sqlx::query("UPDATE stripe_meter_outbox SET status = 'pending', finished_at = NULL")
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    s.h.db.delete_org(s.org).await.unwrap();
+
+    let report = billing::cancel::run_pass(&s.h.db, &s.mock.client())
+        .await
+        .unwrap();
+    assert_eq!(report.claimed, 0, "canceled before the usage shipped");
+    assert!(cancel_calls(&s, &sub).is_empty());
+
+    sqlx::query("UPDATE stripe_meter_outbox SET status = 'sent', finished_at = now()")
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    let report = billing::cancel::run_pass(&s.h.db, &s.mock.client())
+        .await
+        .unwrap();
+    assert_eq!(report.canceled, 1, "{report:?}");
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_subscription_already_canceled_in_stripe_is_done_without_a_call(pool: PgPool) {
+    let s = started(pool).await;
+    complete(&s, "evt_done", Utc::now().timestamp())
+        .await
+        .expect(StatusCode::OK);
+    let sub = current_subscription(&s).await;
+    s.mock.set_subscription_status(&sub, "canceled");
+    s.h.db.delete_org(s.org).await.unwrap();
+
+    let report = billing::cancel::run_pass(&s.h.db, &s.mock.client())
+        .await
+        .unwrap();
+    assert_eq!((report.canceled, report.already_gone), (0, 1), "{report:?}");
+    assert!(cancel_calls(&s, &sub).is_empty());
+    assert_eq!(cancellation_row(&s).await.0, "done");
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn an_org_without_a_subscription_queues_nothing(pool: PgPool) {
+    let s = started(pool).await;
+    // Setup started (a customer) but no card, so no subscription.
+    s.h.db.delete_org(s.org).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM stripe_cancellations")
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_refusal_that_will_not_change_is_kept_failed_for_an_operator(pool: PgPool) {
+    let s = started(pool).await;
+    complete(&s, "evt_done", Utc::now().timestamp())
+        .await
+        .expect(StatusCode::OK);
+    s.mock.fail("/v1/subscriptions", 400);
+    s.h.db.delete_org(s.org).await.unwrap();
+    let report = billing::cancel::run_pass(&s.h.db, &s.mock.client())
+        .await
+        .unwrap();
+    assert_eq!(report.failed, 1, "{report:?}");
+    let (status, _, error) = cancellation_row(&s).await;
+    assert_eq!(status, "failed");
+    assert!(error.is_some());
+}
