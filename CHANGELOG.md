@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/savvagent/otto-platform/compare/v0.12.1...v0.13.0) (2026-10-24)
+
+
+### Miscellaneous Chores
+
+* release the ottoctl rename and the home page CLI section ([#115](https://github.com/savvagent/otto-platform/issues/115)) ([69a8d99](https://github.com/savvagent/otto-platform/commit/69a8d994e5f968fab0b8e973f858ebcde18dcb1f))
+
 ## [0.12.1](https://github.com/savvagent/otto-platform/compare/v0.12.0...v0.12.1) (2026-10-24)
 
 
