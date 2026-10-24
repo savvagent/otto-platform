@@ -46,6 +46,17 @@ bundle built from `web/` (see `web/README.md`): the public marketing pages,
 prerendered (`/`, `/pricing`, a page per product, each in every language),
 and the account/org console, whose home is `/home`.
 
+## The `otto` command
+
+`otto` is the terminal side of the platform. It signs a developer in to any
+otto-* service and runs that service's own subcommands. Its first use is
+otto-flags server keys, which reach a person's terminal and never pass through
+a model. Prebuilt binaries for Linux (x86_64, arm64), macOS (Apple silicon,
+Intel) and Windows (x86_64) are attached to every
+[release](https://github.com/savvagent/otto-platform/releases/latest), with
+checksums. To install and verify one, see
+[docs/otto-cli.md](docs/otto-cli.md#install).
+
 ## Crate layout
 
 ```

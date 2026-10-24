@@ -513,6 +513,8 @@ async fn an_http_authorization_server_off_loopback_is_refused() {
     assert!(matches!(err, Error::Discovery(_)), "{err:?}");
 }
 
+// Windows DACLs are checked by `private_fs`'s own tests.
+#[cfg(unix)]
 #[tokio::test]
 async fn credentials_are_owner_only_and_an_existing_dir_is_left_alone() {
     use std::os::unix::fs::PermissionsExt;

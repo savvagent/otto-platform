@@ -6,12 +6,12 @@
 //! file, which is how secrets end up in CI logs), or to a file the user named,
 //! created readable by its owner only.
 
-use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::pkce::random_token;
+use crate::private_fs;
 
 pub struct Secret(String);
 
@@ -93,25 +93,11 @@ pub enum Sink {
     },
 }
 
-/// Create `path` owner-only. `create_new` (`O_CREAT | O_EXCL`) refuses any
-/// existing entry, a symlink or a FIFO included, so nothing planted at the
-/// path is followed or written through.
-fn create_private(path: &Path) -> std::io::Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)
-}
-
 /// Write `bytes` to a new owner-only file at `path`. An existing entry is
 /// refused; a write that fails part-way removes the file it created, so no
 /// truncated copy of a secret is left behind.
 fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = create_private(path).map_err(|e| {
+    let mut file = private_fs::create_new(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             Error::Refused(format!(
                 "{} already exists; choose another file or allow overwriting",
@@ -155,11 +141,13 @@ pub(crate) fn replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     const VALUE: &str = "srv_THE-SECRET";
 
+    // Windows ACLs are checked in `private_fs`.
+    #[cfg(unix)]
     fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
@@ -206,12 +194,15 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             format!("{VALUE}\n")
         );
+        #[cfg(unix)]
         assert_eq!(mode(&path), 0o600);
         assert!(out.is_empty());
         let status = String::from_utf8(status).unwrap();
         assert!(status.contains("key") && !status.contains("THE-SECRET"));
     }
 
+    // Creating a symlink on Windows needs a privilege CI runners may lack.
+    #[cfg(unix)]
     #[test]
     fn file_sink_refuses_an_existing_file_or_symlink_without_overwrite() {
         let dir = tempfile::tempdir().unwrap();
@@ -233,11 +224,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
     }
 
+    #[cfg(unix)]
     #[test]
     fn overwrite_replaces_a_symlink_instead_of_writing_through_it() {
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim");
         std::fs::write(&victim, "precious").unwrap();
+        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&victim, &link).unwrap();
