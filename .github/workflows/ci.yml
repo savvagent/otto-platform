@@ -357,6 +357,36 @@ jobs:
           cat SHA256SUMS
           gh release upload "$TAG" otto-* SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
 
+      - name: Add install notes to the release
+        # Appended below release-please's changelog. The marker keeps a re-run
+        # from adding them twice.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          marker='<!-- otto-cli-install -->'
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
+          if grep -qF "$marker" notes.md; then exit 0; fi
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          cat >> notes.md <<EOF
+
+          $marker
+          ## Install the \`otto\` CLI
+
+          | Platform | Download |
+          | --- | --- |
+          | Linux x86_64 | [otto-x86_64-unknown-linux-musl.tar.gz]($base/otto-x86_64-unknown-linux-musl.tar.gz) |
+          | Linux arm64 | [otto-aarch64-unknown-linux-musl.tar.gz]($base/otto-aarch64-unknown-linux-musl.tar.gz) |
+          | macOS Apple silicon | [otto-aarch64-apple-darwin.tar.gz]($base/otto-aarch64-apple-darwin.tar.gz) |
+          | macOS Intel | [otto-x86_64-apple-darwin.tar.gz]($base/otto-x86_64-apple-darwin.tar.gz) |
+          | Windows x86_64 | [otto-x86_64-pc-windows-msvc.zip]($base/otto-x86_64-pc-windows-msvc.zip) |
+
+          Check the download against [SHA256SUMS]($base/SHA256SUMS), unpack it, and put \`otto\` on your PATH. Then sign in with \`otto login --resource <service URL>\`.
+          The binaries are not code-signed. For the macOS and Windows first-run steps, see [the install guide](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/docs/otto-cli.md#install).
+          EOF
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+
   # Maintains a single "chore: release X.Y.Z" PR. Merging it cuts the tag and
   # GitHub Release, and release_created becomes true — the signal deploy gates on.
   release-please:
