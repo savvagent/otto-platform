@@ -82,9 +82,9 @@ pub struct Db {
     /// Resolved lazily rather than in `connect`, because `from_pool` is sync and
     /// is what `#[sqlx::test]` uses — making the probe eager would mean either an
     /// async `from_pool` (rippling through every test) or two constructors that
-    /// disagree about a security-relevant fact. `verify_tenant_isolation` forces
-    /// it at startup, so a server never reaches its first tenant query without
-    /// having answered this.
+    /// disagree about a security-relevant fact. The first `begin` (or
+    /// `verify_tenant_isolation`, which a server runs at startup) answers it on
+    /// the connection it already holds.
     tenant_role_assumable: Arc<OnceCell<bool>>,
 }
 
@@ -145,7 +145,13 @@ impl Db {
     /// rests on `FORCE ROW LEVEL SECURITY` instead — which is a real guarantee,
     /// but only for a connecting role that is neither a superuser nor BYPASSRLS.
     /// Nothing here assumes that; [`Self::verify_tenant_isolation`] checks it.
-    async fn tenant_role_assumable(&self) -> Result<bool> {
+    ///
+    /// Runs on `conn`, the connection the caller already holds, never on the
+    /// pool: a probe that took its own connection would hold two at once on the
+    /// first `begin`, and a small pool of concurrent first transactions could
+    /// exhaust itself waiting on the probe. Call it *before* `SET LOCAL ROLE`,
+    /// since the answer is about `current_user`, which that statement changes.
+    async fn tenant_role_assumable(&self, conn: &mut sqlx::PgConnection) -> Result<bool> {
         self.tenant_role_assumable
             .get_or_try_init(|| async {
                 let assumable: bool = sqlx::query_scalar(
@@ -156,7 +162,7 @@ impl Db {
                      )",
                 )
                 .bind(self.tenant_role)
-                .fetch_one(&self.pool)
+                .fetch_one(conn)
                 .await?;
                 Ok(assumable)
             })
@@ -214,7 +220,7 @@ impl Db {
     pub async fn begin(&self, org: OrgId) -> Result<Tx<'static>> {
         let mut tx = self.pool.begin().await?;
 
-        if self.tenant_role_assumable().await? {
+        if self.tenant_role_assumable(&mut tx).await? {
             sqlx::query(&format!("SET LOCAL ROLE {}", self.tenant_role))
                 .execute(&mut *tx)
                 .await?;
@@ -240,8 +246,8 @@ impl Db {
     ///
     /// The transaction is rolled back — this only reads catalogs.
     pub async fn verify_tenant_isolation(&self) -> Result<IsolationReport> {
-        let assumed = self.tenant_role_assumable().await?;
         let mut tx = self.pool.begin().await?;
+        let assumed = self.tenant_role_assumable(&mut tx).await?;
         if assumed {
             sqlx::query(&format!("SET LOCAL ROLE {}", self.tenant_role))
                 .execute(&mut *tx)
