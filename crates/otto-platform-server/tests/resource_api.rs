@@ -1210,12 +1210,20 @@ async fn the_client_lists_member_teams(pool: PgPool) {
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn member_lookups_are_cached_briefly_and_expire(pool: PgPool) {
+    // No assertion here depends on how quickly the test runs. "Cached" is
+    // proven with a TTL far longer than any test, "expires" with a short TTL
+    // that is only ever waited *past* (polling, never racing a deadline).
     let w = world(pool).await;
     let base = serve(&w.db).await;
+    let long_ttl = std::time::Duration::from_secs(3600);
     let mut cfg = ClientConfig::new(&base, FACTORY, &w.factory_secret);
-    cfg.member_ttl = std::time::Duration::from_millis(400);
-    cfg.member_negative_ttl = std::time::Duration::from_millis(400);
+    cfg.member_ttl = long_ttl;
+    cfg.member_negative_ttl = long_ttl;
     let client = PlatformClient::new(cfg).unwrap();
+    let mut cfg = ClientConfig::new(&base, FACTORY, &w.factory_secret);
+    cfg.member_ttl = std::time::Duration::from_millis(100);
+    cfg.member_negative_ttl = std::time::Duration::from_millis(100);
+    let short = PlatformClient::new(cfg).unwrap();
     let (org, user) = (w.org.as_uuid(), w.user.as_uuid());
 
     let mut tx = w.db.begin(w.org).await.unwrap();
@@ -1224,22 +1232,22 @@ async fn member_lookups_are_cached_briefly_and_expire(pool: PgPool) {
     tx.commit().await.unwrap();
     let newcomer = w.db.upsert_user("new@acme.example", None).await.unwrap();
 
-    assert_eq!(
-        client.member(org, user).await.unwrap().unwrap().role,
-        otto_resource::Role::Admin
-    );
-    assert_eq!(
-        client.member_teams(org, user).await.unwrap().unwrap().len(),
-        1
-    );
-    // Not a member yet; remembered.
-    assert!(client
-        .member(org, newcomer.id.as_uuid())
-        .await
-        .unwrap()
-        .is_none());
+    // Both clients see (and remember) the initial state.
+    for c in [&client, &short] {
+        assert_eq!(
+            c.member(org, user).await.unwrap().unwrap().role,
+            otto_resource::Role::Admin
+        );
+        assert_eq!(c.member_teams(org, user).await.unwrap().unwrap().len(), 1);
+        // Not a member yet; remembered.
+        assert!(c
+            .member(org, newcomer.id.as_uuid())
+            .await
+            .unwrap()
+            .is_none());
+    }
 
-    // Platform-side changes are invisible inside the TTL...
+    // Platform-side changes are invisible while the entries are fresh...
     w.db.add_member(w.org, newcomer.id, Role::Member)
         .await
         .unwrap();
@@ -1261,23 +1269,26 @@ async fn member_lookups_are_cached_briefly_and_expire(pool: PgPool) {
         .unwrap()
         .is_none());
 
-    // ...and visible after it.
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-    assert_eq!(
-        client.member(org, user).await.unwrap().unwrap().role,
-        otto_resource::Role::Member
-    );
-    assert!(client
-        .member_teams(org, user)
-        .await
-        .unwrap()
-        .unwrap()
-        .is_empty());
-    assert!(client
-        .member(org, newcomer.id.as_uuid())
-        .await
-        .unwrap()
-        .is_some());
+    // ...and visible once they expire. Poll rather than sleep a fixed time, so
+    // a slow machine only makes this wait longer, never fail.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let role = short.member(org, user).await.unwrap().unwrap().role;
+        let teams = short.member_teams(org, user).await.unwrap().unwrap();
+        let newcomer_in = short
+            .member(org, newcomer.id.as_uuid())
+            .await
+            .unwrap()
+            .is_some();
+        if role == otto_resource::Role::Member && teams.is_empty() && newcomer_in {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cached entries never expired"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     // A zero TTL disables caching altogether.
     let mut cfg = ClientConfig::new(&base, FACTORY, &w.factory_secret);
