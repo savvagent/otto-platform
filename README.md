@@ -79,6 +79,14 @@ crates/
 │                         links: introspection, usage and lookup clients
 │                         with 60 s caches, webhook signature verification.
 │                         No database dependency.
+├── otto-client/          what a terminal tool links to sign in as an MCP
+│                         client does: discovery, dynamic registration,
+│                         PKCE S256 on a loopback redirect, a per-resource
+│                         token cache, and `Secret` output that never reaches
+│                         a log. No database dependency.
+├── otto-cli/             binary `otto`: `otto login --resource <uri>`, and
+│                         `otto <app> ...` runs `otto-<app>` from PATH. See
+│                         [docs/otto-cli.md](docs/otto-cli.md).
 └── otto-platform-server/ binary: loads config, connects, runs migrations,
                           verifies tenant isolation, then serves /healthz,
                           /readyz, otto-web's router, the
