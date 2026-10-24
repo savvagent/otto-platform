@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/savvagent/otto-platform/compare/v0.13.0...v0.13.1) (2026-10-24)
+
+
+### Bug Fixes
+
+* **ci:** attach the ottoctl archives to releases ([#117](https://github.com/savvagent/otto-platform/issues/117)) ([96ae60f](https://github.com/savvagent/otto-platform/commit/96ae60f727567663d09f12462e4f1ec17a50fff9))
+
 ## [0.13.0](https://github.com/savvagent/otto-platform/compare/v0.12.1...v0.13.0) (2026-10-24)
 
 
