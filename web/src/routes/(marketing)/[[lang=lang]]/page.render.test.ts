@@ -117,6 +117,25 @@ describe('the landing page', () => {
     unmount(instance);
   });
 
+  it('pitches ottoctl, with a download and a link to the CLI page', () => {
+    const instance = mount(Page, { target: container, props: { data: { lang: 'en' } } });
+
+    const section = container.querySelector('section[aria-labelledby="cli-title"]');
+    expect(section?.textContent).toContain('Keep secrets out of the chat');
+    expect(section?.textContent).toContain('ottoctl login --resource');
+
+    const download = links('Download ottoctl');
+    expect(download).toHaveLength(1);
+    expect(download[0]?.getAttribute('href')).toBe(
+      'https://github.com/savvagent/otto-platform/releases/latest'
+    );
+    const more = links('About the command line');
+    expect(more).toHaveLength(1);
+    expect(more[0]?.getAttribute('href')).toBe('/cli');
+
+    unmount(instance);
+  });
+
   /**
    * The layout installs the URL's locale as Paraglide's getter before any
    * child renders; this does the same, then checks the two things a
@@ -136,6 +155,7 @@ describe('the landing page', () => {
     }
     expect(container.querySelector('a[href^="/products/"]')).toBeNull();
     for (const a of links('Crear cuenta')) expect(a.getAttribute('href')).toBe('/signup');
+    expect(links('Sobre la línea de comandos')[0]?.getAttribute('href')).toBe('/es/cli');
 
     unmount(instance);
   });
