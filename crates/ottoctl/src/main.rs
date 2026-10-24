@@ -1,9 +1,9 @@
-//! `otto`: sign in to an otto deployment, and run `otto-<app>` subcommands.
+//! `ottoctl`: sign in to an otto deployment, and run `otto-<app>` subcommands.
 //!
-//! `otto <app> <args>` runs the `otto-<app>` binary found on PATH with the
+//! `ottoctl <app> <args>` runs the `otto-<app>` binary found on PATH with the
 //! same arguments, the way git and cargo dispatch. On Unix it replaces this
 //! process (`exec`), so signals, Ctrl-C and the exit status are the app's own.
-//! Windows has no `exec`: `otto` waits for the app, leaves Ctrl-C to it, and
+//! Windows has no `exec`: `ottoctl` waits for the app, leaves Ctrl-C to it, and
 //! exits with its exit code.
 //! Each app ships its own verbs without changing this binary; it links
 //! `otto-client` to get a token for its own resource.
@@ -15,14 +15,14 @@ use otto_client::LoginOutcome;
 
 const USAGE: &str = "\
 usage:
-  otto login --resource <uri> [--scope <scope>]... [--force]
+  ottoctl login --resource <uri> [--scope <scope>]... [--force]
                                  sign in to a resource; --force signs in again
                                  even if a usable login is cached
-  otto <app> [args...]           run the `otto-<app>` binary on PATH, e.g.
-                                 `otto flags help` for Otto Flags keys
-  otto help
+  ottoctl <app> [args...]        run the `otto-<app>` binary on PATH, e.g.
+                                 `ottoctl flags help` for Otto Flags keys
+  ottoctl help
 
-`otto login` opens your browser to sign in. The token is cached per resource
+`ottoctl login` opens your browser to sign in. The token is cached per resource
 in $OTTO_CONFIG_DIR, else $XDG_CONFIG_HOME/otto, else ~/.config/otto
 (%LOCALAPPDATA%\\otto on Windows), in credentials.json, owner-only.";
 
@@ -54,7 +54,7 @@ async fn login(args: &[String]) -> ExitCode {
             "--force" => force = true,
             "--resource" | "--scope" => {
                 let Some(v) = it.next() else {
-                    eprintln!("otto login: {a} needs a value\n\n{USAGE}");
+                    eprintln!("ottoctl login: {a} needs a value\n\n{USAGE}");
                     return ExitCode::from(2);
                 };
                 if a == "--resource" {
@@ -64,13 +64,13 @@ async fn login(args: &[String]) -> ExitCode {
                 }
             }
             _ => {
-                eprintln!("otto login: unexpected argument {a:?}\n\n{USAGE}");
+                eprintln!("ottoctl login: unexpected argument {a:?}\n\n{USAGE}");
                 return ExitCode::from(2);
             }
         }
     }
     let Some(resource) = resource else {
-        eprintln!("otto login: --resource <uri> is required\n\n{USAGE}");
+        eprintln!("ottoctl login: --resource <uri> is required\n\n{USAGE}");
         return ExitCode::from(2);
     };
     let client = match otto_client::Client::with_defaults() {
@@ -91,7 +91,7 @@ async fn login(args: &[String]) -> ExitCode {
 }
 
 fn fail(e: &otto_client::Error) -> ExitCode {
-    eprintln!("otto: {e}");
+    eprintln!("ottoctl: {e}");
     ExitCode::FAILURE
 }
 
@@ -103,12 +103,12 @@ fn dispatch(app: &str, args: &[String]) -> ExitCode {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
     if !valid {
-        eprintln!("otto: {app:?} is not a command or an app name\n\n{USAGE}");
+        eprintln!("ottoctl: {app:?} is not a command or an app name\n\n{USAGE}");
         return ExitCode::from(2);
     }
     let binary = format!("otto-{app}{}", std::env::consts::EXE_SUFFIX);
     let Some(path) = find_on_path(&binary, std::env::var_os("PATH").as_deref()) else {
-        eprintln!("otto: no `{binary}` found on PATH, so `otto {app}` has nothing to run");
+        eprintln!("ottoctl: no `{binary}` found on PATH, so `ottoctl {app}` has nothing to run");
         return ExitCode::from(127);
     };
     // `path` is absolute (see `find_on_path`), so `Command` runs exactly the
@@ -123,7 +123,7 @@ fn run(mut cmd: Command, path: &Path) -> ExitCode {
     use std::os::unix::process::CommandExt;
     // Only returns on failure.
     let e = cmd.exec();
-    eprintln!("otto: could not run {}: {}", path.display(), e.kind());
+    eprintln!("ottoctl: could not run {}: {}", path.display(), e.kind());
     ExitCode::from(126)
 }
 
@@ -134,7 +134,7 @@ fn run(mut cmd: Command, path: &Path) -> ExitCode {
 
     // Ctrl-C reaches every process attached to the console, the app and this
     // one alike. Handle it here by doing nothing, so the app decides what
-    // Ctrl-C means and `otto` exits when it does. A handler, unlike ignoring
+    // Ctrl-C means and `ottoctl` exits when it does. A handler, unlike ignoring
     // the signal outright, is not inherited by the app.
     unsafe extern "system" fn let_the_app_handle_it(_ctrl_type: u32) -> BOOL {
         true.into()
@@ -145,7 +145,7 @@ fn run(mut cmd: Command, path: &Path) -> ExitCode {
         // `process::exit` passes the full status, where `ExitCode` holds a u8.
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(e) => {
-            eprintln!("otto: could not run {}: {}", path.display(), e.kind());
+            eprintln!("ottoctl: could not run {}: {}", path.display(), e.kind());
             ExitCode::from(126)
         }
     }

@@ -136,7 +136,7 @@ pub(crate) async fn login(
         .await
         .map_err(|_| {
             Error::Authorization(
-                "timed out waiting for the browser; if it showed an error, try `otto login \
+                "timed out waiting for the browser; if it showed an error, try `ottoctl login \
                  --force` again"
                     .into(),
             )
@@ -186,8 +186,8 @@ async fn client_id(http: &reqwest::Client, store: &Store, meta: &Discovered) -> 
     let resp = http
         .post(meta.registration_endpoint.clone())
         .json(&serde_json::json!({
-            "client_name": "otto cli",
-            "software_id": "otto-cli",
+            "client_name": "ottoctl",
+            "software_id": "ottoctl",
             // No port: the loopback port is chosen per login.
             "redirect_uris": ["http://127.0.0.1/callback"],
             "grant_types": ["authorization_code", "refresh_token"],

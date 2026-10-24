@@ -304,7 +304,7 @@ async fn login_caches_a_refreshable_token_and_a_second_login_reuses_it() {
             .starts_with("rt-")
     );
 
-    // `otto login` again: no browser, no new authorization.
+    // `ottoctl login` again: no browser, no new authorization.
     let again = client(dir.path(), Box::new(NoBrowser));
     assert_eq!(
         again.login(&resource, &[], false).await.unwrap(),
@@ -409,7 +409,7 @@ async fn concurrent_refreshes_never_replay_a_refresh_token() {
         .unwrap();
     expire(dir.path());
 
-    // Separate clients, separate lock file handles: as two `otto` processes.
+    // Separate clients, separate lock file handles: as two `ottoctl` processes.
     let clients: Vec<_> = (0..4)
         .map(|_| client(dir.path(), Box::new(NoBrowser)))
         .collect();
@@ -451,7 +451,7 @@ async fn a_revoked_grant_says_to_log_in_again_and_leaks_nothing() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::LoginRequired { .. }), "{err:?}");
-    assert!(err.to_string().contains("otto login"), "{err}");
+    assert!(err.to_string().contains("ottoctl login"), "{err}");
     for text in [err.to_string(), format!("{err:?}")] {
         assert!(!text.contains("SECRETVALUE"), "{text}");
     }

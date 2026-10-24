@@ -7,7 +7,7 @@
 //! `credentials.json`.
 //!
 //! Every change happens under an exclusive lock on `credentials.lock`, held
-//! across the whole read-modify-write, so two `otto` processes never lose each
+//! across the whole read-modify-write, so two `ottoctl` processes never lose each
 //! other's writes. Refresh holds it across the token request too: otto-auth
 //! treats a refresh token presented twice as a replay and revokes every token
 //! the client holds, so two processes must never refresh the same grant.
@@ -24,7 +24,7 @@ use crate::error::{Error, Result};
 use crate::private_fs;
 use crate::secret::replace_private;
 
-/// How long to wait for another `otto` process to finish with the store.
+/// How long to wait for another `ottoctl` process to finish with the store.
 const LOCK_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -89,7 +89,7 @@ impl Store {
         match std::fs::read(self.file()) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
                 Error::Store(format!(
-                    "{} is not valid; delete it and run `otto login` again",
+                    "{} is not valid; delete it and run `ottoctl login` again",
                     self.file().display()
                 ))
             }),
@@ -112,7 +112,7 @@ impl Store {
     }
 
     /// Take the store's lock without blocking the async runtime: poll with
-    /// `try_lock`, so a second `otto` process (or a second client in this one)
+    /// `try_lock`, so a second `ottoctl` process (or a second client in this one)
     /// waits instead of stalling a worker thread.
     pub(crate) async fn lock(&self) -> Result<Locked<'_>> {
         let file = self.lock_file()?;
@@ -125,7 +125,7 @@ impl Store {
                 }
                 Err(TryLockError::WouldBlock) => {
                     return Err(Error::Store(
-                        "another otto process is holding the credentials lock".into(),
+                        "another ottoctl process is holding the credentials lock".into(),
                     ))
                 }
                 Err(TryLockError::Error(e)) => {

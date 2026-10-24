@@ -7,7 +7,7 @@
   import type { PageData } from './$types';
 
   /**
-   * The `otto` command-line tool: what it is, where to get it, how to run it
+   * The `ottoctl` command-line tool: what it is, where to get it, how to run it
    * the first time.
    *
    * **Commands, URLs and file names are not messages.** They are the same in
@@ -17,44 +17,44 @@
    * a prerendered file. They are external links: the prerender crawler only
    * follows same-origin ones.
    *
-   * Prebuilt archives and the install steps mirror `docs/otto-cli.md`, which
+   * Prebuilt archives and the install steps mirror `docs/ottoctl.md`, which
    * is the source of truth; change them together.
    */
   let { data }: { data: PageData } = $props();
 
   const RELEASES = 'https://github.com/savvagent/otto-platform/releases/latest';
   const DOWNLOAD = `${RELEASES}/download`;
-  const DOCS = 'https://github.com/savvagent/otto-platform/blob/main/docs/otto-cli.md';
+  const DOCS = 'https://github.com/savvagent/otto-platform/blob/main/docs/ottoctl.md';
 
   /** Platform names are names, so they are not translated. */
   const PLATFORMS = [
-    { name: 'Linux x86_64', archive: 'otto-x86_64-unknown-linux-musl.tar.gz' },
-    { name: 'Linux arm64', archive: 'otto-aarch64-unknown-linux-musl.tar.gz' },
-    { name: 'macOS Apple silicon', archive: 'otto-aarch64-apple-darwin.tar.gz' },
-    { name: 'macOS Intel', archive: 'otto-x86_64-apple-darwin.tar.gz' },
-    { name: 'Windows x86_64', archive: 'otto-x86_64-pc-windows-msvc.zip' }
+    { name: 'Linux x86_64', archive: 'ottoctl-x86_64-unknown-linux-musl.tar.gz' },
+    { name: 'Linux arm64', archive: 'ottoctl-aarch64-unknown-linux-musl.tar.gz' },
+    { name: 'macOS Apple silicon', archive: 'ottoctl-aarch64-apple-darwin.tar.gz' },
+    { name: 'macOS Intel', archive: 'ottoctl-x86_64-apple-darwin.tar.gz' },
+    { name: 'Windows x86_64', archive: 'ottoctl-x86_64-pc-windows-msvc.zip' }
   ];
 
   const UNIX_INSTALL = [
     'target=aarch64-apple-darwin',
     `base=${DOWNLOAD}`,
-    'curl -fsSLO "$base/otto-$target.tar.gz"',
+    'curl -fsSLO "$base/ottoctl-$target.tar.gz"',
     'curl -fsSLO "$base/SHA256SUMS"',
-    'grep " otto-$target.tar.gz\\$" SHA256SUMS | shasum -a 256 -c',
-    'tar xzf "otto-$target.tar.gz"',
-    'install -m 0755 "otto-$target/otto" "otto-$target/otto-flags" ~/.local/bin/'
+    'grep " ottoctl-$target.tar.gz\\$" SHA256SUMS | shasum -a 256 -c',
+    'tar xzf "ottoctl-$target.tar.gz"',
+    'install -m 0755 "ottoctl-$target/ottoctl" "ottoctl-$target/otto-flags" ~/.local/bin/'
   ].join('\n');
 
   const WINDOWS_INSTALL = [
     `$base = "${DOWNLOAD}"`,
-    'Invoke-WebRequest "$base/otto-x86_64-pc-windows-msvc.zip" -OutFile otto.zip',
+    'Invoke-WebRequest "$base/ottoctl-x86_64-pc-windows-msvc.zip" -OutFile ottoctl.zip',
     'Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS',
-    '(Get-FileHash otto.zip -Algorithm SHA256).Hash',
-    'Expand-Archive otto.zip -DestinationPath .'
+    '(Get-FileHash ottoctl.zip -Algorithm SHA256).Hash',
+    'Expand-Archive ottoctl.zip -DestinationPath .'
   ].join('\n');
 
   const FROM_SOURCE =
-    'cargo install --locked --git https://github.com/savvagent/otto-platform otto-cli otto-flags-cli';
+    'cargo install --locked --git https://github.com/savvagent/otto-platform ottoctl otto-flags-cli';
 
   const why = [
     { title: () => m.cli_why_signin_title(), body: () => m.cli_why_signin_body() },
@@ -64,7 +64,7 @@
 
   const loginServices = SERVICES.flatMap((service) =>
     service.mcpUrl
-      ? [{ name: service.name, command: `otto login --resource ${service.mcpUrl}` }]
+      ? [{ name: service.name, command: `ottoctl login --resource ${service.mcpUrl}` }]
       : []
   );
 
@@ -147,7 +147,7 @@
     <p class="mt-3 text-muted">{m.cli_unsigned_body()}</p>
     <div class="mt-5">
       <p class="mb-2 text-sm text-muted">{m.cli_unsigned_macos()}</p>
-      <CopyField value="xattr -d com.apple.quarantine otto" />
+      <CopyField value="xattr -d com.apple.quarantine ottoctl" />
     </div>
     <p class="mt-5 text-sm text-muted">{m.cli_unsigned_windows()}</p>
   </section>
@@ -158,7 +158,7 @@
     </h2>
     <p class="mt-3 text-muted">{m.cli_first_body()}</p>
     <div class="mt-5 flex flex-col gap-4">
-      <CopyField value="otto login --resource <service MCP URL>" label={m.cli_first_label()} />
+      <CopyField value="ottoctl login --resource <service MCP URL>" label={m.cli_first_label()} />
       {#if loginServices.length > 0}
         <p class="text-sm text-muted">{m.cli_first_services()}</p>
         {#each loginServices as service (service.name)}

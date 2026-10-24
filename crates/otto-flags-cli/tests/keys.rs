@@ -221,7 +221,7 @@ fn a_missing_scope_names_it_and_how_to_get_it() {
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("keys:issue"), "{stderr}");
     assert!(
-        stderr.contains(&format!("otto login --resource {}", e.resource)),
+        stderr.contains(&format!("ottoctl login --resource {}", e.resource)),
         "{stderr}"
     );
     assert!(!Path::new(&key).exists());
@@ -235,7 +235,7 @@ fn a_withheld_server_key_says_how_to_issue_one() {
     let (_, stderr) = no_leak(&out);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("otto flags keys rotate --app web"),
+        stderr.contains("ottoctl flags keys rotate --app web"),
         "{stderr}"
     );
     assert!(!Path::new(&key).exists());
@@ -260,7 +260,7 @@ fn no_usable_response_says_the_rotation_may_have_happened() {
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("may have received the request"), "{stderr}");
     assert!(
-        stderr.contains("otto flags keys rotate --app 'my app'"),
+        stderr.contains("ottoctl flags keys rotate --app 'my app'"),
         "{stderr}"
     );
     assert!(!Path::new(&key).exists(), "the reservation is released");

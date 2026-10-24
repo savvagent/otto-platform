@@ -1,5 +1,5 @@
 //! Sign a terminal tool in to an otto resource the way an MCP client does, and
-//! keep the token. Built for the `otto` command and for the `otto-<app>`
+//! keep the token. Built for the `ottoctl` command and for the `otto-<app>`
 //! binaries it runs, which call [`Client::token`] to get a bearer token for
 //! their own resource.
 //!

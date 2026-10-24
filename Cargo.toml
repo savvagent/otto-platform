@@ -8,7 +8,7 @@ members = [
   "crates/otto-web",
   "crates/otto-resource",
   "crates/otto-client",
-  "crates/otto-cli",
+  "crates/ottoctl",
   "crates/otto-flags-cli",
   "crates/otto-platform-server",
 ]
