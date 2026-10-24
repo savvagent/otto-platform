@@ -73,4 +73,17 @@ describe('the marketing header menu', () => {
     expect(current?.className).toMatch(/aria-\[current=page\]:underline/);
     unmount(instance);
   });
+
+  it('links the CLI page in the visitor’s language, and marks it when current', () => {
+    page.url = new URL('http://localhost/es/cli');
+    const instance = mount(MarketingHeader, { target: container, props: { lang: 'es' } });
+
+    const links = Array.from(container.querySelectorAll('a[href="/es/cli"]'));
+    expect(links).toHaveLength(2);
+    for (const link of links) {
+      expect(link.textContent?.trim()).toBe('CLI');
+      expect(link.getAttribute('aria-current')).toBe('page');
+    }
+    unmount(instance);
+  });
 });

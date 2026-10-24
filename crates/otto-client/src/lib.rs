@@ -16,6 +16,7 @@ mod discovery;
 mod error;
 mod flow;
 mod pkce;
+mod private_fs;
 mod secret;
 mod store;
 
@@ -43,17 +44,23 @@ pub trait Opener: Send + Sync {
     fn open(&self, url: &Url) -> Result<()>;
 }
 
-/// Launches the platform's default browser (`xdg-open` on Linux, `open` on macOS).
+/// Launches the platform's default browser: `xdg-open` on Linux, `open` on
+/// macOS, and on Windows the URL protocol handler through `rundll32`, which
+/// takes the URL as it is. (`cmd /c start` would read the `&` between query
+/// parameters as a command separator.)
 pub struct SystemOpener;
 
 impl Opener for SystemOpener {
     fn open(&self, url: &Url) -> Result<()> {
-        let program = if cfg!(target_os = "macos") {
-            "open"
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("rundll32.exe", &["url.dll,FileProtocolHandler"])
+        } else if cfg!(target_os = "macos") {
+            ("open", &[])
         } else {
-            "xdg-open"
+            ("xdg-open", &[])
         };
         Command::new(program)
+            .args(args)
             .arg(url.as_str())
             .stdin(Stdio::null())
             .stdout(Stdio::null())

@@ -38,6 +38,7 @@
     }))
   );
   const pricing = $derived(localizedPath(lang, '/pricing'));
+  const cli = $derived(localizedPath(lang, '/cli'));
 
   /**
    * The small-screen menu's state, owned here rather than left to the
@@ -97,6 +98,7 @@
         <a href={item.href} class={link} aria-current={current(item.href)}>{item.label}</a>
       {/each}
       <a href={pricing} class={link} aria-current={current(pricing)}>{m.marketing_nav_pricing()}</a>
+      <a href={cli} class={link} aria-current={current(cli)}>{m.marketing_nav_cli()}</a>
     </nav>
 
     <div class="ml-auto flex items-center gap-2 text-sm">
@@ -132,6 +134,7 @@
           <a href={pricing} class={link} aria-current={current(pricing)}>
             {m.marketing_nav_pricing()}
           </a>
+          <a href={cli} class={link} aria-current={current(cli)}>{m.marketing_nav_cli()}</a>
           {#if !session.signedIn}
             <a href="/login" data-sveltekit-reload class="sm:hidden {link}">{m.nav_sign_in()}</a>
           {/if}

@@ -3,7 +3,8 @@
 //! (a token has one audience, so each resource gets its own).
 //!
 //! Location: `$OTTO_CONFIG_DIR`, else `$XDG_CONFIG_HOME/otto`, else
-//! `$HOME/.config/otto`, file `credentials.json`. Linux and macOS only.
+//! `$HOME/.config/otto` (on Windows, `%LOCALAPPDATA%\otto`), file
+//! `credentials.json`.
 //!
 //! Every change happens under an exclusive lock on `credentials.lock`, held
 //! across the whole read-modify-write, so two `otto` processes never lose each
@@ -13,13 +14,14 @@
 //! Reads take no lock; the file is only ever replaced by an atomic rename.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::private_fs;
 use crate::secret::replace_private;
 
 /// How long to wait for another `otto` process to finish with the store.
@@ -65,17 +67,11 @@ impl Store {
     }
 
     pub fn open_default() -> Result<Self> {
-        let nonempty = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
-        let dir = if let Some(d) = nonempty("OTTO_CONFIG_DIR") {
-            PathBuf::from(d)
-        } else if let Some(d) = nonempty("XDG_CONFIG_HOME") {
-            PathBuf::from(d).join("otto")
-        } else if let Some(h) = nonempty("HOME") {
-            PathBuf::from(h).join(".config").join("otto")
-        } else {
-            return Err(Error::Store(
-                "cannot find a config directory: set OTTO_CONFIG_DIR".into(),
-            ));
+        let dir = match nonempty_env("OTTO_CONFIG_DIR") {
+            Some(d) => PathBuf::from(d),
+            None => default_dir().ok_or_else(|| {
+                Error::Store("cannot find a config directory: set OTTO_CONFIG_DIR".into())
+            })?,
         };
         Ok(Store { dir })
     }
@@ -106,28 +102,12 @@ impl Store {
     /// is left as it is: it may be one the user chose, such as `$HOME`, and the
     /// files in it are owner-only either way.
     fn ensure_dir(&self) -> Result<()> {
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(&self.dir)
-            .map_err(|e| Error::io("creating config dir", &e))
+        private_fs::create_dir_all(&self.dir).map_err(|e| Error::io("creating config dir", &e))
     }
 
     fn lock_file(&self) -> Result<File> {
         self.ensure_dir()?;
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        opts.open(self.dir.join("credentials.lock"))
+        private_fs::open_or_create(&self.dir.join("credentials.lock"))
             .map_err(|e| Error::io("opening the credentials lock", &e))
     }
 
@@ -159,6 +139,24 @@ impl Store {
             _lock: file,
         })
     }
+}
+
+fn nonempty_env(key: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(key).filter(|v| !v.is_empty())
+}
+
+#[cfg(not(windows))]
+fn default_dir() -> Option<PathBuf> {
+    nonempty_env("XDG_CONFIG_HOME")
+        .map(|d| PathBuf::from(d).join("otto"))
+        .or_else(|| nonempty_env("HOME").map(|h| PathBuf::from(h).join(".config").join("otto")))
+}
+
+/// Local, not roaming: a token is for this machine and should not follow a
+/// roaming profile to others.
+#[cfg(windows)]
+fn default_dir() -> Option<PathBuf> {
+    nonempty_env("LOCALAPPDATA").map(|d| PathBuf::from(d).join("otto"))
 }
 
 /// The store, locked and loaded. Changes are made to the in-memory document

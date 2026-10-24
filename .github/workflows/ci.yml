@@ -199,11 +199,199 @@ jobs:
           requireScope: false
           subjectPattern: ^(?![A-Z]).+$
 
+  # The `otto` CLI ships for macOS and Windows too; the rust job covers Linux.
+  # These crates have no database, so no Postgres here.
+  cli:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy
+        run: cargo clippy -p otto-client -p otto-cli --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test -p otto-client -p otto-cli
+
+  # Whether a PR touches what goes into the CLI binaries, so cli-binaries
+  # builds them on those PRs and not on every one.
+  cli-changes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      cli: ${{ steps.filter.outputs.cli }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            cli:
+              - 'crates/otto-cli/**'
+              - 'crates/otto-client/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+
+  # Release binaries of `otto`, built on each platform's own runner. On a PR
+  # that touches the CLI this only proves they build; on the push that
+  # release-please turned into a release, cli-release attaches them. Archive
+  # names carry no version, so releases/latest/download/<name> is a stable
+  # link for the install instructions.
+  cli-binaries:
+    needs: [cli-changes, release-please]
+    if: |
+      !cancelled() && (
+        (github.event_name == 'pull_request' && needs.cli-changes.outputs.cli == 'true') ||
+        (github.event_name == 'push' &&
+         github.ref == 'refs/heads/main' &&
+         needs.release-please.outputs.release_created == 'true'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+      # musl-gcc is native on both Linux runners; ring's C goes through it.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: cargo build
+        run: cargo build --release --locked -p otto-cli --target "$TARGET"
+        shell: bash
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="otto-$TARGET"
+          mkdir "$staging"
+          cp LICENSE "$staging/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "target/$TARGET/release/otto.exe" "$staging/"
+            7z a "$staging.zip" "$staging" > /dev/null
+            echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
+          else
+            cp "target/$TARGET/release/otto" "$staging/"
+            tar czf "$staging.tar.gz" "$staging"
+            echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Smoke test
+        # Every target here runs on its own runner (x86_64 macOS under
+        # Rosetta), so the binary that was built is the one that is run.
+        shell: bash
+        run: |
+          set -euo pipefail
+          "otto-$TARGET/otto$( [ "$RUNNER_OS" = "Windows" ] && echo .exe )" help | grep -q "otto login"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: otto-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # Attaches the binaries and their SHA256SUMS to the release just created.
+  cli-release:
+    runs-on: ubuntu-latest
+    needs: [release-please, cli-binaries]
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.release-please.outputs.release_created == 'true'
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: otto-*
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to the release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          sha256sum otto-* > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" otto-* SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Add install notes to the release
+        # Appended below release-please's changelog. The marker keeps a re-run
+        # from adding them twice.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          marker='<!-- otto-cli-install -->'
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
+          if grep -qF "$marker" notes.md; then exit 0; fi
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          cat >> notes.md <<EOF
+
+          $marker
+          ## Install the \`otto\` CLI
+
+          | Platform | Download |
+          | --- | --- |
+          | Linux x86_64 | [otto-x86_64-unknown-linux-musl.tar.gz]($base/otto-x86_64-unknown-linux-musl.tar.gz) |
+          | Linux arm64 | [otto-aarch64-unknown-linux-musl.tar.gz]($base/otto-aarch64-unknown-linux-musl.tar.gz) |
+          | macOS Apple silicon | [otto-aarch64-apple-darwin.tar.gz]($base/otto-aarch64-apple-darwin.tar.gz) |
+          | macOS Intel | [otto-x86_64-apple-darwin.tar.gz]($base/otto-x86_64-apple-darwin.tar.gz) |
+          | Windows x86_64 | [otto-x86_64-pc-windows-msvc.zip]($base/otto-x86_64-pc-windows-msvc.zip) |
+
+          Check the download against [SHA256SUMS]($base/SHA256SUMS), unpack it, and put \`otto\` on your PATH. Then sign in with \`otto login --resource <service URL>\`.
+          The binaries are not code-signed. For the macOS and Windows first-run steps, see [the install guide](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/docs/otto-cli.md#install).
+          EOF
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+
   # Maintains a single "chore: release X.Y.Z" PR. Merging it cuts the tag and
   # GitHub Release, and release_created becomes true — the signal deploy gates on.
   release-please:
     runs-on: ubuntu-latest
-    needs: [rust, web, docker-build]
+    needs: [rust, web, docker-build, cli]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     timeout-minutes: 10
     permissions:

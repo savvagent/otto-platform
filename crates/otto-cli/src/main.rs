@@ -3,6 +3,8 @@
 //! `otto <app> <args>` runs the `otto-<app>` binary found on PATH with the
 //! same arguments, the way git and cargo dispatch. On Unix it replaces this
 //! process (`exec`), so signals, Ctrl-C and the exit status are the app's own.
+//! Windows has no `exec`: `otto` waits for the app, leaves Ctrl-C to it, and
+//! exits with its exit code.
 //! Each app ships its own verbs without changing this binary; it links
 //! `otto-client` to get a token for its own resource.
 
@@ -21,7 +23,7 @@ usage:
 
 `otto login` opens your browser to sign in. The token is cached per resource
 in $OTTO_CONFIG_DIR, else $XDG_CONFIG_HOME/otto, else ~/.config/otto
-(credentials.json, owner-only). Linux and macOS.";
+(%LOCALAPPDATA%\\otto on Windows), in credentials.json, owner-only.";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -103,7 +105,7 @@ fn dispatch(app: &str, args: &[String]) -> ExitCode {
         eprintln!("otto: {app:?} is not a command or an app name\n\n{USAGE}");
         return ExitCode::from(2);
     }
-    let binary = format!("otto-{app}");
+    let binary = format!("otto-{app}{}", std::env::consts::EXE_SUFFIX);
     let Some(path) = find_on_path(&binary, std::env::var_os("PATH").as_deref()) else {
         eprintln!("otto: no `{binary}` found on PATH, so `otto {app}` has nothing to run");
         return ExitCode::from(127);
@@ -124,8 +126,20 @@ fn run(mut cmd: Command, path: &Path) -> ExitCode {
     ExitCode::from(126)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn run(mut cmd: Command, path: &Path) -> ExitCode {
+    use windows::core::BOOL;
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+
+    // Ctrl-C reaches every process attached to the console, the app and this
+    // one alike. Handle it here by doing nothing, so the app decides what
+    // Ctrl-C means and `otto` exits when it does. A handler, unlike ignoring
+    // the signal outright, is not inherited by the app.
+    unsafe extern "system" fn let_the_app_handle_it(_ctrl_type: u32) -> BOOL {
+        true.into()
+    }
+    let _ = unsafe { SetConsoleCtrlHandler(Some(let_the_app_handle_it), true) };
+
     match cmd.status() {
         // `process::exit` passes the full status, where `ExitCode` holds a u8.
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
@@ -152,6 +166,8 @@ fn is_executable(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// Windows has no execute bit; `binary` already ends in `.exe`. Batch files
+/// are not looked for: `cmd.exe` would re-parse their arguments.
 #[cfg(not(unix))]
 fn is_executable(p: &Path) -> bool {
     p.is_file()
