@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.12.1](https://github.com/savvagent/otto-platform/compare/v0.12.0...v0.12.1) (2026-10-24)
+
+
+### Bug Fixes
+
+* **otto-core:** retry lifecycle webhooks for about a day, as documented ([#110](https://github.com/savvagent/otto-platform/issues/110)) ([dc22a3f](https://github.com/savvagent/otto-platform/commit/dc22a3f585b85de7df4f57f95ffa2b0a4a938d4c))
+* **otto-platform-server:** make the member-lookup cache test independent of wall-clock timing ([#111](https://github.com/savvagent/otto-platform/issues/111)) ([54ce9bd](https://github.com/savvagent/otto-platform/commit/54ce9bd8740d550c40347e4e47deda2d1cfbe27a))
+* **otto-tenant:** rebuild when a migration is added ([#109](https://github.com/savvagent/otto-platform/issues/109)) ([72c2cf2](https://github.com/savvagent/otto-platform/commit/72c2cf28e3df8a8988297e2dcd45783ca07c568a)), closes [#71](https://github.com/savvagent/otto-platform/issues/71)
+* **otto-tenant:** run the tenant-role probe on the connection Db::begin already holds ([#113](https://github.com/savvagent/otto-platform/issues/113)) ([98d07d5](https://github.com/savvagent/otto-platform/commit/98d07d58de9be8e2779cbcd9c98c329cf7287072))
+
 ## [0.12.0](https://github.com/savvagent/otto-platform/compare/v0.11.1...v0.12.0) (2026-10-24)
 
 
