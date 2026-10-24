@@ -563,7 +563,7 @@
   "cli_install_unix_heading": "Linux और macOS",
   "cli_install_unix_note": "target को अपने प्लेटफ़ॉर्म के नाम पर सेट करें: आर्काइव के नाम में otto- और .tar.gz के बीच का हिस्सा। यह स्निपेट कुछ भी इंस्टॉल करने से पहले डाउनलोड को SHA256SUMS से मिलाकर जाँचता है।",
   "cli_install_windows_heading": "Windows (PowerShell)",
-  "cli_install_windows_note": "जो हैश छपे उसे SHA256SUMS में otto-x86_64-pc-windows-msvc.zip वाली पंक्ति से मिलाएँ, फिर otto.exe को अपने PATH की किसी डायरेक्टरी में रख दें।",
+  "cli_install_windows_note": "जो हैश छपे उसे SHA256SUMS में otto-x86_64-pc-windows-msvc.zip वाली पंक्ति से मिलाएँ, फिर otto.exe और otto-flags.exe को अपने PATH की किसी डायरेक्टरी में रख दें।",
   "cli_unsigned_heading": "बाइनरी कोड-साइन किए हुए नहीं हैं",
   "cli_unsigned_body": "चेकसम बताता है कि आर्काइव वही है जो रिलीज़ ने प्रकाशित किया था, फिर भी पहली बार टूल चलाने से पहले आपका ऑपरेटिंग सिस्टम पूछ सकता है।",
   "cli_unsigned_macos": "macOS: curl से लाई गई फ़ाइल क्वारंटीन नहीं होती। अगर आपने उसे ब्राउज़र से डाउनलोड किया है, तो Gatekeeper उसे रोक देता है। यह चिह्न एक बार हटा दें:",

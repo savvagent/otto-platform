@@ -1790,6 +1790,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "otto-flags-cli"
+version = "0.11.1"
+dependencies = [
+ "axum",
+ "otto-client",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "otto-platform-server"
 version = "0.11.1"
 dependencies = [

@@ -18,7 +18,8 @@ usage:
   otto login --resource <uri> [--scope <scope>]... [--force]
                                  sign in to a resource; --force signs in again
                                  even if a usable login is cached
-  otto <app> [args...]           run the `otto-<app>` binary on PATH
+  otto <app> [args...]           run the `otto-<app>` binary on PATH, e.g.
+                                 `otto flags help` for Otto Flags keys
   otto help
 
 `otto login` opens your browser to sign in. The token is cached per resource

@@ -18,8 +18,8 @@ attaches a prebuilt `otto` for each of these, with a `SHA256SUMS` file:
 | Windows x86_64 | `otto-x86_64-pc-windows-msvc.zip` |
 
 The Linux binaries are static, so they run on any distribution. Each archive
-holds `otto` (`otto.exe` on Windows) and the license, in a directory named after
-the archive.
+holds `otto` and `otto-flags` (`.exe` on Windows) and the license, in a
+directory named after the archive. Install both: `otto flags` runs `otto-flags`.
 
 Linux and macOS. Set `target` to your platform's name from the table:
 
@@ -29,7 +29,7 @@ Linux and macOS. Set `target` to your platform's name from the table:
     curl -fsSLO "$base/SHA256SUMS"
     grep " otto-$target.tar.gz\$" SHA256SUMS | shasum -a 256 -c
     tar xzf "otto-$target.tar.gz"
-    install -m 0755 "otto-$target/otto" ~/.local/bin/otto   # or anywhere on PATH
+    install -m 0755 "otto-$target/otto" "otto-$target/otto-flags" ~/.local/bin/   # or anywhere on PATH
 
 Windows (PowerShell):
 
@@ -38,7 +38,7 @@ Windows (PowerShell):
     Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
     (Get-FileHash otto.zip -Algorithm SHA256).Hash   # compare with SHA256SUMS
     Expand-Archive otto.zip -DestinationPath .
-    # then move otto-x86_64-pc-windows-msvc\otto.exe to a directory on PATH
+    # then move otto.exe and otto-flags.exe from otto-x86_64-pc-windows-msvc\ to a directory on PATH
 
 The binaries are not code-signed. The checksum shows the archive is the one the
 release published.
@@ -51,7 +51,7 @@ release published.
 
 From source, with Rust 1.89 or later:
 
-    cargo install --locked --git https://github.com/savvagent/otto-platform otto-cli
+    cargo install --locked --git https://github.com/savvagent/otto-platform otto-cli otto-flags-cli
 
 ## Sign in
 
@@ -117,6 +117,61 @@ An `otto-<app>` binary links the `otto-client` crate:
     let token = client.token("https://flags.example/mcp").await?; // otto_client::Secret
     // ... call the app with token.expose() as a bearer token ...
     secret_from_app.deliver(&otto_client::Sink::Terminal)?;
+
+## Otto Flags keys
+
+    otto flags app create <name> [--env <environment>]... [--out <file> [--overwrite]]
+    otto flags keys rotate --app <name-or-id> [--which server|client|both] [--out <file> [--overwrite]]
+
+These issue an Otto Flags app's SDK keys. `app create` registers the app and
+issues both keys. `keys rotate` replaces the server key by default, and the old
+one stops working at once. Both need an owner or admin of the organization. They
+sign in to `$OTTO_FLAGS_RESOURCE` (default `https://otto-flags.savvagent.com/mcp`)
+with the `apps:admin` and `keys:issue` scopes. Any scopes already granted to the
+cached sign-in are kept.
+
+The server key (`srv_…`) goes to the terminal, or with `--out` to a new
+owner-only file. The public client key (`sdk_…`) and the app's details are
+printed on stderr. Before anything is issued, the command checks that the key
+can be delivered. It refuses a piped stdout with no `--out`, or an `--out`
+file that exists without `--overwrite`, and reports "Nothing was changed". A
+rotation that issued a key and then could not deliver it would otherwise leave
+the app with no working server key. If writing fails after the key was issued,
+the error says so and the key is not printed instead. Rotate again.
+
+If otto-flags refuses because the sign-in lacks `keys:issue`, the error names
+the scope and the `otto login --resource … --scope apps:admin --scope keys:issue
+--force` that grants it.
+
+## Issuing secrets from a service
+
+The convention for any otto-* service whose tools can return a secret (as
+otto-flags does since savvagent/otto-flags#189):
+- The service withholds the secret unless the token carries an explicit issue
+  scope, named `<thing>:issue`.
+- The issue scope is not in the resource's default scopes, so a client gets it
+  only by asking and being granted it on the consent screen.
+- The service's `otto-<app>` binary asks for it and receives the secret through
+  `otto_client::Client::call_tool` with the field named as secret. It delivers
+  the secret with `Secret::deliver` after `Sink::check`.
+
+`call_tool` sends one JSON-RPC `tools/call` POST with the bearer token and no
+session, which suits a stateless MCP server.
+
+Registering the scope on the platform, with plain words for the consent screen.
+`resource register` is idempotent: on an existing resource it replaces the name
+and scopes, and keeps descriptions it is not given.
+
+    otto-platform-server resource register https://otto-flags.savvagent.com/mcp \
+      --name otto-flags \
+      --scopes flags:read,flags:write,apps:admin,keys:issue \
+      --default-scopes flags:read \
+      --scope-description "keys:issue=Receive new secret server keys for your apps. Grant this only to the otto command in your terminal, never to an AI assistant."
+
+On Fly, run it through `fly ssh console -a otto-platform -C '…'`. Register the
+scope before releasing an `otto-flags` binary that asks for it. Until then the
+authorization server refuses the sign-in with `invalid_scope`. `resource
+describe` changes only the descriptions.
 
 ## Secrets
 

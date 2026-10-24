@@ -564,7 +564,7 @@
   "cli_install_unix_heading": "Linux e macOS",
   "cli_install_unix_note": "Imposta target sul nome della tua piattaforma: la parte del nome dell’archivio tra otto- e .tar.gz. Lo snippet verifica il download con SHA256SUMS prima di installare qualsiasi cosa.",
   "cli_install_windows_heading": "Windows (PowerShell)",
-  "cli_install_windows_note": "Confronta l’hash stampato con la riga di otto-x86_64-pc-windows-msvc.zip in SHA256SUMS, poi sposta otto.exe in una cartella del tuo PATH.",
+  "cli_install_windows_note": "Confronta l’hash stampato con la riga di otto-x86_64-pc-windows-msvc.zip in SHA256SUMS, poi sposta otto.exe e otto-flags.exe in una cartella del tuo PATH.",
   "cli_unsigned_heading": "I binari non sono firmati",
   "cli_unsigned_body": "Il checksum mostra che un archivio è quello pubblicato con la release, ma il sistema operativo può comunque chiedere conferma al primo avvio.",
   "cli_unsigned_macos": "macOS: un file scaricato con curl non viene messo in quarantena. Se lo hai scaricato da un browser, Gatekeeper lo blocca. Rimuovi l’attributo una sola volta:",

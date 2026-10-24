@@ -47,11 +47,7 @@ impl Secret {
         status: &mut dyn Write,
     ) -> Result<()> {
         match sink {
-            Sink::Terminal if !out_is_terminal => Err(Error::Refused(
-                "refusing to print a secret to a pipe or a file, where it could end up in a \
-                 log; name a file to write it to instead"
-                    .into(),
-            )),
+            Sink::Terminal if !out_is_terminal => Err(not_a_terminal()),
             Sink::Terminal => {
                 writeln!(out, "{}", self.0).map_err(|e| Error::io("writing to terminal", &e))
             }
@@ -81,6 +77,14 @@ impl std::fmt::Display for Secret {
     }
 }
 
+fn not_a_terminal() -> Error {
+    Error::Refused(
+        "refusing to print a secret to a pipe or a file, where it could end up in a log; name \
+         a file to write it to instead"
+            .into(),
+    )
+}
+
 #[derive(Debug, Clone)]
 pub enum Sink {
     Terminal,
@@ -91,6 +95,43 @@ pub enum Sink {
         path: PathBuf,
         overwrite: bool,
     },
+}
+
+impl Sink {
+    /// Whether [`Secret::deliver`] would refuse this sink, asked before the
+    /// secret exists. Call it before a request that issues a secret the
+    /// server shows only once, such as a key rotation that also revokes the
+    /// old key: finding out afterwards loses the key. A later write can still
+    /// fail (a full disk), but not for a reason known now.
+    pub fn check(&self) -> Result<()> {
+        self.check_with(std::io::stdout().is_terminal())
+    }
+
+    fn check_with(&self, out_is_terminal: bool) -> Result<()> {
+        match self {
+            Sink::Terminal if !out_is_terminal => Err(not_a_terminal()),
+            Sink::Terminal => Ok(()),
+            Sink::File { path, overwrite } => {
+                if !*overwrite && std::fs::symlink_metadata(path).is_ok() {
+                    return Err(Error::Refused(format!(
+                        "{} already exists; choose another file or allow overwriting",
+                        path.display()
+                    )));
+                }
+                let dir = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                if !dir.is_dir() {
+                    return Err(Error::Refused(format!(
+                        "{} is not a directory",
+                        dir.display()
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Write `bytes` to a new owner-only file at `path`. An existing entry is
@@ -166,6 +207,25 @@ mod tests {
         assert!(matches!(err, Error::Refused(_)));
         assert!(out.is_empty() && status.is_empty());
         assert!(!err.to_string().contains("THE-SECRET"));
+    }
+
+    #[test]
+    fn check_refuses_up_front_what_deliver_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("key");
+        std::fs::write(&existing, "old").unwrap();
+        let file = |path: PathBuf, overwrite| Sink::File { path, overwrite };
+
+        assert!(Sink::Terminal.check_with(false).is_err());
+        assert!(Sink::Terminal.check_with(true).is_ok());
+        assert!(file(existing.clone(), false).check_with(false).is_err());
+        assert!(file(existing.clone(), true).check_with(false).is_ok());
+        assert!(file(dir.path().join("new"), false)
+            .check_with(false)
+            .is_ok());
+        assert!(file(dir.path().join("no/such/dir"), false)
+            .check_with(false)
+            .is_err());
     }
 
     #[test]

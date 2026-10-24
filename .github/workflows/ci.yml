@@ -191,6 +191,7 @@ jobs:
             otto-resource
             otto-client
             otto-cli
+            otto-flags-cli
             otto-platform-server
             web
             docs
@@ -219,10 +220,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo clippy
-        run: cargo clippy -p otto-client -p otto-cli --all-targets -- -D warnings
+        run: cargo clippy -p otto-client -p otto-cli -p otto-flags-cli --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test -p otto-client -p otto-cli
+        run: cargo test -p otto-client -p otto-cli -p otto-flags-cli
 
   # Whether a PR touches what goes into the CLI binaries, so cli-binaries
   # builds them on those PRs and not on every one.
@@ -243,11 +244,12 @@ jobs:
             cli:
               - 'crates/otto-cli/**'
               - 'crates/otto-client/**'
+              - 'crates/otto-flags-cli/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
 
-  # Release binaries of `otto`, built on each platform's own runner. On a PR
+  # Release binaries of `otto` and the `otto-<app>` binaries it runs, built on each platform's own runner. On a PR
   # that touches the CLI this only proves they build; on the push that
   # release-please turned into a release, cli-release attaches them. Archive
   # names carry no version, so releases/latest/download/<name> is a stable
@@ -293,7 +295,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: cargo build
-        run: cargo build --release --locked -p otto-cli --target "$TARGET"
+        run: cargo build --release --locked -p otto-cli -p otto-flags-cli --target "$TARGET"
         shell: bash
 
       - name: Package
@@ -304,11 +306,11 @@ jobs:
           mkdir "$staging"
           cp LICENSE "$staging/"
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cp "target/$TARGET/release/otto.exe" "$staging/"
+            cp "target/$TARGET/release/otto.exe" "target/$TARGET/release/otto-flags.exe" "$staging/"
             7z a "$staging.zip" "$staging" > /dev/null
             echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
           else
-            cp "target/$TARGET/release/otto" "$staging/"
+            cp "target/$TARGET/release/otto" "target/$TARGET/release/otto-flags" "$staging/"
             tar czf "$staging.tar.gz" "$staging"
             echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
           fi
@@ -319,7 +321,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          "otto-$TARGET/otto$( [ "$RUNNER_OS" = "Windows" ] && echo .exe )" help | grep -q "otto login"
+          exe=$( [ "$RUNNER_OS" = "Windows" ] && echo .exe || true )
+          "otto-$TARGET/otto$exe" help | grep -q "otto login"
+          # Dispatch finds the app binary shipped beside it.
+          PATH="$PWD/otto-$TARGET:$PATH" "otto-$TARGET/otto$exe" flags help | grep -q "keys rotate"
 
       - uses: actions/upload-artifact@v4
         with:

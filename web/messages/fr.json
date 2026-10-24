@@ -564,7 +564,7 @@
   "cli_install_unix_heading": "Linux et macOS",
   "cli_install_unix_note": "Donnez à target le nom de votre plateforme : la partie du nom de l’archive comprise entre otto- et .tar.gz. L’extrait vérifie le téléchargement avec SHA256SUMS avant d’installer quoi que ce soit.",
   "cli_install_windows_heading": "Windows (PowerShell)",
-  "cli_install_windows_note": "Comparez l’empreinte affichée avec la ligne otto-x86_64-pc-windows-msvc.zip de SHA256SUMS, puis déplacez otto.exe dans un répertoire de votre PATH.",
+  "cli_install_windows_note": "Comparez l’empreinte affichée avec la ligne otto-x86_64-pc-windows-msvc.zip de SHA256SUMS, puis déplacez otto.exe et otto-flags.exe dans un répertoire de votre PATH.",
   "cli_unsigned_heading": "Les binaires ne sont pas signés",
   "cli_unsigned_body": "La somme de contrôle prouve qu’une archive est bien celle publiée avec la version, mais votre système peut quand même demander confirmation au premier lancement.",
   "cli_unsigned_macos": "macOS : un fichier récupéré avec curl n’est pas mis en quarantaine. Si vous l’avez téléchargé dans un navigateur, Gatekeeper le bloque. Retirez l’attribut une seule fois :",
