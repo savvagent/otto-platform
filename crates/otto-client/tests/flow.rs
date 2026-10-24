@@ -36,6 +36,11 @@ struct Server {
     wrong_issuer: bool,
     /// The code exchange fails with this description.
     token_error: Option<String>,
+    /// Token responses leave out `scope`, as RFC 6749 allows when it is the
+    /// scope asked for.
+    omit_scope: bool,
+    /// Grant only this scope, whatever was asked for.
+    grant_only: Option<String>,
 }
 
 type Shared = Arc<Mutex<Server>>;
@@ -138,7 +143,12 @@ async fn token(
                 return oauth_error("PKCE verification failed");
             }
             assert_eq!(f["resource"], resource);
-            (StatusCode::OK, Json(mint(&mut s, &resource, &scope)))
+            let scope = s.grant_only.clone().unwrap_or(scope);
+            let mut body = mint(&mut s, &resource, &scope);
+            if s.omit_scope {
+                body.as_object_mut().unwrap().remove("scope");
+            }
+            (StatusCode::OK, Json(body))
         }
         "refresh_token" => {
             s.refresh_calls += 1;
@@ -542,4 +552,63 @@ async fn credentials_are_owner_only_and_an_existing_dir_is_left_alone() {
         .unwrap();
     assert_eq!(mode(existing.clone()), 0o755);
     assert_eq!(mode(existing.join("credentials.json")), 0o600);
+}
+
+#[tokio::test]
+async fn asking_for_another_scope_keeps_the_ones_granted() {
+    let (server, resource, _) = spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let c = client(dir.path(), Box::new(FakeBrowser));
+    c.login(&resource, &["flags:read".to_owned()], false)
+        .await
+        .unwrap();
+    c.token_with_scopes(&resource, &["keys:issue".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(
+        server.lock().unwrap().authorizes[1]["scope"],
+        "flags:read keys:issue"
+    );
+    // Covered now: no browser.
+    let cached = client(dir.path(), Box::new(NoBrowser));
+    cached
+        .token_with_scopes(&resource, &["keys:issue".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(server.lock().unwrap().authorizes.len(), 2);
+}
+
+#[tokio::test]
+async fn a_token_response_without_scope_grants_what_was_asked() {
+    let (server, resource, _) = spawn().await;
+    server.lock().unwrap().omit_scope = true;
+    let dir = tempfile::tempdir().unwrap();
+    let wanted = vec!["keys:issue".to_owned()];
+    client(dir.path(), Box::new(FakeBrowser))
+        .login(&resource, &wanted, false)
+        .await
+        .unwrap();
+    // Without the fallback the stored scope is empty and this opens a browser.
+    assert_eq!(
+        client(dir.path(), Box::new(NoBrowser))
+            .login(&resource, &wanted, false)
+            .await
+            .unwrap(),
+        LoginOutcome::AlreadySignedIn
+    );
+}
+
+#[tokio::test]
+async fn a_scope_the_server_did_not_grant_is_reported_before_any_call() {
+    let (server, resource, _) = spawn().await;
+    server.lock().unwrap().grant_only = Some("flags:read".into());
+    let dir = tempfile::tempdir().unwrap();
+    let err = client(dir.path(), Box::new(FakeBrowser))
+        .token_with_scopes(&resource, &["keys:issue".to_owned()])
+        .await
+        .unwrap_err();
+    let Error::InsufficientScope { message, .. } = &err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(message, "the sign-in was not granted keys:issue");
 }

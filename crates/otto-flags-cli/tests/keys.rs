@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
+use axum::http::{header, HeaderMap};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -23,6 +25,8 @@ enum Mode {
     NoScope,
     /// Create the app but withhold the server key.
     Withhold,
+    /// Act, then answer with something that is not a JSON-RPC response.
+    Garbage,
 }
 
 #[derive(Clone)]
@@ -31,15 +35,24 @@ struct Mock {
     calls: Arc<Mutex<Vec<Value>>>,
 }
 
-async fn mcp(State(mock): State<Mock>, Json(req): Json<Value>) -> Json<Value> {
+async fn mcp(State(mock): State<Mock>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    assert_eq!(
+        headers.get(header::AUTHORIZATION).unwrap(),
+        "Bearer at",
+        "the cached token is sent"
+    );
     mock.calls.lock().unwrap().push(req.clone());
     let id = req["id"].clone();
+    if mock.mode == Mode::Garbage {
+        return "<html>gateway timeout</html>".into_response();
+    }
     if mock.mode == Mode::NoScope {
         return Json(json!({"jsonrpc": "2.0", "id": id, "error": {
             "code": -32600,
             "message": "this token lacks the keys:issue scope",
             "data": {"code": "insufficient_scope", "retriable": false},
-        }}));
+        }}))
+        .into_response();
     }
     let args = &req["params"]["arguments"];
     let name = args["name"].as_str().or(args["app"].as_str()).unwrap();
@@ -55,12 +68,14 @@ async fn mcp(State(mock): State<Mock>, Json(req): Json<Value>) -> Json<Value> {
         "app": {"id": "app-1", "name": name, "environments": ["production"],
                 "clientKey": "sdk_PUBLIC"},
         "keys": keys,
-        "note": "The server key (srv_…) is a secret.",
+        // A careless server repeating the key: it must be redacted.
+        "note": format!("Store {SERVER_KEY} now."),
     });
     Json(json!({"jsonrpc": "2.0", "id": id, "result": {
         "content": [{"type": "text", "text": structured.to_string()}],
         "structuredContent": structured,
     }}))
+    .into_response()
 }
 
 struct Env {
@@ -236,16 +251,34 @@ fn rotating_only_the_public_key_needs_no_secret_sink() {
     assert_eq!(e.calls(), 1);
 }
 
-/// The key is issued, then cannot be written: the error must say so without
-/// carrying the key, and leave no partial file.
+#[test]
+fn no_usable_response_says_the_rotation_may_have_happened() {
+    let e = env(Mode::Garbage);
+    let key = e.path("key");
+    let out = e.run(&["keys", "rotate", "--app", "my app", "--out", &key]);
+    let (_, stderr) = no_leak(&out);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("may have received the request"), "{stderr}");
+    assert!(
+        stderr.contains("otto flags keys rotate --app 'my app'"),
+        "{stderr}"
+    );
+    assert!(!Path::new(&key).exists(), "the reservation is released");
+}
+
+/// An unwritable directory is found before anything is issued, not after.
 #[cfg(unix)]
 #[test]
-fn a_key_that_cannot_be_written_is_not_printed_instead() {
+fn an_unwritable_directory_is_refused_before_anything_is_issued() {
     use std::os::unix::fs::PermissionsExt;
     let e = env(Mode::Issue);
     let locked = e.dir.path().join("locked");
     std::fs::create_dir(&locked).unwrap();
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(locked.join("probe"), "").is_ok() {
+        // Root ignores the mode; there is nothing to test.
+        return;
+    }
     let key = locked.join("key");
     let out = e.run(&[
         "keys",
@@ -258,9 +291,7 @@ fn a_key_that_cannot_be_written_is_not_printed_instead() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (_, stderr) = no_leak(&out);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
-    assert!(
-        stderr.contains("issued but could not be delivered"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("Nothing was changed"), "{stderr}");
+    assert_eq!(e.calls(), 0);
     assert!(!key.exists());
 }

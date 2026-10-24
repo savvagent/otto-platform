@@ -6,13 +6,15 @@
 //! A tool result can hold a secret the person must receive and a model must
 //! not. The caller names those fields up front, as JSON pointers, and they are
 //! taken out of the result before it is returned: [`ToolOutput::value`] is
-//! safe to print, and each secret comes back only as a [`Secret`]. Only the
+//! safe to print, and each secret comes back only as a [`Secret`]. A copy of a
+//! secret's value anywhere else in the result is replaced with `<redacted>`. Only the
 //! result's `structuredContent` is kept; its `content` text, which repeats it
 //! secrets included, is dropped unread unless there is no structured result.
 //! No error built here contains any part of a response body beyond the
 //! server's own error message, cleaned by [`server_text`].
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use reqwest::header::{ACCEPT, CONTENT_TYPE, WWW_AUTHENTICATE};
 use reqwest::StatusCode;
@@ -25,6 +27,10 @@ use crate::secret::Secret;
 
 /// Far more than any tool result; a response this large is not one.
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
+/// Longer than the client's default: a tool may do real work, and giving up
+/// early on one that issues a secret loses the secret.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+const REQUEST_ID: u64 = 1;
 
 /// A tool's structured result, with the fields named as secret removed.
 pub struct ToolOutput {
@@ -64,14 +70,26 @@ pub(crate) async fn call_tool(
     let url =
         Url::parse(resource).map_err(|_| Error::Discovery(format!("{resource:?} is not a URL")))?;
     require_secure(&url)?;
+    for pointer in secret_fields {
+        if !pointer.starts_with('/') {
+            return Err(Error::Refused(format!(
+                "{pointer:?} is not a JSON pointer to a field (it must start with '/')"
+            )));
+        }
+    }
     let failed = |message: String| Error::Tool {
         tool: tool.to_owned(),
         message,
     };
+    // Past this point the server may have acted on the request.
+    let no_response = |reason: &str| Error::NoResponse {
+        resource: resource.to_owned(),
+        reason: reason.to_owned(),
+    };
 
     let body = json!({
         "jsonrpc": "2.0",
-        "id": 1,
+        "id": REQUEST_ID,
         "method": "tools/call",
         "params": { "name": tool, "arguments": arguments },
     });
@@ -80,9 +98,16 @@ pub(crate) async fn call_tool(
         .bearer_auth(token.expose())
         .header(ACCEPT, "application/json, text/event-stream")
         .json(&body)
+        .timeout(TOOL_TIMEOUT)
         .send()
         .await
-        .map_err(|_| Error::Network(resource.to_owned()))?;
+        .map_err(|e| {
+            if e.is_connect() {
+                Error::Network(resource.to_owned())
+            } else {
+                no_response("the connection failed or timed out")
+            }
+        })?;
 
     match resp.status() {
         StatusCode::UNAUTHORIZED => {
@@ -105,9 +130,9 @@ pub(crate) async fn call_tool(
                 failed(format!("{resource} returned {}", StatusCode::FORBIDDEN))
             });
         }
-        s if !s.is_success() => return Err(failed(format!("{resource} returned {s}"))),
         _ => {}
     }
+    let status = resp.status();
 
     let event_stream = resp
         .headers()
@@ -118,18 +143,28 @@ pub(crate) async fn call_tool(
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|_| Error::Network(resource.to_owned()))?
+        .map_err(|_| no_response("the connection failed or timed out"))?
     {
         if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
-            return Err(failed(format!("{resource} sent too large a response")));
+            return Err(no_response("the response was too large"));
         }
         bytes.extend_from_slice(&chunk);
     }
-    let not_json = || failed(format!("{resource} did not return a JSON-RPC response"));
-    let message = if event_stream {
-        response_event(&bytes).ok_or_else(not_json)?
+    let parsed = if event_stream {
+        response_event(&bytes)
     } else {
-        serde_json::from_slice::<Value>(&bytes).map_err(|_| not_json())?
+        serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .filter(is_response)
+    };
+    let message = match parsed {
+        Some(m) => m,
+        // A refusal before the server acted, such as a 400 from one that
+        // wants a session, without a JSON-RPC error to say why.
+        None if !status.is_success() => {
+            return Err(failed(format!("{resource} returned {status}")))
+        }
+        None => return Err(no_response("it was not a JSON-RPC response")),
     };
 
     if let Some(e) = message.get("error") {
@@ -144,7 +179,9 @@ pub(crate) async fn call_tool(
             failed(text)
         });
     }
-    let result = message.get("result").ok_or_else(not_json)?;
+    let Some(result) = message.get("result") else {
+        return Err(no_response("it was not a JSON-RPC response"));
+    };
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
         return Err(failed(error_text(result)));
     }
@@ -156,7 +193,7 @@ pub(crate) async fn call_tool(
             .pointer("/content/0/text")
             .and_then(Value::as_str)
             .and_then(|t| serde_json::from_str(t).ok())
-            .ok_or_else(|| failed("returned no structured result".into()))?,
+            .ok_or_else(|| no_response("it held no structured result"))?,
     };
     let mut secrets = BTreeMap::new();
     for pointer in secret_fields {
@@ -165,17 +202,28 @@ pub(crate) async fn call_tool(
                 secrets.insert((*pointer).to_owned(), Secret::new(s));
             }
             None | Some(Value::Null) => {}
-            Some(_) => return Err(failed(format!("{pointer} in the result is not a string"))),
+            Some(_) => return Err(no_response(&format!("{pointer} in it is not a string"))),
         }
+    }
+    for secret in secrets.values() {
+        redact(&mut value, secret.expose());
     }
     Ok(ToolOutput { value, secrets })
 }
 
-/// The JSON-RPC response in an event stream: the `data` of the event that
-/// carries an `id` (others are notifications).
+/// Whether `v` is the response to our request, rather than a notification or
+/// a request the server sends (which can carry an id of its own).
+fn is_response(v: &Value) -> bool {
+    v.get("id") == Some(&json!(REQUEST_ID))
+        && (v.get("result").is_some() || v.get("error").is_some())
+}
+
+/// The JSON-RPC response in an event stream: the `data` of the event that is
+/// the response to our request.
 fn response_event(bytes: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(bytes).ok()?;
     text.replace("\r\n", "\n")
+        .replace('\r', "\n")
         .split("\n\n")
         .filter_map(|event| {
             let data: Vec<&str> = event
@@ -185,7 +233,18 @@ fn response_event(bytes: &[u8]) -> Option<Value> {
                 .collect();
             serde_json::from_str::<Value>(&data.join("\n")).ok()
         })
-        .find(|v| v.get("id").is_some())
+        .find(is_response)
+}
+
+/// Replace every string in `value` equal to `secret` with `<redacted>`, so a
+/// server that repeats a key elsewhere in a result does not leak it.
+fn redact(value: &mut Value, secret: &str) {
+    match value {
+        Value::String(s) if s.contains(secret) => *value = json!("<redacted>"),
+        Value::Array(items) => items.iter_mut().for_each(|v| redact(v, secret)),
+        Value::Object(map) => map.values_mut().for_each(|v| redact(v, secret)),
+        _ => {}
+    }
 }
 
 /// The text items of an `isError` result, cleaned.
@@ -204,16 +263,15 @@ fn error_text(result: &Value) -> String {
     }
 }
 
-/// Remove and return what `pointer` (RFC 6901) names in `value`.
+/// Take what `pointer` (RFC 6901) names out of `value`: an object member is
+/// removed, an array element is replaced with `null` so the indices other
+/// pointers name do not shift.
 fn remove_at(value: &mut Value, pointer: &str) -> Option<Value> {
     let (parent, last) = pointer.rsplit_once('/')?;
     let key = last.replace("~1", "/").replace("~0", "~");
     match value.pointer_mut(parent)? {
         Value::Object(map) => Map::remove(map, &key),
-        Value::Array(items) => {
-            let i: usize = key.parse().ok()?;
-            (i < items.len()).then(|| items.remove(i))
-        }
+        Value::Array(items) => items.get_mut(key.parse::<usize>().ok()?).map(Value::take),
         _ => None,
     }
 }
@@ -224,17 +282,37 @@ mod tests {
 
     #[test]
     fn remove_at_takes_only_the_named_field() {
-        let mut v = json!({"keys": {"serverKey": "srv_x", "clientKey": "sdk_y"}, "a/b": 1});
+        let mut v = json!({
+            "keys": {"serverKey": "srv_x", "clientKey": "sdk_y"},
+            "a/b": 1,
+            "list": ["s1", "s2"],
+        });
         assert_eq!(remove_at(&mut v, "/keys/serverKey"), Some(json!("srv_x")));
         assert_eq!(remove_at(&mut v, "/a~1b"), Some(json!(1)));
+        assert_eq!(remove_at(&mut v, "/list/0"), Some(json!("s1")));
+        assert_eq!(remove_at(&mut v, "/list/1"), Some(json!("s2")), "no shift");
         assert_eq!(remove_at(&mut v, "/keys/missing"), None);
         assert_eq!(remove_at(&mut v, ""), None);
-        assert_eq!(v, json!({"keys": {"clientKey": "sdk_y"}}));
+        assert_eq!(
+            v,
+            json!({"keys": {"clientKey": "sdk_y"}, "list": [null, null]})
+        );
+    }
+
+    #[test]
+    fn a_secret_repeated_elsewhere_is_redacted() {
+        let mut v = json!({"note": "your key is srv_x", "n": 1, "l": ["srv_x", "ok"]});
+        redact(&mut v, "srv_x");
+        assert_eq!(
+            v,
+            json!({"note": "<redacted>", "n": 1, "l": ["<redacted>", "ok"]})
+        );
     }
 
     #[test]
     fn the_response_is_the_event_with_an_id() {
         let stream = b"event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"n\"}\r\n\r\n\
+                       data: {\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\r\n\r\n\
                        data: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":1,\"result\":{}}\r\n\r\n";
         assert_eq!(
             response_event(stream),

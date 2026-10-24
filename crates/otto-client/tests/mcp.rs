@@ -51,6 +51,8 @@ async fn mcp(State(calls): State<Calls>, headers: HeaderMap, Json(req): Json<Val
         "issue" => ok(json!({
             "app": {"name": args["name"]},
             "keys": {"serverKey": SECRET, "clientKey": "sdk_public"},
+            // A careless server repeating the key elsewhere.
+            "note": format!("store {SECRET} now"),
         })),
         "denied" => json!({"jsonrpc": "2.0", "id": req["id"], "error": {
             "code": -32600,
@@ -134,7 +136,11 @@ async fn named_secret_fields_come_back_only_as_secrets() {
     assert_eq!(out.secret("/keys/serverKey").unwrap().expose(), SECRET);
     assert_eq!(
         out.value(),
-        &json!({"app": {"name": "web"}, "keys": {"clientKey": "sdk_public"}})
+        &json!({
+            "app": {"name": "web"},
+            "keys": {"clientKey": "sdk_public"},
+            "note": "<redacted>",
+        })
     );
     let shown = format!("{out:?} {}", out.value());
     assert!(!shown.contains("THE-SECRET"), "{shown}");
@@ -155,6 +161,23 @@ async fn a_missing_scope_is_its_own_error_with_the_servers_reason() {
         !err.to_string().contains('\u{1b}'),
         "escape sequences are dropped"
     );
+}
+
+#[tokio::test]
+async fn a_secret_field_must_be_a_json_pointer() {
+    let (client, resource, calls, _dir) = setup("").await;
+    let err = client
+        .call_tool(
+            &resource,
+            &[],
+            "issue",
+            json!({"name": "web"}),
+            &["keys/serverKey"],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Refused(_)), "{err:?}");
+    assert!(calls.0.lock().unwrap().is_empty(), "refused before sending");
 }
 
 #[tokio::test]

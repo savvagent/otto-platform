@@ -25,7 +25,7 @@ mod store;
 
 pub use error::{Error, Result};
 pub use mcp::ToolOutput;
-pub use secret::{Secret, Sink};
+pub use secret::{Reservation, Secret, Sink};
 pub use store::{Grant, Store};
 
 /// What [`Client::login`] did.
@@ -157,12 +157,25 @@ impl Client {
             }
         }
         self.login(resource, &wanted, false).await?;
-        flow::fresh_grant(&self.http, &self.store, resource)
+        let grant = flow::fresh_grant(&self.http, &self.store, resource)
             .await?
-            .map(|g| Secret::new(g.access_token))
             .ok_or_else(|| Error::LoginRequired {
                 resource: resource.to_owned(),
-            })
+            })?;
+        // The server may grant less than was asked (a scope the person may
+        // not hold). Say so now, rather than send a request it will refuse.
+        let missing: Vec<&str> = scopes
+            .iter()
+            .map(String::as_str)
+            .filter(|s| !grant.scope.split_whitespace().any(|g| g == *s))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::InsufficientScope {
+                resource: resource.to_owned(),
+                message: format!("the sign-in was not granted {}", missing.join(", ")),
+            });
+        }
+        Ok(Secret::new(grant.access_token))
     }
 
     /// Call the MCP tool `tool` on `resource` with `arguments`, signed in

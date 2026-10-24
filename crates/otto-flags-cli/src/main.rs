@@ -8,9 +8,9 @@
 //! issues it only to a token that carries `keys:issue`, a scope this binary
 //! asks for at sign-in and agents are not meant to be granted.
 //!
-//! Where it can go is checked before the request: a rotation revokes the old
-//! key at once, so a key that could not then be delivered would leave the app
-//! with no working one.
+//! Where it goes is claimed before the request (see `Sink::reserve`): a
+//! rotation revokes the old key at once, so a key that could not then be
+//! delivered would leave the app with no working one.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -93,10 +93,9 @@ fn parse(args: &[String]) -> Result<Command, String> {
     let (mut environments, mut out, mut overwrite) = (Vec::new(), None, false);
     let mut it = rest.iter();
     while let Some(&a) = it.next() {
-        let mut value = || {
-            it.next()
-                .map(|v| v.to_string())
-                .ok_or_else(|| format!("{a} needs a value"))
+        let mut value = || match it.next() {
+            Some(v) if !v.is_empty() && !v.starts_with("--") => Ok(v.to_string()),
+            _ => Err(format!("{a} needs a value")),
         };
         match a {
             "--overwrite" => overwrite = true,
@@ -110,11 +109,19 @@ fn parse(args: &[String]) -> Result<Command, String> {
                 }
                 which = Some(w);
             }
-            positional if create && name.is_none() && !positional.starts_with('-') => {
+            positional
+                if create
+                    && name.is_none()
+                    && !positional.is_empty()
+                    && !positional.starts_with('-') =>
+            {
                 name = Some(positional.to_owned());
             }
             other => return Err(format!("unexpected argument {other:?}")),
         }
+    }
+    if which.as_deref() == Some("client") && (out.is_some() || overwrite) {
+        return Err("--which client issues no server key, so there is nothing for --out".into());
     }
     let sink = match out {
         Some(path) => Sink::File { path, overwrite },
@@ -137,7 +144,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
 }
 
 async fn run(command: Command, resource: &str) -> Result<(), String> {
-    let (tool, arguments, sink, issues_server_key) = match command {
+    let (tool, arguments, sink, app, issues_server_key) = match command {
         Command::Help => {
             println!("{USAGE}");
             return Ok(());
@@ -150,6 +157,7 @@ async fn run(command: Command, resource: &str) -> Result<(), String> {
             "create_app",
             json!({ "name": name, "environments": environments }),
             sink,
+            name,
             true,
         ),
         Command::Rotate { app, which, sink } => {
@@ -158,42 +166,47 @@ async fn run(command: Command, resource: &str) -> Result<(), String> {
                 "rotate_app_keys",
                 json!({ "app": app, "which": which }),
                 sink,
+                app,
                 server,
             )
         }
     };
-    if issues_server_key {
-        sink.check()
-            .map_err(|e| format!("{e}. Nothing was changed."))?;
-    }
+    let rotate_hint = format!("otto flags keys rotate --app {}", shell_word(&app));
+    // Claimed now, before anything is issued; dropped unused, it is removed.
+    let reservation = if issues_server_key {
+        Some(
+            sink.reserve()
+                .map_err(|e| format!("{e}. Nothing was changed."))?,
+        )
+    } else {
+        None
+    };
 
     let client = Client::with_defaults().map_err(|e| e.to_string())?;
     let scopes = SCOPES.map(String::from);
     let out = client
         .call_tool(resource, &scopes, tool, arguments, &[SERVER_KEY])
         .await
-        .map_err(|e| explain(e, resource))?;
+        .map_err(|e| explain(e, resource, issues_server_key, &rotate_hint))?;
 
     report(&out);
-    match out.secret(SERVER_KEY) {
-        Some(key) => {
+    match (out.secret(SERVER_KEY), reservation) {
+        (Some(key), Some(reservation)) => {
             eprintln!(
                 "Server key (secret, shown only now; store it in your app's secret manager):"
             );
-            key.deliver(&sink).map_err(|e| {
+            reservation.deliver(key).map_err(|e| {
                 format!(
                     "the new server key was issued but could not be delivered: {e}. It is not \
-                     stored anywhere: issue another with `otto flags keys rotate --app {}`",
-                    text(&out, "/app/name")
+                     stored anywhere: issue another with `{rotate_hint}`"
                 )
             })
         }
-        None if issues_server_key => Err(format!(
-            "otto-flags did not issue a server key. Issue one with `otto flags keys rotate \
-             --app {}`",
-            text(&out, "/app/name")
+        (None, Some(_)) => Err(format!(
+            "otto-flags did not issue a server key. Issue one with `{rotate_hint}`"
         )),
-        None => Ok(()),
+        // `--which client`: a server key, if one came back anyway, is dropped.
+        (_, None) => Ok(()),
     }
 }
 
@@ -227,8 +240,12 @@ fn report(out: &ToolOutput) {
     }
 }
 
-fn explain(e: Error, resource: &str) -> String {
+fn explain(e: Error, resource: &str, issues_server_key: bool, rotate_hint: &str) -> String {
     match e {
+        Error::NoResponse { .. } if issues_server_key => format!(
+            "{e}\nIf it did, the old server key no longer works and the new one was not \
+             received. Issue another with `{rotate_hint}`."
+        ),
         Error::InsufficientScope { message, .. } => format!(
             "{message}\nIssuing keys needs the apps:admin and keys:issue scopes. Sign in again \
              and grant them: otto login --resource {resource} --scope apps:admin --scope \
@@ -245,6 +262,19 @@ fn text(out: &ToolOutput, pointer: &str) -> String {
         .and_then(Value::as_str)
         .map(clean)
         .unwrap_or_else(|| "?".into())
+}
+
+/// `s` as one word for a POSIX shell, quoted when it needs to be, for a
+/// command a message suggests.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.:/@".contains(c));
+    if plain {
+        s.to_owned()
+    } else {
+        format!("'{}'", clean(s).replace('\'', r"'\''"))
+    }
 }
 
 /// Server text without control characters, which could drive the terminal.
@@ -288,6 +318,13 @@ mod tests {
     }
 
     #[test]
+    fn suggested_commands_quote_odd_names() {
+        assert_eq!(shell_word("checkout-web"), "checkout-web");
+        assert_eq!(shell_word("my app"), "'my app'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+    }
+
+    #[test]
     fn refuses_what_it_does_not_understand() {
         for bad in [
             "app create",
@@ -297,6 +334,9 @@ mod tests {
             "keys rotate --app web --which all",
             "keys rotate --app web --overwrite",
             "keys rotate --app",
+            "keys rotate --app web --out --overwrite",
+            "keys rotate --app web --which client --out k",
+            "app create web --env",
             "flags list",
         ] {
             assert!(parse(&args(bad)).is_err(), "{bad:?}");

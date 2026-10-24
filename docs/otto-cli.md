@@ -132,12 +132,23 @@ cached sign-in are kept.
 
 The server key (`srv_…`) goes to the terminal, or with `--out` to a new
 owner-only file. The public client key (`sdk_…`) and the app's details are
-printed on stderr. Before anything is issued, the command checks that the key
-can be delivered. It refuses a piped stdout with no `--out`, or an `--out`
-file that exists without `--overwrite`, and reports "Nothing was changed". A
-rotation that issued a key and then could not deliver it would otherwise leave
-the app with no working server key. If writing fails after the key was issued,
-the error says so and the key is not printed instead. Rotate again.
+printed on stderr. A copy of the server key anywhere else in the response is
+replaced with `<redacted>`.
+
+A rotation revokes the old key at once, so a key that was issued and then
+couldn't be delivered would leave the app with no working one. To prevent
+that, the command claims the destination before anything is issued:
+- With `--out`, it creates the file, empty and owner-only, or with
+  `--overwrite` a temporary file beside it.
+- It refuses a piped stdout with no `--out`, an existing `--out` file without
+  `--overwrite`, or a directory it can't write to.
+
+In each of those cases it reports "Nothing was changed". If the command stops
+before delivering, it removes what it created. Two failures can still lose the
+key, and the error message says what happened and which rotation to run:
+- the file write fails after the key was issued (for example, a full disk);
+- the request was sent but no usable response came back, so the rotation may
+  have happened anyway.
 
 If otto-flags refuses because the sign-in lacks `keys:issue`, the error names
 the scope and the `otto login --resource … --scope apps:admin --scope keys:issue
@@ -152,11 +163,14 @@ otto-flags does since savvagent/otto-flags#189):
 - The issue scope is not in the resource's default scopes, so a client gets it
   only by asking and being granted it on the consent screen.
 - The service's `otto-<app>` binary asks for it and receives the secret through
-  `otto_client::Client::call_tool` with the field named as secret. It delivers
-  the secret with `Secret::deliver` after `Sink::check`.
+  `otto_client::Client::call_tool` with the field named as secret. It claims
+  the destination with `Sink::reserve` before the call and delivers with
+  `Reservation::deliver` after it.
 
 `call_tool` sends one JSON-RPC `tools/call` POST with the bearer token and no
-session, which suits a stateless MCP server.
+session, which suits a stateless MCP server. A failure after the request was
+sent is `Error::NoResponse`, distinct from `Error::Network`, because the tool
+may have acted.
 
 Registering the scope on the platform, with plain words for the consent screen.
 `resource register` is idempotent: on an existing resource it replaces the name

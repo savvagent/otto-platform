@@ -18,6 +18,13 @@ pub enum Error {
     #[error("could not reach {0}")]
     Network(String),
 
+    /// The request was sent but no usable answer came back, so it may have
+    /// taken effect. A caller that issues a secret should say so.
+    #[error(
+        "{resource} may have received the request, but no usable response came back: {reason}"
+    )]
+    NoResponse { resource: String, reason: String },
+
     #[error("credential store: {0}")]
     Store(String),
 
