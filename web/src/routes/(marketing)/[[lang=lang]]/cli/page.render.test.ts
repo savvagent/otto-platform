@@ -114,7 +114,9 @@ describe('the CLI page', () => {
     const unix = all.find((s) => s.includes('shasum -a 256 -c'));
     expect(unix).toContain(`base=${LATEST}/download`);
     expect(unix).toContain('curl -fsSLO "$base/otto-$target.tar.gz"');
-    expect(unix).toContain('install -m 0755 "otto-$target/otto" ~/.local/bin/otto');
+    expect(unix).toContain(
+      'install -m 0755 "otto-$target/otto" "otto-$target/otto-flags" ~/.local/bin/'
+    );
 
     const windows = all.find((s) => s.includes('Invoke-WebRequest'));
     expect(windows).toContain(`$base = "${LATEST}/download"`);
@@ -122,7 +124,7 @@ describe('the CLI page', () => {
     expect(windows).toContain('Get-FileHash otto.zip -Algorithm SHA256');
 
     expect(all).toContain(
-      'cargo install --locked --git https://github.com/savvagent/otto-platform otto-cli'
+      'cargo install --locked --git https://github.com/savvagent/otto-platform otto-cli otto-flags-cli'
     );
 
     unmount(instance);

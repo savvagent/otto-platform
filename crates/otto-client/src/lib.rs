@@ -9,19 +9,23 @@
 //! - [`Client::token`]: the cached token, refreshed when it is near expiry; a
 //!   resource with no grant yet goes through login; a revoked grant is
 //!   [`Error::LoginRequired`].
+//! - [`Client::call_tool`]: call one of a resource's MCP tools with that
+//!   token, taking the fields named as secret out of the result as [`Secret`]s.
 //! - [`Secret`]: for what an app returns that must not reach a model. It cannot
 //!   be formatted, only delivered to the terminal or an owner-only file.
 
 mod discovery;
 mod error;
 mod flow;
+mod mcp;
 mod pkce;
 mod private_fs;
 mod secret;
 mod store;
 
 pub use error::{Error, Result};
-pub use secret::{Secret, Sink};
+pub use mcp::ToolOutput;
+pub use secret::{Reservation, Secret, Sink};
 pub use store::{Grant, Store};
 
 /// What [`Client::login`] did.
@@ -134,6 +138,61 @@ impl Client {
                     })
             }
         }
+    }
+
+    /// A bearer token for `resource` that carries every one of `scopes`.
+    /// A cached grant that lacks one is replaced by signing in again, asking
+    /// for its scopes as well as these, so what was granted before is kept.
+    pub async fn token_with_scopes(&self, resource: &str, scopes: &[String]) -> Result<Secret> {
+        if scopes.is_empty() {
+            return self.token(resource).await;
+        }
+        let mut wanted: Vec<String> = match self.store.grant(resource)? {
+            Some(g) => g.scope.split_whitespace().map(str::to_owned).collect(),
+            None => Vec::new(),
+        };
+        for s in scopes {
+            if !wanted.contains(s) {
+                wanted.push(s.clone());
+            }
+        }
+        self.login(resource, &wanted, false).await?;
+        let grant = flow::fresh_grant(&self.http, &self.store, resource)
+            .await?
+            .ok_or_else(|| Error::LoginRequired {
+                resource: resource.to_owned(),
+            })?;
+        // The server may grant less than was asked (a scope the person may
+        // not hold). Say so now, rather than send a request it will refuse.
+        let missing: Vec<&str> = scopes
+            .iter()
+            .map(String::as_str)
+            .filter(|s| !grant.scope.split_whitespace().any(|g| g == *s))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::InsufficientScope {
+                resource: resource.to_owned(),
+                message: format!("the sign-in was not granted {}", missing.join(", ")),
+            });
+        }
+        Ok(Secret::new(grant.access_token))
+    }
+
+    /// Call the MCP tool `tool` on `resource` with `arguments`, signed in
+    /// with `scopes` (see [`Client::token_with_scopes`]). Each JSON pointer in
+    /// `secret_fields` (e.g. `/keys/serverKey`) is removed from the result and
+    /// returned through [`ToolOutput::secret`], so [`ToolOutput::value`] is
+    /// safe to print.
+    pub async fn call_tool(
+        &self,
+        resource: &str,
+        scopes: &[String],
+        tool: &str,
+        arguments: serde_json::Value,
+        secret_fields: &[&str],
+    ) -> Result<ToolOutput> {
+        let token = self.token_with_scopes(resource, scopes).await?;
+        mcp::call_tool(&self.http, resource, &token, tool, arguments, secret_fields).await
     }
 
     /// Whether `resource` already has a grant, without any network call.

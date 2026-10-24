@@ -98,6 +98,9 @@ crates/
 ├── otto-cli/             binary `otto`: `otto login --resource <uri>`, and
 │                         `otto <app> ...` runs `otto-<app>` from PATH. See
 │                         [docs/otto-cli.md](docs/otto-cli.md).
+├── otto-flags-cli/       binary `otto-flags`, run as `otto flags`: issue an
+│                         Otto Flags app's keys so the secret server key goes
+│                         to a terminal or an owner-only file, not a model.
 └── otto-platform-server/ binary: loads config, connects, runs migrations,
                           verifies tenant isolation, then serves /healthz,
                           /readyz, otto-web's router, the

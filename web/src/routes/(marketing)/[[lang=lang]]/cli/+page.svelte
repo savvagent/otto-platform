@@ -42,7 +42,7 @@
     'curl -fsSLO "$base/SHA256SUMS"',
     'grep " otto-$target.tar.gz\\$" SHA256SUMS | shasum -a 256 -c',
     'tar xzf "otto-$target.tar.gz"',
-    'install -m 0755 "otto-$target/otto" ~/.local/bin/otto'
+    'install -m 0755 "otto-$target/otto" "otto-$target/otto-flags" ~/.local/bin/'
   ].join('\n');
 
   const WINDOWS_INSTALL = [
@@ -54,7 +54,7 @@
   ].join('\n');
 
   const FROM_SOURCE =
-    'cargo install --locked --git https://github.com/savvagent/otto-platform otto-cli';
+    'cargo install --locked --git https://github.com/savvagent/otto-platform otto-cli otto-flags-cli';
 
   const why = [
     { title: () => m.cli_why_signin_title(), body: () => m.cli_why_signin_body() },

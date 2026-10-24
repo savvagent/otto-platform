@@ -164,7 +164,10 @@ pub(crate) async fn login(
     })?;
 
     let mut locked = store.lock().await?;
-    locked.put_grant(resource, grant_from(token, &meta.issuer, &client_id, None));
+    locked.put_grant(
+        resource,
+        grant_from(token, &meta.issuer, &client_id, None, scopes.join(" ")),
+    );
     locked.save()?;
     Ok(LoginOutcome::SignedIn)
 }
@@ -212,6 +215,7 @@ fn grant_from(
     issuer: &str,
     client_id: &str,
     prior_refresh: Option<String>,
+    prior_scope: String,
 ) -> Grant {
     let lifetime = t
         .expires_in
@@ -224,7 +228,9 @@ fn grant_from(
         // A refresh response may omit the refresh token, meaning keep the old one.
         refresh_token: t.refresh_token.or(prior_refresh),
         expires_at: now().saturating_add(lifetime),
-        scope: t.scope.unwrap_or_default(),
+        // RFC 6749 section 5.1: no `scope` means the scope asked for (or, on a
+        // refresh, the grant's own) was granted unchanged.
+        scope: t.scope.unwrap_or(prior_scope),
     }
 }
 
@@ -426,7 +432,13 @@ pub(crate) async fn fresh_grant(
     let token: TokenResponse = resp.json().await.map_err(|_| {
         Error::Authorization("the token endpoint sent an unreadable response".into())
     })?;
-    let renewed = grant_from(token, &grant.issuer, &grant.client_id, Some(refresh));
+    let renewed = grant_from(
+        token,
+        &grant.issuer,
+        &grant.client_id,
+        Some(refresh),
+        grant.scope.clone(),
+    );
     locked.put_grant(resource, renewed.clone());
     locked.save()?;
     Ok(Some(renewed))

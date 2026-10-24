@@ -18,8 +18,24 @@ pub enum Error {
     #[error("could not reach {0}")]
     Network(String),
 
+    /// The request was sent but no usable answer came back, so it may have
+    /// taken effect. A caller that issues a secret should say so.
+    #[error(
+        "{resource} may have received the request, but no usable response came back: {reason}"
+    )]
+    NoResponse { resource: String, reason: String },
+
     #[error("credential store: {0}")]
     Store(String),
+
+    /// The resource refused a tool call because the token lacks a scope.
+    /// `message` is the server's, cleaned; it usually names the scope.
+    #[error("{resource} refused this sign-in: {message}")]
+    InsufficientScope { resource: String, message: String },
+
+    /// A tool call failed: a JSON-RPC error, or a result marked `isError`.
+    #[error("{tool} failed: {message}")]
+    Tool { tool: String, message: String },
 
     /// Writing a secret somewhere that is not safe for it was refused.
     #[error("{0}")]
