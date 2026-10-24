@@ -96,6 +96,7 @@ The public pages, prerendered, `index, follow`:
 | `/`                | Landing: what Otto is, the products, the way into the console.                                      |
 | `/products/[slug]` | One per product in `services.ts`, with its own title and description.                               |
 | `/pricing`         | How plans and usage work, prerendered; the plans themselves fetched live from `GET /api/plans`.     |
+| `/cli`             | The `otto` command-line tool: downloads, install and first-use commands, link to its docs.          |
 | `/{lang}/…`        | Each of the above in `es`, `de`, `fr`, `it` and `hi` (`/es`, `/es/pricing`). English is unprefixed. |
 | `/sitemap.xml`     | Every page in every language, with its alternates. Built from `src/lib/sitemap.ts`.                 |
 | `/robots.txt`      | `static/robots.txt`: disallows the console, API and OAuth paths, and points at the sitemap.         |

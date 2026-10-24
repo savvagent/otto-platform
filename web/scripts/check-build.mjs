@@ -37,7 +37,12 @@ export const SITE_ORIGIN = 'https://otto.savvagent.com';
 const PRODUCT_SLUGS = ['tower', 'flags', 'cxp'];
 
 /** Mirrors `MARKETING_PATHS` in `src/lib/sitemap.ts`. */
-export const PAGE_PATHS = ['/', '/pricing', ...PRODUCT_SLUGS.map((slug) => `/products/${slug}`)];
+export const PAGE_PATHS = [
+  '/',
+  '/pricing',
+  '/cli',
+  ...PRODUCT_SLUGS.map((slug) => `/products/${slug}`)
+];
 
 /** Mirrors `localizedPath` in `src/lib/site.ts`. */
 function localizedPath(baseLocale, lang, path) {

@@ -4,10 +4,11 @@ import { SERVICES } from './services';
 import { MARKETING_PATHS, sitemapXml } from './sitemap';
 
 describe('the marketing page list', () => {
-  it('is the landing page, pricing, and one page per product', () => {
+  it('is the landing page, pricing, the CLI, and one page per product', () => {
     expect(MARKETING_PATHS).toEqual([
       '/',
       '/pricing',
+      '/cli',
       ...SERVICES.map((s) => `/products/${s.slug}`)
     ]);
   });

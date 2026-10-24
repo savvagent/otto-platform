@@ -23,6 +23,7 @@ import { SERVICES } from './services';
 export const MARKETING_PATHS: readonly string[] = [
   '/',
   '/pricing',
+  '/cli',
   ...SERVICES.map((service) => `/products/${service.slug}`)
 ];
 
