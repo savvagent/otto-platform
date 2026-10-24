@@ -253,6 +253,32 @@ mod imp {
                 )
             };
             assert!(err.is_ok(), "{err:?}");
+            let out = dacl_sddl(sd);
+            unsafe { LocalFree(Some(HLOCAL(sd.0))) };
+            out
+        }
+
+        /// `sddl` as Windows itself writes it. It prints some well-known SIDs
+        /// as aliases, e.g. the built-in Administrator (RID 500, which CI
+        /// runners use) as `LA`, so compare after the same round trip.
+        fn canonical(sddl: &str) -> String {
+            let wide: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    PCWSTR(wide.as_ptr()),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    None,
+                )
+            }
+            .unwrap();
+            let out = dacl_sddl(sd);
+            unsafe { LocalFree(Some(HLOCAL(sd.0))) };
+            out
+        }
+
+        fn dacl_sddl(sd: PSECURITY_DESCRIPTOR) -> String {
             let mut s = PWSTR::null();
             unsafe {
                 ConvertSecurityDescriptorToStringSecurityDescriptorW(
@@ -265,10 +291,7 @@ mod imp {
             }
             .unwrap();
             let out = unsafe { s.to_string() }.unwrap();
-            unsafe {
-                LocalFree(Some(HLOCAL(s.0.cast())));
-                LocalFree(Some(HLOCAL(sd.0)));
-            }
+            unsafe { LocalFree(Some(HLOCAL(s.0.cast()))) };
             out
         }
 
@@ -278,15 +301,15 @@ mod imp {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("a").join("cfg");
             super::super::create_dir_all(&dir).unwrap();
-            assert_eq!(dacl(&dir), format!("D:P(A;OICI;FA;;;{sid})"));
+            assert_eq!(dacl(&dir), canonical(&format!("D:P(A;OICI;FA;;;{sid})")));
 
             let file = dir.join("secret");
             drop(super::super::create_new(&file).unwrap());
-            assert_eq!(dacl(&file), format!("D:P(A;;FA;;;{sid})"));
+            assert_eq!(dacl(&file), canonical(&format!("D:P(A;;FA;;;{sid})")));
 
             let lock = dir.join("lock");
             drop(super::super::open_or_create(&lock).unwrap());
-            assert_eq!(dacl(&lock), format!("D:P(A;;FA;;;{sid})"));
+            assert_eq!(dacl(&lock), canonical(&format!("D:P(A;;FA;;;{sid})")));
         }
 
         #[test]
