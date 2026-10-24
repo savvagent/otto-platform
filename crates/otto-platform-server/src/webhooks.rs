@@ -5,8 +5,8 @@
 //! [`run`] is a polling loop: claim due rows, POST each to its resource
 //! server's `webhook_url` signed with that server's secret, record the result.
 //! A failure is retried with exponential backoff (10 s doubling to an hour)
-//! for [`otto_core::lifecycle::MAX_ATTEMPTS`] attempts, then left in the table
-//! marked failed with the last error, for an operator to read.
+//! for [`otto_core::lifecycle::MAX_ATTEMPTS`] attempts (about a day), then left
+//! in the table marked failed with the last error, for an operator to read.
 //!
 //! Delivery is at-least-once, unordered across events, and idempotent on the
 //! event id in the body (`otto_resource::webhook`). Claims carry a lease, so

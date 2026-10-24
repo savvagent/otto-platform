@@ -24,8 +24,11 @@ use uuid::Uuid;
 use crate::error::Result;
 
 /// Delivery attempts before a row is given up on and marked failed. With
-/// [`backoff_seconds`] this spans roughly a day.
-pub const MAX_ATTEMPTS: i32 = 12;
+/// [`backoff_seconds`] (10 s doubling to an hour) the 31 waits between the 32
+/// attempts add up to 84 310 s, about 23.4 hours: a resource server that is
+/// down for an afternoon still hears about every deletion.
+/// `retry_window_is_about_a_day` computes it from the constants.
+pub const MAX_ATTEMPTS: i32 = 32;
 
 /// How long a claimed row is invisible to other delivery tasks. Longer than
 /// the HTTP timeout so a slow delivery is not picked up twice, short enough
@@ -249,6 +252,13 @@ mod tests {
         assert_eq!(backoff_seconds(9), 2560);
         assert_eq!(backoff_seconds(10), 3600);
         assert_eq!(backoff_seconds(50), 3600);
+    }
+
+    #[test]
+    fn retry_window_is_about_a_day() {
+        let window: i64 = (1..MAX_ATTEMPTS).map(backoff_seconds).sum();
+        assert_eq!(window, 84_310, "update MAX_ATTEMPTS' doc comment");
+        assert!((20 * 3600..=26 * 3600).contains(&window), "{window} s");
     }
 
     #[test]
