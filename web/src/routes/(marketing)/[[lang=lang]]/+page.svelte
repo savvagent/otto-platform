@@ -5,6 +5,8 @@
   import Seo from '$lib/components/Seo.svelte';
   import AccountActions from '$lib/components/marketing/AccountActions.svelte';
   import ProductCard from '$lib/components/marketing/ProductCard.svelte';
+  import LinkButton from '$lib/components/LinkButton.svelte';
+  import { localizedPath } from '$lib/site';
 
   import type { PageData } from './$types';
 
@@ -35,6 +37,8 @@
     { title: () => m.landing_family_plan_title(), body: () => m.landing_family_plan_body() },
     { title: () => m.landing_family_tokens_title(), body: () => m.landing_family_tokens_body() }
   ];
+
+  const RELEASES = 'https://github.com/savvagent/otto-platform/releases/latest';
 
   const steps = [
     { title: () => m.landing_how_step1_title(), body: () => m.landing_how_step1_body() },
@@ -142,6 +146,28 @@
         </li>
       {/each}
     </ol>
+  </section>
+
+  <section aria-labelledby="cli-title" class="grid items-center gap-10 lg:grid-cols-[3fr_2fr]">
+    <div>
+      <p class="otto-label text-accent">{m.landing_cli_eyebrow()}</p>
+      <h2 id="cli-title" class="mt-3 text-2xl font-semibold tracking-tight text-ink">
+        {m.landing_cli_heading()}
+      </h2>
+      <p class="mt-3 max-w-2xl text-muted">{m.landing_cli_body()}</p>
+      <div class="mt-6 flex flex-wrap items-center gap-3">
+        <LinkButton href={RELEASES} size="lg">{m.landing_cli_download()}</LinkButton>
+        <LinkButton href={localizedPath(data.lang, '/cli')} tone="quiet" size="lg">
+          {m.landing_cli_learn_more()}
+        </LinkButton>
+      </div>
+    </div>
+    <!-- The one command a visitor runs; decorative, the full steps are on /cli. -->
+    <div class="otto-card p-5" aria-hidden="true">
+      <p class="otto-mono text-xs break-all text-muted sm:text-sm">
+        <span class="text-accent">$</span> ottoctl login --resource &lt;service MCP URL&gt;
+      </p>
+    </div>
   </section>
 
   <section

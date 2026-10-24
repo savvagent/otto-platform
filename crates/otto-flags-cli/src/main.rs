@@ -1,4 +1,4 @@
-//! `otto-flags`, run as `otto flags`: issue an Otto Flags app's SDK keys from a
+//! `otto-flags`, run as `ottoctl flags`: issue an Otto Flags app's SDK keys from a
 //! terminal.
 //!
 //! The server key (`srv_…`) is a secret the person stores in their app's
@@ -26,13 +26,13 @@ const SERVER_KEY: &str = "/keys/serverKey";
 
 const USAGE: &str = "\
 usage:
-  otto flags app create <name> [--env <environment>]... [--out <file> [--overwrite]]
+  ottoctl flags app create <name> [--env <environment>]... [--out <file> [--overwrite]]
                                  register an app and issue its keys
-  otto flags keys rotate --app <name-or-id> [--which server|client|both]
+  ottoctl flags keys rotate --app <name-or-id> [--which server|client|both]
                          [--out <file> [--overwrite]]
                                  replace an app's key (default: the server key);
                                  the old key stops working at once
-  otto flags help
+  ottoctl flags help
 
 The server key (srv_...) is printed only to a terminal, never to a pipe, or
 written owner-only to the file given with --out (which must not exist unless
@@ -48,7 +48,7 @@ async fn main() -> ExitCode {
     let command = match parse(&args) {
         Ok(c) => c,
         Err(message) => {
-            eprintln!("otto flags: {message}\n\n{USAGE}");
+            eprintln!("ottoctl flags: {message}\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -59,7 +59,7 @@ async fn main() -> ExitCode {
     match run(command, &resource).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("otto flags: {message}");
+            eprintln!("ottoctl flags: {message}");
             ExitCode::FAILURE
         }
     }
@@ -171,7 +171,7 @@ async fn run(command: Command, resource: &str) -> Result<(), String> {
             )
         }
     };
-    let rotate_hint = format!("otto flags keys rotate --app {}", shell_word(&app));
+    let rotate_hint = format!("ottoctl flags keys rotate --app {}", shell_word(&app));
     // Claimed now, before anything is issued; dropped unused, it is removed.
     let reservation = if issues_server_key {
         Some(
@@ -248,7 +248,7 @@ fn explain(e: Error, resource: &str, issues_server_key: bool, rotate_hint: &str)
         ),
         Error::InsufficientScope { message, .. } => format!(
             "{message}\nIssuing keys needs the apps:admin and keys:issue scopes. Sign in again \
-             and grant them: otto login --resource {resource} --scope apps:admin --scope \
+             and grant them: ottoctl login --resource {resource} --scope apps:admin --scope \
              keys:issue --force"
         ),
         e => e.to_string(),

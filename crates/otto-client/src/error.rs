@@ -6,7 +6,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The grant for this resource is gone, expired or revoked.
-    #[error("not signed in for {resource}: run `otto login --resource {resource}` again")]
+    #[error("not signed in for {resource}: run `ottoctl login --resource {resource}` again")]
     LoginRequired { resource: String },
 
     #[error("discovery failed: {0}")]

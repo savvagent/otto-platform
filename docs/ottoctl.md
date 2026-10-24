@@ -1,61 +1,61 @@
-# The `otto` command
+# The `ottoctl` command
 
-`otto` signs a developer in to an otto resource and runs per-app subcommands, so
+`ottoctl` signs a developer in to an otto resource and runs per-app subcommands, so
 a secret an app must not hand to an agent (for example otto-flags' `srv_` server
 key) reaches a person's terminal with no model in the path.
 
 ## Install
 
 Every [release](https://github.com/savvagent/otto-platform/releases/latest)
-attaches a prebuilt `otto` for each of these, with a `SHA256SUMS` file:
+attaches a prebuilt `ottoctl` for each of these, with a `SHA256SUMS` file:
 
 | Platform | Archive |
 | --- | --- |
-| Linux x86_64 | `otto-x86_64-unknown-linux-musl.tar.gz` |
-| Linux arm64 | `otto-aarch64-unknown-linux-musl.tar.gz` |
-| macOS Apple silicon | `otto-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `otto-x86_64-apple-darwin.tar.gz` |
-| Windows x86_64 | `otto-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 | `ottoctl-x86_64-unknown-linux-musl.tar.gz` |
+| Linux arm64 | `ottoctl-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Apple silicon | `ottoctl-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `ottoctl-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `ottoctl-x86_64-pc-windows-msvc.zip` |
 
 The Linux binaries are static, so they run on any distribution. Each archive
-holds `otto` and `otto-flags` (`.exe` on Windows) and the license, in a
-directory named after the archive. Install both: `otto flags` runs `otto-flags`.
+holds `ottoctl` and `otto-flags` (`.exe` on Windows) and the license, in a
+directory named after the archive. Install both: `ottoctl flags` runs `otto-flags`.
 
 Linux and macOS. Set `target` to your platform's name from the table:
 
     target=aarch64-apple-darwin
     base=https://github.com/savvagent/otto-platform/releases/latest/download
-    curl -fsSLO "$base/otto-$target.tar.gz"
+    curl -fsSLO "$base/ottoctl-$target.tar.gz"
     curl -fsSLO "$base/SHA256SUMS"
-    grep " otto-$target.tar.gz\$" SHA256SUMS | shasum -a 256 -c
-    tar xzf "otto-$target.tar.gz"
-    install -m 0755 "otto-$target/otto" "otto-$target/otto-flags" ~/.local/bin/   # or anywhere on PATH
+    grep " ottoctl-$target.tar.gz\$" SHA256SUMS | shasum -a 256 -c
+    tar xzf "ottoctl-$target.tar.gz"
+    install -m 0755 "ottoctl-$target/ottoctl" "ottoctl-$target/otto-flags" ~/.local/bin/   # or anywhere on PATH
 
 Windows (PowerShell):
 
     $base = "https://github.com/savvagent/otto-platform/releases/latest/download"
-    Invoke-WebRequest "$base/otto-x86_64-pc-windows-msvc.zip" -OutFile otto.zip
+    Invoke-WebRequest "$base/ottoctl-x86_64-pc-windows-msvc.zip" -OutFile ottoctl.zip
     Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
-    (Get-FileHash otto.zip -Algorithm SHA256).Hash   # compare with SHA256SUMS
-    Expand-Archive otto.zip -DestinationPath .
-    # then move otto.exe and otto-flags.exe from otto-x86_64-pc-windows-msvc\ to a directory on PATH
+    (Get-FileHash ottoctl.zip -Algorithm SHA256).Hash   # compare with SHA256SUMS
+    Expand-Archive ottoctl.zip -DestinationPath .
+    # then move ottoctl.exe and otto-flags.exe from ottoctl-x86_64-pc-windows-msvc\ to a directory on PATH
 
 The binaries are not code-signed. The checksum shows the archive is the one the
 release published.
 
 - **macOS:** a file fetched with `curl` is not quarantined. If you download it in
-  a browser instead, Gatekeeper blocks it. Run `xattr -d com.apple.quarantine otto`
+  a browser instead, Gatekeeper blocks it. Run `xattr -d com.apple.quarantine ottoctl`
   once.
 - **Windows:** SmartScreen may warn the first time. Choose *More info*, then
   *Run anyway*.
 
 From source, with Rust 1.89 or later:
 
-    cargo install --locked --git https://github.com/savvagent/otto-platform otto-cli otto-flags-cli
+    cargo install --locked --git https://github.com/savvagent/otto-platform ottoctl otto-flags-cli
 
 ## Sign in
 
-    otto login --resource https://flags.example/mcp [--scope <scope>]... [--force]
+    ottoctl login --resource https://flags.example/mcp [--scope <scope>]... [--force]
 
 This is the flow an MCP client uses against `otto-auth`, with nothing new on the
 server: read the resource's protected-resource metadata (RFC 9728), check the
@@ -64,7 +64,7 @@ register dynamically (RFC 7591, a public client), then authorization code with
 PKCE S256 and a loopback redirect (`http://127.0.0.1:<port>/callback`). Your
 browser opens the consent screen; the CLI also prints the URL in case it does not.
 
-A token has one audience, so each resource gets its own grant. Running `otto login`
+A token has one audience, so each resource gets its own grant. Running `ottoctl login`
 again keeps a cached grant that is still usable (refreshing it if needed) and
 already covers the scopes asked for, and opens no browser. Asking for a scope the
 grant does not have, or passing `--force`, runs the browser flow again. A resource
@@ -91,20 +91,20 @@ are set as the entry is created.
   expiry. It is replaced by writing a new file and renaming it into place.
 - `credentials.lock` is held while the file changes. Refresh holds it across the
   token request: otto-auth treats a refresh token presented twice as a replay and
-  revokes every token the client holds, so two `otto` processes must never
+  revokes every token the client holds, so two `ottoctl` processes must never
   refresh the same grant. A process that finds the lock taken waits up to 60
   seconds and then uses the other process's result.
 
 Access tokens are refreshed when within 30 seconds of expiry. If a grant was
-revoked or has expired, the command says to run `otto login` again and removes
+revoked or has expired, the command says to run `ottoctl login` again and removes
 the dead grant.
 
 ## Subcommands
 
-`otto <app> <args>` runs `otto-<app>` (`otto-<app>.exe` on Windows) from `PATH`
-with the same arguments. On Unix it replaces the `otto` process, so Ctrl-C,
+`ottoctl <app> <args>` runs `otto-<app>` (`otto-<app>.exe` on Windows) from `PATH`
+with the same arguments. On Unix it replaces the `ottoctl` process, so Ctrl-C,
 signals and the exit status are the app's own. Windows has no equivalent, so
-`otto` waits for the app, leaves Ctrl-C to it, and exits with its exit code. `<app>` is lowercase letters, digits and `-`. Only absolute `PATH`
+`ottoctl` waits for the app, leaves Ctrl-C to it, and exits with its exit code. `<app>` is lowercase letters, digits and `-`. Only absolute `PATH`
 entries are searched. If no such binary is found the error names the one it
 looked for.
 
@@ -120,8 +120,8 @@ An `otto-<app>` binary links the `otto-client` crate:
 
 ## Otto Flags keys
 
-    otto flags app create <name> [--env <environment>]... [--out <file> [--overwrite]]
-    otto flags keys rotate --app <name-or-id> [--which server|client|both] [--out <file> [--overwrite]]
+    ottoctl flags app create <name> [--env <environment>]... [--out <file> [--overwrite]]
+    ottoctl flags keys rotate --app <name-or-id> [--which server|client|both] [--out <file> [--overwrite]]
 
 These issue an Otto Flags app's SDK keys. `app create` registers the app and
 issues both keys. `keys rotate` replaces the server key by default, and the old
@@ -151,7 +151,7 @@ key, and the error message says what happened and which rotation to run:
   have happened anyway.
 
 If otto-flags refuses because the sign-in lacks `keys:issue`, the error names
-the scope and the `otto login --resource … --scope apps:admin --scope keys:issue
+the scope and the `ottoctl login --resource … --scope apps:admin --scope keys:issue
 --force` that grants it.
 
 ## Issuing secrets from a service
@@ -180,7 +180,7 @@ and scopes, and keeps descriptions it is not given.
       --name otto-flags \
       --scopes flags:read,flags:write,apps:admin,keys:issue \
       --default-scopes flags:read \
-      --scope-description "keys:issue=Receive new secret server keys for your apps. Grant this only to the otto command in your terminal, never to an AI assistant."
+      --scope-description "keys:issue=Receive new secret server keys for your apps. Grant this only to the ottoctl command in your terminal, never to an AI assistant."
 
 On Fly, run it through `fly ssh console -a otto-platform -C '…'`. Register the
 scope before releasing an `otto-flags` binary that asks for it. Until then the

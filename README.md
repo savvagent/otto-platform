@@ -46,16 +46,16 @@ bundle built from `web/` (see `web/README.md`): the public marketing pages,
 prerendered (`/`, `/pricing`, a page per product, each in every language),
 and the account/org console, whose home is `/home`.
 
-## The `otto` command
+## The `ottoctl` command
 
-`otto` is the terminal side of the platform. It signs a developer in to any
+`ottoctl` is the terminal side of the platform. It signs a developer in to any
 otto-* service and runs that service's own subcommands. Its first use is
 otto-flags server keys, which reach a person's terminal and never pass through
 a model. Prebuilt binaries for Linux (x86_64, arm64), macOS (Apple silicon,
 Intel) and Windows (x86_64) are attached to every
 [release](https://github.com/savvagent/otto-platform/releases/latest), with
 checksums. To install and verify one, see
-[docs/otto-cli.md](docs/otto-cli.md#install).
+[docs/ottoctl.md](docs/ottoctl.md#install).
 
 ## Crate layout
 
@@ -95,10 +95,10 @@ crates/
 │                         PKCE S256 on a loopback redirect, a per-resource
 │                         token cache, and `Secret` output that never reaches
 │                         a log. No database dependency.
-├── otto-cli/             binary `otto`: `otto login --resource <uri>`, and
-│                         `otto <app> ...` runs `otto-<app>` from PATH. See
-│                         [docs/otto-cli.md](docs/otto-cli.md).
-├── otto-flags-cli/       binary `otto-flags`, run as `otto flags`: issue an
+├── ottoctl/             binary `ottoctl`: `ottoctl login --resource <uri>`, and
+│                         `ottoctl <app> ...` runs `otto-<app>` from PATH. See
+│                         [docs/ottoctl.md](docs/ottoctl.md).
+├── otto-flags-cli/       binary `otto-flags`, run as `ottoctl flags`: issue an
 │                         Otto Flags app's keys so the secret server key goes
 │                         to a terminal or an owner-only file, not a model.
 └── otto-platform-server/ binary: loads config, connects, runs migrations,

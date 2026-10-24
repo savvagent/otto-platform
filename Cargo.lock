@@ -1744,16 +1744,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "otto-cli"
-version = "0.12.1"
-dependencies = [
- "otto-client",
- "tempfile",
- "tokio",
- "windows",
-]
-
-[[package]]
 name = "otto-client"
 version = "0.12.1"
 dependencies = [
@@ -1900,6 +1890,16 @@ dependencies = [
  "webauthn-authenticator-rs",
  "webauthn-rs",
  "webauthn-rs-proto",
+]
+
+[[package]]
+name = "ottoctl"
+version = "0.12.1"
+dependencies = [
+ "otto-client",
+ "tempfile",
+ "tokio",
+ "windows",
 ]
 
 [[package]]
