@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.12.0](https://github.com/savvagent/otto-platform/compare/v0.11.1...v0.12.0) (2026-10-24)
+
+
+### Features
+
+* **otto-billing:** bill only orgs that authorized the calling resource server ([#96](https://github.com/savvagent/otto-platform/issues/96)) ([1a2245b](https://github.com/savvagent/otto-platform/commit/1a2245b8aa135827ca39ffb2210cb91dab138bae))
+* **otto-billing:** cancel Stripe billing when an org is deleted ([#99](https://github.com/savvagent/otto-platform/issues/99)) ([cae56fe](https://github.com/savvagent/otto-platform/commit/cae56fe0d31f1bf2f5baa83da13487ff42675595))
+* **otto-cli:** add the otto command with MCP-style login ([#103](https://github.com/savvagent/otto-platform/issues/103)) ([a95af5b](https://github.com/savvagent/otto-platform/commit/a95af5bd5aa298f074e8ac170f19f5cbfccaab8e)), closes [#102](https://github.com/savvagent/otto-platform/issues/102)
+* **otto-cli:** build otto for Linux, macOS and Windows ([#106](https://github.com/savvagent/otto-platform/issues/106)) ([84f1a6a](https://github.com/savvagent/otto-platform/commit/84f1a6a87aeffcb023dbfdfe704253631a85933c))
+* **otto-flags-cli:** issue Otto Flags app keys from the terminal ([#107](https://github.com/savvagent/otto-platform/issues/107)) ([62b7cae](https://github.com/savvagent/otto-platform/commit/62b7cae8e6a83f56e9d40cb2776426983ea3cbc0))
+
+
+### Bug Fixes
+
+* **otto-auth:** close the remaining revocation races in PAT minting, code issuance and token revocation ([#98](https://github.com/savvagent/otto-platform/issues/98)) ([9b9c63f](https://github.com/savvagent/otto-platform/commit/9b9c63f70af021abc9853705bda5e86f11f8f504))
+* **otto-billing:** record Stripe meter error reports as lost usage ([#97](https://github.com/savvagent/otto-platform/issues/97)) ([55898c4](https://github.com/savvagent/otto-platform/commit/55898c4613b1d26968b3583d6c813d98301f6fbb))
+
 ## [0.11.1](https://github.com/savvagent/otto-platform/compare/v0.11.0...v0.11.1) (2026-10-21)
 
 
