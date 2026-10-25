@@ -1071,7 +1071,10 @@ async fn decide_many(
     };
 
     let mut grants: Vec<(String, Vec<String>)> = Vec::new();
-    let mut admin_dropped = false;
+    // Kept on the page, but nothing it asked for can be granted to this
+    // person. Named in the callback, so the client does not mistake it for a
+    // resource the person left out.
+    let mut refused: Vec<String> = Vec::new();
     for (authorization, chosen) in authorizations.iter().zip(&chosen) {
         let Some(chosen) = chosen else { continue };
         let narrowed = match authorization.narrow(chosen) {
@@ -1093,11 +1096,11 @@ async fn decide_many(
             Ok(scopes) => grants.push((authorization.resource.resource_uri.clone(), scopes)),
             // Only org:admin was left, and this person cannot grant it: this
             // resource gets nothing, the others are unaffected.
-            Err(_) => admin_dropped = true,
+            Err(_) => refused.push(authorization.resource.resource_uri.clone()),
         }
     }
     if grants.is_empty() {
-        return if admin_dropped {
+        return if !refused.is_empty() {
             redirect_error(&params, "invalid_scope", ADMIN_NEEDS_ADMIN)
         } else {
             redirect_error(&params, "access_denied", "no access was selected")
@@ -1149,13 +1152,14 @@ async fn decide_many(
         }
     }
 
-    let pairs: Vec<(&str, &str)> = grants
+    let mut pairs: Vec<(&str, &str)> = grants
         .iter()
         .zip(&codes)
         .flat_map(|((resource, _), code)| {
             [("code", code.as_str()), ("resource", resource.as_str())]
         })
         .collect();
+    pairs.extend(refused.iter().map(|r| ("refused_resource", r.as_str())));
     let mut location = append_query(&params.redirect_uri, &pairs);
     if let Some(s) = &params.state {
         location = append_query(&location, &[("state", s)]);

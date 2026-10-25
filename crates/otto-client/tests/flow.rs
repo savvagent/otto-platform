@@ -49,6 +49,8 @@ struct Server {
     max_resources: Option<usize>,
     /// Resources the person leaves out on a multi-resource consent screen.
     decline: Vec<String>,
+    /// Resources kept but granted nothing, named as `refused_resource`.
+    refuse: Vec<String>,
     /// The `resource` values of each authorize request, in order.
     resource_lists: Vec<Vec<String>>,
 }
@@ -150,6 +152,12 @@ async fn authorize(State(s): State<Shared>, RawQuery(raw): RawQuery) -> Redirect
     } else {
         for resource in &resources {
             if s.decline.contains(resource) {
+                continue;
+            }
+            if s.refuse.contains(resource) {
+                let encoded: String =
+                    url::form_urlencoded::byte_serialize(resource.as_bytes()).collect();
+                redirect.push_str(&format!("refused_resource={encoded}&"));
                 continue;
             }
             s.minted += 1;
@@ -863,4 +871,25 @@ async fn one_undiscoverable_resource_does_not_stop_the_others() {
     );
     assert!(matches!(results[2].1, Ok(LoginOutcome::SignedIn)));
     assert_eq!(server.lock().unwrap().authorizes.len(), 1);
+}
+
+/// Kept on the consent screen but granted nothing is a failure, not a choice.
+#[tokio::test]
+async fn a_resource_the_server_refused_is_a_failure_not_declined() {
+    let (server, mcp, other) = spawn().await;
+    {
+        let mut s = server.lock().unwrap();
+        s.max_resources = Some(10);
+        s.refuse = vec![other.clone()];
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let c = client(dir.path(), Box::new(FakeBrowser));
+    let results = c
+        .login_all(&requests(&[(&mcp, &[]), (&other, &[])]), false)
+        .await;
+    assert!(matches!(results[0].1, Ok(LoginOutcome::SignedIn)));
+    match &results[1].1 {
+        Err(Error::Authorization(m)) => assert!(m.contains("could be granted"), "{m}"),
+        other => panic!("{other:?}"),
+    }
 }

@@ -78,7 +78,13 @@ One consent screen for several resources is an otto extension of RFC 8707: the
 authorization server advertises `otto_authorize_resources_max` in its metadata,
 accepts that many `resource` values on `/oauth/authorize`, and answers with a
 `code` and its `resource` for each one you kept. Each code is an ordinary
-single-resource code, so each token still has exactly one audience. Against a
+single-resource code, so each token still has exactly one audience. The request
+has one `scope` parameter, and each resource is asked for the requested scopes
+it defines, so a scope name two resources share (such as `org:admin`) is asked
+of both; the consent screen shows it under each, and you can untick it under
+either. A resource you kept but whose every scope you may not grant (only
+`org:admin`, as a member) is named in the callback as `refused_resource`, and
+`ottoctl` reports it as a failure. Against a
 server that does not advertise it, `ottoctl` signs in to each resource in turn,
 one consent screen each.
 

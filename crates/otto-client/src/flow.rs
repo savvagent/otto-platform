@@ -229,7 +229,21 @@ async fn login_together(
             .iter()
             .find(|(_, r)| r.as_deref() == Some(resource.as_str()))
             .map(|(code, _)| code.as_str());
+        let returned_other = browser
+            .codes
+            .iter()
+            .any(|(_, r)| r.as_deref().is_some_and(|r| !resources.contains(&r)));
         let result = match code {
+            None if browser.refused.contains(resource) => Err(Error::Authorization(
+                "you kept it on the consent screen, but nothing it asked for could be granted \
+                 to you (org:admin, for example, needs an owner or admin of the organization)"
+                    .into(),
+            )),
+            // A code came back for a URI this request did not name, so this
+            // one may have been renamed: say so rather than call it declined.
+            None if returned_other => Err(Error::Authorization(
+                "the server answered for a different resource URI; it may have been renamed".into(),
+            )),
             None => Ok(LoginOutcome::Declined),
             Some(code) => exchange(
                 http, store, meta, &client_id, &browser, code, resource, scopes,
@@ -279,6 +293,9 @@ struct BrowserResult {
     /// `(code, resource)`: the resource is named only when the request named
     /// several.
     codes: Vec<(String, Option<String>)>,
+    /// Resources the person kept that the server could grant nothing for
+    /// (`refused_resource`; for example only `org:admin`, asked of a member).
+    refused: Vec<String>,
 }
 
 /// Open the browser on an authorization request for `resources` and wait for
@@ -324,7 +341,7 @@ async fn browser_flow(
     // A failure to launch a browser is not fatal: the URL is printed above.
     let _ = opener.open(&authorize);
 
-    let codes = tokio::time::timeout(CALLBACK_TIMEOUT, wait_for_code(&listener, &state))
+    let (codes, refused) = tokio::time::timeout(CALLBACK_TIMEOUT, wait_for_code(&listener, &state))
         .await
         .map_err(|_| {
             Error::Authorization(
@@ -337,6 +354,7 @@ async fn browser_flow(
         redirect_uri,
         verifier: pkce.verifier,
         codes,
+        refused,
     })
 }
 
@@ -445,8 +463,8 @@ fn grant_from(
 }
 
 enum Callback {
-    /// `(code, resource)` pairs; see [`BrowserResult::codes`].
-    Codes(Vec<(String, Option<String>)>),
+    /// `(code, resource)` pairs and refused resources; see [`BrowserResult`].
+    Codes(Vec<(String, Option<String>)>, Vec<String>),
     Denied(String),
 }
 
@@ -458,7 +476,7 @@ enum Callback {
 async fn wait_for_code(
     listener: &TcpListener,
     state: &str,
-) -> Result<Vec<(String, Option<String>)>> {
+) -> Result<(Vec<(String, Option<String>)>, Vec<String>)> {
     let (tx, mut rx) = mpsc::channel::<Callback>(1);
     loop {
         tokio::select! {
@@ -487,7 +505,7 @@ async fn wait_for_code(
             // `tx` is held here, so the channel never closes while looping.
             Some(callback) = rx.recv() => {
                 return match callback {
-                    Callback::Codes(codes) => Ok(codes),
+                    Callback::Codes(codes, refused) => Ok((codes, refused)),
                     Callback::Denied(message) => Err(Error::Authorization(message)),
                 };
             }
@@ -562,7 +580,9 @@ async fn handle_connection(mut sock: TcpStream, state: &str, tx: &mpsc::Sender<C
         "Signed in. You can close this tab and return to the terminal.",
     )
     .await;
-    let _ = tx.send(Callback::Codes(paired)).await;
+    let _ = tx
+        .send(Callback::Codes(paired, all("refused_resource")))
+        .await;
 }
 
 async fn read_request_target(sock: &mut TcpStream) -> Option<String> {

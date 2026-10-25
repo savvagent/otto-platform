@@ -499,4 +499,8 @@ async fn a_member_loses_org_admin_on_each_resource(pool: PgPool) {
         [OTHER_RESOURCE],
         "Things asked only for org:admin, which a member cannot grant"
     );
+    assert!(
+        callback_pairs(&location(&granted)).contains(&("refused_resource".into(), RESOURCE.into())),
+        "a resource kept but granted nothing is named, so it is not taken for one left out"
+    );
 }
