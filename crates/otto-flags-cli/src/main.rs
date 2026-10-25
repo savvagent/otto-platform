@@ -184,6 +184,19 @@ async fn run(command: Command, resource: &str) -> Result<(), String> {
 
     let client = Client::with_defaults().map_err(|e| e.to_string())?;
     let scopes = SCOPES.map(String::from);
+    // Stop here rather than let the call open a browser the person was not
+    // told about.
+    let missing = client
+        .missing_scopes(resource, &scopes)
+        .map_err(|e| e.to_string())?;
+    if !missing.is_empty() {
+        return Err(format!(
+            "the cached sign-in for {resource} lacks {}. Nothing was changed and no browser was \
+             opened. Issuing keys needs the apps:admin and keys:issue scopes; grant them with: \
+             ottoctl login --resource {resource} --scope apps:admin --scope keys:issue --force",
+            missing.join(", ")
+        ));
+    }
     let out = client
         .call_tool(resource, &scopes, tool, arguments, &[SERVER_KEY])
         .await

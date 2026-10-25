@@ -98,6 +98,23 @@ pub(crate) async fn login(
     }
 
     let meta = discovery::discover(http, resource).await?;
+    // Asked for here, the server's refusal is a sentence; asked for in the
+    // browser, it is an error page the terminal never hears about.
+    if !meta.server_scopes.is_empty() {
+        let unoffered: Vec<String> = scopes
+            .iter()
+            .filter(|s| !meta.server_scopes.contains(s))
+            .cloned()
+            .collect();
+        if !unoffered.is_empty() {
+            return Err(Error::ScopeNotOffered {
+                resource: resource.to_owned(),
+                issuer: meta.issuer,
+                scopes: unoffered,
+                offered: meta.server_scopes,
+            });
+        }
+    }
     let client_id = client_id(http, store, &meta).await?;
 
     // Port 0: the OS picks a free one. otto-auth ignores the port of a
