@@ -62,10 +62,11 @@ primary_region = "iad"
   internal_port = 8080
   force_https = true
   auto_start_machines = true
-  # Nothing depends on this service yet, so let it stop when idle. Revisit in
-  # Phase 4, when every otto-* service's logins and token checks go through it.
-  auto_stop_machines = "stop"
-  min_machines_running = 0
+  # Every otto-* service's logins and token checks go through this app, and
+  # `fly ssh console` (used to run `resource register`) fails against a stopped
+  # machine, so it never stops. One machine for now; see `fly scale count`.
+  auto_stop_machines = "off"
+  min_machines_running = 1
   processes = ["app"]
 
   [[http_service.checks]]
