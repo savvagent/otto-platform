@@ -683,3 +683,21 @@ async fn a_bare_login_asks_for_the_resources_scopes_but_not_issue_scopes() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn offered_scopes_from_the_server_are_cleaned_and_capped() {
+    let (server, resource, _) = spawn().await;
+    let mut offered = vec!["evil\u{1b}[31m\u{7}red".to_owned()];
+    offered.extend((0..50).map(|i| format!("scope{i}")));
+    server.lock().unwrap().server_scopes = Some(offered);
+    let dir = tempfile::tempdir().unwrap();
+    let err = client(dir.path(), Box::new(NoBrowser))
+        .login(&resource, &["keys:issue".to_owned()], false)
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(!message.chars().any(char::is_control), "{message:?}");
+    assert!(message.contains("evil[31mred"), "{message}");
+    assert!(message.contains("scope18"), "{message}");
+    assert!(!message.contains("scope19"), "{message}");
+}
