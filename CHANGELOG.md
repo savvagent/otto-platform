@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.14.0](https://github.com/savvagent/otto-platform/compare/v0.13.2...v0.14.0) (2026-10-25)
+
+
+### Features
+
+* **ottoctl:** sign in to every otto resource with a bare login ([#122](https://github.com/savvagent/otto-platform/issues/122)) ([c9df35a](https://github.com/savvagent/otto-platform/commit/c9df35a580b7fddf7485182dc34d71b03556c040)), closes [#119](https://github.com/savvagent/otto-platform/issues/119)
+
+
+### Bug Fixes
+
+* **ottoctl:** don't panic when the reader of help output goes away ([#123](https://github.com/savvagent/otto-platform/issues/123)) ([e41d91e](https://github.com/savvagent/otto-platform/commit/e41d91ee4a38eb0e0315b5515c00e88f9885bb8c)), closes [#119](https://github.com/savvagent/otto-platform/issues/119)
+
 ## [0.13.2](https://github.com/savvagent/otto-platform/compare/v0.13.1...v0.13.2) (2026-10-25)
 
 
