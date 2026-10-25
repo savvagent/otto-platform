@@ -147,3 +147,17 @@ fn the_app_replaces_otto_so_a_signal_reaches_the_caller_as_the_apps() {
     // exec'd, so the process the caller waits on is the one that was killed.
     assert_eq!(out.status.signal(), Some(15));
 }
+
+/// A reader that stops early (`ottoctl help | grep -q login`) is not a crash.
+#[test]
+fn help_survives_a_closed_pipe() {
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = ottoctl(dir.path())
+        .arg("help")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+}

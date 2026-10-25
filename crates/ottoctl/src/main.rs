@@ -8,6 +8,7 @@
 //! Each app ships its own verbs without changing this binary; it links
 //! `otto-client` to get a token for its own resource.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -51,7 +52,9 @@ async fn main() -> ExitCode {
     let rest: Vec<String> = args.collect();
     match cmd.as_str() {
         "help" | "-h" | "--help" => {
-            println!("{USAGE}");
+            // Not `println!`, which panics when the reader has gone, as
+            // `ottoctl help | grep -q login` does once it has its match.
+            let _ = writeln!(std::io::stdout(), "{USAGE}");
             ExitCode::SUCCESS
         }
         "login" => login(&rest).await,
