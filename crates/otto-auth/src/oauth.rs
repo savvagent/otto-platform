@@ -455,6 +455,98 @@ impl Authorization {
 /// with [`AuthError::InvalidScope`], so an [`Authorization`] never carries an
 /// empty list.
 pub async fn validate_authorize(db: &Db, req: &AuthorizeRequest) -> Result<Authorization> {
+    let client = validate_client(db, req).await?;
+
+    // RFC 8707: the client must say which resource the token is for, and it
+    // must be one we issue tokens for. Without this the AS would happily mint
+    // tokens audienced for somewhere else.
+    let resource = resources::resolve_active(db, &req.resource).await?;
+    let scopes = resource.grant_scopes(&req.scopes)?;
+    // A non-empty request either fails above or resolves to something, so
+    // empty here means nothing was asked for and there are no defaults to
+    // fall back on. Refused now, so no consent page renders with nothing on
+    // it and nothing downstream has to guess why the list is empty.
+    if scopes.is_empty() {
+        return Err(resource.no_scope_requested());
+    }
+    Ok(Authorization {
+        client,
+        resource,
+        scopes,
+    })
+}
+
+/// The most resources one authorization request may name.
+pub const MAX_RESOURCES_PER_REQUEST: usize = 10;
+
+/// Validate a request that names several resources (RFC 8707 section 2.1), for
+/// one consent screen that issues one code per resource.
+///
+/// `req.resource` is ignored; `resources` are the request's `resource`
+/// values. The client, redirect URI and PKCE checks are
+/// [`validate_authorize`]'s, in the same order. Then every resource is
+/// resolved, and each gets the requested scopes it defines, or its defaults
+/// when the request named none of them. All or nothing: an unknown or
+/// disabled resource, the same resource twice, a resource left with no scope,
+/// or a requested scope that no named resource defines refuses the whole
+/// request, so no consent page shows part of what was asked for.
+pub async fn validate_authorize_many(
+    db: &Db,
+    req: &AuthorizeRequest,
+    resources: &[String],
+) -> Result<Vec<Authorization>> {
+    let client = validate_client(db, req).await?;
+    if resources.is_empty() || resources.len() > MAX_RESOURCES_PER_REQUEST {
+        return Err(AuthError::InvalidRequest(format!(
+            "an authorization request names 1 to {MAX_RESOURCES_PER_REQUEST} resources"
+        )));
+    }
+    let mut out: Vec<Authorization> = Vec::with_capacity(resources.len());
+    for uri in resources {
+        let resource = resources::resolve_active(db, uri).await?;
+        // Compared canonical to canonical, so an alias and its server are
+        // the same resource.
+        if out
+            .iter()
+            .any(|a| a.resource.resource_uri == resource.resource_uri)
+        {
+            return Err(AuthError::InvalidRequest(format!(
+                "{} is named more than once",
+                resource.resource_uri
+            )));
+        }
+        let wanted: Vec<String> = req
+            .scopes
+            .iter()
+            .filter(|s| resource.scopes.contains(s))
+            .cloned()
+            .collect();
+        let scopes = resource.grant_scopes(&wanted)?;
+        if scopes.is_empty() {
+            return Err(resource.no_scope_requested());
+        }
+        out.push(Authorization {
+            client: client.clone(),
+            resource,
+            scopes,
+        });
+    }
+    if let Some(stray) = req
+        .scopes
+        .iter()
+        .find(|s| !out.iter().any(|a| a.resource.scopes.contains(s)))
+    {
+        return Err(AuthError::InvalidScope(format!(
+            "{stray:?} is not a scope of any requested resource"
+        )));
+    }
+    Ok(out)
+}
+
+/// The client, redirect URI and PKCE checks every authorization request
+/// passes, in the order that keeps errors from being redirected to an
+/// unvalidated destination (see [`validate_authorize`]).
+async fn validate_client(db: &Db, req: &AuthorizeRequest) -> Result<Client> {
     let client = get_client(db, &req.client_id).await?;
     if client.disabled {
         return Err(AuthError::InvalidClient("client is disabled".into()));
@@ -482,24 +574,7 @@ pub async fn validate_authorize(db: &Db, req: &AuthorizeRequest) -> Result<Autho
             "code_challenge is missing or too short".into(),
         ));
     }
-
-    // RFC 8707: the client must say which resource the token is for, and it
-    // must be one we issue tokens for. Without this the AS would happily mint
-    // tokens audienced for somewhere else.
-    let resource = resources::resolve_active(db, &req.resource).await?;
-    let scopes = resource.grant_scopes(&req.scopes)?;
-    // A non-empty request either fails above or resolves to something, so
-    // empty here means nothing was asked for and there are no defaults to
-    // fall back on. Refused now, so no consent page renders with nothing on
-    // it and nothing downstream has to guess why the list is empty.
-    if scopes.is_empty() {
-        return Err(resource.no_scope_requested());
-    }
-    Ok(Authorization {
-        client,
-        resource,
-        scopes,
-    })
+    Ok(client)
 }
 
 /// Issue an authorization code after the user consents.
@@ -522,48 +597,90 @@ pub async fn issue_authorization_code(
     user: UserId,
     org: OrgId,
 ) -> Result<String> {
-    // Defaults are `validate_authorize`'s to resolve, once, before consent.
-    // Here an empty list could only mean "nothing was granted", and
-    // `grant_scopes` would read it as "the defaults" and widen it.
-    if req.scopes.is_empty() {
-        return Err(AuthError::InvalidScope(
-            "an authorization code needs at least one granted scope".into(),
-        ));
-    }
-    let resource = resources::resolve_active(db, &req.resource).await?;
-    let scopes = resource.grant_scopes(&req.scopes)?;
-    let code = crypto::generate(prefix::AUTH_CODE);
+    let grant = [(req.resource.clone(), req.scopes.clone())];
+    let mut codes = issue_authorization_codes(db, req, &grant, user, org).await?;
+    Ok(codes.remove(0))
+}
 
-    // The org live and the user a member, held until the insert commits, so a
+/// Issue one authorization code per `(resource, scopes)` in `grants`, for a
+/// request that named several resources ([`validate_authorize_many`]).
+///
+/// Each code is an ordinary single-resource code, bound and redeemed exactly
+/// as one from [`issue_authorization_code`]: a code issued for one resource
+/// cannot be redeemed for another. `req.resource` and `req.scopes` are
+/// ignored; the rest of `req` (client, redirect URI, PKCE challenge) binds
+/// every code. All the codes are issued in one transaction, or none is: a
+/// grant with no scope, an unknown or disabled resource, or the same resource
+/// twice refuses the lot. Returned in `grants` order.
+pub async fn issue_authorization_codes(
+    db: &Db,
+    req: &AuthorizeRequest,
+    grants: &[(String, Vec<String>)],
+    user: UserId,
+    org: OrgId,
+) -> Result<Vec<String>> {
+    if grants.is_empty() || grants.len() > MAX_RESOURCES_PER_REQUEST {
+        return Err(AuthError::InvalidRequest(format!(
+            "an authorization request names 1 to {MAX_RESOURCES_PER_REQUEST} resources"
+        )));
+    }
+    // Resolved before the transaction: what each code will hold.
+    let mut resolved: Vec<(String, Vec<String>)> = Vec::with_capacity(grants.len());
+    for (uri, scopes) in grants {
+        // Defaults are `validate_authorize`'s to resolve, once, before
+        // consent. Here an empty list could only mean "nothing was granted",
+        // and `grant_scopes` would read it as "the defaults" and widen it.
+        if scopes.is_empty() {
+            return Err(AuthError::InvalidScope(
+                "an authorization code needs at least one granted scope".into(),
+            ));
+        }
+        let resource = resources::resolve_active(db, uri).await?;
+        if resolved.iter().any(|(r, _)| *r == resource.resource_uri) {
+            return Err(AuthError::InvalidRequest(format!(
+                "{} is named more than once",
+                resource.resource_uri
+            )));
+        }
+        let scopes = resource.grant_scopes(scopes)?;
+        resolved.push((resource.resource_uri, scopes));
+    }
+
+    // The org live and the user a member, held until the inserts commit, so a
     // member removal or org deletion serializes with the issuance and
-    // consumes the code if it started later (`tokens::lock_live_member_shared`).
+    // consumes the codes if it started later (`tokens::lock_live_member_shared`).
     let mut tx = db.begin_unpinned().await?;
     sqlx::query(tokens::MINT_LOCK_TIMEOUT)
         .execute(tx.conn())
         .await?;
     tokens::lock_live_member_shared(tx.conn(), user, org).await?;
 
-    sqlx::query(
-        "INSERT INTO authorization_codes \
-           (code_hash, client_id, user_id, org_id, redirect_uri, code_challenge, \
-            code_challenge_method, scopes, resource, expires_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now() + make_interval(secs => $10))",
-    )
-    .bind(&code.hash)
-    .bind(&req.client_id)
-    .bind(user)
-    .bind(org)
-    .bind(&req.redirect_uri)
-    .bind(&req.code_challenge)
-    .bind(&req.code_challenge_method)
-    .bind(&scopes)
-    .bind(&resource.resource_uri)
-    .bind(AUTH_CODE_TTL_SECONDS as f64)
-    .execute(tx.conn())
-    .await?;
+    let mut codes = Vec::with_capacity(resolved.len());
+    for (resource_uri, scopes) in &resolved {
+        let code = crypto::generate(prefix::AUTH_CODE);
+        sqlx::query(
+            "INSERT INTO authorization_codes \
+               (code_hash, client_id, user_id, org_id, redirect_uri, code_challenge, \
+                code_challenge_method, scopes, resource, expires_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now() + make_interval(secs => $10))",
+        )
+        .bind(&code.hash)
+        .bind(&req.client_id)
+        .bind(user)
+        .bind(org)
+        .bind(&req.redirect_uri)
+        .bind(&req.code_challenge)
+        .bind(&req.code_challenge_method)
+        .bind(scopes)
+        .bind(resource_uri)
+        .bind(AUTH_CODE_TTL_SECONDS as f64)
+        .execute(tx.conn())
+        .await?;
+        codes.push(code.into_plaintext());
+    }
     tx.commit().await?;
 
-    Ok(code.into_plaintext())
+    Ok(codes)
 }
 
 /// A claimed row from `authorization_codes`.
@@ -769,6 +886,12 @@ pub fn as_metadata(public_url: &str, scopes_supported: &[String]) -> serde_json:
         "token_endpoint_auth_methods_supported": ["none"],
         // RFC 8707. Advertised so clients know to send `resource`.
         "resource_indicators_supported": true,
+        // An otto extension: `/oauth/authorize` takes up to this many
+        // `resource` values, shows one consent screen, and answers with a
+        // `code` and its `resource` for each one the person kept (see
+        // `validate_authorize_many`). A client that does not read this sends
+        // one `resource`, as before.
+        "otto_authorize_resources_max": MAX_RESOURCES_PER_REQUEST,
     })
 }
 

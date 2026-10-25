@@ -6,9 +6,9 @@
 //! to ask for `things:read things:write` after the page showed `things:read`
 //! re-validates fine. The seal closes that gap. It carries what the server
 //! resolved at render time (client, the redirect URI `validate_authorize`
-//! accepted, the resolved resource URI, the signed-in user, the resolved
-//! scopes, the PKCE `code_challenge` and its method, the client's `state`,
-//! and an expiry). The POST must match it, field for field, before any
+//! accepted, each resolved resource URI with its resolved scopes, in order,
+//! the signed-in user, the PKCE `code_challenge` and its method, the client's
+//! `state`, and an expiry). A request for one resource seals a list of one. The POST must match it, field for field, before any
 //! branch, `deny` included.
 //!
 //! **The key.** The seal is AES-256-GCM under a subkey dedicated to it,
@@ -36,13 +36,15 @@ use sha2::{Digest, Sha256};
 /// Changing it invalidates every page currently open.
 pub(crate) const KEY_LABEL: &str = "otto-web/consent-request-seal";
 /// The seal's format version. Bump it on any change to [`RequestSeal`].
-pub(crate) const SEAL_VERSION: u8 = 2;
+pub(crate) const SEAL_VERSION: u8 = 3;
 /// How long a rendered consent page stays submittable.
 pub(crate) const SEAL_TTL_SECONDS: i64 = 600;
 const NONCE_LEN: usize = 12;
-/// Longest encoded seal accepted. A real one is a few hundred characters; the
-/// cap keeps a forged multi-megabyte field from reaching the decoder at all.
-const MAX_ENCODED_LEN: usize = 4096;
+/// Longest encoded seal accepted. A real one is a few hundred characters per
+/// resource, and a request names at most
+/// [`otto_auth::oauth::MAX_RESOURCES_PER_REQUEST`]; the cap keeps a forged
+/// multi-megabyte field from reaching the decoder at all.
+const MAX_ENCODED_LEN: usize = 16 * 1024;
 
 /// What the consent page was rendered for.
 ///
@@ -58,12 +60,9 @@ pub(crate) struct RequestSeal {
     pub(crate) client_id: String,
     /// The exact string `validate_authorize` accepted.
     pub(crate) redirect_uri: String,
-    /// The resolved RFC 8707 resource URI, not the client's raw parameter.
-    pub(crate) resource: String,
+    /// One entry per resource the page offered, in page order.
+    pub(crate) grants: Vec<SealedGrant>,
     pub(crate) user_id: UserId,
-    /// `Authorization::scopes`: what the client requested, or the resource
-    /// server's defaults when it requested nothing.
-    pub(crate) scopes: Vec<String>,
     /// Digest of the PKCE challenge the code will be bound to.
     pub(crate) code_challenge: String,
     pub(crate) code_challenge_method: String,
@@ -74,15 +73,25 @@ pub(crate) struct RequestSeal {
     pub(crate) exp: i64,
 }
 
+/// One resource a page offered, and the scopes it offered for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SealedGrant {
+    /// The resolved RFC 8707 resource URI, not the client's raw parameter.
+    pub(crate) resource: String,
+    /// `Authorization::scopes`: what the client requested, or the resource
+    /// server's defaults when it requested nothing.
+    pub(crate) scopes: Vec<String>,
+}
+
 /// A resolved, validated request: what a page is sealed for, and what a
 /// consent POST must match.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Expected<'a> {
     pub(crate) client_id: &'a str,
     pub(crate) redirect_uri: &'a str,
-    pub(crate) resource: &'a str,
+    /// `(resource, scopes)` for each resource, in page order.
+    pub(crate) grants: Vec<(&'a str, &'a [String])>,
     pub(crate) user_id: UserId,
-    pub(crate) scopes: &'a [String],
     pub(crate) code_challenge: &'a str,
     pub(crate) code_challenge_method: &'a str,
     pub(crate) state: Option<&'a str>,
@@ -135,9 +144,15 @@ impl RequestSeal {
             v: SEAL_VERSION,
             client_id: request.client_id.to_string(),
             redirect_uri: request.redirect_uri.to_string(),
-            resource: request.resource.to_string(),
+            grants: request
+                .grants
+                .iter()
+                .map(|(resource, scopes)| SealedGrant {
+                    resource: resource.to_string(),
+                    scopes: scopes.to_vec(),
+                })
+                .collect(),
             user_id: request.user_id,
-            scopes: request.scopes.to_vec(),
             code_challenge: digest(request.code_challenge),
             code_challenge_method: request.code_challenge_method.to_string(),
             state: normalize_state(request.state).map(digest),
@@ -192,13 +207,24 @@ impl RequestSeal {
         if self.redirect_uri != expected.redirect_uri {
             return Err(SealError::Mismatch("redirect_uri"));
         }
-        if self.resource != expected.resource {
+        if self.grants.len() != expected.grants.len()
+            || self
+                .grants
+                .iter()
+                .zip(&expected.grants)
+                .any(|(sealed, (resource, _))| sealed.resource != *resource)
+        {
             return Err(SealError::Mismatch("resource"));
         }
         if self.user_id != expected.user_id {
             return Err(SealError::Mismatch("user_id"));
         }
-        if as_set(&self.scopes) != as_set(expected.scopes) {
+        if self
+            .grants
+            .iter()
+            .zip(&expected.grants)
+            .any(|(sealed, (_, scopes))| as_set(&sealed.scopes) != as_set(scopes))
+        {
             return Err(SealError::Mismatch("scopes"));
         }
         if self.code_challenge != digest(expected.code_challenge) {
@@ -268,9 +294,8 @@ mod tests {
             Expected {
                 client_id: "otto_client_a",
                 redirect_uri: "http://127.0.0.1:1455/callback",
-                resource: "https://things.otto.test/mcp",
+                grants: vec![("https://things.otto.test/mcp", &self.scopes[..])],
                 user_id: self.user,
-                scopes: &self.scopes,
                 code_challenge: CHALLENGE,
                 code_challenge_method: "S256",
                 state: Some("opaque-state"),
@@ -411,7 +436,24 @@ mod tests {
             (
                 "resource",
                 Expected {
-                    resource: "https://widgets.otto.test/mcp",
+                    grants: vec![("https://widgets.otto.test/mcp", &f.scopes[..])],
+                    ..f.expected()
+                },
+            ),
+            (
+                "resource",
+                Expected {
+                    grants: vec![
+                        ("https://things.otto.test/mcp", &f.scopes[..]),
+                        ("https://widgets.otto.test/mcp", &f.scopes[..]),
+                    ],
+                    ..f.expected()
+                },
+            ),
+            (
+                "resource",
+                Expected {
+                    grants: vec![],
                     ..f.expected()
                 },
             ),
@@ -425,14 +467,14 @@ mod tests {
             (
                 "scopes",
                 Expected {
-                    scopes: &wider,
+                    grants: vec![("https://things.otto.test/mcp", &wider[..])],
                     ..f.expected()
                 },
             ),
             (
                 "scopes",
                 Expected {
-                    scopes: &narrower,
+                    grants: vec![("https://things.otto.test/mcp", &narrower[..])],
                     ..f.expected()
                 },
             ),
@@ -532,7 +574,7 @@ mod tests {
             &c,
             Some(&sealed),
             &Expected {
-                scopes: &reordered,
+                grants: vec![("https://things.otto.test/mcp", &reordered[..])],
                 ..f.expected()
             },
             now,
@@ -569,7 +611,7 @@ mod tests {
                 Some(&sealed),
                 &Expected {
                     state: Some(&other),
-                    ..expected
+                    ..expected.clone()
                 },
                 now
             ),
@@ -582,11 +624,52 @@ mod tests {
                 Some(&sealed),
                 &Expected {
                     code_challenge: &other,
-                    ..expected
+                    ..expected.clone()
                 },
                 now
             ),
             Err(SealError::Mismatch("code_challenge"))
+        );
+    }
+
+    /// Several resources: each keeps its own scopes, and the order is bound.
+    #[test]
+    fn several_resources_bind_each_ones_scopes_and_their_order() {
+        let f = Fixture::new();
+        let c = cipher(7);
+        let now = Utc::now();
+        let widgets = scopes(&["widgets:read"]);
+        let expected = Expected {
+            grants: vec![
+                ("https://things.otto.test/mcp", &f.scopes[..]),
+                ("https://widgets.otto.test/mcp", &widgets[..]),
+            ],
+            ..f.expected()
+        };
+        let sealed = RequestSeal::new(&expected, now).seal(&c).unwrap();
+        check(&c, Some(&sealed), &expected, now).unwrap();
+        // The scopes moved to the other resource.
+        let swapped = Expected {
+            grants: vec![
+                ("https://things.otto.test/mcp", &widgets[..]),
+                ("https://widgets.otto.test/mcp", &f.scopes[..]),
+            ],
+            ..expected.clone()
+        };
+        assert_eq!(
+            check(&c, Some(&sealed), &swapped, now),
+            Err(SealError::Mismatch("scopes"))
+        );
+        let reordered = Expected {
+            grants: vec![
+                ("https://widgets.otto.test/mcp", &widgets[..]),
+                ("https://things.otto.test/mcp", &f.scopes[..]),
+            ],
+            ..expected.clone()
+        };
+        assert_eq!(
+            check(&c, Some(&sealed), &reordered, now),
+            Err(SealError::Mismatch("resource"))
         );
     }
 

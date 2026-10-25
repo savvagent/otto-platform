@@ -17,6 +17,10 @@ pub struct Discovered {
     pub server_scopes: Vec<String>,
     /// What the resource says it supports (RFC 9728). Empty if it does not say.
     pub resource_scopes: Vec<String>,
+    /// How many resources one authorization request may name: the server's
+    /// `otto_authorize_resources_max`, an otto extension, or 1 if it does not
+    /// say.
+    pub max_resources: usize,
 }
 
 #[derive(Deserialize)]
@@ -36,6 +40,8 @@ struct ServerMeta {
     registration_endpoint: Option<String>,
     #[serde(default)]
     scopes_supported: Vec<String>,
+    #[serde(default)]
+    otto_authorize_resources_max: Option<usize>,
 }
 
 /// Credentials cross the wire to these URLs, so they must be https. Plain http
@@ -103,6 +109,7 @@ pub async fn discover(http: &reqwest::Client, resource: &str) -> Result<Discover
         token_endpoint: endpoint("token_endpoint", &server.token_endpoint)?,
         registration_endpoint: endpoint("registration_endpoint", &registration)?,
         server_scopes: server.scopes_supported,
+        max_resources: server.otto_authorize_resources_max.unwrap_or(1),
         resource_scopes,
     })
 }

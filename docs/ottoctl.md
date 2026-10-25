@@ -58,9 +58,10 @@ From source, with Rust 1.89 or later:
     ottoctl login [--force]
     ottoctl login --resource <uri> [--scope <scope>]... [--force]
 
-With no `--resource`, `ottoctl` signs in to each otto resource in turn, one
-browser consent each, and reuses your browser session at the authorization
-server:
+With no `--resource`, `ottoctl` signs in to every otto resource with one
+browser consent screen. The screen lists each resource with its scopes. Untick
+a resource to leave it out: it gets no access, and `ottoctl` reports it as left
+out rather than as a failure. The resources are:
 
 - `https://otto-tower.savvagent.com/mcp`
 - `https://otto-flags.savvagent.com/mcp`
@@ -72,6 +73,14 @@ decides what is granted. A resource that already has a usable grant covering
 those scopes opens no browser. If one resource fails, the grants for the others
 are kept, the failure is named, and the exit status is non-zero. `--scope` goes
 with `--resource`, since scopes belong to one resource server.
+
+One consent screen for several resources is an otto extension of RFC 8707: the
+authorization server advertises `otto_authorize_resources_max` in its metadata,
+accepts that many `resource` values on `/oauth/authorize`, and answers with a
+`code` and its `resource` for each one you kept. Each code is an ordinary
+single-resource code, so each token still has exactly one audience. Against a
+server that does not advertise it, `ottoctl` signs in to each resource in turn,
+one consent screen each.
 
 If you ask for a scope the authorization server does not offer, `ottoctl` says
 so and lists what it does offer, instead of opening a consent page that shows

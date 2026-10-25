@@ -109,15 +109,22 @@ async fn login(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    // One resource failing keeps the grants already obtained.
+    // One consent screen for all of them where the server offers it. One
+    // resource failing keeps the grants already obtained.
     let mut failed = Vec::new();
+    let mut requests = Vec::new();
     for resource in RESOURCES {
-        let result = match client.requestable_scopes(resource).await {
-            Ok(wanted) => client.login(resource, &wanted, force).await,
-            Err(e) => Err(e),
-        };
+        match client.requestable_scopes(resource).await {
+            Ok(wanted) => requests.push((resource.to_owned(), wanted)),
+            Err(e) => {
+                eprintln!("ottoctl: {resource}: {e}");
+                failed.push(resource.to_owned());
+            }
+        }
+    }
+    for (resource, result) in client.login_all(&requests, force).await {
         match result {
-            Ok(outcome) => report(resource, outcome),
+            Ok(outcome) => report(&resource, outcome),
             Err(e) => {
                 eprintln!("ottoctl: {resource}: {e}");
                 failed.push(resource);
@@ -143,6 +150,10 @@ fn report(resource: &str, outcome: LoginOutcome) {
             eprintln!("Already signed in to {resource}. Use --force to sign in again.");
         }
         LoginOutcome::SignedIn => eprintln!("Signed in to {resource}."),
+        // The person's choice, not a failure.
+        LoginOutcome::Declined => {
+            eprintln!("Not signed in to {resource}: you left it out on the consent screen.");
+        }
     }
 }
 

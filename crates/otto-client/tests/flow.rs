@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::{Query, State};
+use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
@@ -45,6 +45,12 @@ struct Server {
     server_scopes: Option<Vec<String>>,
     /// The first resource's `scopes_supported`, when it says.
     resource_scopes: Option<Vec<String>>,
+    /// `otto_authorize_resources_max`, when the server says.
+    max_resources: Option<usize>,
+    /// Resources the person leaves out on a multi-resource consent screen.
+    decline: Vec<String>,
+    /// The `resource` values of each authorize request, in order.
+    resource_lists: Vec<Vec<String>>,
 }
 
 type Shared = Arc<Mutex<Server>>;
@@ -99,6 +105,9 @@ async fn server_meta(State(s): State<Shared>) -> Json<serde_json::Value> {
     if let Some(scopes) = &s.server_scopes {
         meta["scopes_supported"] = scopes.clone().into();
     }
+    if let Some(max) = s.max_resources {
+        meta["otto_authorize_resources_max"] = max.into();
+    }
     Json(meta)
 }
 
@@ -114,16 +123,48 @@ async fn register(
     )
 }
 
-async fn authorize(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Redirect {
+/// One code, or for a request naming several resources one `code` and its
+/// `resource` per resource not in `decline`, as otto-auth answers.
+async fn authorize(State(s): State<Shared>, RawQuery(raw): RawQuery) -> Redirect {
+    let raw = raw.unwrap_or_default();
+    let pairs: Vec<(String, String)> = url::form_urlencoded::parse(raw.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let resources: Vec<String> = pairs
+        .iter()
+        .filter(|(k, _)| k == "resource")
+        .map(|(_, v)| v.clone())
+        .collect();
+    let q: HashMap<String, String> = pairs.into_iter().collect();
     let mut s = s.lock().unwrap();
-    s.minted += 1;
-    let code = format!("code-{}", s.minted);
     let scope = q.get("scope").cloned().unwrap_or_else(|| "mcp".into());
-    s.codes.insert(
-        code.clone(),
-        (q["code_challenge"].clone(), q["resource"].clone(), scope),
-    );
-    let redirect = format!("{}?code={code}&state={}", q["redirect_uri"], q["state"]);
+    let mut redirect = format!("{}?", q["redirect_uri"]);
+    if resources.len() == 1 {
+        s.minted += 1;
+        let code = format!("code-{}", s.minted);
+        s.codes.insert(
+            code.clone(),
+            (q["code_challenge"].clone(), resources[0].clone(), scope),
+        );
+        redirect.push_str(&format!("code={code}&"));
+    } else {
+        for resource in &resources {
+            if s.decline.contains(resource) {
+                continue;
+            }
+            s.minted += 1;
+            let code = format!("code-{}", s.minted);
+            s.codes.insert(
+                code.clone(),
+                (q["code_challenge"].clone(), resource.clone(), scope.clone()),
+            );
+            let encoded: String =
+                url::form_urlencoded::byte_serialize(resource.as_bytes()).collect();
+            redirect.push_str(&format!("code={code}&resource={encoded}&"));
+        }
+    }
+    redirect.push_str(&format!("state={}", q["state"]));
+    s.resource_lists.push(resources);
     s.authorizes.push(q);
     Redirect::to(&redirect)
 }
@@ -700,4 +741,126 @@ async fn offered_scopes_from_the_server_are_cleaned_and_capped() {
     assert!(message.contains("evil[31mred"), "{message}");
     assert!(message.contains("scope18"), "{message}");
     assert!(!message.contains("scope19"), "{message}");
+}
+
+fn requests(pairs: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+    pairs
+        .iter()
+        .map(|(r, scopes)| {
+            (
+                r.to_string(),
+                scopes.iter().map(|s| s.to_string()).collect(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn one_browser_flow_signs_in_to_several_resources_when_the_server_offers_it() {
+    let (server, mcp, other) = spawn().await;
+    server.lock().unwrap().max_resources = Some(10);
+    let dir = tempfile::tempdir().unwrap();
+    let c = client(dir.path(), Box::new(FakeBrowser));
+    let results = c
+        .login_all(
+            &requests(&[(&mcp, &["a:read"]), (&other, &["b:read"])]),
+            false,
+        )
+        .await;
+    let outcomes: Vec<_> = results
+        .iter()
+        .map(|(r, o)| (r.as_str(), *o.as_ref().unwrap()))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            (mcp.as_str(), LoginOutcome::SignedIn),
+            (other.as_str(), LoginOutcome::SignedIn)
+        ]
+    );
+    {
+        let s = server.lock().unwrap();
+        assert_eq!(s.authorizes.len(), 1, "one consent screen");
+        assert_eq!(s.resource_lists[0], [mcp.clone(), other.clone()]);
+        assert_eq!(s.authorizes[0]["scope"], "a:read b:read");
+    }
+    // Each grant is for its own audience.
+    let creds = credentials(dir.path());
+    for r in [&mcp, &other] {
+        let token = creds["grants"][r]["access_token"].as_str().unwrap();
+        assert!(token.ends_with(&format!("-{r}-SECRETVALUE")), "{token}");
+    }
+
+    // Already covered: no browser at all.
+    let again = client(dir.path(), Box::new(NoBrowser));
+    let results = again
+        .login_all(
+            &requests(&[(&mcp, &["a:read"]), (&other, &["b:read"])]),
+            false,
+        )
+        .await;
+    assert!(results
+        .iter()
+        .all(|(_, o)| matches!(o, Ok(LoginOutcome::AlreadySignedIn))));
+    assert_eq!(server.lock().unwrap().authorizes.len(), 1);
+}
+
+#[tokio::test]
+async fn a_resource_left_out_on_the_consent_screen_is_declined_not_failed() {
+    let (server, mcp, other) = spawn().await;
+    {
+        let mut s = server.lock().unwrap();
+        s.max_resources = Some(10);
+        s.decline = vec![other.clone()];
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let c = client(dir.path(), Box::new(FakeBrowser));
+    let results = c
+        .login_all(&requests(&[(&mcp, &[]), (&other, &[])]), false)
+        .await;
+    assert!(matches!(results[0].1, Ok(LoginOutcome::SignedIn)));
+    assert!(matches!(results[1].1, Ok(LoginOutcome::Declined)));
+    assert!(!c.is_signed_in(&other).unwrap());
+}
+
+/// A server that does not advertise the extension gets one ordinary request
+/// per resource, as before.
+#[tokio::test]
+async fn without_the_extension_each_resource_gets_its_own_browser_flow() {
+    let (server, mcp, other) = spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let c = client(dir.path(), Box::new(FakeBrowser));
+    let results = c
+        .login_all(&requests(&[(&mcp, &[]), (&other, &[])]), false)
+        .await;
+    assert!(results
+        .iter()
+        .all(|(_, o)| matches!(o, Ok(LoginOutcome::SignedIn))));
+    let s = server.lock().unwrap();
+    assert_eq!(s.authorizes.len(), 2);
+    assert!(s.resource_lists.iter().all(|l| l.len() == 1));
+}
+
+/// One resource that cannot be discovered fails alone; the rest sign in.
+#[tokio::test]
+async fn one_undiscoverable_resource_does_not_stop_the_others() {
+    let (server, mcp, other) = spawn().await;
+    server.lock().unwrap().max_resources = Some(10);
+    let nope = mcp.replace("/mcp", "/nope");
+    let dir = tempfile::tempdir().unwrap();
+    let c = client(dir.path(), Box::new(FakeBrowser));
+    let results = c
+        .login_all(
+            &requests(&[(&mcp, &[]), (&nope, &[]), (&other, &[])]),
+            false,
+        )
+        .await;
+    assert!(matches!(results[0].1, Ok(LoginOutcome::SignedIn)));
+    assert!(
+        matches!(results[1].1, Err(Error::Discovery(_))),
+        "{:?}",
+        results[1].1
+    );
+    assert!(matches!(results[2].1, Ok(LoginOutcome::SignedIn)));
+    assert_eq!(server.lock().unwrap().authorizes.len(), 1);
 }
