@@ -55,7 +55,27 @@ From source, with Rust 1.89 or later:
 
 ## Sign in
 
-    ottoctl login --resource https://flags.example/mcp [--scope <scope>]... [--force]
+    ottoctl login [--force]
+    ottoctl login --resource <uri> [--scope <scope>]... [--force]
+
+With no `--resource`, `ottoctl` signs in to each otto resource in turn, one
+browser consent each, and reuses your browser session at the authorization
+server:
+
+- `https://otto-tower.savvagent.com/mcp`
+- `https://otto-flags.savvagent.com/mcp`
+- `https://otto-cxp.savvagent.com/mcp`
+
+For each it asks for the scopes the resource advertises, except opt-in issue
+scopes (`<thing>:issue`), which are asked for only with `--scope`; consent
+decides what is granted. A resource that already has a usable grant covering
+those scopes opens no browser. If one resource fails, the grants for the others
+are kept, the failure is named, and the exit status is non-zero. `--scope` goes
+with `--resource`, since scopes belong to one resource server.
+
+If you ask for a scope the authorization server does not offer, `ottoctl` says
+so and lists what it does offer, instead of opening a consent page that shows
+only an error.
 
 This is the flow an MCP client uses against `otto-auth`, with nothing new on the
 server: read the resource's protected-resource metadata (RFC 9728), check the

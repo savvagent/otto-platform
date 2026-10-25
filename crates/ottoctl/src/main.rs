@@ -13,10 +13,25 @@ use std::process::{Command, ExitCode};
 
 use otto_client::LoginOutcome;
 
+/// The otto resources `ottoctl login` signs in to when no `--resource` is
+/// given. the `resources_match_the_web_services` test fails if this differs from the MCP URLs in
+/// `web/src/lib/services.ts`, the list the web CLI page is built from.
+const RESOURCES: [&str; 3] = [
+    "https://otto-tower.savvagent.com/mcp",
+    "https://otto-flags.savvagent.com/mcp",
+    "https://otto-cxp.savvagent.com/mcp",
+];
+
 const USAGE: &str = "\
 usage:
+  ottoctl login [--force]        sign in to every otto resource:
+                                   https://otto-tower.savvagent.com/mcp
+                                   https://otto-flags.savvagent.com/mcp
+                                   https://otto-cxp.savvagent.com/mcp
+                                 asking for each one's scopes except opt-in
+                                 `<thing>:issue` ones, which need --scope
   ottoctl login --resource <uri> [--scope <scope>]... [--force]
-                                 sign in to a resource; --force signs in again
+                                 sign in to one resource; --force signs in again
                                  even if a usable login is cached
   ottoctl <app> [args...]        run the `otto-<app>` binary on PATH, e.g.
                                  `ottoctl flags help` for Otto Flags keys
@@ -69,24 +84,62 @@ async fn login(args: &[String]) -> ExitCode {
             }
         }
     }
-    let Some(resource) = resource else {
-        eprintln!("ottoctl login: --resource <uri> is required\n\n{USAGE}");
-        return ExitCode::from(2);
-    };
     let client = match otto_client::Client::with_defaults() {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
-    match client.login(&resource, &scopes, force).await {
-        Ok(LoginOutcome::AlreadySignedIn) => {
+    if let Some(resource) = resource {
+        return match client.login(&resource, &scopes, force).await {
+            Ok(outcome) => {
+                report(&resource, outcome);
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        };
+    }
+    // Scopes mean something only within one resource server, so they cannot
+    // be applied to all of them.
+    if !scopes.is_empty() {
+        eprintln!(
+            "ottoctl login: --scope needs --resource <uri>, one of:\n{}\n\n{USAGE}",
+            RESOURCES.join("\n")
+        );
+        return ExitCode::from(2);
+    }
+    // One resource failing keeps the grants already obtained.
+    let mut failed = Vec::new();
+    for resource in RESOURCES {
+        let result = match client.requestable_scopes(resource).await {
+            Ok(wanted) => client.login(resource, &wanted, force).await,
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(outcome) => report(resource, outcome),
+            Err(e) => {
+                eprintln!("ottoctl: {resource}: {e}");
+                failed.push(resource);
+            }
+        }
+    }
+    if failed.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "ottoctl: signed in to {} of {} resources; not signed in to: {}",
+            RESOURCES.len() - failed.len(),
+            RESOURCES.len(),
+            failed.join(", ")
+        );
+        ExitCode::FAILURE
+    }
+}
+
+fn report(resource: &str, outcome: LoginOutcome) {
+    match outcome {
+        LoginOutcome::AlreadySignedIn => {
             eprintln!("Already signed in to {resource}. Use --force to sign in again.");
-            ExitCode::SUCCESS
         }
-        Ok(LoginOutcome::SignedIn) => {
-            eprintln!("Signed in to {resource}.");
-            ExitCode::SUCCESS
-        }
-        Err(e) => fail(&e),
+        LoginOutcome::SignedIn => eprintln!("Signed in to {resource}."),
     }
 }
 
@@ -172,4 +225,33 @@ fn is_executable(p: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(p: &Path) -> bool {
     p.is_file()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The MCP URLs in `web/src/lib/services.ts`, in file order.
+    fn web_mcp_urls() -> Vec<String> {
+        include_str!("../../../web/src/lib/services.ts")
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("mcpUrl: '"))
+            .filter_map(|l| l.split('\'').next())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn resources_match_the_web_services() {
+        assert_eq!(web_mcp_urls(), RESOURCES);
+    }
+
+    #[test]
+    fn the_usage_and_docs_list_every_resource() {
+        let docs = include_str!("../../../docs/ottoctl.md");
+        for r in RESOURCES {
+            assert!(USAGE.contains(r), "usage lacks {r}");
+            assert!(docs.contains(r), "docs/ottoctl.md lacks {r}");
+        }
+    }
 }

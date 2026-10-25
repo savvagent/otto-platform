@@ -228,6 +228,32 @@ fn a_missing_scope_names_it_and_how_to_get_it() {
 }
 
 #[test]
+fn a_cached_sign_in_lacking_the_scope_stops_before_any_browser_or_call() {
+    let e = env(Mode::Issue);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let doc = json!({"clients": {}, "grants": {&e.resource: {
+        "issuer": "http://127.0.0.1:1", "client_id": "c", "access_token": "at",
+        "refresh_token": null, "expires_at": now + 3600, "scope": "flags:read",
+    }}});
+    std::fs::write(e.dir.path().join("cfg/credentials.json"), doc.to_string()).unwrap();
+    let key = e.path("key");
+    let out = e.run(&["keys", "rotate", "--app", "web", "--out", &key]);
+    let (_, stderr) = no_leak(&out);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("lacks apps:admin, keys:issue"), "{stderr}");
+    assert!(stderr.contains("no browser was opened"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("ottoctl login --resource {}", e.resource)),
+        "{stderr}"
+    );
+    assert_eq!(e.calls(), 0);
+    assert!(!Path::new(&key).exists());
+}
+
+#[test]
 fn a_withheld_server_key_says_how_to_issue_one() {
     let e = env(Mode::Withhold);
     let key = e.path("key");

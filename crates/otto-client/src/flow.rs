@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use crate::discovery::{self, Discovered};
-use crate::error::{server_error, Error, Result};
+use crate::error::{server_error, server_text, Error, Result};
 use crate::pkce::{random_token, Pkce};
 use crate::store::{Grant, Store};
 use crate::{LoginOutcome, Opener};
@@ -22,6 +22,8 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 /// A browser sends its request line at once; this only bounds a slow or
 /// stalled client.
 const CONNECTION_DEADLINE: Duration = Duration::from_secs(2);
+/// Most scopes named in a "the server does not offer" error.
+const MAX_OFFERED_SCOPES: usize = 20;
 /// A token this close to expiry is refreshed rather than handed out.
 const EXPIRY_SKEW_SECS: u64 = 30;
 /// Assumed lifetime when a token response omits `expires_in`, and the most a
@@ -98,6 +100,30 @@ pub(crate) async fn login(
     }
 
     let meta = discovery::discover(http, resource).await?;
+    // Asked for here, the server's refusal is a sentence; asked for in the
+    // browser, it is an error page the terminal never hears about.
+    if !meta.server_scopes.is_empty() {
+        let unoffered: Vec<String> = scopes
+            .iter()
+            .filter(|s| !meta.server_scopes.contains(s))
+            .cloned()
+            .collect();
+        if !unoffered.is_empty() {
+            // From the server's metadata, so cleaned and capped like any
+            // other server text before it can reach a terminal.
+            return Err(Error::ScopeNotOffered {
+                resource: resource.to_owned(),
+                issuer: server_text(&meta.issuer),
+                scopes: unoffered,
+                offered: meta
+                    .server_scopes
+                    .iter()
+                    .take(MAX_OFFERED_SCOPES)
+                    .map(|s| server_text(s))
+                    .collect(),
+            });
+        }
+    }
     let client_id = client_id(http, store, &meta).await?;
 
     // Port 0: the OS picks a free one. otto-auth ignores the port of a

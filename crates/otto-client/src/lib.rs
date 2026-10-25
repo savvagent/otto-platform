@@ -195,6 +195,35 @@ impl Client {
         mcp::call_tool(&self.http, resource, &token, tool, arguments, secret_fields).await
     }
 
+    /// The scopes a bare `ottoctl login` asks `resource` for: everything it
+    /// advertises except opt-in issue scopes (`<thing>:issue`), which hand out
+    /// secrets and are asked for only by name. Empty if it advertises none, in
+    /// which case the server's defaults apply.
+    pub async fn requestable_scopes(&self, resource: &str) -> Result<Vec<String>> {
+        let meta = discovery::discover(&self.http, resource).await?;
+        Ok(meta
+            .resource_scopes
+            .into_iter()
+            .filter(|s| !s.ends_with(":issue"))
+            .collect())
+    }
+
+    /// The members of `scopes` the cached grant for `resource` lacks (all of
+    /// them if there is no grant). Reads the store only: no network, no
+    /// browser, so a command can refuse before it starts a sign-in.
+    pub fn missing_scopes(&self, resource: &str, scopes: &[String]) -> Result<Vec<String>> {
+        let granted = self
+            .store
+            .grant(resource)?
+            .map(|g| g.scope)
+            .unwrap_or_default();
+        Ok(scopes
+            .iter()
+            .filter(|s| !granted.split_whitespace().any(|g| g == s.as_str()))
+            .cloned()
+            .collect())
+    }
+
     /// Whether `resource` already has a grant, without any network call.
     pub fn is_signed_in(&self, resource: &str) -> Result<bool> {
         Ok(self.store.grant(resource)?.is_some())

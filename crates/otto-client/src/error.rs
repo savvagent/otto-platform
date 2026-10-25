@@ -15,6 +15,16 @@ pub enum Error {
     #[error("authorization failed: {0}")]
     Authorization(String),
 
+    /// The authorization server does not offer a scope that was asked for, so
+    /// its consent page would only show an error.
+    #[error("{issuer} does not offer {} for {resource}; it offers: {}", .scopes.join(", "), .offered.join(", "))]
+    ScopeNotOffered {
+        resource: String,
+        issuer: String,
+        scopes: Vec<String>,
+        offered: Vec<String>,
+    },
+
     #[error("could not reach {0}")]
     Network(String),
 

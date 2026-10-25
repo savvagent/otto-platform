@@ -41,6 +41,10 @@ struct Server {
     omit_scope: bool,
     /// Grant only this scope, whatever was asked for.
     grant_only: Option<String>,
+    /// The authorization server's `scopes_supported`, when it says.
+    server_scopes: Option<Vec<String>>,
+    /// The first resource's `scopes_supported`, when it says.
+    resource_scopes: Option<Vec<String>>,
 }
 
 type Shared = Arc<Mutex<Server>>;
@@ -58,8 +62,16 @@ fn oauth_error(description: &str) -> (StatusCode, Json<serde_json::Value>) {
 }
 
 async fn resource_meta_root(State(s): State<Shared>) -> Json<serde_json::Value> {
-    let base = s.lock().unwrap().base.clone();
-    Json(serde_json::json!({ "resource": format!("{base}/mcp"), "authorization_servers": [base] }))
+    let (base, scopes) = {
+        let s = s.lock().unwrap();
+        (s.base.clone(), s.resource_scopes.clone())
+    };
+    let mut meta =
+        serde_json::json!({ "resource": format!("{base}/mcp"), "authorization_servers": [base] });
+    if let Some(scopes) = scopes {
+        meta["scopes_supported"] = scopes.into();
+    }
+    Json(meta)
 }
 
 /// The RFC 9728 path-inserted form, for a second resource on the same host.
@@ -78,12 +90,16 @@ async fn server_meta(State(s): State<Shared>) -> Json<serde_json::Value> {
     } else {
         base.clone()
     };
-    Json(serde_json::json!({
+    let mut meta = serde_json::json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{base}/oauth/authorize"),
         "token_endpoint": format!("{base}/oauth/token"),
         "registration_endpoint": format!("{base}/oauth/register"),
-    }))
+    });
+    if let Some(scopes) = &s.server_scopes {
+        meta["scopes_supported"] = scopes.clone().into();
+    }
+    Json(meta)
 }
 
 async fn register(
@@ -611,4 +627,77 @@ async fn a_scope_the_server_did_not_grant_is_reported_before_any_call() {
         panic!("{err:?}");
     };
     assert_eq!(message, "the sign-in was not granted keys:issue");
+}
+
+#[tokio::test]
+async fn a_scope_the_server_does_not_offer_is_refused_before_the_browser() {
+    let (server, resource, _) = spawn().await;
+    server.lock().unwrap().server_scopes =
+        Some(vec!["flags:read".to_owned(), "apps:admin".to_owned()]);
+    let dir = tempfile::tempdir().unwrap();
+    let wanted = vec!["flags:read".to_owned(), "keys:issue".to_owned()];
+    let err = client(dir.path(), Box::new(NoBrowser))
+        .login(&resource, &wanted, false)
+        .await
+        .unwrap_err();
+    match &err {
+        Error::ScopeNotOffered {
+            scopes, offered, ..
+        } => {
+            assert_eq!(scopes, &["keys:issue"]);
+            assert_eq!(offered, &["flags:read", "apps:admin"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    let message = err.to_string();
+    assert!(message.contains("does not offer keys:issue"), "{message}");
+    assert!(message.contains("flags:read, apps:admin"), "{message}");
+    assert!(server.lock().unwrap().authorizes.is_empty());
+}
+
+#[tokio::test]
+async fn a_bare_login_asks_for_the_resources_scopes_but_not_issue_scopes() {
+    let (server, resource, _) = spawn().await;
+    server.lock().unwrap().resource_scopes = Some(
+        ["flags:read", "apps:admin", "keys:issue"]
+            .map(String::from)
+            .to_vec(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let c = client(dir.path(), Box::new(FakeBrowser));
+    assert_eq!(
+        c.requestable_scopes(&resource).await.unwrap(),
+        ["flags:read", "apps:admin"]
+    );
+    assert_eq!(
+        c.missing_scopes(&resource, &["flags:read".to_owned()])
+            .unwrap(),
+        ["flags:read"],
+        "nothing is cached yet"
+    );
+    c.login(&resource, &["flags:read".to_owned()], false)
+        .await
+        .unwrap();
+    assert!(c
+        .missing_scopes(&resource, &["flags:read".to_owned()])
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn offered_scopes_from_the_server_are_cleaned_and_capped() {
+    let (server, resource, _) = spawn().await;
+    let mut offered = vec!["evil\u{1b}[31m\u{7}red".to_owned()];
+    offered.extend((0..50).map(|i| format!("scope{i}")));
+    server.lock().unwrap().server_scopes = Some(offered);
+    let dir = tempfile::tempdir().unwrap();
+    let err = client(dir.path(), Box::new(NoBrowser))
+        .login(&resource, &["keys:issue".to_owned()], false)
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(!message.chars().any(char::is_control), "{message:?}");
+    assert!(message.contains("evil[31mred"), "{message}");
+    assert!(message.contains("scope18"), "{message}");
+    assert!(!message.contains("scope19"), "{message}");
 }

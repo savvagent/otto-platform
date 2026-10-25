@@ -91,12 +91,32 @@ fn a_non_executable_file_is_not_a_command() {
     assert_eq!(out.status.code(), Some(127));
 }
 
+/// A bare `ottoctl login` signs in to every resource, so these tests only use
+/// arguments that are refused before any sign-in starts.
 #[test]
-fn login_requires_a_resource() {
+fn login_scopes_need_a_resource() {
     let dir = tempfile::tempdir().unwrap();
-    let out = ottoctl(dir.path()).arg("login").output().unwrap();
+    let out = ottoctl(dir.path())
+        .args(["login", "--scope", "flags:read"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--resource"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--scope needs --resource"), "{stderr}");
+    assert!(
+        stderr.contains("https://otto-flags.savvagent.com/mcp"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn login_refuses_an_unknown_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = ottoctl(dir.path())
+        .args(["login", "--bogus"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]

@@ -12,6 +12,11 @@ pub struct Discovered {
     pub authorization_endpoint: Url,
     pub token_endpoint: Url,
     pub registration_endpoint: Url,
+    /// What the authorization server says it can grant, across all its
+    /// resources. Empty if it does not say.
+    pub server_scopes: Vec<String>,
+    /// What the resource says it supports (RFC 9728). Empty if it does not say.
+    pub resource_scopes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -19,6 +24,8 @@ struct ResourceMeta {
     resource: String,
     #[serde(default)]
     authorization_servers: Vec<String>,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -27,6 +34,8 @@ struct ServerMeta {
     authorization_endpoint: String,
     token_endpoint: String,
     registration_endpoint: Option<String>,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
 }
 
 /// Credentials cross the wire to these URLs, so they must be https. Plain http
@@ -57,6 +66,7 @@ pub async fn discover(http: &reqwest::Client, resource: &str) -> Result<Discover
             server_text(&meta.resource)
         )));
     }
+    let resource_scopes = meta.scopes_supported;
     let issuer = meta
         .authorization_servers
         .into_iter()
@@ -92,6 +102,8 @@ pub async fn discover(http: &reqwest::Client, resource: &str) -> Result<Discover
         authorization_endpoint: endpoint("authorization_endpoint", &server.authorization_endpoint)?,
         token_endpoint: endpoint("token_endpoint", &server.token_endpoint)?,
         registration_endpoint: endpoint("registration_endpoint", &registration)?,
+        server_scopes: server.scopes_supported,
+        resource_scopes,
     })
 }
 
