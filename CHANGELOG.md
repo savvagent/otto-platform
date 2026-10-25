@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.2](https://github.com/savvagent/otto-platform/compare/v0.13.1...v0.13.2) (2026-10-25)
+
+
+### Bug Fixes
+
+* **deploy:** keep the otto-platform machine running ([42e454c](https://github.com/savvagent/otto-platform/commit/42e454cdd975916a276135d3d5f6d36fff308f2f)), closes [#119](https://github.com/savvagent/otto-platform/issues/119)
+* **otto-platform-server:** keep the otto-platform machine running ([1753ed1](https://github.com/savvagent/otto-platform/commit/1753ed1596be36d0f3b95259e5291f21e95be83d))
+
 ## [0.13.1](https://github.com/savvagent/otto-platform/compare/v0.13.0...v0.13.1) (2026-10-24)
 
 
