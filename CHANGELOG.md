@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.0](https://github.com/savvagent/otto-platform/compare/v0.14.0...v0.15.0) (2026-10-30)
+
+
+### Features
+
+* **otto-auth:** one consent screen for several resources ([#125](https://github.com/savvagent/otto-platform/issues/125)) ([a7b415e](https://github.com/savvagent/otto-platform/commit/a7b415e434ca9ff94e1423fba71d038a4dd7b065)), closes [#119](https://github.com/savvagent/otto-platform/issues/119)
+* **otto-resource:** accept sav_ token prefixes ahead of the rebrand ([#137](https://github.com/savvagent/otto-platform/issues/137)) ([03f52e9](https://github.com/savvagent/otto-platform/commit/03f52e9f2139d08d60d0695b5cde4834f0cf19c2)), closes [#128](https://github.com/savvagent/otto-platform/issues/128)
+
 ## [0.14.0](https://github.com/savvagent/otto-platform/compare/v0.13.2...v0.14.0) (2026-10-25)
 
 
