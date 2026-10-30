@@ -1,4 +1,4 @@
-//! `otto-flags`, run as `ottoctl flags`: issue an Otto Flags app's SDK keys from a
+//! `savctl-flags`, run as `savctl flags`: issue an Otto Flags app's SDK keys from a
 //! terminal.
 //!
 //! The server key (`srv_…`) is a secret the person stores in their app's
@@ -26,20 +26,20 @@ const SERVER_KEY: &str = "/keys/serverKey";
 
 const USAGE: &str = "\
 usage:
-  ottoctl flags app create <name> [--env <environment>]... [--out <file> [--overwrite]]
+  savctl flags app create <name> [--env <environment>]... [--out <file> [--overwrite]]
                                  register an app and issue its keys
-  ottoctl flags keys rotate --app <name-or-id> [--which server|client|both]
-                         [--out <file> [--overwrite]]
+  savctl flags keys rotate --app <name-or-id> [--which server|client|both]
+                        [--out <file> [--overwrite]]
                                  replace an app's key (default: the server key);
                                  the old key stops working at once
-  ottoctl flags help
+  savctl flags help
 
 The server key (srv_...) is printed only to a terminal, never to a pipe, or
 written owner-only to the file given with --out (which must not exist unless
 --overwrite). The public client key (sdk_...) is printed normally.
 
 Both commands need an owner or admin of the organization, and sign in with
-the apps:admin and keys:issue scopes. The service is $OTTO_FLAGS_RESOURCE,
+the apps:admin and keys:issue scopes. The service is $SAVVAGENT_FLAGS_RESOURCE,
 else https://otto-flags.savvagent.com/mcp.";
 
 #[tokio::main]
@@ -48,18 +48,18 @@ async fn main() -> ExitCode {
     let command = match parse(&args) {
         Ok(c) => c,
         Err(message) => {
-            eprintln!("ottoctl flags: {message}\n\n{USAGE}");
+            eprintln!("savctl flags: {message}\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
-    let resource = std::env::var("OTTO_FLAGS_RESOURCE")
+    let resource = std::env::var("SAVVAGENT_FLAGS_RESOURCE")
         .ok()
         .filter(|r| !r.is_empty())
         .unwrap_or_else(|| DEFAULT_RESOURCE.to_owned());
     match run(command, &resource).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("ottoctl flags: {message}");
+            eprintln!("savctl flags: {message}");
             ExitCode::FAILURE
         }
     }
@@ -171,7 +171,7 @@ async fn run(command: Command, resource: &str) -> Result<(), String> {
             )
         }
     };
-    let rotate_hint = format!("ottoctl flags keys rotate --app {}", shell_word(&app));
+    let rotate_hint = format!("savctl flags keys rotate --app {}", shell_word(&app));
     // Claimed now, before anything is issued; dropped unused, it is removed.
     let reservation = if issues_server_key {
         Some(
@@ -193,7 +193,7 @@ async fn run(command: Command, resource: &str) -> Result<(), String> {
         return Err(format!(
             "the cached sign-in for {resource} lacks {}. Nothing was changed and no browser was \
              opened. Issuing keys needs the apps:admin and keys:issue scopes; grant them with: \
-             ottoctl login --resource {resource} --scope apps:admin --scope keys:issue --force",
+             savctl login --resource {resource} --scope apps:admin --scope keys:issue --force",
             missing.join(", ")
         ));
     }
@@ -261,7 +261,7 @@ fn explain(e: Error, resource: &str, issues_server_key: bool, rotate_hint: &str)
         ),
         Error::InsufficientScope { message, .. } => format!(
             "{message}\nIssuing keys needs the apps:admin and keys:issue scopes. Sign in again \
-             and grant them: ottoctl login --resource {resource} --scope apps:admin --scope \
+             and grant them: savctl login --resource {resource} --scope apps:admin --scope \
              keys:issue --force"
         ),
         e => e.to_string(),

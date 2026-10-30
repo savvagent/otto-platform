@@ -1,5 +1,5 @@
 //! Sign a terminal tool in to an otto resource the way an MCP client does, and
-//! keep the token. Built for the `ottoctl` command and for the `otto-<app>`
+//! keep the token. Built for the `savctl` command and for the `savctl-<app>`
 //! binaries it runs, which call [`Client::token`] to get a bearer token for
 //! their own resource.
 //!
@@ -218,7 +218,7 @@ impl Client {
         mcp::call_tool(&self.http, resource, &token, tool, arguments, secret_fields).await
     }
 
-    /// The scopes a bare `ottoctl login` asks `resource` for: everything it
+    /// The scopes a bare `savctl login` asks `resource` for: everything it
     /// advertises except opt-in issue scopes (`<thing>:issue`), which hand out
     /// secrets and are asked for only by name. Empty if it advertises none, in
     /// which case the server's defaults apply.

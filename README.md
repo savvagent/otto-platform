@@ -46,16 +46,19 @@ bundle built from `web/` (see `web/README.md`): the public marketing pages,
 prerendered (`/`, `/pricing`, a page per product, each in every language),
 and the account/org console, whose home is `/home`.
 
-## The `ottoctl` command
+## The `savctl` command
 
-`ottoctl` is the terminal side of the platform. It signs a developer in to any
-otto-* service and runs that service's own subcommands. Its first use is
-otto-flags server keys, which reach a person's terminal and never pass through
-a model. Prebuilt binaries for Linux (x86_64, arm64), macOS (Apple silicon,
-Intel) and Windows (x86_64) are attached to every
+`savctl` is the terminal side of the platform. `savctl login` signs a developer
+in to every Savvagent service at once, and `savctl <app>` runs that service's
+own subcommands (`savctl flags` runs the `savctl-flags` binary shipped beside
+it). Its first use is otto-flags server keys, which reach a person's terminal
+and never pass through a model. Prebuilt binaries for Linux (x86_64, arm64),
+macOS (Apple silicon, Intel) and Windows (x86_64) are attached to every
 [release](https://github.com/savvagent/otto-platform/releases/latest), with
 checksums. To install and verify one, see
-[docs/ottoctl.md](docs/ottoctl.md#install).
+[docs/savctl.md](docs/savctl.md#install). `savctl` replaces `ottoctl`:
+credentials now live under `~/.config/savvagent` (`SAVVAGENT_CONFIG_DIR`), so
+run `savctl login` once after upgrading.
 
 ## Crate layout
 
@@ -95,10 +98,10 @@ crates/
 │                         PKCE S256 on a loopback redirect, a per-resource
 │                         token cache, and `Secret` output that never reaches
 │                         a log. No database dependency.
-├── ottoctl/             binary `ottoctl`: `ottoctl login --resource <uri>`, and
-│                         `ottoctl <app> ...` runs `otto-<app>` from PATH. See
-│                         [docs/ottoctl.md](docs/ottoctl.md).
-├── otto-flags-cli/       binary `otto-flags`, run as `ottoctl flags`: issue an
+├── ottoctl/              binary `savctl`: `savctl login [--resource <uri>]`, and
+│                         `savctl <app> ...` runs `savctl-<app>` from PATH. See
+│                         [docs/savctl.md](docs/savctl.md).
+├── otto-flags-cli/       binary `savctl-flags`, run as `savctl flags`: issue an
 │                         Otto Flags app's keys so the secret server key goes
 │                         to a terminal or an owner-only file, not a model.
 └── otto-platform-server/ binary: loads config, connects, runs migrations,

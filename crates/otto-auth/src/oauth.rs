@@ -891,12 +891,12 @@ pub fn as_metadata(public_url: &str, scopes_supported: &[String]) -> serde_json:
         "token_endpoint_auth_methods_supported": ["none"],
         // RFC 8707. Advertised so clients know to send `resource`.
         "resource_indicators_supported": true,
-        // An otto extension: `/oauth/authorize` takes up to this many
+        // A Savvagent extension: `/oauth/authorize` takes up to this many
         // `resource` values, shows one consent screen, and answers with a
         // `code` and its `resource` for each one the person kept (see
         // `validate_authorize_many`). A client that does not read this sends
         // one `resource`, as before.
-        "otto_authorize_resources_max": MAX_RESOURCES_PER_REQUEST,
+        "savvagent_authorize_resources_max": MAX_RESOURCES_PER_REQUEST,
     })
 }
 
