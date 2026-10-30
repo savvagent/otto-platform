@@ -1,4 +1,4 @@
-//! `otto-flags` against a mock otto-flags MCP server, with a cached grant so no
+//! `savctl-flags` against a mock otto-flags MCP server, with a cached grant so no
 //! browser is involved. Every case captures stdout and stderr (this binary has
 //! no other log) and checks no server key appears in either: the only place a
 //! `srv_` value may go is the sink the user chose.
@@ -120,12 +120,12 @@ fn env(mode: Mode) -> Env {
 }
 
 impl Env {
-    /// Run `otto-flags` with stdout and stderr captured: stdout is a pipe.
+    /// Run `savctl-flags` with stdout and stderr captured: stdout is a pipe.
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_otto-flags"))
+        Command::new(env!("CARGO_BIN_EXE_savctl-flags"))
             .args(args)
-            .env("OTTO_CONFIG_DIR", self.dir.path().join("cfg"))
-            .env("OTTO_FLAGS_RESOURCE", &self.resource)
+            .env("SAVVAGENT_CONFIG_DIR", self.dir.path().join("cfg"))
+            .env("SAVVAGENT_FLAGS_RESOURCE", &self.resource)
             .output()
             .unwrap()
     }
@@ -221,7 +221,7 @@ fn a_missing_scope_names_it_and_how_to_get_it() {
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("keys:issue"), "{stderr}");
     assert!(
-        stderr.contains(&format!("ottoctl login --resource {}", e.resource)),
+        stderr.contains(&format!("savctl login --resource {}", e.resource)),
         "{stderr}"
     );
     assert!(!Path::new(&key).exists());
@@ -246,7 +246,38 @@ fn a_cached_sign_in_lacking_the_scope_stops_before_any_browser_or_call() {
     assert!(stderr.contains("lacks apps:admin, keys:issue"), "{stderr}");
     assert!(stderr.contains("no browser was opened"), "{stderr}");
     assert!(
-        stderr.contains(&format!("ottoctl login --resource {}", e.resource)),
+        stderr.contains(&format!("savctl login --resource {}", e.resource)),
+        "{stderr}"
+    );
+    assert_eq!(e.calls(), 0);
+    assert!(!Path::new(&key).exists());
+}
+
+/// The pre-Savvagent `OTTO_CONFIG_DIR` and `OTTO_FLAGS_RESOURCE` are not read:
+/// the grant cached under the old directory for the old resource is not used,
+/// and the default resource is the one named.
+#[test]
+fn the_old_otto_variables_are_ignored() {
+    let e = env(Mode::Issue);
+    let fresh = e.dir.path().join("fresh");
+    std::fs::create_dir(&fresh).unwrap();
+    let key = e.path("key");
+    let out = Command::new(env!("CARGO_BIN_EXE_savctl-flags"))
+        .args(["keys", "rotate", "--app", "web", "--out", &key])
+        .env_remove("SAVVAGENT_FLAGS_RESOURCE")
+        .env("SAVVAGENT_CONFIG_DIR", &fresh)
+        .env("OTTO_CONFIG_DIR", e.dir.path().join("cfg"))
+        .env("OTTO_FLAGS_RESOURCE", &e.resource)
+        .output()
+        .unwrap();
+    let (_, stderr) = no_leak(&out);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("the cached sign-in for https://otto-flags.savvagent.com/mcp lacks"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("savctl login --resource https://otto-flags.savvagent.com/mcp"),
         "{stderr}"
     );
     assert_eq!(e.calls(), 0);
@@ -261,7 +292,7 @@ fn a_withheld_server_key_says_how_to_issue_one() {
     let (_, stderr) = no_leak(&out);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("ottoctl flags keys rotate --app web"),
+        stderr.contains("savctl flags keys rotate --app web"),
         "{stderr}"
     );
     assert!(!Path::new(&key).exists());
@@ -286,7 +317,7 @@ fn no_usable_response_says_the_rotation_may_have_happened() {
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("may have received the request"), "{stderr}");
     assert!(
-        stderr.contains("ottoctl flags keys rotate --app 'my app'"),
+        stderr.contains("savctl flags keys rotate --app 'my app'"),
         "{stderr}"
     );
     assert!(!Path::new(&key).exists(), "the reservation is released");

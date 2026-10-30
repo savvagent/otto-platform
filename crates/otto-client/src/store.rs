@@ -2,18 +2,19 @@
 //! registered client id per authorization server and one grant per resource
 //! (a token has one audience, so each resource gets its own).
 //!
-//! Location: `$OTTO_CONFIG_DIR`, else `$XDG_CONFIG_HOME/otto`, else
-//! `$HOME/.config/otto` (on Windows, `%LOCALAPPDATA%\otto`), file
+//! Location: `$SAVVAGENT_CONFIG_DIR`, else `$XDG_CONFIG_HOME/savvagent`, else
+//! `$HOME/.config/savvagent` (on Windows, `%LOCALAPPDATA%\savvagent`), file
 //! `credentials.json`.
 //!
 //! Every change happens under an exclusive lock on `credentials.lock`, held
-//! across the whole read-modify-write, so two `ottoctl` processes never lose each
+//! across the whole read-modify-write, so two `savctl` processes never lose each
 //! other's writes. Refresh holds it across the token request too: otto-auth
 //! treats a refresh token presented twice as a replay and revokes every token
 //! the client holds, so two processes must never refresh the same grant.
 //! Reads take no lock; the file is only ever replaced by an atomic rename.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::{File, TryLockError};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,7 +25,12 @@ use crate::error::{Error, Result};
 use crate::private_fs;
 use crate::secret::replace_private;
 
-/// How long to wait for another `ottoctl` process to finish with the store.
+/// The variable that overrides where the store lives.
+const CONFIG_DIR_VAR: &str = "SAVVAGENT_CONFIG_DIR";
+/// The store's directory name under the platform's config directory.
+const DIR_NAME: &str = "savvagent";
+
+/// How long to wait for another `savctl` process to finish with the store.
 const LOCK_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -67,12 +73,11 @@ impl Store {
     }
 
     pub fn open_default() -> Result<Self> {
-        let dir = match nonempty_env("OTTO_CONFIG_DIR") {
-            Some(d) => PathBuf::from(d),
-            None => default_dir().ok_or_else(|| {
-                Error::Store("cannot find a config directory: set OTTO_CONFIG_DIR".into())
-            })?,
-        };
+        let dir = config_dir(nonempty_env).ok_or_else(|| {
+            Error::Store(format!(
+                "cannot find a config directory: set {CONFIG_DIR_VAR}"
+            ))
+        })?;
         Ok(Store { dir })
     }
 
@@ -89,7 +94,7 @@ impl Store {
         match std::fs::read(self.file()) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
                 Error::Store(format!(
-                    "{} is not valid; delete it and run `ottoctl login` again",
+                    "{} is not valid; delete it and run `savctl login` again",
                     self.file().display()
                 ))
             }),
@@ -112,7 +117,7 @@ impl Store {
     }
 
     /// Take the store's lock without blocking the async runtime: poll with
-    /// `try_lock`, so a second `ottoctl` process (or a second client in this one)
+    /// `try_lock`, so a second `savctl` process (or a second client in this one)
     /// waits instead of stalling a worker thread.
     pub(crate) async fn lock(&self) -> Result<Locked<'_>> {
         let file = self.lock_file()?;
@@ -125,7 +130,7 @@ impl Store {
                 }
                 Err(TryLockError::WouldBlock) => {
                     return Err(Error::Store(
-                        "another ottoctl process is holding the credentials lock".into(),
+                        "another savctl process is holding the credentials lock".into(),
                     ))
                 }
                 Err(TryLockError::Error(e)) => {
@@ -141,22 +146,30 @@ impl Store {
     }
 }
 
-fn nonempty_env(key: &str) -> Option<std::ffi::OsString> {
+fn nonempty_env(key: &str) -> Option<OsString> {
     std::env::var_os(key).filter(|v| !v.is_empty())
 }
 
+/// Where the store lives, given a lookup of non-empty environment variables:
+/// `$SAVVAGENT_CONFIG_DIR`, else the platform's default.
+fn config_dir(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    env(CONFIG_DIR_VAR)
+        .map(PathBuf::from)
+        .or_else(|| default_dir(env))
+}
+
 #[cfg(not(windows))]
-fn default_dir() -> Option<PathBuf> {
-    nonempty_env("XDG_CONFIG_HOME")
-        .map(|d| PathBuf::from(d).join("otto"))
-        .or_else(|| nonempty_env("HOME").map(|h| PathBuf::from(h).join(".config").join("otto")))
+fn default_dir(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    env("XDG_CONFIG_HOME")
+        .map(|d| PathBuf::from(d).join(DIR_NAME))
+        .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".config").join(DIR_NAME)))
 }
 
 /// Local, not roaming: a token is for this machine and should not follow a
 /// roaming profile to others.
 #[cfg(windows)]
-fn default_dir() -> Option<PathBuf> {
-    nonempty_env("LOCALAPPDATA").map(|d| PathBuf::from(d).join("otto"))
+fn default_dir(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    env("LOCALAPPDATA").map(|d| PathBuf::from(d).join(DIR_NAME))
 }
 
 /// The store, locked and loaded. Changes are made to the in-memory document
@@ -198,5 +211,71 @@ impl Locked<'_> {
         let bytes = serde_json::to_vec_pretty(&self.doc)
             .map_err(|_| Error::Store("could not encode credentials".into()))?;
         replace_private(&self.store.file(), &bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lookup over `vars`, as `nonempty_env` would see them.
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |key| {
+            vars.iter()
+                .find(|(k, v)| *k == key && !v.is_empty())
+                .map(|(_, v)| OsString::from(v))
+        }
+    }
+
+    #[test]
+    fn the_savvagent_variable_wins() {
+        let vars = [
+            ("SAVVAGENT_CONFIG_DIR", "/chosen"),
+            ("XDG_CONFIG_HOME", "/xdg"),
+            ("HOME", "/home/me"),
+            ("LOCALAPPDATA", "C:\\Local"),
+        ];
+        assert_eq!(config_dir(env(&vars)), Some(PathBuf::from("/chosen")));
+    }
+
+    /// The pre-Savvagent `OTTO_CONFIG_DIR` is not read, and the default is a
+    /// `savvagent` directory, not `otto`.
+    #[test]
+    fn the_old_otto_variable_is_ignored() {
+        let vars = [
+            ("OTTO_CONFIG_DIR", "/old"),
+            ("XDG_CONFIG_HOME", "/xdg"),
+            ("LOCALAPPDATA", "/local"),
+        ];
+        let dir = config_dir(env(&vars)).unwrap();
+        assert_ne!(dir, PathBuf::from("/old"));
+        assert_eq!(dir.file_name(), Some("savvagent".as_ref()));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_defaults_to_xdg_then_home() {
+        let both = [("XDG_CONFIG_HOME", "/xdg"), ("HOME", "/home/me")];
+        assert_eq!(
+            config_dir(env(&both)),
+            Some(PathBuf::from("/xdg/savvagent"))
+        );
+        let home = [("XDG_CONFIG_HOME", ""), ("HOME", "/home/me")];
+        assert_eq!(
+            config_dir(env(&home)),
+            Some(PathBuf::from("/home/me/.config/savvagent"))
+        );
+        assert_eq!(config_dir(env(&[])), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_defaults_to_local_app_data() {
+        let vars = [("LOCALAPPDATA", "C:\\Users\\me\\AppData\\Local")];
+        assert_eq!(
+            config_dir(env(&vars)),
+            Some(PathBuf::from("C:\\Users\\me\\AppData\\Local\\savvagent"))
+        );
+        assert_eq!(config_dir(env(&[])), None);
     }
 }

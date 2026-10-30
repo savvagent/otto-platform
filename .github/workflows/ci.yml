@@ -200,7 +200,8 @@ jobs:
           requireScope: false
           subjectPattern: ^(?![A-Z]).+$
 
-  # The `ottoctl` CLI ships for macOS and Windows too; the rust job covers Linux.
+  # The `savctl` CLI (packages ottoctl and otto-flags-cli) ships for macOS and
+  # Windows too; the rust job covers Linux.
   # These crates have no database, so no Postgres here.
   cli:
     strategy:
@@ -249,7 +250,8 @@ jobs:
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
 
-  # Release binaries of `ottoctl` and the `otto-<app>` binaries it runs, built on each platform's own runner. On a PR
+  # Release binaries of `savctl` and the `savctl-<app>` binaries it runs (built
+  # from the ottoctl and otto-flags-cli packages), on each platform's own runner. On a PR
   # that touches the CLI this only proves they build; on the push that
   # release-please turned into a release, cli-release attaches them. Archive
   # names carry no version, so releases/latest/download/<name> is a stable
@@ -302,15 +304,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          staging="ottoctl-$TARGET"
+          staging="savctl-$TARGET"
           mkdir "$staging"
           cp LICENSE "$staging/"
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cp "target/$TARGET/release/ottoctl.exe" "target/$TARGET/release/otto-flags.exe" "$staging/"
+            cp "target/$TARGET/release/savctl.exe" "target/$TARGET/release/savctl-flags.exe" "$staging/"
             7z a "$staging.zip" "$staging" > /dev/null
             echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
           else
-            cp "target/$TARGET/release/ottoctl" "target/$TARGET/release/otto-flags" "$staging/"
+            cp "target/$TARGET/release/savctl" "target/$TARGET/release/savctl-flags" "$staging/"
             tar czf "$staging.tar.gz" "$staging"
             echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
           fi
@@ -322,13 +324,13 @@ jobs:
         run: |
           set -euo pipefail
           exe=$( [ "$RUNNER_OS" = "Windows" ] && echo .exe || true )
-          "ottoctl-$TARGET/ottoctl$exe" help | grep -q "ottoctl login"
+          "savctl-$TARGET/savctl$exe" help | grep -q "savctl login"
           # Dispatch finds the app binary shipped beside it.
-          PATH="$PWD/ottoctl-$TARGET:$PATH" "ottoctl-$TARGET/ottoctl$exe" flags help | grep -q "keys rotate"
+          PATH="$PWD/savctl-$TARGET:$PATH" "savctl-$TARGET/savctl$exe" flags help | grep -q "keys rotate"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ottoctl-${{ matrix.target }}
+          name: savctl-${{ matrix.target }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
           retention-days: 7
@@ -352,7 +354,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: ottoctl-*
+          pattern: savctl-*
           path: dist
           merge-multiple: true
 
@@ -363,9 +365,9 @@ jobs:
           TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           set -euo pipefail
-          sha256sum ottoctl-* > SHA256SUMS
+          sha256sum savctl-* > SHA256SUMS
           cat SHA256SUMS
-          gh release upload "$TAG" ottoctl-* SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$TAG" savctl-* SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
 
       - name: Add install notes to the release
         # Appended below release-please's changelog. The marker keeps a re-run
@@ -375,25 +377,25 @@ jobs:
           TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           set -euo pipefail
-          marker='<!-- ottoctl-install -->'
+          marker='<!-- savctl-install -->'
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
           if grep -qF "$marker" notes.md; then exit 0; fi
           base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
           cat >> notes.md <<EOF
 
           $marker
-          ## Install the \`ottoctl\` CLI
+          ## Install the \`savctl\` CLI
 
           | Platform | Download |
           | --- | --- |
-          | Linux x86_64 | [ottoctl-x86_64-unknown-linux-musl.tar.gz]($base/ottoctl-x86_64-unknown-linux-musl.tar.gz) |
-          | Linux arm64 | [ottoctl-aarch64-unknown-linux-musl.tar.gz]($base/ottoctl-aarch64-unknown-linux-musl.tar.gz) |
-          | macOS Apple silicon | [ottoctl-aarch64-apple-darwin.tar.gz]($base/ottoctl-aarch64-apple-darwin.tar.gz) |
-          | macOS Intel | [ottoctl-x86_64-apple-darwin.tar.gz]($base/ottoctl-x86_64-apple-darwin.tar.gz) |
-          | Windows x86_64 | [ottoctl-x86_64-pc-windows-msvc.zip]($base/ottoctl-x86_64-pc-windows-msvc.zip) |
+          | Linux x86_64 | [savctl-x86_64-unknown-linux-musl.tar.gz]($base/savctl-x86_64-unknown-linux-musl.tar.gz) |
+          | Linux arm64 | [savctl-aarch64-unknown-linux-musl.tar.gz]($base/savctl-aarch64-unknown-linux-musl.tar.gz) |
+          | macOS Apple silicon | [savctl-aarch64-apple-darwin.tar.gz]($base/savctl-aarch64-apple-darwin.tar.gz) |
+          | macOS Intel | [savctl-x86_64-apple-darwin.tar.gz]($base/savctl-x86_64-apple-darwin.tar.gz) |
+          | Windows x86_64 | [savctl-x86_64-pc-windows-msvc.zip]($base/savctl-x86_64-pc-windows-msvc.zip) |
 
-          Check the download against [SHA256SUMS]($base/SHA256SUMS), unpack it, and put \`ottoctl\` on your PATH. Then sign in with \`ottoctl login --resource <service URL>\`.
-          The binaries are not code-signed. For the macOS and Windows first-run steps, see [the install guide](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/docs/ottoctl.md#install).
+          Check the download against [SHA256SUMS]($base/SHA256SUMS), unpack it, and put \`savctl\` and \`savctl-flags\` on your PATH. Then sign in with \`savctl login\`.
+          The binaries are not code-signed. For the macOS and Windows first-run steps, see [the install guide](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/docs/savctl.md#install).
           EOF
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
 

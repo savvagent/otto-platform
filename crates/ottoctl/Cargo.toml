@@ -5,10 +5,10 @@ edition.workspace = true
 license.workspace = true
 # Follows otto-client.
 rust-version = "1.89"
-description = "The `ottoctl` command: sign in to an otto deployment and run `otto-<app>` subcommands, so a developer can receive an app secret without a model in the path."
+description = "The `savctl` command: sign in to Savvagent and run `savctl-<app>` subcommands, so a developer can receive an app secret without a model in the path."
 
 [[bin]]
-name = "ottoctl"
+name = "savctl"
 path = "src/main.rs"
 
 [dependencies]
@@ -16,7 +16,7 @@ otto-client.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [target.'cfg(windows)'.dependencies]
-# SetConsoleCtrlHandler, so Ctrl-C is left to the app `ottoctl` runs.
+# SetConsoleCtrlHandler, so Ctrl-C is left to the app `savctl` runs.
 windows = { version = "0.62", features = ["Win32_System_Console"] }
 
 [dev-dependencies]

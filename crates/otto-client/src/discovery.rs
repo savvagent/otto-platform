@@ -18,7 +18,7 @@ pub struct Discovered {
     /// What the resource says it supports (RFC 9728). Empty if it does not say.
     pub resource_scopes: Vec<String>,
     /// How many resources one authorization request may name: the server's
-    /// `otto_authorize_resources_max`, an otto extension, or 1 if it does not
+    /// `savvagent_authorize_resources_max`, a Savvagent extension, or 1 if it does not
     /// say.
     pub max_resources: usize,
 }
@@ -41,7 +41,7 @@ struct ServerMeta {
     #[serde(default)]
     scopes_supported: Vec<String>,
     #[serde(default)]
-    otto_authorize_resources_max: Option<usize>,
+    savvagent_authorize_resources_max: Option<usize>,
 }
 
 /// Credentials cross the wire to these URLs, so they must be https. Plain http
@@ -109,7 +109,7 @@ pub async fn discover(http: &reqwest::Client, resource: &str) -> Result<Discover
         token_endpoint: endpoint("token_endpoint", &server.token_endpoint)?,
         registration_endpoint: endpoint("registration_endpoint", &registration)?,
         server_scopes: server.scopes_supported,
-        max_resources: server.otto_authorize_resources_max.unwrap_or(1),
+        max_resources: server.savvagent_authorize_resources_max.unwrap_or(1),
         resource_scopes,
     })
 }
@@ -153,4 +153,35 @@ async fn get_json<T: for<'de> Deserialize<'de>>(http: &reqwest::Client, url: &Ur
     resp.json()
         .await
         .map_err(|_| Error::Discovery(format!("{url} did not return the expected JSON")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_meta(extra: serde_json::Value) -> ServerMeta {
+        let mut v = serde_json::json!({
+            "issuer": "https://savvagent.com",
+            "authorization_endpoint": "https://savvagent.com/oauth/authorize",
+            "token_endpoint": "https://savvagent.com/oauth/token",
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn reads_the_savvagent_resources_max() {
+        let m = server_meta(serde_json::json!({ "savvagent_authorize_resources_max": 8 }));
+        assert_eq!(m.savvagent_authorize_resources_max, Some(8));
+    }
+
+    /// The pre-Savvagent name is not read: such a server gets one resource
+    /// per request, as one that does not say.
+    #[test]
+    fn ignores_the_old_otto_name() {
+        let m = server_meta(serde_json::json!({ "otto_authorize_resources_max": 8 }));
+        assert_eq!(m.savvagent_authorize_resources_max, None);
+    }
 }
