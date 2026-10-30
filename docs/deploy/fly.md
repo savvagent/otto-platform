@@ -1,6 +1,6 @@
 # Deploying the platform on Fly
 
-`otto.savvagent.com` resolves straight to the Fly app `otto-platform`, and
+`savvagent.com` resolves straight to the Fly app `otto-platform`, and
 `otto-platform-server` serves everything: the API, the OAuth authorization server, and the
 `web/` bundle, which is the prerendered marketing pages and the console (`web/build`, baked
 into the image at `/srv/console`). There is no edge in front,
@@ -9,16 +9,21 @@ alternative is in [`cloudflare.md`](cloudflare.md).
 
 One origin matters here for two reasons. The session is a `__Host-` cookie, which the
 browser stores only for exactly the host that set it. And the WebAuthn relying party id is
-the host of `OTTO_PUBLIC_URL`, so passkeys only work when the browser is on
-`otto.savvagent.com`, not on `otto-platform.fly.dev`.
+the host of `SAVVAGENT_PUBLIC_URL`, so passkeys only work when the browser is on
+`savvagent.com`, not on `otto-platform.fly.dev` or the old `otto.savvagent.com`.
+
+`otto.savvagent.com` was the console and issuer until the [Savvagent
+cutover](#savvagent-cutover). It still resolves to this app, and keeps answering resource
+servers' introspection, token and `/internal/*` calls (none of which checks the `Host`)
+until every service has moved to `savvagent.com` (#135).
 
 ## Configuration (`fly.toml`)
 
 | Variable                | Value                        | Why                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | ----------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OTTO_PUBLIC_URL`       | `https://otto.savvagent.com` | OAuth issuer, discovery documents, rp_id, and the origin the CSRF guard compares against.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `OTTO_STATIC_DIR`       | `/srv/console`               | Serve the console from this process. Prerendered pages answer as themselves (`/pricing` from `pricing.html` and `/` from `index.html`; `/pricing.html`, `/index.html` and a trailing slash are each a `308` to the one URL); any other extensionless path gets the SPA shell, `200.html`, with `X-Robots-Tag: noindex, nofollow`. The bundle must contain `200.html` (adapter-static `fallback: '200.html'`), or the server refuses to start. A missing asset stays a `404`; so does a path with a malformed escape or a `.`/`..` segment, as JSON. Unknown `/api`, `/oauth`, `/sso`, `/.well-known` and `/internal` paths answer a JSON `404`, never the shell. |
-| `OTTO_CLIENT_IP_HEADER` | `fly-client-ip`              | Fly's proxy overwrites it with the real client address, so per-IP throttles and the audit trail are sound with nothing else to lock down.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `SAVVAGENT_PUBLIC_URL`       | `https://savvagent.com`      | OAuth issuer, discovery documents, rp_id, and the origin the CSRF guard compares against.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `SAVVAGENT_STATIC_DIR`       | `/srv/console`               | Serve the console from this process. Prerendered pages answer as themselves (`/pricing` from `pricing.html` and `/` from `index.html`; `/pricing.html`, `/index.html` and a trailing slash are each a `308` to the one URL); any other extensionless path gets the SPA shell, `200.html`, with `X-Robots-Tag: noindex, nofollow`. The bundle must contain `200.html` (adapter-static `fallback: '200.html'`), or the server refuses to start. A missing asset stays a `404`; so does a path with a malformed escape or a `.`/`..` segment, as JSON. Unknown `/api`, `/oauth`, `/sso`, `/.well-known` and `/internal` paths answer a JSON `404`, never the shell. |
+| `SAVVAGENT_CLIENT_IP_HEADER` | `fly-client-ip`              | Fly's proxy overwrites it with the real client address, so per-IP throttles and the audit trail are sound with nothing else to lock down.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 
 ## Secrets
 
@@ -28,9 +33,9 @@ Never in `fly.toml`. Staged with `fly secrets set -a otto-platform`; see also th
 | Secret                  | Required                        | What                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ----------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `DATABASE_URL`          | yes                             | Staged by `fly postgres attach`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `OTTO_ENCRYPTION_KEY`   | yes                             | 32 random bytes, base64 (`openssl rand -base64 32`). Encrypts secrets at rest; losing it makes them unreadable.                                                                                                                                                                                                                                                                                                                                                                                             |
-| `OTTO_SMTP_URL`         | no; together with the next one  | Notification email's SMTP server, credentials in the URL: `smtps://user:pass@host:465` or `smtp://user:pass@host:587?tls=required`. Unset (with `OTTO_EMAIL_FROM` also unset), email is disabled: the boot log says so and budget-alert emails wait in `notification_outbox` until it is set.                                                                                                                                                                                                               |
-| `OTTO_EMAIL_FROM`       | no; together with the one above | The `From:` mailbox, e.g. `otto <alerts@savvagent.com>`. Setting exactly one of the two email secrets fails the deploy's health check by refusing to start.                                                                                                                                                                                                                                                                                                                                                 |
+| `SAVVAGENT_ENCRYPTION_KEY`   | yes                             | 32 random bytes, base64 (`openssl rand -base64 32`). Encrypts secrets at rest; losing it makes them unreadable.                                                                                                                                                                                                                                                                                                                                                                                             |
+| `SAVVAGENT_SMTP_URL`         | no; together with the next one  | Notification email's SMTP server, credentials in the URL: `smtps://user:pass@host:465` or `smtp://user:pass@host:587?tls=required`. Unset (with `SAVVAGENT_EMAIL_FROM` also unset), email is disabled: the boot log says so and budget-alert emails wait in `notification_outbox` until it is set.                                                                                                                                                                                                               |
+| `SAVVAGENT_EMAIL_FROM`       | no; together with the one above | The `From:` mailbox, e.g. `otto <alerts@savvagent.com>`. Setting exactly one of the two email secrets fails the deploy's health check by refusing to start.                                                                                                                                                                                                                                                                                                                                                 |
 | `STRIPE_SECRET_KEY`     | no; together with the next one  | Billing's Stripe API key: a restricted key (`rk_live_...`) with the permissions under [Stripe setup](#stripe-setup). Its mode (live or test) must match the one recorded in the database ([Switching Stripe modes](#switching-stripe-modes)), or the server refuses to start. Unset (with `STRIPE_WEBHOOK_SECRET` also unset), billing is disabled: the boot log says so, `GET /api/orgs/{org}/billing` reports `billingEnabled: false`, and the setup route and the webhook answer `503 billing_disabled`. |
 | `STRIPE_WEBHOOK_SECRET` | no; together with the one above | The webhook endpoint's signing secret (`whsec_...`), shown by Stripe when the endpoint is created. Setting exactly one of the two Stripe secrets fails the deploy's health check by refusing to start.                                                                                                                                                                                                                                                                                                      |
 
@@ -38,8 +43,8 @@ Set the two email secrets in one command so no release boots with only one of th
 
 ```bash
 fly secrets set -a otto-platform \
-  OTTO_SMTP_URL='smtps://USER:PASSWORD@smtp.example.com:465' \
-  OTTO_EMAIL_FROM='otto <alerts@savvagent.com>'
+  SAVVAGENT_SMTP_URL='smtps://USER:PASSWORD@smtp.example.com:465' \
+  SAVVAGENT_EMAIL_FROM='otto <alerts@savvagent.com>'
 ```
 
 **Turning email on sends the backlog.** With the secrets unset, every notification is kept
@@ -55,7 +60,7 @@ UPDATE notification_outbox
 ```
 
 **Wrong credentials or sender.** When the SMTP server refuses the platform rather than one
-message (a rejected login, an `OTTO_EMAIL_FROM` the provider does not let us send as, a
+message (a rejected login, an `SAVVAGENT_EMAIL_FROM` the provider does not let us send as, a
 `5.7.x` policy refusal, a refused greeting), the server logs one `error` ("the SMTP server
 refused us, not the message") and keeps every message queued, retrying with backoff for
 about a day (32 attempts). Fix the secret within that window and nothing is lost. Only a
@@ -320,7 +325,7 @@ an hour. With billing disabled the rows wait until it is enabled.
   minutes; fix the key and nothing is lost.
 - `fly ssh console -a otto-platform -C "otto-platform-server usage held"`: usage events
   held for review instead of billed, because they would take an org's total of one meter
-  in one billing month past `OTTO_USAGE_HOLD_THRESHOLD` (default 1,000,000,000,000). Each is
+  in one billing month past `SAVVAGENT_USAGE_HOLD_THRESHOLD` (default 1,000,000,000,000). Each is
   logged at error level when held ("usage held for operator review"), has been refused to
   its shipper (reason `held_for_review`) and is neither counted nor billed. An empty list
   is normal. A held event means a runaway or compromised resource server, or a real org
@@ -470,29 +475,33 @@ If the database never held objects of the other mode (the mode was recorded by m
 DNS is at Namecheap and stays there.
 
 ```bash
-fly certs add otto.savvagent.com -a otto-platform
-fly certs show otto.savvagent.com -a otto-platform   # prints the records to create
+fly certs add savvagent.com -a otto-platform
+fly certs show savvagent.com -a otto-platform   # prints the records to create
 ```
 
-Create at Namecheap what `fly certs show` prints: an `A` and `AAAA` for `otto` (the
-app's IPs, as for `otto-factory`), or a `CNAME` for `otto` to `otto-platform.fly.dev` if you
-prefer. Then `fly certs check otto.savvagent.com -a otto-platform` until it reports issued.
+Create at Namecheap what `fly certs show` prints: an `A` and `AAAA` for `@` (the app's
+IPs; an apex cannot be a `CNAME`). Then `fly certs check savvagent.com -a otto-platform`
+until it reports issued. `otto.savvagent.com` keeps its certificate and records on this app
+until #135 makes it redirect-only.
 
 **Settle this before the first passkey is registered.** Changing the host later invalidates
 every passkey.
 
 ## Resource servers
 
-With no edge, `/oauth/introspect` and `/internal/*` are reachable on `otto.savvagent.com`
-like everything else. That is fine: they authenticate with the resource server's own
-credential. Resource servers can use `https://otto.savvagent.com` for everything, the
-issuer, introspection, usage ingest and webhooks, and `https://otto-platform.fly.dev` is
-no longer needed by anyone.
+With no edge, `/oauth/introspect` and `/internal/*` are reachable on `savvagent.com` like
+everything else. That is fine: they authenticate with the resource server's own
+credential. Resource servers use `https://savvagent.com` for everything, the issuer,
+introspection, usage ingest and webhooks, and `https://otto-platform.fly.dev` is no longer
+needed by anyone. Until a service is repointed it keeps working against
+`https://otto.savvagent.com`: nothing on these routes compares the `Host` with
+`SAVVAGENT_PUBLIC_URL` (`the_old_host_keeps_answering_server_to_server_calls_after_the_cutover`
+pins it), only the advertised issuer differs.
 
 ## CSRF
 
 `crates/otto-web/src/csrf.rs` refuses a non-`GET` that carries the session cookie unless its
-`Origin` equals the origin of `OTTO_PUBLIC_URL` (or, with no `Origin`, it carries
+`Origin` equals the origin of `SAVVAGENT_PUBLIC_URL` (or, with no `Origin`, it carries
 `Sec-Fetch-Site: same-origin`). Served directly the browser sends exactly that origin, so
 nothing needs configuring. `the_console_served_directly_keeps_csrf_and_json_404s` pins it.
 
@@ -501,6 +510,204 @@ nothing needs configuring. `the_console_served_directly_keeps_csrf_and_json_404s
 Deploys run from CI on a release (`flyctl deploy --remote-only -a otto-platform`). The
 image builds the console in its own stage, so one commit ships the server and the bundle
 together and they cannot drift.
+
+## Savvagent cutover
+
+The one-time move of the console and the OAuth issuer from `otto.savvagent.com` to
+`savvagent.com` (savvagent/otto-platform#131, part of #128). The release that carries it
+reads `SAVVAGENT_*` instead of `OTTO_*`, sets `SAVVAGENT_PUBLIC_URL=https://savvagent.com`,
+and renames the cookies to `__Host-savvagent_session` and `__Host-savvagent_sso_binding`.
+There is no compatibility period: that release reads none of the old variables, and
+**refuses to start while any of the server's old `OTTO_*` variables is still set**, naming
+each with its replacement. Every browser session ends, because the cookie it rides on has a
+new name.
+
+Before starting, phase 1 of #128 must be done: the new hosts resolve and have
+certificates (`fly certs check savvagent.com -a otto-platform` reports issued, and
+`tower.savvagent.com`, `flags.savvagent.com` and `cxp.savvagent.com` answer). Do the steps
+in this order, on one day. Steps 2, 6 and 7 change production and are run by hand.
+
+### 1. Reset your own passkeys and keep the claim code
+
+Passkeys are bound to the relying party id, the host of the public URL. Every passkey
+registered at `otto.savvagent.com` stops working at `savvagent.com`, and sign-in is
+passkey-only, so the way across is an account claim, issued on the old host and redeemed on
+the new one.
+
+In the console at `https://otto.savvagent.com`, open the org you own, then **Members**, and
+on your own row choose **Reset passkeys** and confirm. (This is
+`POST /api/orgs/{org}/members/{user}/reset-passkeys`; resetting your own account is always
+allowed.) It clears every passkey on the account, ends all of its browser sessions, and
+shows a one-time **code** and a **link**. Copy the code: it is shown once (only its hash is
+stored), and it expires after 14 days. The link names `otto.savvagent.com`; ignore its host,
+the code is not tied to one.
+
+Do this just before the deploy: from here until step 4 the account cannot sign in to the
+console. Agents' tokens and personal access tokens are untouched by the reset.
+
+### 2. Stage the secrets under their new names
+
+Secrets are copied, never regenerated. **`SAVVAGENT_ENCRYPTION_KEY` must be exactly the
+value of `OTTO_ENCRYPTION_KEY`**: it opens the SSO client secrets and resource-server
+webhook signing secrets already in the database, and a new key would make every one of
+them unreadable. The boot check only validates its shape, so a wrong key would not stop the
+deploy; webhook deliveries would start failing with "wrong SAVVAGENT_ENCRYPTION_KEY?".
+
+List what is set; every `OTTO_*` name there is renamed, value unchanged:
+
+```bash
+fly secrets list -a otto-platform
+```
+
+The server reads these secrets (names before and after):
+
+| Before                  | After                      | Notes                                          |
+| ----------------------- | -------------------------- | ---------------------------------------------- |
+| `OTTO_ENCRYPTION_KEY`   | `SAVVAGENT_ENCRYPTION_KEY` | Required. Copy exactly.                        |
+| `OTTO_SMTP_URL`         | `SAVVAGENT_SMTP_URL`       | Copy if set. Set with the next one or neither. |
+| `OTTO_EMAIL_FROM`       | `SAVVAGENT_EMAIL_FROM`     | Copy if set.                                   |
+| `DATABASE_URL`          | unchanged                  | Leave alone.                                   |
+| `STRIPE_SECRET_KEY`     | unchanged                  | Leave alone.                                   |
+| `STRIPE_WEBHOOK_SECRET` | unchanged                  | Leave alone.                                   |
+
+Any other `OTTO_*` in the list (for example `OTTO_USAGE_HOLD_THRESHOLD`,
+`OTTO_ENFORCE_QUOTAS`, `OTTO_CLIENT_IP_HEADER`, `OTTO_STATIC_DIR`, `OTTO_PUBLIC_URL`, if any
+was ever set as a secret rather than in `fly.toml`) is renamed the same way, `OTTO_` to
+`SAVVAGENT_`; otherwise the new release refuses to start, naming it. `OTTO_PUBLIC_URL` is the
+exception: do not copy it, `fly.toml` sets `SAVVAGENT_PUBLIC_URL`; only unset it.
+
+Read the current values from the running machine into shell variables (never into a file or
+your history), and check each copy against the original before staging anything:
+
+```bash
+copy() { fly ssh console --quiet -a otto-platform -C "printenv $1" | tr -d '\r\n'; }
+remote_sum() { fly ssh console --quiet -a otto-platform -C "sh -c 'printenv $1 | sha256sum'" | cut -c1-64; }
+
+KEY="$(copy OTTO_ENCRYPTION_KEY)"
+printf '%s' "$KEY" | base64 -d | wc -c                     # must print 32
+[ "$(printf '%s\n' "$KEY" | sha256sum | cut -c1-64)" = "$(remote_sum OTTO_ENCRYPTION_KEY)" ] \
+  && echo key copied exactly || echo STOP: key differs
+
+# Only if OTTO_SMTP_URL / OTTO_EMAIL_FROM are in the list:
+SMTP="$(copy OTTO_SMTP_URL)"; FROM="$(copy OTTO_EMAIL_FROM)"
+[ "$(printf '%s\n' "$SMTP" | sha256sum | cut -c1-64)" = "$(remote_sum OTTO_SMTP_URL)" ] && echo smtp ok
+[ "$(printf '%s\n' "$FROM" | sha256sum | cut -c1-64)" = "$(remote_sum OTTO_EMAIL_FROM)" ] && echo from ok
+```
+
+Then stage the new names and the removal of the old ones, so the next deploy applies both
+at once and no release ever boots with one set and not the other:
+
+```bash
+fly secrets set --stage -a otto-platform \
+  SAVVAGENT_ENCRYPTION_KEY="$KEY" \
+  SAVVAGENT_SMTP_URL="$SMTP" \
+  SAVVAGENT_EMAIL_FROM="$FROM"
+
+fly secrets unset --stage -a otto-platform \
+  OTTO_ENCRYPTION_KEY OTTO_SMTP_URL OTTO_EMAIL_FROM   # plus any other OTTO_* listed above
+
+fly secrets list -a otto-platform   # SAVVAGENT_* staged, no OTTO_* left
+unset KEY SMTP FROM
+```
+
+Leave out the email pair from both commands if it was not set. Nothing is live yet: the
+running release keeps its `OTTO_*` values until the deploy.
+
+### 3. Deploy
+
+Merge the release PR that carries this change; CI deploys it (see [Deploying](#deploying)).
+Then check, from anywhere:
+
+```bash
+curl -fsS https://savvagent.com/readyz
+curl -fsS https://savvagent.com/.well-known/oauth-authorization-server | jq -r .issuer       # https://savvagent.com
+curl -fsS https://otto.savvagent.com/.well-known/oauth-authorization-server | jq -r .issuer  # https://savvagent.com too
+fly logs -a otto-platform   # no "still set, and no longer read"; email and billing state as before
+```
+
+A deploy whose machines fail their health check stops with the previous release still
+serving. The usual cause is a leftover or missing variable: the boot log names it. Fix the
+staged secrets and deploy again. If the deploy cannot be made to work today, the claim code
+from step 1 still works on the old release: redeem it at
+`https://otto.savvagent.com/claim?code=…` to get back into the old console.
+
+### 4. Redeem the claim at savvagent.com
+
+Open `https://savvagent.com/claim?code=<the code from step 1>` (the console's claim page;
+the code can also be pasted into its field) and register a new passkey. That passkey is
+bound to `savvagent.com`, and signs you in to the console from now on. Register a second
+device from the console's settings while you are there.
+
+### 5. First-party OAuth clients
+
+Nothing to do for the console: it signs in with passkeys and the session cookie, not
+through an OAuth client, so there is no console client to register. OAuth clients
+(dynamically registered, or `otto-platform-server client register --first-party`) are rows
+in the database and do not depend on the issuer's host; their redirect URIs are on the
+clients' own hosts and keep working. A first-party client whose redirect URI is on
+`otto.savvagent.com` would need registering again with `otto-platform-server client
+register --first-party` and its `savvagent.com` URI; nothing in this repository registers
+one.
+
+### 6. Rename the resource servers
+
+Each service's canonical resource URI moves to its new host, and the old URI becomes an
+alias that keeps authenticating the service at introspection until the sunset, so services
+not yet redeployed carry on. Pick a sunset well past phase 3 (#128); the aliases are
+dropped there explicitly anyway (`resource drop-alias`).
+
+```bash
+fly ssh console -a otto-platform
+# then, inside the machine:
+otto-platform-server resource list      # confirm the current URIs below before renaming
+otto-platform-server resource rename https://otto-tower.savvagent.com/mcp https://tower.savvagent.com/mcp \
+  --alias-until 2027-06-30T00:00:00Z --name "Savvagent Tower"
+otto-platform-server resource rename https://otto-flags.savvagent.com/mcp https://flags.savvagent.com/mcp \
+  --alias-until 2027-06-30T00:00:00Z --name "Savvagent Flags"
+otto-platform-server resource rename https://otto-cxp.savvagent.com/mcp https://cxp.savvagent.com/mcp \
+  --alias-until 2027-06-30T00:00:00Z --name "Savvagent CXP"
+otto-platform-server resource list      # each new URI, with its old one as a `live` alias
+```
+
+`rename` moves each server's tokens, authorization codes and usage dedupe ledger in one
+transaction. A rename can be undone by renaming back onto the live alias
+(`resource rename <new> <old>`), which swaps the two. Billing service slugs
+(`otto-tower`, `otto-flags`) do not change.
+
+### 7. Point the services at savvagent.com
+
+On each service, change its platform URL to `https://savvagent.com` and redeploy it:
+`OF_PLATFORM_URL` on the tower app, `FLAGS_PLATFORM_URL` on the flags app, and
+`CXP_PLATFORM_URL` on the cxp app (in that service's `fly.toml` `[env]`, or with
+`fly secrets set -a <app>` if it keeps it as a secret). The service's own credential is
+unchanged: it still names the old resource URI, which the alias accepts until that service
+moves to its new URI in phase 3.
+
+Until a service is flipped, the protected-resource metadata it publishes still names
+`https://otto.savvagent.com` as its authorization server, whose discovery document now says
+`issuer: https://savvagent.com`. Clients that check that the issuer matches the URL they
+fetched (RFC 8414 §3.3) refuse a new sign-in to that service until it is flipped, so flip
+all three the same day. Tokens already issued keep working throughout.
+
+### 8. Leave otto.savvagent.com pointed at this app
+
+Do not remove `otto.savvagent.com`'s DNS records or its certificate. Services that have not
+been redeployed, agents holding tokens, and MCP clients that cached the old endpoints keep
+calling `https://otto.savvagent.com/oauth/introspect`, `/oauth/token` and `/internal/*`,
+and those answer there exactly as on `savvagent.com`: nothing on them checks the `Host`
+(`the_old_host_keeps_answering_server_to_server_calls_after_the_cutover` pins it). Only
+browser sign-in on the old host stops working, because no passkey is bound to it any more.
+#135 turns it into a redirect once every service has moved.
+
+### Rolling back across the cutover
+
+A release from before the cutover reads `OTTO_*` and ignores `SAVVAGENT_*`, and its
+`fly.toml` sets `OTTO_PUBLIC_URL`. To run one again, stage the `OTTO_*` secrets with the
+same values (the reverse of step 2; the key is the same key, so stored secrets still open),
+and deploy the previous image from a checkout of that release so its `fly.toml` `[env]`
+applies. Passkeys registered in step 4 are bound to `savvagent.com` and do not work on the
+old host, so the console is out of reach on a rolled-back release until you roll forward
+again; API, token and introspection calls are unaffected. Prefer rolling forward with a fix.
 
 ## Migrations and rolling back
 
@@ -517,7 +724,9 @@ refusing to boot. **To roll back, deploy the previous release's image** (for exa
 `fly deploy -a otto-platform --image <previous image>`; `fly releases -a otto-platform
 --image` lists them). It boots against the newer schema and serves. (A release from
 before the epic #55 release does not ignore unknown migrations; rolling back to one needs
-`OTTO_RUN_MIGRATIONS=0` on that deploy, see the [release notes](#release-notes).) Do not touch
+`OTTO_RUN_MIGRATIONS=0` on that deploy, see the [release notes](#release-notes). A release
+from before the Savvagent cutover reads `OTTO_*` rather than `SAVVAGENT_*`; see [Rolling
+back across the cutover](#rolling-back-across-the-cutover).) Do not touch
 `_sqlx_migrations`. When the rolled-forward release ships again, it finds its migrations
 already applied. Every migration a release does know is still checked against its applied
 checksum, so an edited migration is still refused.
@@ -580,7 +789,7 @@ still serving.
   only through such tokens and still has usage to ship is refused, and is fixed by one new
   token (or by inserting its row into `org_resource_grants`).
 - A metered event that would take an org's total of one meter in one UTC billing month past
-  `OTTO_USAGE_HOLD_THRESHOLD` is held in `usage_held_events` (`otto-platform-server usage
+  `SAVVAGENT_USAGE_HOLD_THRESHOLD` is held in `usage_held_events` (`otto-platform-server usage
   held`), not counted and not billed, and reported to its shipper as rejected with a reason
   starting `held_for_review`. There is no release command yet: counting a held event is a
   manual operator step.
