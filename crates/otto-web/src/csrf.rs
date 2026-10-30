@@ -111,7 +111,7 @@ mod tests {
         b.body(Body::empty()).unwrap()
     }
 
-    const COOKIE: (&str, &str) = ("cookie", "theme=dark; __Host-savvagent_session=otto_ss_abc");
+    const COOKIE: (&str, &str) = ("cookie", "theme=dark; __Host-savvagent_session=sav_ss_abc");
 
     #[test]
     fn the_origin_is_scheme_host_and_port() {

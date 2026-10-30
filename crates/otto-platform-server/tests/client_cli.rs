@@ -24,7 +24,7 @@ async fn the_operator_cli_registers_a_first_party_client(pool: PgPool) {
     .await
     .unwrap();
     let client_id = out.trim();
-    assert!(client_id.starts_with("otto_client_"), "{out:?}");
+    assert!(client_id.starts_with("sav_client_"), "{out:?}");
 
     let client = oauth::get_client(&db, client_id).await.unwrap();
     assert!(client.first_party);

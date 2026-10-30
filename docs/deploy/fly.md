@@ -522,6 +522,14 @@ There is no compatibility period: that release reads none of the old variables, 
 each with its replacement. Every browser session ends, because the cookie it rides on has a
 new name.
 
+The same release mints every token and secret with a `sav_` prefix (#132) and refuses the
+sign-in credentials minted before it: `otto_at_` access tokens, `otto_rt_` refresh tokens,
+`otto_pat_` personal access tokens, `otto_ac_` authorization codes and `otto_ss_` sessions.
+After the deploy every agent signs in again and every personal access token is minted anew.
+What keeps working until phase 3 rotates it per service: `otto_client_` client ids, each
+resource server's `otto_rs_` introspection secret and `otto_whsec_` webhook secret, and
+`otto_inv_` invitation and claim codes, so the claim code from step 1 still redeems.
+
 Before starting, phase 1 of #128 must be done: the new hosts resolve and have
 certificates (`fly certs check savvagent.com -a otto-platform` reports issued, and
 `tower.savvagent.com`, `flags.savvagent.com` and `cxp.savvagent.com` answer). Do the steps
@@ -543,7 +551,8 @@ stored), and it expires after 14 days. The link names `otto.savvagent.com`; igno
 the code is not tied to one.
 
 Do this just before the deploy: from here until step 4 the account cannot sign in to the
-console. Agents' tokens and personal access tokens are untouched by the reset.
+console. Agents' tokens and personal access tokens are untouched by the reset, though
+the deploy itself retires them (see above).
 
 ### 2. Stage the secrets under their new names
 
@@ -687,7 +696,7 @@ Until a service is flipped, the protected-resource metadata it publishes still n
 `https://otto.savvagent.com` as its authorization server, whose discovery document now says
 `issuer: https://savvagent.com`. Clients that check that the issuer matches the URL they
 fetched (RFC 8414 §3.3) refuse a new sign-in to that service until it is flipped, so flip
-all three the same day. Tokens already issued keep working throughout.
+all three the same day. Tokens issued after the deploy (`sav_`) keep working throughout.
 
 ### 8. Leave otto.savvagent.com pointed at this app
 

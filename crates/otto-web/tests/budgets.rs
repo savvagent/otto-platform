@@ -337,7 +337,7 @@ async fn a_bearer_token_or_pat_cannot_change_a_budget(pool: PgPool) {
         .await;
     minted.expect(StatusCode::CREATED);
     let pat = minted.body["token"].as_str().unwrap().to_owned();
-    assert!(pat.starts_with("otto_pat_"));
+    assert!(pat.starts_with("sav_pat_"));
 
     for call in [
         Call::put("/api/orgs/acme/budgets/things")

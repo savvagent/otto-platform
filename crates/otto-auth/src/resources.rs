@@ -152,10 +152,17 @@ use crate::crypto::{self, Secret};
 use crate::error::{AuthError, Result};
 
 /// Prefix for a resource server's introspection credential.
-pub const INTROSPECTION_SECRET_PREFIX: &str = "otto_rs_";
+///
+/// `sav_` since the switch to Savvagent (#128). A credential issued earlier
+/// (`otto_rs_`) keeps working: it is looked up by hash with no prefix check,
+/// and phase 3 rotates each service's.
+pub const INTROSPECTION_SECRET_PREFIX: &str = "sav_rs_";
 
 /// Prefix for the key a resource server verifies lifecycle webhooks with.
-pub const WEBHOOK_SECRET_PREFIX: &str = "otto_whsec_";
+///
+/// `sav_` since the switch to Savvagent (#128). A key issued earlier
+/// (`otto_whsec_`) keeps signing until phase 3 rotates each service's.
+pub const WEBHOOK_SECRET_PREFIX: &str = "sav_whsec_";
 
 /// Longest scope description accepted, in characters. A description is one
 /// line on a consent screen, not documentation; a cap keeps a registry typo

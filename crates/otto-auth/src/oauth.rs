@@ -292,7 +292,7 @@ async fn insert_client(
         }
     }
 
-    let client_id = crypto::generate("otto_client_").into_plaintext();
+    let client_id = crypto::generate(prefix::CLIENT_ID).into_plaintext();
 
     sqlx::query(
         "INSERT INTO oauth_clients \
@@ -718,6 +718,11 @@ pub async fn redeem_code(
     code_verifier: &str,
     requested_resource: Option<&str>,
 ) -> Result<(IssuedTokens, UserId, OrgId)> {
+    // A code minted before the switch to Savvagent (#128) is refused as an
+    // unknown one, before the lookup: see `crypto::retired`.
+    if crypto::retired(code) {
+        return Err(AuthError::InvalidGrant("unknown authorization code".into()));
+    }
     let hash = crypto::hash(code.trim());
     let mut tx = db.begin_unpinned().await?;
     // One connection for the whole redemption, and a bounded wait on the
@@ -1103,7 +1108,7 @@ mod tests {
         let owned: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
         Authorization {
             client: Client {
-                client_id: "otto_client_x".into(),
+                client_id: "sav_client_x".into(),
                 client_name: None,
                 redirect_uris: vec!["http://127.0.0.1:1455/callback".into()],
                 disabled: false,

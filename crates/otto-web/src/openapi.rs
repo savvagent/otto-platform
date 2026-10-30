@@ -515,7 +515,7 @@ fn entity_schemas() -> Value {
             "type": "object",
             "description": "Shown once. Only a SHA-256 hash of `token` is stored.",
             "properties": {
-                "token": { "type": "string", "examples": ["otto_pat_…"] },
+                "token": { "type": "string", "examples": ["sav_pat_…"] },
                 "id": uuid,
                 "name": { "type": "string" },
                 "scopes": { "type": "array", "items": { "type": "string" } },

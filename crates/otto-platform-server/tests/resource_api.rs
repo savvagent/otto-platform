@@ -306,6 +306,121 @@ async fn personal_access_tokens_introspect_too(pool: PgPool) {
     assert_eq!(other, json!({ "active": false }));
 }
 
+/// Point the stored token whose plaintext is `minted` at `presented` instead:
+/// the row a token minted before the switch to Savvagent (#128) would be.
+async fn rehash_access_token(db: &Db, minted: &str, presented: &str) {
+    let n = sqlx::query("UPDATE access_tokens SET token_hash = $2 WHERE token_hash = $1")
+        .bind(otto_auth::crypto::hash(minted))
+        .bind(otto_auth::crypto::hash(presented))
+        .execute(db.pool())
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(n, 1);
+}
+
+/// Savvagent (#128) is a hard switch: an access token or PAT minted under
+/// `otto_at_`/`otto_pat_` is inactive, exactly as an unknown token is, even
+/// with its row still live.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn access_tokens_and_pats_minted_before_savvagent_are_inactive(pool: PgPool) {
+    let w = world(pool).await;
+    let auth = w.factory_basic();
+    let oauth = w.oauth_token(FACTORY, &["jobs:read"]).await;
+    let (pat, _) = tokens::mint_pat(&w.db, w.user, w.org, "ci", &[], FACTORY, None)
+        .await
+        .unwrap();
+
+    for (minted, new, old) in [
+        (&oauth, "sav_at_", "otto_at_"),
+        (&pat, "sav_pat_", "otto_pat_"),
+    ] {
+        assert_eq!(
+            introspect(&w.db, Some(&auth), minted).await.1["active"],
+            true
+        );
+        let retired = minted.replacen(new, old, 1);
+        assert_ne!(&retired, minted);
+        rehash_access_token(&w.db, minted, &retired).await;
+        assert_eq!(
+            introspect(&w.db, Some(&auth), &retired).await,
+            (StatusCode::OK, json!({ "active": false })),
+            "{old}"
+        );
+        // The row is untouched: put the new prefix back and it answers again.
+        rehash_access_token(&w.db, &retired, minted).await;
+        assert_eq!(
+            introspect(&w.db, Some(&auth), minted).await.1["active"],
+            true
+        );
+    }
+}
+
+/// Resource server credentials issued before the switch (`otto_rs_`
+/// introspection secrets, `otto_whsec_` webhook keys) keep working until
+/// phase 3 rotates each service's.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn resource_server_secrets_issued_before_savvagent_keep_working(pool: PgPool) {
+    use std::sync::atomic::AtomicU16;
+
+    let w = world(pool).await;
+    assert!(w.factory_secret.starts_with("sav_rs_"));
+    let old = w.factory_secret.replacen("sav_rs_", "otto_rs_", 1);
+    sqlx::query(
+        "UPDATE resource_servers SET introspection_secret_hash = $2 WHERE resource_uri = $1",
+    )
+    .bind(FACTORY)
+    .bind(otto_auth::crypto::hash(&old))
+    .execute(w.db.pool())
+    .await
+    .unwrap();
+    let token = w.oauth_token(FACTORY, &["jobs:read"]).await;
+    for auth in [basic(FACTORY, &old), format!("Bearer {old}")] {
+        let (status, body) = introspect(&w.db, Some(&auth), &token).await;
+        assert_eq!(
+            (status, &body["active"]),
+            (StatusCode::OK, &json!(true)),
+            "{auth}"
+        );
+    }
+
+    // A webhook key issued under `otto_whsec_` still signs deliveries.
+    let (url, received) = receiver(Arc::new(AtomicU16::new(204))).await;
+    let cipher = cipher();
+    let minted = resources::set_webhook(&w.db, &cipher, FACTORY, Some(&url))
+        .await
+        .unwrap()
+        .unwrap();
+    let old_key = minted.replacen("sav_whsec_", "otto_whsec_", 1);
+    let sealed = cipher.seal(old_key.as_bytes()).unwrap();
+    sqlx::query(
+        "UPDATE resource_servers SET webhook_secret_ciphertext = $2, webhook_secret_nonce = $3 \
+         WHERE resource_uri = $1",
+    )
+    .bind(FACTORY)
+    .bind(sealed.ciphertext.as_slice())
+    .bind(sealed.nonce.as_slice())
+    .execute(w.db.pool())
+    .await
+    .unwrap();
+    let mut tx = w.db.begin(w.org).await.unwrap();
+    let team = tx.create_team("platform", "Platform").await.unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = w.db.begin(w.org).await.unwrap();
+    tx.delete_team(team.id).await.unwrap();
+    tx.commit().await.unwrap();
+    let http = otto_platform_server::webhooks::http_client().unwrap();
+    otto_platform_server::webhooks::deliver_due(&w.db, &cipher, &http)
+        .await
+        .unwrap();
+    let got = received.lock().unwrap();
+    let (headers, body) = got.first().expect("no delivery");
+    let sig = headers[otto_resource::webhook::SIGNATURE_HEADER]
+        .to_str()
+        .unwrap();
+    otto_resource::webhook::verify(&old_key, sig, body).unwrap();
+}
+
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn a_removed_member_or_deleted_org_deactivates_the_token(pool: PgPool) {
     let w = world(pool).await;
@@ -348,11 +463,11 @@ async fn resource_server_credentials_are_required_and_checked(pool: PgPool) {
 
     for auth in [
         None,
-        Some(basic(FACTORY, "otto_rs_wrong")),
+        Some(basic(FACTORY, "sav_rs_wrong")),
         // Flags' secret presented as the factory.
         Some(basic(FACTORY, &w.flags_secret)),
         Some(basic("https://nobody.example/mcp", &w.factory_secret)),
-        Some("Bearer otto_rs_wrong".to_owned()),
+        Some("Bearer sav_rs_wrong".to_owned()),
         Some("Basic !!!not-base64".to_owned()),
     ] {
         let (status, body) = introspect(&w.db, auth.as_deref(), &token).await;
@@ -556,7 +671,7 @@ async fn internal_routes_require_the_resource_server_credential(pool: PgPool) {
     ] {
         let (status, _) = send(&w.db, Request::get(&path).body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
-        let (status, _) = get(&w.db, "Bearer otto_rs_nope", &path).await;
+        let (status, _) = get(&w.db, "Bearer sav_rs_nope", &path).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
     }
     let (status, _) = send(
@@ -804,7 +919,7 @@ async fn webhooks_are_signed_delivered_retried_and_deduplicable(pool: PgPool) {
         .await
         .unwrap()
         .unwrap();
-    assert!(secret.starts_with("otto_whsec_"));
+    assert!(secret.starts_with("sav_whsec_"));
 
     let mut tx = w.db.begin(w.org).await.unwrap();
     let team = tx.create_team("platform", "Platform").await.unwrap();
@@ -895,7 +1010,7 @@ async fn webhooks_are_signed_delivered_retried_and_deduplicable(pool: PgPool) {
     let sig = headers[otto_resource::webhook::SIGNATURE_HEADER]
         .to_str()
         .unwrap();
-    assert!(otto_resource::webhook::verify("otto_whsec_other", sig, body).is_err());
+    assert!(otto_resource::webhook::verify("sav_whsec_other", sig, body).is_err());
 }
 
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
@@ -1084,7 +1199,7 @@ async fn the_client_reports_bad_credentials_as_errors_not_inactive_tokens(pool: 
     let base = serve(&w.db).await;
     let token = w.oauth_token(FACTORY, &["jobs:read"]).await;
 
-    let client = PlatformClient::new(ClientConfig::new(&base, FACTORY, "otto_rs_wrong")).unwrap();
+    let client = PlatformClient::new(ClientConfig::new(&base, FACTORY, "sav_rs_wrong")).unwrap();
     assert!(matches!(
         client.introspect(&token).await,
         Err(otto_resource::Error::Unauthorized)
@@ -1400,9 +1515,9 @@ async fn the_operator_cli_provisions_a_working_resource_server(pool: PgPool) {
     };
 
     run(&format!("register {FLAGS} --name otto-flags --scopes flags:read,flags:write --default-scopes flags:read")).await;
-    let secret = secret_in(&run(&format!("rotate-secret {FLAGS}")).await, "otto_rs_");
+    let secret = secret_in(&run(&format!("rotate-secret {FLAGS}")).await, "sav_rs_");
     let hook = run(&format!("set-webhook {FLAGS} https://flags.example/hooks")).await;
-    secret_in(&hook, "otto_whsec_");
+    secret_in(&hook, "sav_whsec_");
     assert!(run("list")
         .await
         .contains("webhook=https://flags.example/hooks"));
@@ -1418,7 +1533,7 @@ async fn the_operator_cli_provisions_a_working_resource_server(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
 
     // Rotating invalidates the previous one.
-    let newer = secret_in(&run(&format!("rotate-secret {FLAGS}")).await, "otto_rs_");
+    let newer = secret_in(&run(&format!("rotate-secret {FLAGS}")).await, "sav_rs_");
     assert_ne!(secret, newer);
     let (status, _) = get(
         &db,
@@ -1582,16 +1697,23 @@ async fn every_token_the_platform_mints_passes_the_clients_shape_filter(pool: Pg
     let (pat, _) = tokens::mint_pat(&w.db, w.user, w.org, "ci", &[], FACTORY, None)
         .await
         .unwrap();
+    assert!(oauth.starts_with("sav_at_"), "{oauth}");
+    assert!(pat.starts_with("sav_pat_"), "{pat}");
     assert!(otto_resource::looks_like_token(&oauth), "{oauth}");
     assert!(otto_resource::looks_like_token(&pat), "{pat}");
 
+    // The same tokens under the prefixes Savvagent (#128) retired do not.
+    let retired_oauth = oauth.replacen("sav_at_", "otto_at_", 1);
+    let retired_pat = pat.replacen("sav_pat_", "otto_pat_", 1);
     for junk in [
         "",
         "Bearer x",
-        "otto_at_short",
-        "otto_rt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        "otto_at_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        "otto_at_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA!A",
+        "sav_at_short",
+        "sav_rt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sav_at_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sav_at_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA!A",
+        &retired_oauth,
+        &retired_pat,
     ] {
         assert!(!otto_resource::looks_like_token(junk), "{junk:?}");
     }
@@ -1603,7 +1725,10 @@ async fn implausible_tokens_are_inactive_without_a_network_call() {
     let client =
         PlatformClient::new(ClientConfig::new("http://127.0.0.1:1", FACTORY, "x")).unwrap();
     assert!(client.introspect("not-a-token").await.unwrap().is_none());
-    assert!(client.introspect("otto_at_x").await.unwrap().is_none());
+    assert!(client.introspect("sav_at_x").await.unwrap().is_none());
+    // A well-formed token under a prefix Savvagent (#128) retired.
+    let retired = format!("otto_at_{}", "A".repeat(43));
+    assert!(client.introspect(&retired).await.unwrap().is_none());
 }
 
 #[test]
@@ -1885,7 +2010,7 @@ async fn meters_can_only_be_declared_under_the_callers_own_service(pool: PgPool)
     assert_eq!(mine[0].unit, "evaluation");
 
     // The declaring route takes the same credential as every /internal route.
-    let (status, _) = put_meters(&w.db, "Bearer otto_rs_nope", json!([])).await;
+    let (status, _) = put_meters(&w.db, "Bearer sav_rs_nope", json!([])).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 

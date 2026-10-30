@@ -121,7 +121,7 @@ async fn register(
     assert_eq!(body["redirect_uris"][0], "http://127.0.0.1/callback");
     (
         StatusCode::CREATED,
-        Json(serde_json::json!({ "client_id": "otto_client_test" })),
+        Json(serde_json::json!({ "client_id": "sav_client_test" })),
     )
 }
 

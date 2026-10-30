@@ -73,7 +73,7 @@ async fn the_console_served_directly_keeps_csrf_and_json_404s(pool: PgPool) {
             (status, String::from_utf8_lossy(&body).into_owned())
         }
     };
-    let cookie = ("cookie", "__Host-savvagent_session=otto_ss_unknown");
+    let cookie = ("cookie", "__Host-savvagent_session=sav_ss_unknown");
     let logout = |origin: Option<&str>| {
         let mut b = Request::post("/api/auth/logout").header(cookie.0, cookie.1);
         if let Some(o) = origin {

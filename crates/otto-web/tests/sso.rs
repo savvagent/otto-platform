@@ -858,7 +858,7 @@ async fn a_mismatched_binding_cookie_is_refused_and_burns_the_ceremony(pool: PgP
         &h,
         &idp,
         &state,
-        Some("otto_ssb_not-the-right-one"),
+        Some("sav_ssb_not-the-right-one"),
         &id_token,
     )
     .await;

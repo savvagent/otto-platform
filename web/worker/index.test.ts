@@ -129,7 +129,7 @@ describe('the Worker', () => {
       upstream.mockClear();
       await call(
         new Request(`https://otto.test${path}`, {
-          headers: { cookie: '__Host-savvagent_session=otto_ss_abc' }
+          headers: { cookie: '__Host-savvagent_session=sav_ss_abc' }
         })
       );
       for (const [forwarded] of upstream.mock.calls) {
@@ -158,7 +158,7 @@ describe('the Worker', () => {
         headers: {
           origin: 'https://otto.test',
           'sec-fetch-site': 'same-origin',
-          cookie: '__Host-savvagent_session=otto_ss_abc',
+          cookie: '__Host-savvagent_session=sav_ss_abc',
           'cf-connecting-ip': '203.0.113.9'
         }
       })

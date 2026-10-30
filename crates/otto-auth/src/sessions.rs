@@ -111,6 +111,11 @@ struct SessionRow {
 
 /// Resolve a presented cookie value to a live session.
 pub async fn resolve(db: &Db, presented: &str) -> Result<Session> {
+    // A session minted before the switch to Savvagent (#128) is refused as an
+    // unknown one (below), before the lookup: see `crypto::retired`.
+    if crypto::retired(presented) {
+        return Err(AuthError::Revoked);
+    }
     let hash = crypto::hash(presented.trim());
 
     let row: Option<SessionRow> = sqlx::query_as(
@@ -260,7 +265,7 @@ mod tests {
     #[test]
     fn debug_does_not_leak_the_cookie_value() {
         let s = NewSession {
-            token: "otto_ss_supersecret".into(),
+            token: "sav_ss_supersecret".into(),
             session: Session {
                 id: Uuid::nil(),
                 user_id: UserId::new(),

@@ -225,6 +225,12 @@ struct TokenRow {
 /// optional "for convenience" — an unaudienced introspection is the confused
 /// deputy the RFC exists to prevent.
 pub async fn introspect(db: &Db, presented: &str, expected_resource: &str) -> Result<Principal> {
+    // An access token or PAT minted before the switch to Savvagent (#128) is
+    // refused as an unknown one (below), before the lookup: see
+    // `crypto::retired`.
+    if crypto::retired(presented) {
+        return Err(AuthError::Revoked);
+    }
     let hash = crypto::hash(presented.trim());
 
     let row: Option<TokenRow> = sqlx::query_as(&format!(
@@ -319,6 +325,11 @@ pub async fn redeem_refresh(
     client_id: &str,
     requested_resource: Option<&str>,
 ) -> Result<(IssuedTokens, UserId, OrgId, bool)> {
+    // A refresh token minted before the switch to Savvagent (#128) is refused
+    // as an unknown one, before the lookup: see `crypto::retired`.
+    if crypto::retired(presented) {
+        return Err(AuthError::InvalidGrant("unknown refresh token".into()));
+    }
     let hash = crypto::hash(presented.trim());
     let mut tx = db.begin_unpinned().await?;
     // Everything below runs on this one connection, never a second pool
