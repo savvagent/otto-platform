@@ -128,7 +128,7 @@ of them is done by CI or by the server.
    same permissions; a missing permission shows up as a `403` in `stripe sync`'s errors or
    in the shipper's logs.
 3. **Webhook endpoint.** Dashboard → Developers → Webhooks → Add endpoint:
-   - URL: `https://otto.savvagent.com/api/stripe/webhook`
+   - URL: `https://savvagent.com/api/stripe/webhook`
    - API version: `2025-03-31.basil` (the version the client is pinned to)
    - Events, exactly these eight: `checkout.session.completed`,
      `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.created`,
@@ -533,7 +533,7 @@ resource server's `otto_rs_` introspection secret and `otto_whsec_` webhook secr
 Before starting, phase 1 of #128 must be done: the new hosts resolve and have
 certificates (`fly certs check savvagent.com -a otto-platform` reports issued, and
 `tower.savvagent.com`, `flags.savvagent.com` and `cxp.savvagent.com` answer). Do the steps
-in this order, on one day. Steps 2, 6 and 7 change production and are run by hand.
+in this order, on one day. Steps 2, 4, 7 and 8 change production and are run by hand.
 
 ### 1. Reset your own passkeys and keep the claim code
 
@@ -541,6 +541,11 @@ Passkeys are bound to the relying party id, the host of the public URL. Every pa
 registered at `otto.savvagent.com` stops working at `savvagent.com`, and sign-in is
 passkey-only, so the way across is an account claim, issued on the old host and redeemed on
 the new one.
+
+Rob's is the only account (#128), so his are the only passkeys to reset. If other members
+exist by the time of the cutover, reset each of them the same way from **Members** at
+`https://savvagent.com` once step 5 has you signed in there, and hand each their code to
+redeem at `https://savvagent.com/claim`.
 
 In the console at `https://otto.savvagent.com`, open the org you own, then **Members**, and
 on your own row choose **Reset passkeys** and confirm. (This is
@@ -550,7 +555,7 @@ shows a one-time **code** and a **link**. Copy the code: it is shown once (only 
 stored), and it expires after 14 days. The link names `otto.savvagent.com`; ignore its host,
 the code is not tied to one.
 
-Do this just before the deploy: from here until step 4 the account cannot sign in to the
+Do this just before the deploy: from here until step 5 the account cannot sign in to the
 console. Agents' tokens and personal access tokens are untouched by the reset, though
 the deploy itself retires them (see above).
 
@@ -640,14 +645,36 @@ staged secrets and deploy again. If the deploy cannot be made to work today, the
 from step 1 still works on the old release: redeem it at
 `https://otto.savvagent.com/claim?code=…` to get back into the old console.
 
-### 4. Redeem the claim at savvagent.com
+### 4. Repoint the Stripe webhook
+
+Skip this if billing is disabled (no `STRIPE_SECRET_KEY`). The endpoint registered in
+[Stripe setup](#stripe-setup) still posts to `https://otto.savvagent.com/api/stripe/webhook`.
+That keeps working for now, but Stripe does not follow redirects, and #135 makes
+`otto.savvagent.com` redirect-only, so every delivery would then fail. Edit the existing
+endpoint rather than adding a new one: Dashboard → Developers → Webhooks → the endpoint →
+**Update details**, URL `https://savvagent.com/api/stripe/webhook`, or with the Stripe CLI:
+
+```bash
+stripe webhook_endpoints list --live                 # find the endpoint's we_... id
+stripe webhook_endpoints update we_... --live -d url=https://savvagent.com/api/stripe/webhook
+```
+
+Editing the URL keeps the endpoint, its events and its signing secret, so
+`STRIPE_WEBHOOK_SECRET` stays as it is. A new endpoint would get a new `whsec_...`, which
+would have to be set as `STRIPE_WEBHOOK_SECRET` (with `STRIPE_SECRET_KEY`, as in Stripe
+setup) and the old endpoint deleted, or Stripe sends every event twice. Check the
+endpoint's next deliveries succeed (Dashboard → the endpoint → **Event deliveries**). Do the
+same, without `--live`, for a test-mode endpoint that points at `otto.savvagent.com`, if
+there is one.
+
+### 5. Redeem the claim at savvagent.com
 
 Open `https://savvagent.com/claim?code=<the code from step 1>` (the console's claim page;
 the code can also be pasted into its field) and register a new passkey. That passkey is
 bound to `savvagent.com`, and signs you in to the console from now on. Register a second
 device from the console's settings while you are there.
 
-### 5. First-party OAuth clients
+### 6. First-party OAuth clients
 
 Nothing to do for the console: it signs in with passkeys and the session cookie, not
 through an OAuth client, so there is no console client to register. OAuth clients
@@ -658,7 +685,7 @@ clients' own hosts and keep working. A first-party client whose redirect URI is 
 register --first-party` and its `savvagent.com` URI; nothing in this repository registers
 one.
 
-### 6. Rename the resource servers
+### 7. Rename the resource servers
 
 Each service's canonical resource URI moves to its new host, and the old URI becomes an
 alias that keeps authenticating the service at introspection until the sunset, so services
@@ -683,7 +710,7 @@ transaction. A rename can be undone by renaming back onto the live alias
 (`resource rename <new> <old>`), which swaps the two. Billing service slugs
 (`otto-tower`, `otto-flags`) do not change.
 
-### 7. Point the services at savvagent.com
+### 8. Point the services at savvagent.com
 
 On each service, change its platform URL to `https://savvagent.com` and redeploy it:
 `OF_PLATFORM_URL` on `otto-factory-mcp` (tower), `FLAGS_PLATFORM_URL` on `otto-flags`, and
@@ -698,7 +725,7 @@ Until a service is flipped, the protected-resource metadata it publishes still n
 fetched (RFC 8414 §3.3) refuse a new sign-in to that service until it is flipped, so flip
 all three the same day. Tokens issued after the deploy (`sav_`) keep working throughout.
 
-### 8. Leave otto.savvagent.com pointed at this app
+### 9. Leave otto.savvagent.com pointed at this app
 
 Do not remove `otto.savvagent.com`'s DNS records or its certificate. Services that have not
 been redeployed, agents holding tokens, and MCP clients that cached the old endpoints keep
@@ -714,7 +741,7 @@ A release from before the cutover reads `OTTO_*` and ignores `SAVVAGENT_*`, and 
 `fly.toml` sets `OTTO_PUBLIC_URL`. To run one again, stage the `OTTO_*` secrets with the
 same values (the reverse of step 2; the key is the same key, so stored secrets still open),
 and deploy the previous image from a checkout of that release so its `fly.toml` `[env]`
-applies. Passkeys registered in step 4 are bound to `savvagent.com` and do not work on the
+applies. Passkeys registered in step 5 are bound to `savvagent.com` and do not work on the
 old host, so the console is out of reach on a rolled-back release until you roll forward
 again; API, token and introspection calls are unaffected. Prefer rolling forward with a fix.
 

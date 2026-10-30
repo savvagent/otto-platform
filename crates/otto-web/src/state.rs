@@ -9,7 +9,7 @@ use otto_tenant::Db;
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Public base URL of the console and the authorization server — the origin
-    /// a browser sees (`SAVVAGENT_PUBLIC_URL`; `https://otto.savvagent.com` in
+    /// a browser sees (`SAVVAGENT_PUBLIC_URL`; `https://savvagent.com` in
     /// production). Every link the product hands out is built from it: the
     /// OAuth issuer, the discovery document, the SSO callback, and the
     /// invitation URL an admin copies. A wrong value produces links that 404

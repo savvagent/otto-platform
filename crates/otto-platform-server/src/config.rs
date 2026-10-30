@@ -37,7 +37,7 @@ pub struct Config {
     pub bind: SocketAddr,
 
     /// Public origin a browser sees (`SAVVAGENT_PUBLIC_URL`), e.g.
-    /// `https://otto.savvagent.com`. The OAuth issuer, the discovery document,
+    /// `https://savvagent.com`. The OAuth issuer, the discovery document,
     /// every link handed to a human, and the WebAuthn relying party id (its
     /// host) are all built from it.
     pub public_url: String,
@@ -235,6 +235,8 @@ impl Config {
 fn refuse_retired(env: Lookup<'_>) -> Result<()> {
     let set: Vec<String> = RETIRED
         .iter()
+        // `is_some`, not `optional`: a set-but-empty `OTTO_X=""` is refused too,
+        // on purpose. A leftover is a leftover, and the fix is the same.
         .filter(|(old, _)| env(old).is_some())
         .map(|(old, new)| format!("{old} (now {new})"))
         .collect();
@@ -557,6 +559,186 @@ mod tests {
                 "{name} is read"
             );
         }
+
+        // And every `var::*` constant is asked for, so a constant nothing
+        // reads (a setting renamed in `var` but no longer looked up) fails
+        // here. The list comes from this file's own `mod var`, so a new
+        // constant cannot be left out of the check.
+        let asked = asked.borrow();
+        let declared = declared_vars();
+        assert_eq!(declared.len(), RETIRED.len(), "{declared:?}");
+        for name in &declared {
+            assert!(asked.iter().any(|a| a == name), "{name} is never read");
+        }
+    }
+
+    /// The names `mod var` declares, read from this file's source.
+    fn declared_vars() -> Vec<String> {
+        let src = include_str!("config.rs");
+        let body = src
+            .split_once("pub mod var {")
+            .and_then(|(_, rest)| rest.split_once("\n}"))
+            .expect("config.rs has a `pub mod var` block")
+            .0;
+        body.lines()
+            .filter_map(|line| line.trim().strip_prefix("pub const "))
+            .map(|decl| {
+                let value = decl.split_once('=').expect("a const has a value").1;
+                value
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The `[env]` table of `fly.toml`, as `KEY = "value"` lines. Anything
+    /// else in the table fails loudly rather than being skipped.
+    fn fly_env(src: &str) -> Vec<(String, String)> {
+        let mut in_env = false;
+        let mut out = Vec::new();
+        for line in src.lines().map(str::trim) {
+            if line.starts_with('[') {
+                in_env = line == "[env]";
+                continue;
+            }
+            if !in_env || line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (key, value) = line
+                .split_once('=')
+                .unwrap_or_else(|| panic!("not KEY = \"value\" in fly.toml [env]: {line}"));
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or_else(|| panic!("not a plain string in fly.toml [env]: {line}"));
+            out.push((key.trim().to_string(), value.to_string()));
+        }
+        out
+    }
+
+    /// `.env.example`'s assignments: the live ones, and the commented-out
+    /// examples (`# KEY=value`) separately.
+    fn dotenv(src: &str) -> (Vec<(String, String)>, Vec<String>) {
+        let is_key = |k: &str| {
+            !k.is_empty()
+                && k.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        };
+        let (mut live, mut commented) = (Vec::new(), Vec::new());
+        for line in src.lines().map(str::trim) {
+            let (text, is_comment) = match line.strip_prefix('#') {
+                Some(rest) => (rest.trim(), true),
+                None => (line, false),
+            };
+            let Some((key, value)) = text.split_once('=') else {
+                assert!(
+                    is_comment || text.is_empty(),
+                    "unparsed .env.example line: {line}"
+                );
+                continue;
+            };
+            if is_comment {
+                if is_key(key) {
+                    commented.push(key.to_string());
+                }
+            } else {
+                assert!(is_key(key), "not KEY=value in .env.example: {line}");
+                live.push((key.to_string(), value.to_string()));
+            }
+        }
+        (live, commented)
+    }
+
+    /// The secrets the cutover runbook (docs/deploy/fly.md) has staged, the
+    /// optional pairs included when `all` is set.
+    fn staged_secrets(all: bool) -> Vec<(&'static str, &'static str)> {
+        let mut secrets = vec![
+            (
+                "DATABASE_URL",
+                "postgres://otto:pw@otto-db.flycast:5432/otto_platform",
+            ),
+            ("SAVVAGENT_ENCRYPTION_KEY", KEY),
+        ];
+        if all {
+            secrets.extend([
+                ("SAVVAGENT_SMTP_URL", "smtps://u:p@smtp.example.com:465"),
+                ("SAVVAGENT_EMAIL_FROM", "otto <alerts@savvagent.com>"),
+                ("STRIPE_SECRET_KEY", "rk_live_example"),
+                ("STRIPE_WEBHOOK_SECRET", "whsec_example"),
+            ]);
+        }
+        secrets
+    }
+
+    /// `pairs` with each secret added where `pairs` has no non-empty value.
+    fn with_secrets(
+        pairs: &[(String, String)],
+        secrets: &[(&str, &str)],
+    ) -> std::collections::HashMap<String, String> {
+        let mut map: std::collections::HashMap<String, String> = pairs.iter().cloned().collect();
+        for (k, v) in secrets {
+            let slot = map.entry(k.to_string()).or_default();
+            if slot.trim().is_empty() {
+                *slot = v.to_string();
+            }
+        }
+        map
+    }
+
+    fn repo_file(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+    }
+
+    /// What ships in `fly.toml`, plus the secrets the runbook stages, boots:
+    /// no setting the server needs went missing in the rename, and no
+    /// `OTTO_*` name is left for the boot check to refuse.
+    #[test]
+    fn fly_toml_with_the_staged_secrets_boots() {
+        let env = fly_env(&repo_file("fly.toml"));
+        assert!(!env.is_empty(), "fly.toml has no [env] table");
+        for (key, _) in &env {
+            assert!(!key.starts_with("OTTO_"), "fly.toml [env] still sets {key}");
+        }
+        for (secret, _) in staged_secrets(true) {
+            assert!(
+                env.iter().all(|(k, _)| k != secret),
+                "{secret} is a secret and belongs in `fly secrets`, not fly.toml"
+            );
+        }
+        for all in [false, true] {
+            let map = with_secrets(&env, &staged_secrets(all));
+            let config = Config::from_lookup(&|name| map.get(name).cloned())
+                .unwrap_or_else(|e| panic!("fly.toml does not boot (all secrets: {all}): {e:#}"));
+            assert_eq!(config.public_url, "https://savvagent.com");
+            assert_eq!(config.static_dir, Some(PathBuf::from("/srv/console")));
+            assert_eq!(config.client_ip_header.as_deref(), Some("fly-client-ip"));
+            assert_eq!(config.log_format, LogFormat::Json);
+            assert_eq!(config.email.is_some(), all);
+            assert_eq!(config.stripe.is_some(), all);
+        }
+    }
+
+    /// `.env.example`, copied to `.env` with the encryption key filled in,
+    /// boots, and neither its live settings nor its commented-out examples
+    /// name an `OTTO_*` variable.
+    #[test]
+    fn env_example_with_the_secrets_filled_in_boots() {
+        let (live, commented) = dotenv(&repo_file(".env.example"));
+        assert!(!live.is_empty(), ".env.example sets nothing");
+        for key in live.iter().map(|(k, _)| k).chain(&commented) {
+            assert!(!key.starts_with("OTTO_"), ".env.example still names {key}");
+        }
+        let map = with_secrets(&live, &staged_secrets(false));
+        let config = Config::from_lookup(&|name| map.get(name).cloned())
+            .unwrap_or_else(|e| panic!(".env.example does not boot: {e:#}"));
+        assert_eq!(config.public_url, "http://localhost:8080");
+        assert!(config.email.is_none() && config.stripe.is_none());
     }
 
     #[test]

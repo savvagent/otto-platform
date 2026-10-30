@@ -22,7 +22,7 @@ Cloudflare is a deployment choice, not an architecture: with `SAVVAGENT_STATIC_D
 ## Why a Worker rather than two origins
 
 The console's session is an `HttpOnly`, `__Host-`-prefixed cookie
-(`__Host-otto_session`). `__Host-` means the browser refuses to store it unless it is
+(`__Host-savvagent_session`). `__Host-` means the browser refuses to store it unless it is
 `Secure`, has `Path=/`, and carries **no `Domain`**, so it is bound to exactly one origin.
 Hosting the SPA on one hostname and the API on another does not need a CORS header; it
 needs a different authentication transport. So whatever fronts the console must _proxy_ the
