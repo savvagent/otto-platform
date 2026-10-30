@@ -120,7 +120,7 @@ pub fn router(db: Db, billing: Billing) -> Router {
     router_with_hold_threshold(db, billing, usage::DEFAULT_HOLD_THRESHOLD)
 }
 
-/// [`router`] with the usage review threshold set (`OTTO_USAGE_HOLD_THRESHOLD`).
+/// [`router`] with the usage review threshold set (`SAVVAGENT_USAGE_HOLD_THRESHOLD`).
 pub fn router_with_hold_threshold(db: Db, billing: Billing, hold_threshold: i64) -> Router {
     Router::new()
         .route("/internal/usage", post(ingest_usage))

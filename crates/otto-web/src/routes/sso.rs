@@ -17,7 +17,7 @@
 //!   before either does) and the short one that provisions `org_members`
 //!   for a brand-new federated user (after every IdP call has already
 //!   returned).
-//! - **The callback needs both `state` and the `__Host-otto_sso_binding`
+//! - **The callback needs both `state` and the `__Host-savvagent_sso_binding`
 //!   cookie to agree before it does anything** — see [`session`]'s module
 //!   docs and the design spec's Assumptions for the login-CSRF hole a bare
 //!   `state` check leaves open.

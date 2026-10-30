@@ -483,7 +483,7 @@ async fn an_unknown_mailbox_is_permanent_but_a_refused_sender_is_not(pool: PgPoo
     let r = row(&db, id).await;
     assert!(r.failed, "5.1.1 is the recipient's fault: {r:?}");
 
-    // An unauthorised OTTO_EMAIL_FROM: our configuration, not the message.
+    // An unauthorised SAVVAGENT_EMAIL_FROM: our configuration, not the message.
     // Giving up would discard every queued alert on the first try.
     for (script, what) in [
         (

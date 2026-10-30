@@ -1717,7 +1717,7 @@ async fn the_openapi_document_is_public_and_describes_the_surface(pool: PgPool) 
     assert!(doc.body["paths"]["/api/orgs/{org}/teams"]["post"].is_object());
     assert_eq!(
         doc.body["components"]["securitySchemes"]["sessionCookie"]["name"],
-        "__Host-otto_session"
+        "__Host-savvagent_session"
     );
 }
 

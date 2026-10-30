@@ -1446,7 +1446,7 @@ async fn the_operator_cli_provisions_a_working_resource_server(pool: PgPool) {
     .await;
     assert!(
         no_key.is_err(),
-        "storing a signing secret needs OTTO_ENCRYPTION_KEY"
+        "storing a signing secret needs SAVVAGENT_ENCRYPTION_KEY"
     );
 }
 
@@ -1658,7 +1658,7 @@ async fn resource_server_calls_are_not_subject_to_the_browser_csrf_guard(pool: P
         .oneshot(
             Request::post("/api/auth/logout")
                 .header("origin", "https://evil.example")
-                .header("cookie", "__Host-otto_session=x")
+                .header("cookie", "__Host-savvagent_session=x")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1673,7 +1673,7 @@ async fn resource_server_calls_are_not_subject_to_the_browser_csrf_guard(pool: P
                 .header("authorization", w.factory_basic())
                 .header("origin", "https://evil.example")
                 .header("sec-fetch-site", "cross-site")
-                .header("cookie", "__Host-otto_session=x")
+                .header("cookie", "__Host-savvagent_session=x")
                 .body(Body::from(url_form(&[("token", &token)])))
                 .unwrap(),
         )
@@ -1698,6 +1698,116 @@ async fn resource_server_calls_are_not_subject_to_the_browser_csrf_guard(pool: P
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+/// The Savvagent cutover (savvagent/otto-platform#131) moves the public URL,
+/// and with it the issuer and the CSRF origin, to `https://savvagent.com`,
+/// while resource servers not yet repointed keep calling
+/// `https://otto.savvagent.com`. Nothing may check the `Host` of those calls
+/// against the public URL: introspection, the token endpoint and the internal
+/// API must answer on the old host exactly as on the new one.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn the_old_host_keeps_answering_server_to_server_calls_after_the_cutover(pool: PgPool) {
+    let w = world(pool).await;
+    let config = otto_platform_server::Config {
+        database_url: "unused".into(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        public_url: "https://savvagent.com".into(),
+        encryption_key: B64.encode([5u8; 32]),
+        client_ip_header: None,
+        enforce_quotas: false,
+        static_dir: None,
+        run_migrations: true,
+        log_format: otto_platform_server::LogFormat::Text,
+        email: None,
+        stripe: None,
+        usage_hold_threshold: otto_billing::usage::DEFAULT_HOLD_THRESHOLD,
+    };
+    let app = || otto_platform_server::app(w.db.clone(), &config).unwrap();
+    const OLD_HOST: &str = "otto.savvagent.com";
+
+    let token = w.oauth_token(FACTORY, &["jobs:read"]).await;
+    let res = app()
+        .oneshot(
+            Request::post("https://otto.savvagent.com/oauth/introspect")
+                .header("host", OLD_HOST)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("authorization", w.factory_basic())
+                .body(Body::from(url_form(&[("token", &token)])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["active"], true, "{body}");
+
+    // A refresh, which is what an agent holding a token from before the
+    // cutover does against the token endpoint it was given.
+    let issued = tokens::issue(
+        &w.db,
+        IssueParams {
+            user_id: w.user,
+            org_id: w.org,
+            client_id: Some("agent"),
+            scopes: &["jobs:read".to_string()],
+            resource: FACTORY,
+            with_refresh: true,
+        },
+    )
+    .await
+    .unwrap();
+    let refresh = issued.refresh_token.expect("issued with a refresh token");
+    let res = app()
+        .oneshot(
+            Request::post("https://otto.savvagent.com/oauth/token")
+                .header("host", OLD_HOST)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(url_form(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", &refresh),
+                    ("client_id", "agent"),
+                    ("resource", FACTORY),
+                ])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["access_token"].is_string(), "{body}");
+
+    let res = app()
+        .oneshot(
+            Request::post("https://otto.savvagent.com/internal/usage")
+                .header("host", OLD_HOST)
+                .header("content-type", "application/json")
+                .header("authorization", w.factory_basic())
+                .body(Body::from(r#"{"events":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // And the discovery document names the new issuer whichever host serves
+    // it, which is why resource servers must be repointed (cutover step 7).
+    let res = app()
+        .oneshot(
+            Request::get("https://otto.savvagent.com/.well-known/oauth-authorization-server")
+                .header("host", OLD_HOST)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["issuer"], "https://savvagent.com", "{body}");
 }
 
 // ------------------------------------------------------------------ meters

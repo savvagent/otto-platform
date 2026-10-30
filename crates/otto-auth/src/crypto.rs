@@ -33,7 +33,7 @@ pub mod prefix {
     /// Enterprise OIDC federation (`sso_ceremonies.state_hash`) — see
     /// otto-factory's `docs/specs/2026-09-16-oidc-federation-design.md` §5.
     pub const SSO_STATE: &str = "otto_sst_";
-    /// The `__Host-otto_sso_binding` cookie value (`sso_ceremonies.binding_hash`).
+    /// The `__Host-savvagent_sso_binding` cookie value (`sso_ceremonies.binding_hash`).
     pub const SSO_BINDING: &str = "otto_ssb_";
 }
 

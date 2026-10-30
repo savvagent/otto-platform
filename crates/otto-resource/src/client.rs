@@ -102,7 +102,7 @@ impl std::fmt::Debug for ClientConfig {
 /// let platform = PlatformClient::new(ClientConfig::new(
 ///     "https://otto.savvagent.com",
 ///     "https://otto-flags.savvagent.com/mcp",
-///     std::env::var("OTTO_INTROSPECTION_SECRET").unwrap(),
+///     std::env::var("SAVVAGENT_INTROSPECTION_SECRET").unwrap(),
 /// ))?;
 ///
 /// match platform.introspect("otto_at_...").await? {

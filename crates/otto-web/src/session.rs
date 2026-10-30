@@ -24,7 +24,7 @@
 //!
 //! ## `__Host-`
 //!
-//! The name is `__Host-otto_session`. The prefix is not decoration: browsers
+//! The name is `__Host-savvagent_session`. The prefix is not decoration: browsers
 //! refuse to store a `__Host-`-prefixed cookie unless it is `Secure`, has
 //! `Path=/`, and carries **no `Domain`** — which makes it impossible for a
 //! sibling subdomain to set one. Without it, an XSS on any `*.example.com` host
@@ -56,7 +56,7 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 /// The cookie name. See the module docs for why the prefix is there.
-pub const COOKIE_NAME: &str = "__Host-otto_session";
+pub const COOKIE_NAME: &str = "__Host-savvagent_session";
 
 /// Build the `Set-Cookie` value for a freshly opened session.
 ///
@@ -86,7 +86,7 @@ pub fn set_cookie(token: &str) -> HeaderValue {
 /// cookies and sends the stale one — a logout that appears to work and does not.
 pub fn clear_cookie() -> HeaderValue {
     HeaderValue::from_static(
-        "__Host-otto_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
+        "__Host-savvagent_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
     )
 }
 
@@ -126,7 +126,7 @@ pub fn token_from(parts: &Parts) -> Option<String> {
 /// `__Host-` prefix — except this cookie's `Max-Age` is the ceremony's own
 /// short TTL, not the session's, because it protects nothing once the
 /// ceremony it names has expired or been consumed.
-pub const BINDING_COOKIE_NAME: &str = "__Host-otto_sso_binding";
+pub const BINDING_COOKIE_NAME: &str = "__Host-savvagent_sso_binding";
 
 /// Build the `Set-Cookie` value for a freshly started SSO ceremony.
 ///
@@ -149,7 +149,7 @@ pub fn set_binding_cookie(token: &str, max_age_secs: i64) -> HeaderValue {
 /// anyway so it does not sit there until its own `Max-Age` expires.
 pub fn clear_binding_cookie() -> HeaderValue {
     HeaderValue::from_static(
-        "__Host-otto_sso_binding=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
+        "__Host-savvagent_sso_binding=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
     )
 }
 
@@ -341,23 +341,23 @@ mod tests {
 
     #[test]
     fn the_session_token_is_found_among_other_cookies() {
-        let parts = parts_with("theme=dark; __Host-otto_session=otto_ss_abc; locale=en");
+        let parts = parts_with("theme=dark; __Host-savvagent_session=otto_ss_abc; locale=en");
         assert_eq!(token_from(&parts), Some("otto_ss_abc".into()));
 
-        let parts = parts_with("__Host-otto_session=otto_ss_abc");
+        let parts = parts_with("__Host-savvagent_session=otto_ss_abc");
         assert_eq!(token_from(&parts), Some("otto_ss_abc".into()));
     }
 
     /// A cookie whose *name* merely ends in ours must not be read as ours —
-    /// `evil-__Host-otto_session` is a name an attacker can set on a sibling host.
+    /// `evil-__Host-savvagent_session` is a name an attacker can set on a sibling host.
     #[test]
     fn a_lookalike_cookie_name_is_not_the_session() {
         for cookie in [
-            "otto_session=otto_ss_abc",
-            "evil__Host-otto_session=otto_ss_abc",
-            "x__Host-otto_session=otto_ss_abc",
-            "__Host-otto_session_other=otto_ss_abc",
-            "__Host-otto_session=",
+            "savvagent_session=otto_ss_abc",
+            "evil__Host-savvagent_session=otto_ss_abc",
+            "x__Host-savvagent_session=otto_ss_abc",
+            "__Host-savvagent_session_other=otto_ss_abc",
+            "__Host-savvagent_session=",
             "theme=dark",
         ] {
             assert_eq!(
@@ -376,7 +376,7 @@ mod tests {
         let cookie = set_cookie("otto_ss_abc");
         let cookie = cookie.to_str().unwrap();
 
-        assert!(cookie.starts_with("__Host-otto_session=otto_ss_abc"));
+        assert!(cookie.starts_with("__Host-savvagent_session=otto_ss_abc"));
         assert!(cookie.contains("HttpOnly"), "script could read it");
         assert!(
             cookie.contains("Secure"),
@@ -425,7 +425,7 @@ mod tests {
         let cookie = set_binding_cookie("otto_ssb_abc", 600);
         let cookie = cookie.to_str().unwrap();
 
-        assert!(cookie.starts_with("__Host-otto_sso_binding=otto_ssb_abc"));
+        assert!(cookie.starts_with("__Host-savvagent_sso_binding=otto_ssb_abc"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("Path=/"));
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn the_binding_token_is_found_among_other_cookies() {
-        let parts = parts_with("theme=dark; __Host-otto_sso_binding=otto_ssb_abc; locale=en");
+        let parts = parts_with("theme=dark; __Host-savvagent_sso_binding=otto_ssb_abc; locale=en");
         assert_eq!(binding_token_from(&parts), Some("otto_ssb_abc".into()));
         assert_eq!(binding_token_from(&parts_with("theme=dark")), None);
     }

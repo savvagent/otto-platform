@@ -20,7 +20,7 @@ import { defineConfig } from 'vite';
  * certificate; it has nothing to do with the cookie's `Secure` attribute, which
  * browsers honour on `localhost` regardless.
  */
-const api = process.env.OTTO_API_ORIGIN ?? 'http://127.0.0.1:8080';
+const api = process.env.SAVVAGENT_API_ORIGIN ?? 'http://127.0.0.1:8080';
 
 const proxied = {
   target: api,

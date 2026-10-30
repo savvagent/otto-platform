@@ -4,7 +4,7 @@
 //! this file is longer than a `serde` derive would be:
 //!
 //! 1. **A setting whose wrong value fails silently has no default.** A wrong
-//!    `OTTO_PUBLIC_URL` does not crash: it mails links to an origin that does
+//!    `SAVVAGENT_PUBLIC_URL` does not crash: it mails links to an origin that does
 //!    not exist, builds an OAuth issuer nothing trusts, and binds every passkey
 //!    to the wrong relying party, and the first report arrives hours later from
 //!    somebody who cannot sign in. Refusing to start is the cheap version of
@@ -14,14 +14,15 @@
 //!
 //! Nothing here falls back quietly. A variable that is set but unparseable is
 //! an error naming the variable and what it accepts, never a default — an
-//! `OTTO_ENFORCE_QUOTAS=yes-please` that silently reads as "off" is how a
+//! `SAVVAGENT_ENFORCE_QUOTAS=yes-please` that silently reads as "off" is how a
 //! billing control gets reported switched off for a year.
 //!
-//! Every variable is `OTTO_*`, ported from otto-factory's `OF_*` set. The
+//! Every variable is `SAVVAGENT_*` (`OTTO_*` until the Savvagent rebrand; see
+//! [`RETIRED`]), ported from otto-factory's `OF_*` set. The
 //! factory-only settings (GitHub App, JIRA, the MCP resource URI, MCP host and
 //! origin allow-lists) did not come with it: a resource server's configuration
 //! belongs to that resource server. The console bundle directory did, as the
-//! optional `OTTO_STATIC_DIR`.
+//! optional `SAVVAGENT_STATIC_DIR`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -35,29 +36,29 @@ pub struct Config {
     pub database_url: String,
     pub bind: SocketAddr,
 
-    /// Public origin a browser sees (`OTTO_PUBLIC_URL`), e.g.
+    /// Public origin a browser sees (`SAVVAGENT_PUBLIC_URL`), e.g.
     /// `https://otto.savvagent.com`. The OAuth issuer, the discovery document,
     /// every link handed to a human, and the WebAuthn relying party id (its
     /// host) are all built from it.
     pub public_url: String,
 
-    /// 32 bytes, base64 (`OTTO_ENCRYPTION_KEY`). Encrypts secrets at rest —
+    /// 32 bytes, base64 (`SAVVAGENT_ENCRYPTION_KEY`). Encrypts secrets at rest —
     /// today the enterprise SSO connections' IdP client secrets.
     pub encryption_key: String,
 
     /// The header a trusted proxy writes the client address into
-    /// (`OTTO_CLIENT_IP_HEADER`). See `otto_web::Config::client_ip_header` for
+    /// (`SAVVAGENT_CLIENT_IP_HEADER`). See `otto_web::Config::client_ip_header` for
     /// why this must stay unset unless a proxy that *overwrites* it sits in
     /// front — on Fly.io, `fly-client-ip`.
     pub client_ip_header: Option<String>,
 
     /// Whether the resource servers are enforcing hard-stop plans
-    /// (`OTTO_ENFORCE_QUOTAS`). Reporting only: this server enforces nothing,
+    /// (`SAVVAGENT_ENFORCE_QUOTAS`). Reporting only: this server enforces nothing,
     /// it tells the console what the resource servers are doing. See
     /// `otto_web::Config::enforce_quotas`.
     pub enforce_quotas: bool,
 
-    /// The built console bundle (`OTTO_STATIC_DIR`): prerendered pages as
+    /// The built console bundle (`SAVVAGENT_STATIC_DIR`): prerendered pages as
     /// themselves and the SPA shell, `200.html`, for every other client route.
     /// The bundle must contain `200.html`; `app` refuses to build without it.
     /// The hosted deployment sets it (`fly.toml`);
@@ -68,7 +69,7 @@ pub struct Config {
     pub run_migrations: bool,
     pub log_format: LogFormat,
 
-    /// Outgoing notification email (`OTTO_SMTP_URL` and `OTTO_EMAIL_FROM`,
+    /// Outgoing notification email (`SAVVAGENT_SMTP_URL` and `SAVVAGENT_EMAIL_FROM`,
     /// both secrets, set together or not at all). `None` disables sending:
     /// the server says so at boot, the delivery loop does not run, and queued
     /// rows wait in `notification_outbox` until a deployment configures it.
@@ -81,7 +82,7 @@ pub struct Config {
     /// answer `503 billing_disabled`. Production boots either way.
     pub stripe: Option<StripeConfig>,
 
-    /// `OTTO_USAGE_HOLD_THRESHOLD`: the most of one meter an org may accrue in
+    /// `SAVVAGENT_USAGE_HOLD_THRESHOLD`: the most of one meter an org may accrue in
     /// a billing month before usage ingest holds further events for operator
     /// review instead of billing them (`otto-platform-server usage held`).
     /// Default [`otto_billing::usage::DEFAULT_HOLD_THRESHOLD`].
@@ -129,39 +130,95 @@ pub enum LogFormat {
     Text,
 }
 
+/// Every variable this file reads, named once.
+///
+/// `SAVVAGENT_*` since the Savvagent rebrand (savvagent/otto-platform#131),
+/// with no fallback to the `OTTO_*` names they replace: see [`RETIRED`].
+pub mod var {
+    pub const PUBLIC_URL: &str = "SAVVAGENT_PUBLIC_URL";
+    pub const BIND: &str = "SAVVAGENT_BIND";
+    pub const ENCRYPTION_KEY: &str = "SAVVAGENT_ENCRYPTION_KEY";
+    pub const CLIENT_IP_HEADER: &str = "SAVVAGENT_CLIENT_IP_HEADER";
+    pub const ENFORCE_QUOTAS: &str = "SAVVAGENT_ENFORCE_QUOTAS";
+    pub const STATIC_DIR: &str = "SAVVAGENT_STATIC_DIR";
+    pub const RUN_MIGRATIONS: &str = "SAVVAGENT_RUN_MIGRATIONS";
+    pub const LOG_FORMAT: &str = "SAVVAGENT_LOG_FORMAT";
+    pub const SMTP_URL: &str = "SAVVAGENT_SMTP_URL";
+    pub const EMAIL_FROM: &str = "SAVVAGENT_EMAIL_FROM";
+    pub const USAGE_HOLD_THRESHOLD: &str = "SAVVAGENT_USAGE_HOLD_THRESHOLD";
+}
+
+/// The pre-rebrand names, each with the variable that replaced it.
+///
+/// None of them is read. A deployment that still sets one is refused at
+/// startup, naming the replacement, rather than started without it: a
+/// leftover `OTTO_SMTP_URL` would otherwise boot with email quietly off, and a
+/// leftover `OTTO_STATIC_DIR` with no console, which is the silent failure
+/// this file exists to prevent. Refusing is not a compatibility period: the
+/// old value is never used, and the fix is renaming it.
+pub const RETIRED: &[(&str, &str)] = &[
+    ("OTTO_PUBLIC_URL", var::PUBLIC_URL),
+    ("OTTO_BIND", var::BIND),
+    ("OTTO_ENCRYPTION_KEY", var::ENCRYPTION_KEY),
+    ("OTTO_CLIENT_IP_HEADER", var::CLIENT_IP_HEADER),
+    ("OTTO_ENFORCE_QUOTAS", var::ENFORCE_QUOTAS),
+    ("OTTO_STATIC_DIR", var::STATIC_DIR),
+    ("OTTO_RUN_MIGRATIONS", var::RUN_MIGRATIONS),
+    ("OTTO_LOG_FORMAT", var::LOG_FORMAT),
+    ("OTTO_SMTP_URL", var::SMTP_URL),
+    ("OTTO_EMAIL_FROM", var::EMAIL_FROM),
+    ("OTTO_USAGE_HOLD_THRESHOLD", var::USAGE_HOLD_THRESHOLD),
+];
+
+/// How a variable is looked up: the process environment in production, a map
+/// in tests, so the parsing can be tested without mutating a shared global.
+type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
 impl Config {
     /// Read the environment. Every failure names the variable it is about.
     pub fn from_env() -> Result<Self> {
-        let public_url = required("OTTO_PUBLIC_URL")?
+        Self::from_lookup(&process_env)
+    }
+
+    /// [`Config::from_env`] over any source of variables.
+    fn from_lookup(env: Lookup<'_>) -> Result<Self> {
+        refuse_retired(env)?;
+
+        let public_url = required(env, var::PUBLIC_URL)?
             .trim_end_matches('/')
             .to_string();
         validate_public_url(&public_url)?;
 
         Ok(Self {
-            database_url: required("DATABASE_URL")?,
-            bind: parse_var("OTTO_BIND", "0.0.0.0:8080", |v| {
+            database_url: required(env, "DATABASE_URL")?,
+            bind: parse_var(env, var::BIND, "0.0.0.0:8080", |v| {
                 v.parse::<SocketAddr>()
                     .map_err(|e| anyhow!("{e}; expected host:port, e.g. 0.0.0.0:8080"))
             })?,
-            encryption_key: required("OTTO_ENCRYPTION_KEY")?,
-            client_ip_header: optional("OTTO_CLIENT_IP_HEADER")
+            encryption_key: required(env, var::ENCRYPTION_KEY)?,
+            client_ip_header: optional(env, var::CLIENT_IP_HEADER)
                 .map(|v| v.trim().to_ascii_lowercase())
                 .filter(|v| !v.is_empty()),
-            enforce_quotas: parse_var("OTTO_ENFORCE_QUOTAS", "0", parse_bool)?,
-            static_dir: optional("OTTO_STATIC_DIR").map(|v| PathBuf::from(v.trim())),
-            run_migrations: parse_var("OTTO_RUN_MIGRATIONS", "1", parse_bool)?,
-            log_format: parse_var("OTTO_LOG_FORMAT", "text", |v| match v {
+            enforce_quotas: parse_var(env, var::ENFORCE_QUOTAS, "0", parse_bool)?,
+            static_dir: optional(env, var::STATIC_DIR).map(|v| PathBuf::from(v.trim())),
+            run_migrations: parse_var(env, var::RUN_MIGRATIONS, "1", parse_bool)?,
+            log_format: parse_var(env, var::LOG_FORMAT, "text", |v| match v {
                 "json" => Ok(LogFormat::Json),
                 "text" => Ok(LogFormat::Text),
                 other => Err(anyhow!("expected json or text, got {other:?}")),
             })?,
-            email: parse_email(optional("OTTO_SMTP_URL"), optional("OTTO_EMAIL_FROM"))?,
+            email: parse_email(optional(env, var::SMTP_URL), optional(env, var::EMAIL_FROM))?,
             stripe: parse_stripe(
-                optional("STRIPE_SECRET_KEY"),
-                optional("STRIPE_WEBHOOK_SECRET"),
+                optional(env, "STRIPE_SECRET_KEY"),
+                optional(env, "STRIPE_WEBHOOK_SECRET"),
             )?,
             usage_hold_threshold: parse_var(
-                "OTTO_USAGE_HOLD_THRESHOLD",
+                env,
+                var::USAGE_HOLD_THRESHOLD,
                 &otto_billing::usage::DEFAULT_HOLD_THRESHOLD.to_string(),
                 |v| match v.parse::<i64>() {
                     Ok(n) if n >= 1 => Ok(n),
@@ -173,7 +230,25 @@ impl Config {
     }
 }
 
-/// `OTTO_SMTP_URL` and `OTTO_EMAIL_FROM`: both, or neither.
+/// Refuse to start while any [`RETIRED`] variable is set, naming each one and
+/// its replacement. Never repeats a value: some of them are secrets.
+fn refuse_retired(env: Lookup<'_>) -> Result<()> {
+    let set: Vec<String> = RETIRED
+        .iter()
+        .filter(|(old, _)| env(old).is_some())
+        .map(|(old, new)| format!("{old} (now {new})"))
+        .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{} still set, and no longer read: the OTTO_* variables were renamed SAVVAGENT_*. \
+         Set each replacement to the same value and unset the old name",
+        set.join(", ")
+    ))
+}
+
+/// `SAVVAGENT_SMTP_URL` and `SAVVAGENT_EMAIL_FROM`: both, or neither.
 ///
 /// Exactly one is a boot error rather than "email off": an operator who set
 /// one of a pair meant to turn email on, and a deployment that quietly does
@@ -187,13 +262,13 @@ fn parse_email(smtp_url: Option<String>, from: Option<String>) -> Result<Option<
         (Some(u), Some(f)) => (u.trim().to_string(), f.trim().to_string()),
         (Some(_), None) => {
             return Err(anyhow!(
-                "OTTO_SMTP_URL is set but OTTO_EMAIL_FROM is not; set both to send \
+                "SAVVAGENT_SMTP_URL is set but SAVVAGENT_EMAIL_FROM is not; set both to send \
                  notification email, or neither to disable it"
             ))
         }
         (None, Some(_)) => {
             return Err(anyhow!(
-                "OTTO_EMAIL_FROM is set but OTTO_SMTP_URL is not; set both to send \
+                "SAVVAGENT_EMAIL_FROM is set but SAVVAGENT_SMTP_URL is not; set both to send \
                  notification email, or neither to disable it"
             ))
         }
@@ -201,7 +276,7 @@ fn parse_email(smtp_url: Option<String>, from: Option<String>) -> Result<Option<
     validate_smtp_url(&smtp_url)?;
     from.parse::<lettre::message::Mailbox>().map_err(|e| {
         anyhow!(
-            "OTTO_EMAIL_FROM is not a valid mailbox ({e}); expected an address such as \
+            "SAVVAGENT_EMAIL_FROM is not a valid mailbox ({e}); expected an address such as \
              alerts@example.com or `Name <alerts@example.com>` (value not shown)"
         )
     })?;
@@ -261,23 +336,23 @@ pub fn parse_stripe_key(secret_key: Option<String>) -> Result<SecretKey> {
 
 /// [`parse_stripe_key`] from the environment.
 pub fn stripe_key_from_env() -> Result<SecretKey> {
-    parse_stripe_key(optional("STRIPE_SECRET_KEY"))
+    parse_stripe_key(optional(&process_env, "STRIPE_SECRET_KEY"))
 }
 
 fn validate_smtp_url(raw: &str) -> Result<()> {
     const SHAPE: &str = "expected smtps://user:password@host:465 or \
                          smtp://user:password@host:587?tls=required \
                          (value not shown: it holds credentials)";
-    let parsed =
-        url::Url::parse(raw).map_err(|e| anyhow!("OTTO_SMTP_URL is not a URL ({e}); {SHAPE}"))?;
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| anyhow!("SAVVAGENT_SMTP_URL is not a URL ({e}); {SHAPE}"))?;
     if !matches!(parsed.scheme(), "smtp" | "smtps") {
         return Err(anyhow!(
-            "OTTO_SMTP_URL must use the smtp or smtps scheme, got {:?}; {SHAPE}",
+            "SAVVAGENT_SMTP_URL must use the smtp or smtps scheme, got {:?}; {SHAPE}",
             parsed.scheme()
         ));
     }
     let Some(host) = parsed.host().filter(|h| !h.to_string().is_empty()) else {
-        return Err(anyhow!("OTTO_SMTP_URL has no host; {SHAPE}"));
+        return Err(anyhow!("SAVVAGENT_SMTP_URL has no host; {SHAPE}"));
     };
     // lettre reads `smtp://` with no `tls` parameter as plaintext, and
     // `tls=opportunistic` as "plaintext if STARTTLS is not offered", which an
@@ -300,42 +375,42 @@ fn validate_smtp_url(raw: &str) -> Result<()> {
     };
     if !tls_required && !loopback {
         return Err(anyhow!(
-            "OTTO_SMTP_URL would send the SMTP password unencrypted; use smtps:// or add \
+            "SAVVAGENT_SMTP_URL would send the SMTP password unencrypted; use smtps:// or add \
              ?tls=required. {SHAPE}"
         ));
     }
     // lettre has its own opinions (the `tls` query parameter, for one); ask it
     // too, so a URL it would refuse fails here and not on the first send.
     lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::from_url(raw)
-        .map_err(|_| anyhow!("OTTO_SMTP_URL is not a URL the SMTP client accepts; {SHAPE}"))?;
+        .map_err(|_| anyhow!("SAVVAGENT_SMTP_URL is not a URL the SMTP client accepts; {SHAPE}"))?;
     Ok(())
 }
 
-/// Parsed rather than merely stored: an `OTTO_PUBLIC_URL` with no scheme
+/// Parsed rather than merely stored: an `SAVVAGENT_PUBLIC_URL` with no scheme
 /// produces links a mail client will not linkify and a relying party id of the
 /// empty string, both of which are much harder to diagnose later than a message
 /// here.
 fn validate_public_url(public_url: &str) -> Result<()> {
     let parsed = url::Url::parse(public_url)
-        .with_context(|| format!("OTTO_PUBLIC_URL is not a URL: {public_url:?}"))?;
+        .with_context(|| format!("SAVVAGENT_PUBLIC_URL is not a URL: {public_url:?}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(anyhow!(
-            "OTTO_PUBLIC_URL must be http or https, got {:?}",
+            "SAVVAGENT_PUBLIC_URL must be http or https, got {:?}",
             parsed.scheme()
         ));
     }
     if parsed.host_str().is_none() {
-        return Err(anyhow!("OTTO_PUBLIC_URL has no host: {public_url:?}"));
+        return Err(anyhow!("SAVVAGENT_PUBLIC_URL has no host: {public_url:?}"));
     }
     Ok(())
 }
 
-fn optional(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+fn optional(env: Lookup<'_>, name: &str) -> Option<String> {
+    env(name).filter(|v| !v.trim().is_empty())
 }
 
-fn required(name: &str) -> Result<String> {
-    optional(name).ok_or_else(|| anyhow!("{name} is required and not set"))
+fn required(env: Lookup<'_>, name: &str) -> Result<String> {
+    optional(env, name).ok_or_else(|| anyhow!("{name} is required and not set"))
 }
 
 /// Parse an optional variable, defaulting only when it is absent.
@@ -343,8 +418,13 @@ fn required(name: &str) -> Result<String> {
 /// A variable that is *present* and unparseable is an error. Falling back to
 /// the default there would mean a typo in a value someone deliberately set is
 /// indistinguishable from not setting it.
-fn parse_var<T>(name: &str, default: &str, parse: impl Fn(&str) -> Result<T>) -> Result<T> {
-    let raw = optional(name);
+fn parse_var<T>(
+    env: Lookup<'_>,
+    name: &str,
+    default: &str,
+    parse: impl Fn(&str) -> Result<T>,
+) -> Result<T> {
+    let raw = optional(env, name);
     let value = raw.as_deref().unwrap_or(default);
     parse(value.trim()).with_context(|| format!("{name}={value:?} is not valid"))
 }
@@ -400,7 +480,7 @@ mod tests {
     }
 
     /// The whole point of `parse_bool` returning a `Result`.
-    /// `OTTO_ENFORCE_QUOTAS` reading as "off" because somebody wrote `enabled`
+    /// `SAVVAGENT_ENFORCE_QUOTAS` reading as "off" because somebody wrote `enabled`
     /// is a control that is reported switched off, and nothing says so.
     #[test]
     fn a_misspelled_boolean_is_an_error_and_not_a_default() {
@@ -412,9 +492,127 @@ mod tests {
     #[test]
     fn a_default_applies_only_when_the_variable_is_absent() {
         assert_eq!(
-            parse_var("OTTO_TEST_ABSENT_VAR_XYZ", "7", |v| Ok(v.parse::<u8>()?)).unwrap(),
+            parse_var(&|_| None, "SAVVAGENT_TEST_ABSENT_VAR_XYZ", "7", |v| Ok(
+                v.parse::<u8>()?
+            ))
+            .unwrap(),
             7
         );
+    }
+
+    /// A lookup over a fixed set of variables, recording every name asked for.
+    fn vars<'a>(
+        pairs: &'a [(&'a str, &'a str)],
+        asked: &'a std::cell::RefCell<Vec<String>>,
+    ) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            asked.borrow_mut().push(name.to_string());
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    #[test]
+    fn the_configuration_is_read_from_savvagent_variables() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let env = [
+            ("DATABASE_URL", "postgres://db"),
+            ("SAVVAGENT_PUBLIC_URL", "https://savvagent.com/"),
+            ("SAVVAGENT_ENCRYPTION_KEY", KEY),
+            ("SAVVAGENT_BIND", "127.0.0.1:9000"),
+            ("SAVVAGENT_CLIENT_IP_HEADER", "Fly-Client-IP"),
+            ("SAVVAGENT_ENFORCE_QUOTAS", "yes"),
+            ("SAVVAGENT_STATIC_DIR", "/srv/console"),
+            ("SAVVAGENT_RUN_MIGRATIONS", "off"),
+            ("SAVVAGENT_LOG_FORMAT", "json"),
+            ("SAVVAGENT_SMTP_URL", "smtps://u:p@smtp.example.com:465"),
+            ("SAVVAGENT_EMAIL_FROM", "alerts@example.com"),
+            ("SAVVAGENT_USAGE_HOLD_THRESHOLD", "42"),
+        ];
+        let config = Config::from_lookup(&vars(&env, &asked)).unwrap();
+        assert_eq!(config.public_url, "https://savvagent.com");
+        assert_eq!(config.encryption_key, KEY);
+        assert_eq!(config.bind, "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(config.client_ip_header.as_deref(), Some("fly-client-ip"));
+        assert!(config.enforce_quotas);
+        assert_eq!(config.static_dir, Some(PathBuf::from("/srv/console")));
+        assert!(!config.run_migrations);
+        assert_eq!(config.log_format, LogFormat::Json);
+        assert_eq!(config.email.unwrap().from, "alerts@example.com");
+        assert_eq!(config.usage_hold_threshold, 42);
+
+        // Nothing outside SAVVAGENT_*, DATABASE_URL and the Stripe pair is
+        // consulted, except to refuse the retired names.
+        let retired: Vec<&str> = RETIRED.iter().map(|(old, _)| *old).collect();
+        for name in asked.borrow().iter() {
+            assert!(
+                name.starts_with("SAVVAGENT_")
+                    || name == "DATABASE_URL"
+                    || name.starts_with("STRIPE_")
+                    || retired.contains(&name.as_str()),
+                "{name} is read"
+            );
+        }
+    }
+
+    #[test]
+    fn the_old_otto_names_are_not_read() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let env = [
+            ("DATABASE_URL", "postgres://db"),
+            ("OTTO_PUBLIC_URL", "https://otto.savvagent.com"),
+            ("OTTO_ENCRYPTION_KEY", KEY),
+        ];
+        let err = format!(
+            "{:#}",
+            Config::from_lookup(&vars(&env, &asked)).unwrap_err()
+        );
+        assert!(!err.contains(KEY), "a value was echoed: {err}");
+        assert!(
+            err.contains("OTTO_PUBLIC_URL (now SAVVAGENT_PUBLIC_URL)")
+                && err.contains("OTTO_ENCRYPTION_KEY (now SAVVAGENT_ENCRYPTION_KEY)"),
+            "{err}"
+        );
+    }
+
+    /// A leftover old name is refused even beside a complete new set, so a
+    /// half-done rename (say `OTTO_SMTP_URL` left behind, booting with email
+    /// silently off) cannot start.
+    #[test]
+    fn a_leftover_otto_variable_is_refused_by_name_even_with_the_new_set_complete() {
+        for (old, new) in RETIRED {
+            assert_eq!(*new, old.replacen("OTTO_", "SAVVAGENT_", 1), "{old}");
+            let asked = std::cell::RefCell::new(Vec::new());
+            let env = [
+                ("DATABASE_URL", "postgres://db"),
+                ("SAVVAGENT_PUBLIC_URL", "https://savvagent.com"),
+                ("SAVVAGENT_ENCRYPTION_KEY", KEY),
+                (*old, "hunter2-leftover"),
+            ];
+            let err = format!(
+                "{:#}",
+                Config::from_lookup(&vars(&env, &asked)).unwrap_err()
+            );
+            assert!(err.contains(old) && err.contains(new), "{err}");
+            assert!(!err.contains("hunter2"), "a value was echoed: {err}");
+        }
+    }
+
+    #[test]
+    fn a_missing_public_url_names_the_savvagent_variable() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let env = [
+            ("DATABASE_URL", "postgres://db"),
+            ("SAVVAGENT_ENCRYPTION_KEY", KEY),
+        ];
+        let err = Config::from_lookup(&vars(&env, &asked))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "SAVVAGENT_PUBLIC_URL is required and not set");
     }
 
     const URL: &str = "smtps://mailer:hunter2-secret@smtp.example.com:465";
@@ -451,9 +649,9 @@ mod tests {
     #[test]
     fn email_with_only_one_set_is_a_boot_error_naming_the_missing_one() {
         let err = parse_email(s(URL), None).unwrap_err().to_string();
-        assert!(err.contains("OTTO_EMAIL_FROM is not"), "{err}");
+        assert!(err.contains("SAVVAGENT_EMAIL_FROM is not"), "{err}");
         let err = parse_email(None, s(FROM)).unwrap_err().to_string();
-        assert!(err.contains("OTTO_SMTP_URL is not"), "{err}");
+        assert!(err.contains("SAVVAGENT_SMTP_URL is not"), "{err}");
     }
 
     #[test]
@@ -475,9 +673,9 @@ mod tests {
             assert!(!err.contains("hunter2"), "secret echoed: {err}");
             assert!(!err.contains("mailer"), "username echoed: {err}");
             let names = if from == FROM {
-                "OTTO_SMTP_URL"
+                "SAVVAGENT_SMTP_URL"
             } else {
-                "OTTO_EMAIL_FROM"
+                "SAVVAGENT_EMAIL_FROM"
             };
             assert!(err.contains(names), "{err} should name {names}");
         }

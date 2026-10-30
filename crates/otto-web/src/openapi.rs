@@ -81,7 +81,7 @@ pub fn document(endpoints: &[Endpoint]) -> Value {
             "description":
                 "The identity and account REST surface, and the OAuth 2.1 authorization \
                  server for every registered otto-* resource server. Authentication is a \
-                 session cookie (`__Host-otto_session`), set by the sign-in endpoints; \
+                 session cookie (`__Host-savvagent_session`), set by the sign-in endpoints; \
                  the resource servers themselves use bearer tokens and are described by \
                  their own metadata documents.",
         },

@@ -11,7 +11,7 @@
  * CORS header rescues it.
  *
  * The same single hostname is what makes passkeys work. The WebAuthn relying
- * party id is the host of the server's `OTTO_PUBLIC_URL` (`otto.savvagent.com`),
+ * party id is the host of the server's `SAVVAGENT_PUBLIC_URL` (`savvagent.com`),
  * and a browser only completes a ceremony for an rp_id that is a suffix of the
  * page's own origin. The origin the browser sees is this Worker's hostname, so
  * the two match; the Fly hostname never appears in a ceremony.
@@ -107,7 +107,7 @@ export interface Env {
   /** The built `web/build` bundle, uploaded with the Worker. */
   ASSETS: Fetcher;
   /** Where `otto-platform-server` actually listens, e.g. `https://otto-platform.fly.dev`. */
-  OTTO_ORIGIN: string;
+  SAVVAGENT_ORIGIN: string;
 }
 
 const json = (status: number, body: unknown) =>
@@ -150,7 +150,7 @@ const NOINDEX = 'noindex, nofollow';
  * A shell the binding will not return is a broken deployment, not a missing
  * page: the bundle has no `200.html`, or `html_handling` no longer maps `/200`
  * to it. Every client route depends on it, so it is logged and answered with a
- * named JSON `500`, like a missing `OTTO_ORIGIN`, rather than a bare `404`
+ * named JSON `500`, like a missing `SAVVAGENT_ORIGIN`, rather than a bare `404`
  * that looks like an ordinary miss.
  */
 async function shell(request: Request, env: Env): Promise<Response> {
@@ -285,15 +285,15 @@ export default {
       return fromBundle(request, env, url, path);
     }
 
-    if (!env.OTTO_ORIGIN) {
+    if (!env.SAVVAGENT_ORIGIN) {
       // Loud, and in the one place it can be seen. Without this the failure is
       // a URL constructor throwing inside a proxy hop, which reaches the caller
       // as a bare 500 with nothing naming the cause.
       return json(500, {
         error: 'misconfigured',
         error_description:
-          'this Worker has no OTTO_ORIGIN, so it does not know where otto-platform-server is. ' +
-          'Deploy with --env production, or pass --var OTTO_ORIGIN:https://…'
+          'this Worker has no SAVVAGENT_ORIGIN, so it does not know where otto-platform-server is. ' +
+          'Deploy with --env production, or pass --var SAVVAGENT_ORIGIN:https://…'
       });
     }
 
@@ -305,7 +305,7 @@ export default {
     // this Worker would forward the visitor's session cookie there and serve the
     // reply on our origin. A pathname setter cannot change the host. The origin
     // comparison below is the backstop: nothing leaves for any other host.
-    const origin = new URL(env.OTTO_ORIGIN);
+    const origin = new URL(env.SAVVAGENT_ORIGIN);
     const target = new URL(origin.origin);
     target.pathname = url.pathname;
     target.search = url.search;
@@ -315,7 +315,7 @@ export default {
     const headers = new Headers(request.headers);
 
     // The origin keys every per-IP throttle on this header
-    // (`OTTO_CLIENT_IP_HEADER=cf-connecting-ip`), so what it contains has to be
+    // (`SAVVAGENT_CLIENT_IP_HEADER=cf-connecting-ip`), so what it contains has to be
     // the platform's value and never the caller's. Cloudflare overwrites
     // `CF-Connecting-IP` before the Worker is invoked, which is what makes the
     // inbound value safe to forward. The `delete` is for the case where there is
@@ -338,7 +338,7 @@ export default {
 
     // `Origin` and `Sec-Fetch-Site` are deliberately left exactly as the browser
     // sent them. The server's CSRF guard requires a cookie-bearing write to carry
-    // an `Origin` equal to `OTTO_PUBLIC_URL`'s origin, and the browser's origin
+    // an `Origin` equal to `SAVVAGENT_PUBLIC_URL`'s origin, and the browser's origin
     // is this Worker's hostname, which is that value.
 
     return fetch(

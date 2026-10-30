@@ -14,7 +14,7 @@
 //! other than the sender codes `5.1.7`/`5.1.8`), the mailbox's state
 //! (`5.2.x`), its size (`5.3.4`), or its content (`5.6.x`). Everything else
 //! that is permanent to the server — rejected credentials, an unauthorised
-//! `OTTO_EMAIL_FROM` (`5.7.x`), a refused greeting, any code we cannot read — is
+//! `SAVVAGENT_EMAIL_FROM` (`5.7.x`), a refused greeting, any code we cannot read — is
 //! retried like a transient failure and logged once at `error`, because it is
 //! a fault in our configuration, the same for every message, and giving up
 //! would discard every queued alert on the first try. See [`verdict`].
@@ -26,7 +26,7 @@
 //! and the lease lapsed. For a budget alert a duplicate is the cheap failure;
 //! a lost one is not.
 //!
-//! The binary starts this only when `OTTO_SMTP_URL` and `OTTO_EMAIL_FROM` are
+//! The binary starts this only when `SAVVAGENT_SMTP_URL` and `SAVVAGENT_EMAIL_FROM` are
 //! both set. Otherwise rows stay queued, never dropped, and go out once a
 //! deployment configures SMTP.
 //!
@@ -166,13 +166,13 @@ impl SmtpMailer {
     /// the first send. Errors name the variable, never its value.
     pub fn new(config: &EmailConfig) -> Result<Self> {
         let transport = AsyncSmtpTransport::<Tokio1Executor>::from_url(&config.smtp_url)
-            .map_err(|_| anyhow!("OTTO_SMTP_URL is not a URL the SMTP client accepts"))?
+            .map_err(|_| anyhow!("SAVVAGENT_SMTP_URL is not a URL the SMTP client accepts"))?
             .timeout(Some(CONNECT_TIMEOUT))
             .build();
         let from = config
             .from
             .parse::<Mailbox>()
-            .map_err(|_| anyhow!("OTTO_EMAIL_FROM is not a valid mailbox"))?;
+            .map_err(|_| anyhow!("SAVVAGENT_EMAIL_FROM is not a valid mailbox"))?;
         Ok(Self {
             transport,
             from,
@@ -203,8 +203,8 @@ impl SmtpMailer {
                 if !self.config_fault_reported.swap(true, Ordering::Relaxed) {
                     tracing::error!(
                         error = %message,
-                        "the SMTP server refused us, not the message: check OTTO_SMTP_URL \
-                         (credentials) and OTTO_EMAIL_FROM (an address the provider lets us \
+                        "the SMTP server refused us, not the message: check SAVVAGENT_SMTP_URL \
+                         (credentials) and SAVVAGENT_EMAIL_FROM (an address the provider lets us \
                          send as). Every notification email stays queued until it is fixed"
                     );
                 }

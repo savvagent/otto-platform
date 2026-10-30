@@ -65,7 +65,7 @@ pub fn relying_party(
 ) -> anyhow::Result<std::sync::Arc<otto_auth::passkeys::Webauthn>> {
     let rp_id = config.rp_id().ok_or_else(|| {
         anyhow::anyhow!(
-            "OTTO_PUBLIC_URL ({}) has no host, so there is nothing to bind passkeys to",
+            "SAVVAGENT_PUBLIC_URL ({}) has no host, so there is nothing to bind passkeys to",
             config.public_url
         )
     })?;

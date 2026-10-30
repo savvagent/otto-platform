@@ -166,7 +166,7 @@ pub async fn webauthn_config(State(state): State<AppState>) -> ApiResult<Json<We
         ApiError::internal(
             "webauthn_config",
             format!(
-                "OTTO_PUBLIC_URL ({}) has no host, so there is no relying party id to publish",
+                "SAVVAGENT_PUBLIC_URL ({}) has no host, so there is no relying party id to publish",
                 state.config.public_url
             ),
         )

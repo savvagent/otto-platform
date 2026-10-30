@@ -111,7 +111,7 @@ mod tests {
         b.body(Body::empty()).unwrap()
     }
 
-    const COOKIE: (&str, &str) = ("cookie", "theme=dark; __Host-otto_session=otto_ss_abc");
+    const COOKIE: (&str, &str) = ("cookie", "theme=dark; __Host-savvagent_session=otto_ss_abc");
 
     #[test]
     fn the_origin_is_scheme_host_and_port() {
@@ -165,7 +165,7 @@ mod tests {
         // Not our cookie: nothing ambient to protect.
         assert!(allowed(
             ORIGIN,
-            &req(Method::POST, &[("cookie", "x__Host-otto_session=a")])
+            &req(Method::POST, &[("cookie", "x__Host-savvagent_session=a")])
         ));
     }
 

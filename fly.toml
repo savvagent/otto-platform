@@ -15,21 +15,24 @@
 # startup isolation check verifies.
 #
 # Secrets are NOT in this file. `fly postgres attach` stages DATABASE_URL, and
-# OTTO_ENCRYPTION_KEY (32 random bytes, base64: `openssl rand -base64 32`) must
+# SAVVAGENT_ENCRYPTION_KEY (32 random bytes, base64: `openssl rand -base64 32`) must
 # be staged by hand with `fly secrets set -a otto-platform`. The server refuses
 # to start without it, which is the point: a deploy that cannot encrypt SSO
 # secrets should fail its health check rather than limp. The optional
-# secrets (OTTO_SMTP_URL with OTTO_EMAIL_FROM, set together or not at all) are
+# secrets (SAVVAGENT_SMTP_URL with SAVVAGENT_EMAIL_FROM, set together or not at all) are
 # listed in docs/deploy/fly.md.
 #
-# Hostname: Phase 4 of docs/plans/2026-10-06-platform-cutover.md serves the
-# console at otto.savvagent.com, straight from this app (DNS at Namecheap points
-# at Fly; `fly certs add otto.savvagent.com -a otto-platform`; see
-# docs/deploy/fly.md). OTTO_PUBLIC_URL below says so, and its host is the
-# WebAuthn relying party id, so passkeys only work when the browser is actually
-# on that host: otto-platform.fly.dev serves the API but cannot complete a
-# passkey ceremony. Settle the hostname before anyone registers a passkey:
-# changing it later invalidates every one.
+# Hostname: since the Savvagent cutover (savvagent/otto-platform#131) the
+# console and the OAuth issuer are at savvagent.com, served straight from this
+# app (DNS at Namecheap points at Fly; `fly certs add savvagent.com -a
+# otto-platform`; see docs/deploy/fly.md). SAVVAGENT_PUBLIC_URL below says so,
+# and its host is the WebAuthn relying party id, so passkeys only work when the
+# browser is actually on that host: neither otto-platform.fly.dev nor the old
+# otto.savvagent.com can complete a passkey ceremony. otto.savvagent.com still
+# points at this app and keeps answering resource servers' introspection and
+# token calls until every service has moved (savvagent/otto-platform#135).
+# Changing the host again invalidates every passkey; the cutover runbook in
+# docs/deploy/fly.md is how this one was done.
 
 app = "otto-platform"
 primary_region = "iad"
@@ -39,24 +42,25 @@ primary_region = "iad"
 
 [env]
   # Fly's proxy terminates TLS and forwards plain HTTP over the internal network.
-  OTTO_BIND = "0.0.0.0:8080"
-  OTTO_LOG_FORMAT = "json"
+  SAVVAGENT_BIND = "0.0.0.0:8080"
+  SAVVAGENT_LOG_FORMAT = "json"
   RUST_LOG = "info"
   # The origin browsers see; also fixes the WebAuthn relying party id (its host).
-  OTTO_PUBLIC_URL = "https://otto.savvagent.com"
+  SAVVAGENT_PUBLIC_URL = "https://savvagent.com"
   # Fly's proxy overwrites this header with the real client address (it does
   # not append, unlike X-Forwarded-For), which is the only property that makes
   # a per-IP throttle keyed on it worth anything. Nothing sits in front of Fly:
-  # otto.savvagent.com resolves straight to this app, so no edge can rewrite it.
+  # savvagent.com (and otto.savvagent.com) resolve straight to this app, so no
+  # edge can rewrite it.
   # (Behind the optional Cloudflare Worker this would have to be
   # `cf-connecting-ip`; see docs/deploy/cloudflare.md.)
-  OTTO_CLIENT_IP_HEADER = "fly-client-ip"
+  SAVVAGENT_CLIENT_IP_HEADER = "fly-client-ip"
   # This process serves the console itself, the way otto-factory does: the image
   # carries the built bundle at /srv/console: prerendered pages as themselves,
   # and the SPA shell (200.html, which the bundle must contain or the server
   # refuses to start) with X-Robots-Tag: noindex for client-side routes. Unknown
   # /api, /oauth, /sso, /.well-known and /internal paths still answer a JSON 404.
-  OTTO_STATIC_DIR = "/srv/console"
+  SAVVAGENT_STATIC_DIR = "/srv/console"
 
 [http_service]
   internal_port = 8080

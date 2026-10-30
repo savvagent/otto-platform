@@ -19,7 +19,7 @@ marketing pages describe; see "Adding a product" below.
 
 ```bash
 npm install
-npm run dev      # Vite on :5173, proxying /api /oauth /sso /.well-known to OTTO_API_ORIGIN
+npm run dev      # Vite on :5173, proxying /api /oauth /sso /.well-known to SAVVAGENT_API_ORIGIN
 npm run check    # compile messages, check completeness, then svelte-check + tsc (incl. worker/)
 npm run lint     # prettier --check
 npm test         # vitest: the Worker's routing rule, locale resolution, the error map, pages
@@ -28,8 +28,8 @@ npm run check:build  # the build check alone: every marketing page exists, in it
 npm run deploy   # build, then deploy the production Worker — docs/deploy/cloudflare.md
 ```
 
-`npm run dev` needs a server behind it. Set `OTTO_API_ORIGIN` if it is not on
-`http://127.0.0.1:8080`, and start that server with `OTTO_PUBLIC_URL=http://localhost:5173`:
+`npm run dev` needs a server behind it. Set `SAVVAGENT_API_ORIGIN` if it is not on
+`http://127.0.0.1:8080`, and start that server with `SAVVAGENT_PUBLIC_URL=http://localhost:5173`:
 the server's CSRF guard compares the browser's `Origin` with the public URL, and its
 WebAuthn relying party id is that URL's host, so a mismatch fails every sign-in.
 
@@ -206,8 +206,8 @@ is stored; an English page only offers a link to the visitor's apparent language
 
 ## Deploying
 
-Production serves this bundle from `otto-platform-server` on Fly (`OTTO_STATIC_DIR=/srv/console`
-in `fly.toml`; the Dockerfile builds it), at `otto.savvagent.com`:
+Production serves this bundle from `otto-platform-server` on Fly (`SAVVAGENT_STATIC_DIR=/srv/console`
+in `fly.toml`; the Dockerfile builds it), at `savvagent.com`:
 [`docs/deploy/fly.md`](../docs/deploy/fly.md).
 
 Whatever serves it must follow the same few rules, and the server and the Worker both do. An

@@ -9,7 +9,7 @@ use otto_tenant::Db;
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Public base URL of the console and the authorization server — the origin
-    /// a browser sees (`OTTO_PUBLIC_URL`; `https://otto.savvagent.com` in
+    /// a browser sees (`SAVVAGENT_PUBLIC_URL`; `https://otto.savvagent.com` in
     /// production). Every link the product hands out is built from it: the
     /// OAuth issuer, the discovery document, the SSO callback, and the
     /// invitation URL an admin copies. A wrong value produces links that 404
@@ -52,7 +52,7 @@ pub struct Config {
     /// refusing calls is a caller reading its own dashboard and drawing the
     /// wrong conclusion about why its agent just got a `quota_exceeded` error —
     /// so it must be set to match the deployment's resource servers
-    /// (`OTTO_ENFORCE_QUOTAS`).
+    /// (`SAVVAGENT_ENFORCE_QUOTAS`).
     pub enforce_quotas: bool,
 }
 

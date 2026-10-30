@@ -5,7 +5,7 @@
 //! ```
 //!
 //! Lists the events usage ingest held instead of billing
-//! (`OTTO_USAGE_HOLD_THRESHOLD`, savvagent/otto-platform#79), oldest first.
+//! (`SAVVAGENT_USAGE_HOLD_THRESHOLD`, savvagent/otto-platform#79), oldest first.
 //! A held event is not counted, not billed and not queued for Stripe; it has
 //! been acknowledged to its shipper, which will not resend it. It needs only
 //! `DATABASE_URL`.

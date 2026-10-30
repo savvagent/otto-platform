@@ -77,7 +77,7 @@ fn query_pairs(url: &str) -> HashMap<String, String> {
         .collect()
 }
 
-/// The `__Host-otto_sso_binding` cookie value a response set, if it set one —
+/// The `__Host-savvagent_sso_binding` cookie value a response set, if it set one —
 /// the binding-cookie counterpart to `common::Reply::session_cookie`.
 fn binding_cookie(reply: &Reply) -> Option<String> {
     reply
@@ -86,7 +86,7 @@ fn binding_cookie(reply: &Reply) -> Option<String> {
         .iter()
         .filter_map(|v| v.to_str().ok())
         .find_map(|v| {
-            let value = v.strip_prefix("__Host-otto_sso_binding=")?;
+            let value = v.strip_prefix("__Host-savvagent_sso_binding=")?;
             let value = value.split(';').next()?;
             (!value.is_empty()).then(|| value.to_string())
         })
@@ -173,7 +173,7 @@ async fn complete_callback(
     idp.push_token_response(id_token);
     let mut call = Call::get(format!("/sso/callback?code=auth-code-1&state={state}"));
     if let Some(binding) = binding {
-        call = call.header("cookie", format!("__Host-otto_sso_binding={binding}"));
+        call = call.header("cookie", format!("__Host-savvagent_sso_binding={binding}"));
     }
     call.send(&h.router).await
 }
@@ -355,7 +355,7 @@ async fn sso_sign_in_ignores_an_unsafe_next(pool: PgPool) {
     let reply = Call::get(format!(
         "/sso/callback?code=auth-code-1&state={state}&next=%2Fadmin"
     ))
-    .header("cookie", format!("__Host-otto_sso_binding={binding}"))
+    .header("cookie", format!("__Host-savvagent_sso_binding={binding}"))
     .send(&h.router)
     .await;
     reply.expect(StatusCode::SEE_OTHER);
@@ -792,7 +792,7 @@ async fn callback_refuses_an_unverified_email_claim(pool: PgPool) {
         .get_all(http::header::SET_COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .any(|v| v.starts_with("__Host-otto_sso_binding=") && v.contains("Max-Age=0"));
+        .any(|v| v.starts_with("__Host-savvagent_sso_binding=") && v.contains("Max-Age=0"));
     assert!(cleared, "refusal must clear the binding cookie");
 }
 

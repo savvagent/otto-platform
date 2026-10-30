@@ -14,7 +14,7 @@
 //!   /.well-known/…            otto-web    AS discovery, open by necessity
 //!   everything else           web/build   prerendered pages, then the SPA shell
 //!                                         (200.html, noindex) for client routes;
-//!                                         only with OTTO_STATIC_DIR set
+//!                                         only with SAVVAGENT_STATIC_DIR set
 //! ```
 //!
 //! The resource-server-facing endpoints authenticate with the resource
@@ -30,7 +30,7 @@
 //! `otto-platform-server pricebook ...` sets what each value meter costs
 //! ([`pricebook_cmd`]), and `otto-platform-server stripe sync` makes Stripe
 //! match the price book ([`stripe_cmd`]). The console bundle is
-//! a separate piece in `web/`, served from here when `OTTO_STATIC_DIR` is set,
+//! a separate piece in `web/`, served from here when `SAVVAGENT_STATIC_DIR` is set,
 //! which is how the hosted Fly deployment runs.
 //!
 //! Assembly is a library function rather than something buried in `main` so a
@@ -170,7 +170,7 @@ fn console(
     let readable = std::fs::File::open(&shell_path).and_then(|f| f.metadata());
     anyhow::ensure!(
         readable.as_ref().is_ok_and(|meta| meta.is_file()),
-        "OTTO_STATIC_DIR is {}, which has no readable {SHELL} ({}): the console bundle must \
+        "SAVVAGENT_STATIC_DIR is {}, which has no readable {SHELL} ({}): the console bundle must \
          carry the SPA shell there (adapter-static `fallback: '{SHELL}'`), readable by this \
          process",
         static_dir.display(),
@@ -466,14 +466,14 @@ fn not_found(path: &str) -> Response {
 /// `otto-web`'s state, with the settings that are this deployment's to decide.
 fn web_state(db: Db, config: &Config) -> Result<otto_web::AppState> {
     let cipher = otto_tenant::crypto::Cipher::from_base64_key(&config.encryption_key)
-        .context("OTTO_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
+        .context("SAVVAGENT_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
 
     let web_config = web_config(config);
     // Built here and once: `rp_id` is what every passkey is bound to, so a bad
     // value must stop the process rather than surface as a browser error on
     // somebody's first sign-in.
     let webauthn = otto_web::relying_party(&web_config)
-        .context("could not build the WebAuthn relying party from OTTO_PUBLIC_URL")?;
+        .context("could not build the WebAuthn relying party from SAVVAGENT_PUBLIC_URL")?;
 
     Ok(otto_web::AppState::new(db, cipher, webauthn, web_config).with_stripe(stripe(config)?))
 }
@@ -615,7 +615,7 @@ mod tests {
         );
         let err = app(db, &config).expect_err("a bad key must not build an app");
         assert!(
-            format!("{err:#}").contains("OTTO_ENCRYPTION_KEY"),
+            format!("{err:#}").contains("SAVVAGENT_ENCRYPTION_KEY"),
             "{err:#}"
         );
     }
@@ -700,7 +700,7 @@ mod tests {
         )
     }
 
-    /// With `OTTO_STATIC_DIR` the server also serves the console: real files
+    /// With `SAVVAGENT_STATIC_DIR` the server also serves the console: real files
     /// as themselves, any other page route as the SPA shell, and anything
     /// API-shaped as a JSON `404` rather than HTML with a `200`.
     #[tokio::test]
@@ -1039,7 +1039,7 @@ mod tests {
         let err = app(lazy_db(), &config).expect_err("no shell, no app");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("OTTO_STATIC_DIR") && msg.contains("200.html"),
+            msg.contains("SAVVAGENT_STATIC_DIR") && msg.contains("200.html"),
             "{msg}"
         );
     }

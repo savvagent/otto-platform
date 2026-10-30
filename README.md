@@ -41,7 +41,7 @@ resource-server API (introspection, usage ingest, member lookup, lifecycle
 webhooks) and the public plan catalog, `GET /api/plans` (no credential;
 each plan's name, list price and allowlisted features, plus the metered prices
 in effect this month as `meters`; cached in-process for a minute and sent with
-`max-age=300`). With `OTTO_STATIC_DIR` set, as on Fly, it also serves the
+`max-age=300`). With `SAVVAGENT_STATIC_DIR` set, as on Fly, it also serves the
 bundle built from `web/` (see `web/README.md`): the public marketing pages,
 prerendered (`/`, `/pricing`, a page per product, each in every language),
 and the account/org console, whose home is `/home`.
@@ -105,7 +105,7 @@ crates/
                           verifies tenant isolation, then serves /healthz,
                           /readyz, otto-web's router, the
                           resource-server API (`POST /oauth/introspect`,
-                          `/internal/*`), and, with OTTO_STATIC_DIR, the
+                          `/internal/*`), and, with SAVVAGENT_STATIC_DIR, the
                           web/ bundle. Delivers lifecycle webhooks and
                           provisions resource servers, first-party
                           OAuth clients and the price book, and syncs
@@ -143,27 +143,27 @@ required settings (see `.env.example`, which documents every variable):
 ```sh
 cp .env.example .env
 # edit .env: DATABASE_URL=postgres://postgres:postgres@localhost:5432/otto_platform
-#            OTTO_ENCRYPTION_KEY=$(openssl rand -base64 32)
+#            SAVVAGENT_ENCRYPTION_KEY=$(openssl rand -base64 32)
 
 cargo run -p otto-platform-server
 ```
 
-Configuration is all `OTTO_*` (plus `DATABASE_URL`, `RUST_LOG` and the two
+Configuration is all `SAVVAGENT_*` (plus `DATABASE_URL`, `RUST_LOG` and the two
 Stripe secrets):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DATABASE_URL` | required | Postgres connection string. |
-| `OTTO_PUBLIC_URL` | required | Public origin, e.g. `https://otto.savvagent.com`. The OAuth issuer and every link are built from it, and its **host is the WebAuthn relying party id** — changing it invalidates every passkey. |
-| `OTTO_ENCRYPTION_KEY` | required | 32 bytes, base64. Encrypts secrets at rest (SSO IdP client secrets). |
-| `OTTO_BIND` | `0.0.0.0:8080` | Listen address. |
-| `OTTO_STATIC_DIR` | unset | The built `web/` bundle (`/srv/console` in the image). Set, the server serves the marketing pages and the console beside the API; the bundle must contain `200.html` or it refuses to start. |
-| `OTTO_CLIENT_IP_HEADER` | unset | Header a trusted proxy *overwrites* with the client address (`fly-client-ip` on Fly). Keys rate limits and audit IPs; leave unset without such a proxy. |
-| `OTTO_ENFORCE_QUOTAS` | `0` | Reporting only, and legacy: whether resource servers enforce the retired family-wide hard stop, echoed as `enforced` by the usage endpoint. Per-service budgets and their opt-in hard stop replace it. |
-| `OTTO_RUN_MIGRATIONS` | `1` | Apply migrations at startup. |
-| `OTTO_LOG_FORMAT` | `text` | `json` for structured logs. |
-| `OTTO_SMTP_URL` | unset | Secret. SMTP server for notification email, credentials in the URL: `smtps://user:pass@host:465` or `smtp://user:pass@host:587?tls=required` (plain `smtp://` only to a loopback host). Set together with `OTTO_EMAIL_FROM`; exactly one of the two refuses to start. With neither, email is disabled (logged at boot) and messages stay queued in `notification_outbox`. |
-| `OTTO_EMAIL_FROM` | unset | Secret. The `From:` mailbox for notification email, e.g. `otto <alerts@savvagent.com>`. Set together with `OTTO_SMTP_URL`. |
+| `SAVVAGENT_PUBLIC_URL` | required | Public origin, e.g. `https://savvagent.com`. The OAuth issuer and every link are built from it, and its **host is the WebAuthn relying party id** — changing it invalidates every passkey. |
+| `SAVVAGENT_ENCRYPTION_KEY` | required | 32 bytes, base64. Encrypts secrets at rest (SSO IdP client secrets). |
+| `SAVVAGENT_BIND` | `0.0.0.0:8080` | Listen address. |
+| `SAVVAGENT_STATIC_DIR` | unset | The built `web/` bundle (`/srv/console` in the image). Set, the server serves the marketing pages and the console beside the API; the bundle must contain `200.html` or it refuses to start. |
+| `SAVVAGENT_CLIENT_IP_HEADER` | unset | Header a trusted proxy *overwrites* with the client address (`fly-client-ip` on Fly). Keys rate limits and audit IPs; leave unset without such a proxy. |
+| `SAVVAGENT_ENFORCE_QUOTAS` | `0` | Reporting only, and legacy: whether resource servers enforce the retired family-wide hard stop, echoed as `enforced` by the usage endpoint. Per-service budgets and their opt-in hard stop replace it. |
+| `SAVVAGENT_RUN_MIGRATIONS` | `1` | Apply migrations at startup. |
+| `SAVVAGENT_LOG_FORMAT` | `text` | `json` for structured logs. |
+| `SAVVAGENT_SMTP_URL` | unset | Secret. SMTP server for notification email, credentials in the URL: `smtps://user:pass@host:465` or `smtp://user:pass@host:587?tls=required` (plain `smtp://` only to a loopback host). Set together with `SAVVAGENT_EMAIL_FROM`; exactly one of the two refuses to start. With neither, email is disabled (logged at boot) and messages stay queued in `notification_outbox`. |
+| `SAVVAGENT_EMAIL_FROM` | unset | Secret. The `From:` mailbox for notification email, e.g. `otto <alerts@savvagent.com>`. Set together with `SAVVAGENT_SMTP_URL`. |
 | `STRIPE_SECRET_KEY` | unset | Secret. Billing's Stripe API key (`sk_...`, or a restricted `rk_...`), live or test mode (`..._live_...` / `..._test_...`); the first boot records its mode in the database and a key of the other mode refuses to start. Set together with `STRIPE_WEBHOOK_SECRET`; exactly one of the two refuses to start. With neither, billing is disabled (logged at boot): `GET /api/orgs/{org}/billing` reports `billingEnabled: false`, and `POST /api/orgs/{org}/billing/setup` and `POST /api/stripe/webhook` answer `503 billing_disabled`. |
 | `STRIPE_WEBHOOK_SECRET` | unset | Secret. The Stripe webhook endpoint's signing secret (`whsec_...`). Set together with `STRIPE_SECRET_KEY`. |
 
@@ -176,10 +176,10 @@ On startup it will:
 3. Verify tenant isolation is actually enforced — as the role a tenant
    transaction runs as, not just that the migrations ran — and refuse to
    report ready if it is not.
-4. Build the WebAuthn relying party from `OTTO_PUBLIC_URL` (failing here, not
+4. Build the WebAuthn relying party from `SAVVAGENT_PUBLIC_URL` (failing here, not
    at someone's first sign-in, if it has no host) and serve HTTP.
 
-Set `OTTO_RUN_MIGRATIONS=0` to skip step 2 (e.g. a deployment that migrates
+Set `SAVVAGENT_RUN_MIGRATIONS=0` to skip step 2 (e.g. a deployment that migrates
 as a separate step ahead of a rolling restart).
 
 A resource server must be registered by an operator
@@ -469,8 +469,8 @@ To run the server against a database by hand:
 ```sh
 createdb otto_platform_dev
 DATABASE_URL=postgres://localhost/otto_platform_dev \
-  OTTO_PUBLIC_URL=http://localhost:8080 \
-  OTTO_ENCRYPTION_KEY=$(openssl rand -base64 32) \
+  SAVVAGENT_PUBLIC_URL=http://localhost:8080 \
+  SAVVAGENT_ENCRYPTION_KEY=$(openssl rand -base64 32) \
   cargo run -p otto-platform-server
 ```
 
