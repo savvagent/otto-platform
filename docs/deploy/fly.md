@@ -677,8 +677,8 @@ transaction. A rename can be undone by renaming back onto the live alias
 ### 7. Point the services at savvagent.com
 
 On each service, change its platform URL to `https://savvagent.com` and redeploy it:
-`OF_PLATFORM_URL` on the tower app, `FLAGS_PLATFORM_URL` on the flags app, and
-`CXP_PLATFORM_URL` on the cxp app (in that service's `fly.toml` `[env]`, or with
+`OF_PLATFORM_URL` on `otto-factory-mcp` (tower), `FLAGS_PLATFORM_URL` on `otto-flags`, and
+`CXP_PLATFORM_URL` on `otto-cxp` (in that service's `fly.toml` `[env]`, or with
 `fly secrets set -a <app>` if it keeps it as a secret). The service's own credential is
 unchanged: it still names the old resource URI, which the alias accepts until that service
 moves to its new URI in phase 3.
