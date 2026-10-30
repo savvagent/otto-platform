@@ -35,6 +35,9 @@ pub enum LoginOutcome {
     AlreadySignedIn,
     /// The browser flow ran and a new grant was stored.
     SignedIn,
+    /// The person left this resource out on a consent screen that offered
+    /// several. Nothing was stored for it.
+    Declined,
 }
 
 use std::process::{Command, Stdio};
@@ -118,6 +121,26 @@ impl Client {
             self.opener.as_ref(),
             resource,
             scopes,
+            force,
+        )
+        .await
+    }
+
+    /// Sign in to each `(resource, scopes)` in `requests`, with one browser
+    /// consent for every resource sharing an authorization server that offers
+    /// it, else one per resource. Each resource succeeds or fails on its own;
+    /// the results are in `requests` order. See [`Client::login`] for
+    /// `force` and reuse.
+    pub async fn login_all(
+        &self,
+        requests: &[(String, Vec<String>)],
+        force: bool,
+    ) -> Vec<(String, Result<LoginOutcome>)> {
+        flow::login_many(
+            &self.http,
+            &self.store,
+            self.opener.as_ref(),
+            requests,
             force,
         )
         .await

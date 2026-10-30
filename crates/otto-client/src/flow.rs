@@ -100,32 +100,213 @@ pub(crate) async fn login(
     }
 
     let meta = discovery::discover(http, resource).await?;
-    // Asked for here, the server's refusal is a sentence; asked for in the
-    // browser, it is an error page the terminal never hears about.
-    if !meta.server_scopes.is_empty() {
-        let unoffered: Vec<String> = scopes
-            .iter()
-            .filter(|s| !meta.server_scopes.contains(s))
-            .cloned()
-            .collect();
-        if !unoffered.is_empty() {
-            // From the server's metadata, so cleaned and capped like any
-            // other server text before it can reach a terminal.
-            return Err(Error::ScopeNotOffered {
-                resource: resource.to_owned(),
-                issuer: server_text(&meta.issuer),
-                scopes: unoffered,
-                offered: meta
-                    .server_scopes
-                    .iter()
-                    .take(MAX_OFFERED_SCOPES)
-                    .map(|s| server_text(s))
-                    .collect(),
-            });
+    check_offered(&meta, resource, scopes)?;
+    let client_id = client_id(http, store, &meta).await?;
+    let browser = browser_flow(opener, &meta, &client_id, &[resource], scopes).await?;
+    let code = browser
+        .codes
+        .first()
+        .map(|(code, _)| code.as_str())
+        .ok_or_else(|| Error::Authorization("the callback carried no code".into()))?;
+    exchange(
+        http, store, &meta, &client_id, &browser, code, resource, scopes,
+    )
+    .await?;
+    Ok(LoginOutcome::SignedIn)
+}
+
+/// Sign in to each `(resource, scopes)` in `requests`, with one browser
+/// consent for every resource that shares an authorization server offering it
+/// (`Discovered::max_resources`), else one per resource.
+///
+/// A resource whose usable grant already covers its scopes is skipped unless
+/// `force`. One that cannot be discovered, or asks for a scope its server
+/// does not offer, fails on its own and the rest carry on. A resource the
+/// person left out on the consent screen is [`LoginOutcome::Declined`]. The
+/// results are in `requests` order.
+pub(crate) async fn login_many(
+    http: &reqwest::Client,
+    store: &Store,
+    opener: &dyn Opener,
+    requests: &[(String, Vec<String>)],
+    force: bool,
+) -> Vec<(String, Result<LoginOutcome>)> {
+    let mut results: Vec<Option<Result<LoginOutcome>>> = requests.iter().map(|_| None).collect();
+    let mut wanted: Vec<(usize, Discovered)> = Vec::new();
+    for (i, (resource, scopes)) in requests.iter().enumerate() {
+        if !force {
+            if let Ok(Some(g)) = fresh_grant(http, store, resource).await {
+                if covers(&g, scopes) {
+                    results[i] = Some(Ok(LoginOutcome::AlreadySignedIn));
+                    continue;
+                }
+            }
+        }
+        let discovered = match discovery::discover(http, resource).await {
+            Ok(meta) => check_offered(&meta, resource, scopes).map(|()| meta),
+            Err(e) => Err(e),
+        };
+        match discovered {
+            Ok(meta) => wanted.push((i, meta)),
+            Err(e) => results[i] = Some(Err(e)),
         }
     }
-    let client_id = client_id(http, store, &meta).await?;
 
+    let together = wanted.len() >= 2
+        && wanted
+            .iter()
+            .all(|(_, m)| m.issuer == wanted[0].1.issuer && m.max_resources >= wanted.len());
+    if together {
+        match login_together(http, store, opener, requests, &wanted).await {
+            Ok(each) => {
+                for (i, result) in each {
+                    results[i] = Some(result);
+                }
+            }
+            // The one browser flow failed, so every resource in it did.
+            Err(e) => {
+                let message = match e {
+                    Error::Authorization(m) => m,
+                    other => other.to_string(),
+                };
+                for (i, _) in &wanted {
+                    results[*i] = Some(Err(Error::Authorization(message.clone())));
+                }
+            }
+        }
+    } else {
+        for (i, _) in &wanted {
+            let (resource, scopes) = &requests[*i];
+            // The cached grant was already found wanting above.
+            results[*i] = Some(login(http, store, opener, resource, scopes, true).await);
+        }
+    }
+
+    requests
+        .iter()
+        .zip(results)
+        .map(|((resource, _), result)| {
+            (
+                resource.clone(),
+                result.unwrap_or_else(|| Err(Error::Authorization("not attempted".into()))),
+            )
+        })
+        .collect()
+}
+
+/// One browser flow naming every resource in `wanted`, all at the same
+/// authorization server, then one code exchange per resource the person kept.
+async fn login_together(
+    http: &reqwest::Client,
+    store: &Store,
+    opener: &dyn Opener,
+    requests: &[(String, Vec<String>)],
+    wanted: &[(usize, Discovered)],
+) -> Result<Vec<(usize, Result<LoginOutcome>)>> {
+    let client_id = client_id(http, store, &wanted[0].1).await?;
+    let resources: Vec<&str> = wanted
+        .iter()
+        .map(|(i, _)| requests[*i].0.as_str())
+        .collect();
+    // One `scope` for the whole request; the server gives each resource the
+    // ones it defines.
+    let mut scopes: Vec<String> = Vec::new();
+    for (i, _) in wanted {
+        for s in &requests[*i].1 {
+            if !scopes.contains(s) {
+                scopes.push(s.clone());
+            }
+        }
+    }
+    let browser = browser_flow(opener, &wanted[0].1, &client_id, &resources, &scopes).await?;
+    let mut out = Vec::with_capacity(wanted.len());
+    for (i, meta) in wanted {
+        let (resource, scopes) = &requests[*i];
+        // The server names each code's resource. The exchange re-checks it:
+        // a code redeemed for another resource is refused.
+        let code = browser
+            .codes
+            .iter()
+            .find(|(_, r)| r.as_deref() == Some(resource.as_str()))
+            .map(|(code, _)| code.as_str());
+        let returned_other = browser
+            .codes
+            .iter()
+            .any(|(_, r)| r.as_deref().is_some_and(|r| !resources.contains(&r)));
+        let result = match code {
+            None if browser.refused.contains(resource) => Err(Error::Authorization(
+                "you kept it on the consent screen, but nothing it asked for could be granted \
+                 to you (org:admin, for example, needs an owner or admin of the organization)"
+                    .into(),
+            )),
+            // A code came back for a URI this request did not name, so this
+            // one may have been renamed: say so rather than call it declined.
+            None if returned_other => Err(Error::Authorization(
+                "the server answered for a different resource URI; it may have been renamed".into(),
+            )),
+            None => Ok(LoginOutcome::Declined),
+            Some(code) => exchange(
+                http, store, meta, &client_id, &browser, code, resource, scopes,
+            )
+            .await
+            .map(|()| LoginOutcome::SignedIn),
+        };
+        out.push((*i, result));
+    }
+    Ok(out)
+}
+
+/// Refuse, before any browser opens, a scope `meta`'s server does not offer.
+/// Asked for here, the server's refusal is a sentence; asked for in the
+/// browser, it is an error page the terminal never hears about.
+fn check_offered(meta: &Discovered, resource: &str, scopes: &[String]) -> Result<()> {
+    if meta.server_scopes.is_empty() {
+        return Ok(());
+    }
+    let unoffered: Vec<String> = scopes
+        .iter()
+        .filter(|s| !meta.server_scopes.contains(s))
+        .cloned()
+        .collect();
+    if unoffered.is_empty() {
+        return Ok(());
+    }
+    // From the server's metadata, so cleaned and capped like any other server
+    // text before it can reach a terminal.
+    Err(Error::ScopeNotOffered {
+        resource: resource.to_owned(),
+        issuer: server_text(&meta.issuer),
+        scopes: unoffered,
+        offered: meta
+            .server_scopes
+            .iter()
+            .take(MAX_OFFERED_SCOPES)
+            .map(|s| server_text(s))
+            .collect(),
+    })
+}
+
+/// What a finished browser flow hands to the code exchange.
+struct BrowserResult {
+    redirect_uri: String,
+    verifier: String,
+    /// `(code, resource)`: the resource is named only when the request named
+    /// several.
+    codes: Vec<(String, Option<String>)>,
+    /// Resources the person kept that the server could grant nothing for
+    /// (`refused_resource`; for example only `org:admin`, asked of a member).
+    refused: Vec<String>,
+}
+
+/// Open the browser on an authorization request for `resources` and wait for
+/// the callback.
+async fn browser_flow(
+    opener: &dyn Opener,
+    meta: &Discovered,
+    client_id: &str,
+    resources: &[&str],
+    scopes: &[String],
+) -> Result<BrowserResult> {
     // Port 0: the OS picks a free one. otto-auth ignores the port of a
     // loopback redirect when matching (RFC 8252 section 7.3).
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -143,12 +324,14 @@ pub(crate) async fn login(
     {
         let mut q = authorize.query_pairs_mut();
         q.append_pair("response_type", "code")
-            .append_pair("client_id", &client_id)
+            .append_pair("client_id", client_id)
             .append_pair("redirect_uri", &redirect_uri)
             .append_pair("code_challenge", &pkce.challenge)
-            .append_pair("code_challenge_method", "S256")
-            .append_pair("resource", resource)
-            .append_pair("state", &state);
+            .append_pair("code_challenge_method", "S256");
+        for resource in resources {
+            q.append_pair("resource", resource);
+        }
+        q.append_pair("state", &state);
         if !scopes.is_empty() {
             q.append_pair("scope", &scopes.join(" "));
         }
@@ -158,7 +341,7 @@ pub(crate) async fn login(
     // A failure to launch a browser is not fatal: the URL is printed above.
     let _ = opener.open(&authorize);
 
-    let code = tokio::time::timeout(CALLBACK_TIMEOUT, wait_for_code(&listener, &state))
+    let (codes, refused) = tokio::time::timeout(CALLBACK_TIMEOUT, wait_for_code(&listener, &state))
         .await
         .map_err(|_| {
             Error::Authorization(
@@ -167,15 +350,34 @@ pub(crate) async fn login(
                     .into(),
             )
         })??;
+    Ok(BrowserResult {
+        redirect_uri,
+        verifier: pkce.verifier,
+        codes,
+        refused,
+    })
+}
 
+/// Redeem `code` for `resource` and store the grant.
+#[allow(clippy::too_many_arguments)]
+async fn exchange(
+    http: &reqwest::Client,
+    store: &Store,
+    meta: &Discovered,
+    client_id: &str,
+    browser: &BrowserResult,
+    code: &str,
+    resource: &str,
+    scopes: &[String],
+) -> Result<()> {
     let resp = http
         .post(meta.token_endpoint.clone())
         .form(&[
             ("grant_type", "authorization_code"),
-            ("code", code.as_str()),
-            ("redirect_uri", redirect_uri.as_str()),
-            ("code_verifier", pkce.verifier.as_str()),
-            ("client_id", client_id.as_str()),
+            ("code", code),
+            ("redirect_uri", browser.redirect_uri.as_str()),
+            ("code_verifier", browser.verifier.as_str()),
+            ("client_id", client_id),
             ("resource", resource),
         ])
         .send()
@@ -192,10 +394,10 @@ pub(crate) async fn login(
     let mut locked = store.lock().await?;
     locked.put_grant(
         resource,
-        grant_from(token, &meta.issuer, &client_id, None, scopes.join(" ")),
+        grant_from(token, &meta.issuer, client_id, None, scopes.join(" ")),
     );
     locked.save()?;
-    Ok(LoginOutcome::SignedIn)
+    Ok(())
 }
 
 /// The registered client id for this issuer, registering one if there is
@@ -261,7 +463,8 @@ fn grant_from(
 }
 
 enum Callback {
-    Code(String),
+    /// `(code, resource)` pairs and refused resources; see [`BrowserResult`].
+    Codes(Vec<(String, Option<String>)>, Vec<String>),
     Denied(String),
 }
 
@@ -270,7 +473,10 @@ enum Callback {
 /// so a local process that connects and stalls cannot hold up the browser's
 /// callback. Anything else (a favicon request, a probe, a wrong state) is
 /// answered and ignored, so a stray process cannot cancel the login either.
-async fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
+async fn wait_for_code(
+    listener: &TcpListener,
+    state: &str,
+) -> Result<(Vec<(String, Option<String>)>, Vec<String>)> {
     let (tx, mut rx) = mpsc::channel::<Callback>(1);
     loop {
         tokio::select! {
@@ -299,7 +505,7 @@ async fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
             // `tx` is held here, so the channel never closes while looping.
             Some(callback) = rx.recv() => {
                 return match callback {
-                    Callback::Code(code) => Ok(code),
+                    Callback::Codes(codes, refused) => Ok((codes, refused)),
                     Callback::Denied(message) => Err(Error::Authorization(message)),
                 };
             }
@@ -344,17 +550,39 @@ async fn handle_connection(mut sock: TcpStream, state: &str, tx: &mpsc::Sender<C
         let _ = tx.send(Callback::Denied(server_error(&err, &desc))).await;
         return;
     }
-    let Some(code) = param("code") else {
+    // A request for several resources gets a `code` and its `resource` for
+    // each one the person kept, in order; a single-resource one gets a lone
+    // `code`.
+    let all = |k: &str| -> Vec<String> {
+        url.query_pairs()
+            .filter(|(n, _)| n == k)
+            .map(|(_, v)| v.into_owned())
+            .collect()
+    };
+    let (codes, resources) = (all("code"), all("resource"));
+    let paired: Vec<(String, Option<String>)> = if resources.is_empty() {
+        codes.into_iter().take(1).map(|c| (c, None)).collect()
+    } else if resources.len() == codes.len() {
+        codes
+            .into_iter()
+            .zip(resources.into_iter().map(Some))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if paired.is_empty() {
         respond(&mut sock, "400 Bad Request", "No authorization code.").await;
         return;
-    };
+    }
     respond(
         &mut sock,
         "200 OK",
         "Signed in. You can close this tab and return to the terminal.",
     )
     .await;
-    let _ = tx.send(Callback::Code(code)).await;
+    let _ = tx
+        .send(Callback::Codes(paired, all("refused_resource")))
+        .await;
 }
 
 async fn read_request_target(sock: &mut TcpStream) -> Option<String> {

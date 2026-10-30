@@ -46,7 +46,7 @@
 //!   parameters, which is what lets an agent show a useful message instead of
 //!   hanging on a callback that never arrives.
 
-use axum::extract::{Form, Query, RawForm, State};
+use axum::extract::{Form, RawForm, State};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
@@ -216,7 +216,14 @@ impl AuthorizeParams {
         let resource = resolve_resource(db, self.resource.as_deref())
             .await?
             .resource_uri;
-        Ok(oauth::AuthorizeRequest {
+        Ok(self.request_for(resource))
+    }
+
+    /// The `otto-auth` request with `resource` as its audience. For a request
+    /// naming several resources, whose audiences travel beside it,
+    /// `resource` is empty and ignored (see `oauth::validate_authorize_many`).
+    fn request_for(&self, resource: String) -> oauth::AuthorizeRequest {
+        oauth::AuthorizeRequest {
             client_id: self.client_id.clone(),
             redirect_uri: self.redirect_uri.clone(),
             code_challenge: self.code_challenge.clone(),
@@ -230,8 +237,28 @@ impl AuthorizeParams {
                 .collect(),
             resource,
             state: self.state.clone(),
-        })
+        }
     }
+}
+
+/// The `resource` values of a query string or form body, and the rest of it
+/// with them taken out.
+///
+/// RFC 8707 lets `resource` repeat, to ask for several audiences at once, and
+/// `serde_urlencoded` refuses a repeated field, so they are read here and the
+/// rest is deserialized as before. One value (or none) is the ordinary
+/// single-resource request, unchanged.
+fn take_resources(raw: &[u8]) -> (Vec<String>, String) {
+    let mut resources = Vec::new();
+    let mut rest = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in url::form_urlencoded::parse(raw) {
+        if key == "resource" {
+            resources.push(value.into_owned());
+        } else {
+            rest.append_pair(&key, &value);
+        }
+    }
+    (resources, rest.finish())
 }
 
 /// The org `hint` names, if the caller belongs to it. Matches the slug or the
@@ -308,9 +335,11 @@ impl<'a> Resolved<'a> {
         crate::consent_seal::Expected {
             client_id: &self.authorization.client.client_id,
             redirect_uri: &self.request.redirect_uri,
-            resource: &self.authorization.resource.resource_uri,
+            grants: vec![(
+                &self.authorization.resource.resource_uri,
+                &self.authorization.scopes,
+            )],
             user_id: user,
-            scopes: &self.authorization.scopes,
             code_challenge: &self.request.code_challenge,
             code_challenge_method: &self.request.code_challenge_method,
             state: self.request.state.as_deref(),
@@ -397,11 +426,7 @@ fn render_consent(
 /// A signed-out visitor is sent to the console's login page with `next` set to
 /// this exact URL, so the flow resumes where it left off. That navigation is
 /// the reason the session cookie is `SameSite=Lax`.
-pub async fn authorize_page(
-    State(state): State<AppState>,
-    parts: Parts,
-    Query(params): Query<AuthorizeParams>,
-) -> Response {
+pub async fn authorize_page(State(state): State<AppState>, parts: Parts) -> Response {
     let caller = match CurrentUser::from_request_parts_public(&parts, &state).await {
         Some(caller) => caller,
         None => {
@@ -417,6 +442,23 @@ pub async fn authorize_page(
     // One resolution for every page this handler can render, so a consent
     // screen and the error that replaces it are never in different languages.
     let locale = page_locale(&caller, &parts);
+
+    let (mut resources, rest) = take_resources(parts.uri.query().unwrap_or_default().as_bytes());
+    let mut params: AuthorizeParams = match serde_urlencoded::from_str(&rest) {
+        Ok(params) => params,
+        Err(_) => {
+            return error_page(
+                &AuthError::InvalidRequest(
+                    "the authorization request could not be read; start again from the app".into(),
+                ),
+                locale,
+            )
+        }
+    };
+    if resources.len() > 1 {
+        return authorize_many_page(&state, &caller, &params, &resources, locale).await;
+    }
+    params.resource = resources.pop();
 
     // Validated before anything is rendered. Every failure at this stage is a
     // page, never a redirect: the destination is what could not be verified.
@@ -594,7 +636,10 @@ pub async fn authorize_decision(
     // repeated `grant` values, which `serde_urlencoded` cannot collect into a
     // field, so the body is needed twice. A body that does not deserialize is
     // a 400 page, as `Form`'s rejection was a 4xx, never a 500.
-    let form: ConsentForm = match serde_urlencoded::from_bytes(&body) {
+    // `resource` may repeat (see `take_resources`), which `serde_urlencoded`
+    // would refuse, so it is read apart from the rest.
+    let (mut resources, rest) = take_resources(&body);
+    let mut form: ConsentForm = match serde_urlencoded::from_str(&rest) {
         Ok(form) => form,
         Err(e) => {
             // serde's wording names fields and is for the log, not the person.
@@ -611,6 +656,10 @@ pub async fn authorize_decision(
             );
         }
     };
+    if resources.len() > 1 {
+        return decide_many(&state, &parts, &caller, &form, &resources, &body, locale).await;
+    }
+    form.resource = resources.pop();
     let params = form.params();
     let mut req = match params.to_request(&state.db).await {
         Ok(req) => req,
@@ -754,6 +803,372 @@ pub async fn authorize_decision(
         locale,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Several resources, one consent screen
+// ---------------------------------------------------------------------------
+
+/// A request naming several resources, resolved and validated: what one
+/// consent page is rendered for, and what its seal binds.
+struct ResolvedMany<'a> {
+    params: &'a AuthorizeParams,
+    request: &'a oauth::AuthorizeRequest,
+    authorizations: &'a [oauth::Authorization],
+}
+
+impl<'a> ResolvedMany<'a> {
+    /// As [`Resolved::bound`], with every resource and its scopes, in page
+    /// order.
+    fn bound(&self, user: UserId) -> crate::consent_seal::Expected<'a> {
+        crate::consent_seal::Expected {
+            client_id: &self.authorizations[0].client.client_id,
+            redirect_uri: &self.request.redirect_uri,
+            grants: self
+                .authorizations
+                .iter()
+                .map(|a| (a.resource.resource_uri.as_str(), a.scopes.as_slice()))
+                .collect(),
+            user_id: user,
+            code_challenge: &self.request.code_challenge,
+            code_challenge_method: &self.request.code_challenge_method,
+            state: self.request.state.as_deref(),
+        }
+    }
+}
+
+/// `GET /oauth/authorize` naming several resources: one consent screen that
+/// lists each with its scopes, and lets the person leave any of them out.
+///
+/// The same checks as a single-resource request, in the same order, through
+/// `oauth::validate_authorize_many`, which refuses the whole request if any
+/// resource or scope is wrong. Never skips consent, first-party or not: a
+/// grant spanning services is what a person should see before it happens.
+async fn authorize_many_page(
+    state: &AppState,
+    caller: &CurrentUser,
+    params: &AuthorizeParams,
+    resources: &[String],
+    locale: Locale,
+) -> Response {
+    let request = params.request_for(String::new());
+    let authorizations = match oauth::validate_authorize_many(&state.db, &request, resources).await
+    {
+        Ok(authorizations) => authorizations,
+        Err(e) => return error_page(&e, locale),
+    };
+    if params.response_type != "code" {
+        return redirect_error(
+            params,
+            "unsupported_response_type",
+            "this server issues authorization codes only",
+        );
+    }
+    let orgs = match consent_orgs(state, caller, &authorizations[0].client, locale).await {
+        Ok(orgs) => orgs,
+        Err(page) => return *page,
+    };
+    let hinted = resolve_org_hint(&orgs, params.org_hint.as_deref());
+    let resolved = ResolvedMany {
+        params,
+        request: &request,
+        authorizations: &authorizations,
+    };
+    let checked: Vec<Vec<String>> = authorizations.iter().map(|a| a.scopes.clone()).collect();
+    let included = vec![true; authorizations.len()];
+    render_consent_many(
+        state,
+        caller,
+        &resolved,
+        &orgs,
+        hinted.map(|m| m.org_id),
+        &checked,
+        &included,
+        locale,
+    )
+}
+
+/// As [`render_consent`], for several resources.
+#[allow(clippy::too_many_arguments)]
+fn render_consent_many(
+    state: &AppState,
+    caller: &CurrentUser,
+    resolved: &ResolvedMany<'_>,
+    orgs: &[otto_core::orgs::Membership],
+    preselect: Option<OrgId>,
+    checked: &[Vec<String>],
+    included: &[bool],
+    locale: Locale,
+) -> Response {
+    let preselected = preselect.filter(|id| orgs.iter().any(|m| m.org_id == *id));
+    let request_seal =
+        match crate::consent_seal::RequestSeal::new(&resolved.bound(caller.user.id), Utc::now())
+            .seal(&state.consent_cipher)
+        {
+            Ok(seal) => seal,
+            Err(e) => return ApiError::internal("seal the consent request", e).into_response(),
+        };
+    Html(consent_many_html(
+        resolved.params,
+        resolved.authorizations,
+        checked,
+        included,
+        orgs,
+        preselected,
+        caller
+            .user
+            .email
+            .as_deref()
+            .unwrap_or_else(|| i18n::msg(locale, Key::ConsentThisAccount)),
+        &request_seal,
+        locale,
+    ))
+    .into_response()
+}
+
+/// What a consent POST for several resources asked to keep: per resource, in
+/// page order, `None` if it was left out, else the scopes left checked.
+///
+/// Each `grant` is `"<index> <scope>"` (a scope token holds no space), and
+/// each `include` is an index. An index that is not on the page is refused,
+/// never dropped: the seal verified, so it was hand-edited.
+fn chosen_many(body: &[u8], count: usize) -> Result<Vec<Option<Vec<String>>>, AuthError> {
+    let forged = || AuthError::InvalidScope("a choice was made that the page did not offer".into());
+    let index = |raw: &str| raw.parse::<usize>().ok().filter(|i| *i < count);
+    let mut chosen: Vec<Option<Vec<String>>> = vec![None; count];
+    let mut grants: Vec<(usize, String)> = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(body) {
+        match &*key {
+            "include" => {
+                let i = index(&value).ok_or_else(forged)?;
+                chosen[i].get_or_insert_with(Vec::new);
+            }
+            "grant" => {
+                let (i, scope) = value.split_once(' ').ok_or_else(forged)?;
+                grants.push((index(i).ok_or_else(forged)?, scope.to_owned()));
+            }
+            _ => {}
+        }
+    }
+    for (i, scope) in grants {
+        // A scope ticked under a resource that was left out grants nothing.
+        if let Some(scopes) = &mut chosen[i] {
+            scopes.push(scope);
+        }
+    }
+    Ok(chosen)
+}
+
+/// `POST /oauth/authorize` for a page that named several resources.
+///
+/// The same order as [`authorize_decision`]: re-validate, check the seal
+/// before any branch, then read the decision. Each resource kept is narrowed
+/// to what was left checked and downscoped for the person's role, exactly as
+/// a single grant is; one left out, or left with nothing, gets no code. The
+/// codes are issued together, and the callback carries a `code` and its
+/// `resource` for each, in page order.
+#[allow(clippy::too_many_arguments)]
+async fn decide_many(
+    state: &AppState,
+    parts: &Parts,
+    caller: &CurrentUser,
+    form: &ConsentForm,
+    resources: &[String],
+    body: &[u8],
+    locale: Locale,
+) -> Response {
+    let params = form.params();
+    let request = params.request_for(String::new());
+    let authorizations = match oauth::validate_authorize_many(&state.db, &request, resources).await
+    {
+        Ok(authorizations) => authorizations,
+        Err(e) => return error_page(&e, locale),
+    };
+    let resolved = ResolvedMany {
+        params: &params,
+        request: &request,
+        authorizations: &authorizations,
+    };
+    if let Err(e) = crate::consent_seal::check(
+        &state.consent_cipher,
+        form.request_seal.as_deref(),
+        &resolved.bound(caller.user.id),
+        Utc::now(),
+    ) {
+        tracing::warn!(
+            reason = ?e,
+            client_id = %authorizations[0].client.client_id,
+            user_id = %caller.user.id,
+            "consent form refused: the request seal did not verify"
+        );
+        return error_page(&AuthError::InvalidRequest(e.to_string()), locale);
+    }
+
+    // Absent `scope_choice` is an empty selection, never "everything".
+    let chosen = if form.scope_choice.as_deref() == Some("1") {
+        match chosen_many(body, authorizations.len()) {
+            Ok(chosen) => chosen,
+            Err(e) => {
+                tracing::warn!(
+                    client_id = %authorizations[0].client.client_id,
+                    user_id = %caller.user.id,
+                    error = %e,
+                    "consent form refused: a choice was not on the page"
+                );
+                return error_page(&e, locale);
+            }
+        }
+    } else {
+        vec![None; authorizations.len()]
+    };
+
+    if form.decision == "read_only" {
+        let orgs = match consent_orgs(state, caller, &authorizations[0].client, locale).await {
+            Ok(orgs) => orgs,
+            Err(page) => return *page,
+        };
+        let read_only: Vec<Vec<String>> = authorizations
+            .iter()
+            .map(|a| {
+                a.scopes
+                    .iter()
+                    .filter(|s| resources::is_read_scope(s))
+                    .cloned()
+                    .collect()
+            })
+            .collect();
+        let included: Vec<bool> = chosen.iter().map(Option::is_some).collect();
+        return render_consent_many(
+            state,
+            caller,
+            &resolved,
+            &orgs,
+            Some(form.org_id),
+            &read_only,
+            &included,
+            locale,
+        );
+    }
+
+    if form.decision != "allow" {
+        return redirect_error(
+            &params,
+            "access_denied",
+            "the user declined this authorization request",
+        );
+    }
+
+    let role = match state.db.member_role(form.org_id, caller.user.id).await {
+        Ok(Some(role)) => role,
+        Ok(None) => {
+            return redirect_error(
+                &params,
+                "access_denied",
+                "you are not a member of the selected organization",
+            )
+        }
+        Err(e) => return ApiError::internal("check membership for consent", e).into_response(),
+    };
+
+    let mut grants: Vec<(String, Vec<String>)> = Vec::new();
+    // Kept on the page, but nothing it asked for can be granted to this
+    // person. Named in the callback, so the client does not mistake it for a
+    // resource the person left out.
+    let mut refused: Vec<String> = Vec::new();
+    for (authorization, chosen) in authorizations.iter().zip(&chosen) {
+        let Some(chosen) = chosen else { continue };
+        let narrowed = match authorization.narrow(chosen) {
+            Ok(narrowed) => narrowed,
+            Err(e) => {
+                tracing::warn!(
+                    client_id = %authorization.client.client_id,
+                    user_id = %caller.user.id,
+                    error = %e,
+                    "consent form refused: a chosen scope was not on the page"
+                );
+                return error_page(&e, locale);
+            }
+        };
+        if narrowed.is_empty() {
+            continue;
+        }
+        match grantable(&narrowed, role) {
+            Ok(scopes) => grants.push((authorization.resource.resource_uri.clone(), scopes)),
+            // Only org:admin was left, and this person cannot grant it: this
+            // resource gets nothing, the others are unaffected.
+            Err(_) => refused.push(authorization.resource.resource_uri.clone()),
+        }
+    }
+    if grants.is_empty() {
+        return if !refused.is_empty() {
+            redirect_error(&params, "invalid_scope", ADMIN_NEEDS_ADMIN)
+        } else {
+            redirect_error(&params, "access_denied", "no access was selected")
+        };
+    }
+
+    let codes = match oauth::issue_authorization_codes(
+        &state.db,
+        &request,
+        &grants,
+        caller.user.id,
+        form.org_id,
+    )
+    .await
+    {
+        Ok(codes) => codes,
+        Err(e) => return error_page(&e, locale),
+    };
+
+    for (resource, scopes) in &grants {
+        let requested = authorizations
+            .iter()
+            .find(|a| a.resource.resource_uri == *resource)
+            .map(|a| a.scopes.clone())
+            .unwrap_or_default();
+        if let Err(e) = state
+            .db
+            .audit_for_org(
+                form.org_id,
+                Entry::new(action::AUTHORIZATION_GRANTED)
+                    .actor(caller.user.id)
+                    .target("client", params.client_id.clone())
+                    .from_request(client_ip(parts, &state.config).as_deref(), None)
+                    .detail(serde_json::json!({
+                        "scopes": scopes,
+                        "requested": requested,
+                        "resource": resource,
+                        "consent_skipped": false,
+                    })),
+            )
+            .await
+        {
+            tracing::error!(
+                error = %e,
+                org_id = %form.org_id,
+                client_id = %params.client_id,
+                "failed to write audit event for an authorization grant"
+            );
+        }
+    }
+
+    let mut pairs: Vec<(&str, &str)> = grants
+        .iter()
+        .zip(&codes)
+        .flat_map(|((resource, _), code)| {
+            [("code", code.as_str()), ("resource", resource.as_str())]
+        })
+        .collect();
+    pairs.extend(refused.iter().map(|r| ("refused_resource", r.as_str())));
+    let mut location = append_query(&params.redirect_uri, &pairs);
+    if let Some(s) = &params.state {
+        location = append_query(&location, &[("state", s)]);
+    }
+    (
+        http::StatusCode::SEE_OTHER,
+        [(http::header::LOCATION, location)],
+    )
+        .into_response()
 }
 
 /// Issue the authorization code for `org_id` and send the browser to the
@@ -1145,6 +1560,7 @@ h1{font-size:1.35rem;margin:0 0 1rem}\
 border-radius:6px}\
 .name{color:#555}\
 fieldset{border:0;padding:0;margin:0}\
+fieldset.resource{border-top:1px solid #eee;padding-top:.75rem;margin-top:.75rem}\
 legend{padding:0;margin:0 0 .5rem}\
 .grant{margin:.35rem 0}\
 .grant label{margin-left:.4rem}\
@@ -1318,6 +1734,185 @@ fn consent_html(
         allow = escape(i18n::msg(locale, Key::ConsentAllow)),
         cancel = escape(i18n::msg(locale, Key::ConsentCancel)),
         narrow_hint = escape(i18n::msg(locale, Key::ConsentNarrowHint)),
+        signed_in = escape(&i18n::fill(
+            i18n::msg(locale, Key::ConsentSignedInAs),
+            signed_in_as
+        )),
+    )
+}
+
+/// The consent page for several resources: one section per resource, each
+/// with the checkbox that keeps it and its own scope checkboxes, then one org
+/// choice and one decision for all of them. Escaping and the redirect host's
+/// prominence are as on [`consent_html`].
+#[allow(clippy::too_many_arguments)]
+fn consent_many_html(
+    params: &AuthorizeParams,
+    authorizations: &[oauth::Authorization],
+    checked: &[Vec<String>],
+    included: &[bool],
+    orgs: &[otto_core::orgs::Membership],
+    preselected: Option<OrgId>,
+    signed_in_as: &str,
+    request_seal: &str,
+    locale: Locale,
+) -> String {
+    let client = &authorizations[0].client;
+    let host = url::Url::parse(&params.redirect_uri)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| params.redirect_uri.clone());
+    let named = client
+        .client_name
+        .as_deref()
+        .map(|n| {
+            format!(
+                "<p class=name>{}</p>",
+                escape(&i18n::fill(i18n::msg(locale, Key::ConsentCallsItself), n))
+            )
+        })
+        .unwrap_or_default();
+
+    let sections = authorizations
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let items = a
+                .scopes
+                .iter()
+                .enumerate()
+                .map(|(j, s)| {
+                    let text = match a.resource.scope_description(s) {
+                        Some(d) => format!("{} <code class=scope>{}</code>", escape(d), escape(s)),
+                        None => format!("<code>{}</code>", escape(s)),
+                    };
+                    let on = checked.get(i).is_some_and(|c| c.contains(s));
+                    format!(
+                        "<div class=grant><input type=checkbox id=grant-{i}-{j} name=grant \
+                         value=\"{i} {}\"{}><label for=grant-{i}-{j}>{text}</label></div>",
+                        escape(s),
+                        if on { " checked" } else { "" },
+                    )
+                })
+                .collect::<String>();
+            format!(
+                "<fieldset class=resource><legend><input type=checkbox id=include-{i} \
+                 name=include value={i}{}><label for=include-{i}><strong>{}</strong></label>\
+                 </legend>{items}</fieldset>",
+                if included.get(i).copied().unwrap_or(false) {
+                    " checked"
+                } else {
+                    ""
+                },
+                escape(&i18n::fill(
+                    i18n::msg(locale, Key::ConsentIncludeResource),
+                    &a.resource.name
+                )),
+            )
+        })
+        .collect::<String>();
+
+    let all = || authorizations.iter().flat_map(|a| a.scopes.iter());
+    let mixed =
+        all().any(|s| resources::is_read_scope(s)) && all().any(|s| !resources::is_read_scope(s));
+    let read_only = if mixed {
+        format!(
+            "<button type=submit name=decision value=read_only>{}</button>",
+            escape(i18n::msg(locale, Key::ConsentReadOnly))
+        )
+    } else {
+        String::new()
+    };
+
+    let org_options = orgs
+        .iter()
+        .map(|m| {
+            format!(
+                "<option value=\"{}\"{}>{}</option>",
+                escape(&m.org_id.to_string()),
+                if preselected == Some(m.org_id) {
+                    " selected"
+                } else {
+                    ""
+                },
+                escape(&m.org_name)
+            )
+        })
+        .collect::<String>();
+
+    // The resolved audiences, one hidden `resource` each, in page order, for
+    // the same reason the single page pins its one: the POST must name exactly
+    // what the page showed.
+    let mut hidden: Vec<(&str, &str)> = vec![
+        ("response_type", params.response_type.as_str()),
+        ("client_id", params.client_id.as_str()),
+        ("redirect_uri", params.redirect_uri.as_str()),
+        ("code_challenge", params.code_challenge.as_str()),
+        (
+            "code_challenge_method",
+            params.code_challenge_method.as_str(),
+        ),
+        ("scope", params.scope.as_deref().unwrap_or("")),
+    ];
+    hidden.extend(
+        authorizations
+            .iter()
+            .map(|a| ("resource", a.resource.resource_uri.as_str())),
+    );
+    hidden.extend([
+        ("state", params.state.as_deref().unwrap_or("")),
+        ("org_hint", params.org_hint.as_deref().unwrap_or("")),
+        ("scope_choice", "1"),
+        ("request_seal", request_seal),
+    ]);
+    let hidden = hidden
+        .iter()
+        .map(|(k, v)| format!("<input type=hidden name={k} value=\"{}\">", escape(v)))
+        .collect::<String>();
+
+    let asking = i18n::fill(
+        i18n::msg(locale, Key::ConsentAsking),
+        &format!("<span class=host>{}</span>", escape(&host)),
+    );
+    let names = authorizations
+        .iter()
+        .map(|a| a.resource.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "<!doctype html><html lang={lang}><meta charset=utf-8><title>{title}</title>{STYLE}\
+         <main>\
+         <h1>{heading}</h1>\
+         <p>{asking}</p>\
+         {named}\
+         <p class=note>{warn}</p>\
+         <form method=post action=\"/oauth/authorize\">{hidden}\
+         <p>{asking_to}</p>\
+         {sections}\
+         <p class=note>{decline_hint}</p>\
+         <p class=note>{narrow_hint}</p>\
+         {read_only}\
+         <label class=field for=org_id>{organization}</label>\
+         <select id=org_id name=org_id>{org_options}</select>\
+         <p class=note>{org_note}</p>\
+         <div class=row>\
+         <button class=primary type=submit name=decision value=allow>{allow}</button>\
+         <button type=submit name=decision value=deny>{cancel}</button>\
+         </div></form>\
+         <p class=note>{signed_in}</p>\
+         </main></html>",
+        lang = locale.as_str(),
+        title = escape(i18n::msg(locale, Key::ConsentTitle)),
+        heading = escape(&i18n::fill(i18n::msg(locale, Key::ConsentHeading), &names)),
+        warn = escape(i18n::msg(locale, Key::ConsentWarnName)),
+        asking_to = escape(i18n::msg(locale, Key::ConsentItIsAskingTo)),
+        decline_hint = escape(i18n::msg(locale, Key::ConsentDeclineHint)),
+        narrow_hint = escape(i18n::msg(locale, Key::ConsentNarrowHint)),
+        organization = escape(i18n::msg(locale, Key::ConsentOrganization)),
+        org_note = escape(i18n::msg(locale, Key::ConsentOrgScopeNote)),
+        allow = escape(i18n::msg(locale, Key::ConsentAllow)),
+        cancel = escape(i18n::msg(locale, Key::ConsentCancel)),
         signed_in = escape(&i18n::fill(
             i18n::msg(locale, Key::ConsentSignedInAs),
             signed_in_as

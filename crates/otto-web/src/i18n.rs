@@ -120,6 +120,11 @@ pub enum Key {
     ConsentNarrowHint,
     /// The no-JS button that re-renders with only the `:read` scopes checked.
     ConsentReadOnly,
+    /// On a page for several resources: the checkbox that keeps one resource
+    /// in the grant. Takes the resource server's name.
+    ConsentIncludeResource,
+    /// On a page for several resources: unticking one leaves it out.
+    ConsentDeclineHint,
 
     // The error page.
     ErrorTitle,
@@ -291,6 +296,36 @@ pub fn msg(locale: Locale, key: Key) -> &'static str {
         (ConsentReadOnly, It) => "Sola lettura",
         (ConsentReadOnly, Hi) => "केवल पढ़ना",
 
+        (ConsentIncludeResource, En) => "Allow access to {}",
+        (ConsentIncludeResource, Es) => "Permitir acceso a {}",
+        (ConsentIncludeResource, De) => "Zugriff auf {} erlauben",
+        (ConsentIncludeResource, Fr) => "Autoriser l'accès à {}",
+        (ConsentIncludeResource, It) => "Consenti l'accesso a {}",
+        (ConsentIncludeResource, Hi) => "{} तक पहुँच की अनुमति दें",
+
+        (ConsentDeclineHint, En) => {
+            "Untick a service to leave it out. It gets no access, and the others are unaffected."
+        }
+        (ConsentDeclineHint, Es) => {
+            "Desmarca un servicio para excluirlo. No recibirá acceso, y los demás no cambian."
+        }
+        (ConsentDeclineHint, De) => {
+            "Entferne das Häkchen bei einem Dienst, um ihn auszulassen. \
+             Er erhält keinen Zugriff, die anderen bleiben unverändert."
+        }
+        (ConsentDeclineHint, Fr) => {
+            "Décochez un service pour l'exclure. Il n'obtiendra aucun accès, \
+             et les autres ne changent pas."
+        }
+        (ConsentDeclineHint, It) => {
+            "Deseleziona un servizio per escluderlo. Non riceverà alcun accesso, \
+             e gli altri non cambiano."
+        }
+        (ConsentDeclineHint, Hi) => {
+            "किसी सेवा को बाहर रखने के लिए उसका निशान हटाएँ। उसे कोई पहुँच नहीं मिलेगी, \
+             और बाकी सेवाएँ वैसी ही रहेंगी।"
+        }
+
         // --------------------------------------------------------- errors
         (ErrorTitle, En) => "This request could not be authorized",
         (ErrorTitle, Es) => "No se pudo autorizar esta solicitud",
@@ -436,6 +471,8 @@ mod tests {
             ConsentThisAccount,
             ConsentNarrowHint,
             ConsentReadOnly,
+            ConsentIncludeResource,
+            ConsentDeclineHint,
             ErrorTitle,
             ErrorNothingAuthorized,
             ErrorNoOrgTitle,
@@ -459,6 +496,7 @@ mod tests {
         use Key::*;
         for key in [
             ConsentHeading,
+            ConsentIncludeResource,
             ConsentAsking,
             ConsentCallsItself,
             ConsentSignedInAs,
