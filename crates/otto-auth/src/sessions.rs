@@ -112,8 +112,9 @@ struct SessionRow {
 /// Resolve a presented cookie value to a live session.
 pub async fn resolve(db: &Db, presented: &str) -> Result<Session> {
     // A session minted before the switch to Savvagent (#128) is refused as an
-    // unknown one (below), before the lookup: see `crypto::retired`.
-    if crypto::retired(presented) {
+    // unknown one (below), before the lookup: see
+    // `crypto::is_retired_sign_in`.
+    if crypto::is_retired_sign_in(presented) {
         return Err(AuthError::Revoked);
     }
     let hash = crypto::hash(presented.trim());
@@ -178,6 +179,12 @@ pub async fn resolve(db: &Db, presented: &str) -> Result<Session> {
 /// such session" tells a visitor holding a stale cookie something, and there is
 /// nothing useful for a caller to do differently either way.
 pub async fn revoke(db: &Db, presented: &str) -> Result<()> {
+    // A session minted before the switch to Savvagent (#128) is an unknown
+    // one here too, so logging it out touches nothing: see
+    // `crypto::is_retired_sign_in`.
+    if crypto::is_retired_sign_in(presented) {
+        return Ok(());
+    }
     let hash = crypto::hash(presented.trim());
     sqlx::query("UPDATE browser_sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL")
         .bind(&hash)

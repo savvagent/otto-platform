@@ -140,6 +140,11 @@ async fn an_access_token_minted_before_savvagent_is_refused_at_introspection(poo
         .await
         .unwrap_err();
     same_refusal(&retired, &unknown);
+    // Padded as a header or a pasted value may be, which the lookup trims.
+    let padded = tokens::introspect(&db, &format!("  {old}\n"), RESOURCE)
+        .await
+        .unwrap_err();
+    same_refusal(&padded, &unknown);
 
     rehash(&db, "access_tokens", "token_hash", &old, &access).await;
     tokens::introspect(&db, &access, RESOURCE).await.unwrap();
@@ -233,6 +238,65 @@ async fn a_session_minted_before_savvagent_is_refused(pool: PgPool) {
         .await
         .unwrap_err();
     same_refusal(&retired, &unknown);
+
+    rehash(&db, "browser_sessions", "token_hash", &old, &session).await;
+    sessions::resolve(&db, &session).await.unwrap();
+}
+
+/// Revoking a retired refresh token (RFC 7009) answers as for an unknown one
+/// and revokes nothing: not the row still carrying its hash, nor the access
+/// token issued with it.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn revoking_a_refresh_token_minted_before_savvagent_touches_nothing(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let (user, org, client) = setup(&db).await;
+    let issued = issue(&db, user, org, &client).await;
+    let refresh = issued.refresh_token.unwrap();
+
+    let old = twin(&refresh, "sav_rt_", "otto_rt_");
+    rehash(&db, "refresh_tokens", "token_hash", &refresh, &old).await;
+    tokens::revoke_presented(&db, &old).await.unwrap();
+    tokens::revoke_presented(&db, &format!("  {old}\n"))
+        .await
+        .unwrap();
+
+    let revoked: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1")
+            .bind(crypto::hash(&old))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(revoked.is_none(), "the repointed refresh row was revoked");
+    tokens::introspect(&db, &issued.access_token, RESOURCE)
+        .await
+        .unwrap();
+
+    rehash(&db, "refresh_tokens", "token_hash", &old, &refresh).await;
+    tokens::redeem_refresh(&db, &refresh, &client, None)
+        .await
+        .unwrap();
+}
+
+/// Logging out a retired session answers as for an unknown one and ends
+/// nothing: the row still carrying its hash stays live.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn logging_out_a_session_minted_before_savvagent_touches_nothing(pool: PgPool) {
+    let db = Db::from_pool(pool);
+    let (user, _, _) = setup(&db).await;
+    let session = sessions::create(&db, user).await.unwrap().token;
+
+    let old = twin(&session, "sav_ss_", "otto_ss_");
+    rehash(&db, "browser_sessions", "token_hash", &session, &old).await;
+    sessions::revoke(&db, &old).await.unwrap();
+    sessions::revoke(&db, &format!("  {old}\n")).await.unwrap();
+
+    let revoked: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM browser_sessions WHERE token_hash = $1")
+            .bind(crypto::hash(&old))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(revoked.is_none(), "the repointed session row was revoked");
 
     rehash(&db, "browser_sessions", "token_hash", &old, &session).await;
     sessions::resolve(&db, &session).await.unwrap();

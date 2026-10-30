@@ -356,6 +356,105 @@ async fn access_tokens_and_pats_minted_before_savvagent_are_inactive(pool: PgPoo
     }
 }
 
+/// Post a refresh grant for `refresh` to the token endpoint, which only the
+/// assembled `app` serves (otto-web's router, not `router`).
+async fn refresh_grant(db: &Db, refresh: &str) -> (StatusCode, Value) {
+    let config = otto_platform_server::Config {
+        database_url: "unused".into(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        public_url: "https://savvagent.test".into(),
+        encryption_key: B64.encode([5u8; 32]),
+        client_ip_header: None,
+        enforce_quotas: false,
+        static_dir: None,
+        run_migrations: true,
+        log_format: otto_platform_server::LogFormat::Text,
+        email: None,
+        stripe: None,
+        usage_hold_threshold: otto_billing::usage::DEFAULT_HOLD_THRESHOLD,
+    };
+    let res = otto_platform_server::app(db.clone(), &config)
+        .unwrap()
+        .oneshot(
+            Request::post("https://savvagent.test/oauth/token")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(url_form(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh),
+                    ("client_id", "agent"),
+                    ("resource", FACTORY),
+                ])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+/// A refresh token minted under `otto_rt_` gets the token endpoint's answer
+/// for an unknown refresh token, even with its row still live, and the row is
+/// neither consumed nor revoked by the attempt.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn a_refresh_token_minted_before_savvagent_is_refused_at_the_token_endpoint(pool: PgPool) {
+    let w = world(pool).await;
+    let refresh = tokens::issue(
+        &w.db,
+        IssueParams {
+            user_id: w.user,
+            org_id: w.org,
+            client_id: Some("agent"),
+            scopes: &["jobs:read".to_string()],
+            resource: FACTORY,
+            with_refresh: true,
+        },
+    )
+    .await
+    .unwrap()
+    .refresh_token
+    .expect("issued with a refresh token");
+
+    let retired = refresh.replacen("sav_rt_", "otto_rt_", 1);
+    assert_ne!(retired, refresh);
+    let n = sqlx::query("UPDATE refresh_tokens SET token_hash = $2 WHERE token_hash = $1")
+        .bind(otto_auth::crypto::hash(&refresh))
+        .bind(otto_auth::crypto::hash(&retired))
+        .execute(w.db.pool())
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(n, 1);
+
+    let unknown = otto_auth::crypto::generate(otto_auth::crypto::prefix::REFRESH).into_plaintext();
+    let refused = refresh_grant(&w.db, &retired).await;
+    assert_eq!(refused, refresh_grant(&w.db, &unknown).await);
+    assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{}", refused.1);
+
+    let (consumed, revoked): (Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("SELECT consumed_at, revoked_at FROM refresh_tokens WHERE token_hash = $1")
+            .bind(otto_auth::crypto::hash(&retired))
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        (consumed, revoked),
+        (None, None),
+        "the refusal touched the row"
+    );
+
+    // Put the new prefix back and the same row refreshes.
+    sqlx::query("UPDATE refresh_tokens SET token_hash = $2 WHERE token_hash = $1")
+        .bind(otto_auth::crypto::hash(&retired))
+        .bind(otto_auth::crypto::hash(&refresh))
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    let (status, body) = refresh_grant(&w.db, &refresh).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["access_token"].is_string(), "{body}");
+}
+
 /// Resource server credentials issued before the switch (`otto_rs_`
 /// introspection secrets, `otto_whsec_` webhook keys) keep working until
 /// phase 3 rotates each service's.

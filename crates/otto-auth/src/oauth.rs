@@ -719,8 +719,8 @@ pub async fn redeem_code(
     requested_resource: Option<&str>,
 ) -> Result<(IssuedTokens, UserId, OrgId)> {
     // A code minted before the switch to Savvagent (#128) is refused as an
-    // unknown one, before the lookup: see `crypto::retired`.
-    if crypto::retired(code) {
+    // unknown one, before the lookup: see `crypto::is_retired_sign_in`.
+    if crypto::is_retired_sign_in(code) {
         return Err(AuthError::InvalidGrant("unknown authorization code".into()));
     }
     let hash = crypto::hash(code.trim());

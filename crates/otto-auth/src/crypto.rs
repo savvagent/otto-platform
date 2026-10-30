@@ -57,10 +57,21 @@ pub mod prefix {
 const RETIRED_SIGN_IN: [&str; 5] = ["otto_at_", "otto_rt_", "otto_ac_", "otto_ss_", "otto_pat_"];
 
 /// Whether `presented` is a sign-in credential retired by the switch to
-/// Savvagent (`RETIRED_SIGN_IN`). Every presentation point checks this
-/// before its lookup and answers exactly as it does for an unknown value, so
-/// a retired credential is indistinguishable from one that never existed.
-pub fn retired(presented: &str) -> bool {
+/// Savvagent (`RETIRED_SIGN_IN`), ignoring surrounding whitespace as the
+/// lookups do.
+///
+/// Each place that looks a sign-in credential up by its presented value
+/// checks this first and, for a retired one, answers exactly as it does for
+/// an unknown value without touching the database: introspection of an
+/// access token or PAT ([`crate::tokens::introspect`]), the refresh grant
+/// ([`crate::tokens::redeem_refresh`]), code redemption
+/// ([`crate::oauth::redeem_code`]), session resolution
+/// ([`crate::sessions::resolve`]), and the two revocations, RFC 7009
+/// ([`crate::tokens::revoke_presented`]) and logout
+/// ([`crate::sessions::revoke`]), which succeed silently and revoke nothing.
+/// A retired credential is thereby indistinguishable from one that never
+/// existed, even if a row still carries its hash.
+pub fn is_retired_sign_in(presented: &str) -> bool {
     let presented = presented.trim();
     RETIRED_SIGN_IN.iter().any(|p| presented.starts_with(p))
 }
@@ -204,7 +215,10 @@ mod tests {
             assert_eq!(prefix, expected);
             let minted = generate(prefix);
             assert!(minted.expose().starts_with(expected), "{prefix}");
-            assert!(!retired(minted.expose()), "{prefix} is minted retired");
+            assert!(
+                !is_retired_sign_in(minted.expose()),
+                "{prefix} is minted retired"
+            );
         }
     }
 
@@ -214,8 +228,11 @@ mod tests {
     fn only_old_sign_in_prefixes_are_retired() {
         let body = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         for old in ["otto_at_", "otto_rt_", "otto_ac_", "otto_ss_", "otto_pat_"] {
-            assert!(retired(&format!("{old}{body}")), "{old}");
-            assert!(retired(&format!("  {old}{body}\n")), "{old} padded");
+            assert!(is_retired_sign_in(&format!("{old}{body}")), "{old}");
+            assert!(
+                is_retired_sign_in(&format!("  {old}{body}\n")),
+                "{old} padded"
+            );
         }
         for kept in [
             "otto_client_",
@@ -231,7 +248,7 @@ mod tests {
             "sav_pat_",
             "",
         ] {
-            assert!(!retired(&format!("{kept}{body}")), "{kept}");
+            assert!(!is_retired_sign_in(&format!("{kept}{body}")), "{kept}");
         }
     }
 

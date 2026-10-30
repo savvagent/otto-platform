@@ -728,12 +728,15 @@ all three the same day. Tokens issued after the deploy (`sav_`) keep working thr
 ### 9. Leave otto.savvagent.com pointed at this app
 
 Do not remove `otto.savvagent.com`'s DNS records or its certificate. Services that have not
-been redeployed, agents holding tokens, and MCP clients that cached the old endpoints keep
-calling `https://otto.savvagent.com/oauth/introspect`, `/oauth/token` and `/internal/*`,
-and those answer there exactly as on `savvagent.com`: nothing on them checks the `Host`
-(`the_old_host_keeps_answering_server_to_server_calls_after_the_cutover` pins it). Only
-browser sign-in on the old host stops working, because no passkey is bound to it any more.
-#135 turns it into a redirect once every service has moved.
+been redeployed, agents holding `sav_` tokens, and MCP clients that cached the old endpoints
+keep calling `https://otto.savvagent.com/oauth/introspect`, `/oauth/token` and
+`/internal/*`, and those answer there exactly as on `savvagent.com`: nothing on them checks
+the `Host` (`the_old_host_keeps_answering_server_to_server_calls_after_the_cutover` pins
+it). That includes refusing the old sign-in tokens (`otto_at_`, `otto_rt_`, `otto_ac_`,
+`otto_ss_`, `otto_pat_`): they are treated as unknown on either host, so an agent still
+holding one signs in again, wherever it points. Only browser sign-in on the old host stops
+working, because no passkey is bound to it any more. #135 turns it into a redirect once
+every service has moved.
 
 ### Rolling back across the cutover
 
@@ -743,7 +746,11 @@ same values (the reverse of step 2; the key is the same key, so stored secrets s
 and deploy the previous image from a checkout of that release so its `fly.toml` `[env]`
 applies. Passkeys registered in step 5 are bound to `savvagent.com` and do not work on the
 old host, so the console is out of reach on a rolled-back release until you roll forward
-again; API, token and introspection calls are unaffected. Prefer rolling forward with a fix.
+again; API, token and introspection calls are unaffected. The rolled-back release looks
+credentials up by hash and knows nothing of the prefix switch, so `sav_` tokens and
+secrets issued after the cutover keep working on it, and the retired `otto_` sign-in tokens
+that are still unexpired and unrevoked come back to life until you roll forward again.
+Prefer rolling forward with a fix.
 
 ## Migrations and rolling back
 
