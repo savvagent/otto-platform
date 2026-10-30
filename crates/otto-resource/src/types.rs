@@ -27,19 +27,21 @@ impl Role {
 }
 
 /// Whether `s` has the shape of a token the platform mints for a resource
-/// server: `otto_at_` (OAuth access) or `otto_pat_` (personal access) followed
-/// by 43 base64url characters (32 random bytes, unpadded). Refresh tokens
-/// (`otto_rt_`) are never presented to a resource server.
+/// server: an OAuth access (`*_at_`) or personal access (`*_pat_`) prefix
+/// followed by 43 base64url characters (32 random bytes, unpadded). Refresh
+/// tokens (`*_rt_`) are never presented to a resource server.
+///
+/// Both the `otto_` and the `sav_` prefixes pass while the Savvagent rebrand
+/// (#128) is under way: resource servers pin this crate by rev, so they have to
+/// accept `sav_` tokens before the platform starts minting them.
 ///
 /// A pre-filter only: passing it says nothing about validity, but failing it
 /// means the platform would answer inactive, so no call is needed. This
 /// mirrors `otto_auth::crypto::generate`; the platform's test suite asserts
 /// every token kind it mints passes.
 pub fn looks_like_token(s: &str) -> bool {
-    let Some(rest) = s
-        .strip_prefix("otto_at_")
-        .or_else(|| s.strip_prefix("otto_pat_"))
-    else {
+    const PREFIXES: [&str; 4] = ["sav_at_", "sav_pat_", "otto_at_", "otto_pat_"];
+    let Some(rest) = PREFIXES.iter().find_map(|p| s.strip_prefix(p)) else {
         return false;
     };
     rest.len() == 43
@@ -665,5 +667,38 @@ impl MeterDeclarationReceipt {
     pub(crate) fn merge(&mut self, other: MeterDeclarationReceipt) {
         self.declared.extend(other.declared);
         self.rejected.extend(other.rejected);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_token;
+
+    const BODY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-_9";
+
+    #[test]
+    fn access_and_personal_tokens_pass_under_either_prefix() {
+        for prefix in ["sav_at_", "sav_pat_", "otto_at_", "otto_pat_"] {
+            let token = format!("{prefix}{BODY}");
+            assert!(looks_like_token(&token), "{token}");
+        }
+    }
+
+    #[test]
+    fn other_kinds_and_malformed_bodies_do_not() {
+        for prefix in ["sav_rt_", "otto_rt_", "sav_ss_", "sav_rs_", "sav_", "at_"] {
+            let token = format!("{prefix}{BODY}");
+            assert!(!looks_like_token(&token), "{token}");
+        }
+        for junk in [
+            "",
+            "sav_at_",
+            "sav_at_short",
+            &format!("sav_at_{BODY}A"),
+            &format!("sav_pat_{}!", &BODY[..42]),
+            &format!("SAV_AT_{BODY}"),
+        ] {
+            assert!(!looks_like_token(junk), "{junk:?}");
+        }
     }
 }
