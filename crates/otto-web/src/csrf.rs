@@ -2,7 +2,7 @@
 //!
 //! `SameSite=Lax` keeps a session cookie off cross-*site* POSTs, but it does
 //! nothing about **same-site** siblings: every `*.savvagent.com` host is
-//! same-site with `otto.savvagent.com`, so an XSS on any of them can submit a
+//! same-site with `savvagent.com`, so an XSS on any of them can submit a
 //! form here with the victim's cookie attached — `POST /oauth/authorize` with
 //! `decision=allow`, or any of the bodyless POSTs (`/api/auth/logout`,
 //! `members/{user}/logout`, `sso/domains/{d}/verify`) that no body-shaped check

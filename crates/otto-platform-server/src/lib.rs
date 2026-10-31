@@ -106,12 +106,78 @@ pub fn app(db: Db, config: &Config) -> Result<Router> {
         None => app.fallback(|uri: axum::http::Uri| async move { not_found(uri.path()) }),
     };
 
+    let old_hosts = std::sync::Arc::new(OldHosts {
+        hosts: config.redirect_hosts.clone(),
+        base: config.public_url.trim_end_matches('/').to_string(),
+    });
     Ok(app
         // Request spans, without headers. `DefaultMakeSpan::include_headers`
         // would put `Authorization` and `Cookie` into the logs — every bearer
         // token and every session cookie, in plaintext, in whatever the log
         // aggregator retains. Do not turn it on.
-        .layer(TraceLayer::new_for_http()))
+        .layer(TraceLayer::new_for_http())
+        // Outermost, so it runs before the trace span, CSRF, auth, rate limits
+        // and static serving: an old host answers nothing but the redirect.
+        .layer(axum::middleware::from_fn_with_state(
+            old_hosts,
+            redirect_old_hosts,
+        )))
+}
+
+/// The hosts that only redirect (`SAVVAGENT_REDIRECT_HOSTS`) and where to.
+struct OldHosts {
+    /// Lowercase bare hostnames.
+    hosts: Vec<String>,
+    /// `SAVVAGENT_PUBLIC_URL` without a trailing `/`: the only scheme and host
+    /// a `Location` ever carries.
+    base: String,
+}
+
+/// `308` every request for an old host to the same path and query under the
+/// public URL, for every method, with an empty body.
+///
+/// The `Location` is the public URL followed by the request's raw
+/// path-and-query, byte for byte: nothing is decoded and re-encoded, and
+/// neither the scheme nor the host of the request, nor any `X-Forwarded-*`
+/// header, is consulted for it.
+async fn redirect_old_hosts(
+    axum::extract::State(old): axum::extract::State<std::sync::Arc<OldHosts>>,
+    req: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    if old.hosts.is_empty() || !is_old_host(&old.hosts, &req) {
+        return next.run(req).await;
+    }
+    let target = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
+    let target = if target.starts_with('/') { target } else { "/" };
+    let mut res = Response::new(Body::empty());
+    *res.status_mut() = StatusCode::PERMANENT_REDIRECT;
+    // A request URI is visible ASCII, so this does not fail; if it ever did,
+    // the root of the public URL beats serving the old host.
+    let location = HeaderValue::try_from(format!("{}{target}", old.base))
+        .or_else(|_| HeaderValue::try_from(format!("{}/", old.base)));
+    if let Ok(location) = location {
+        res.headers_mut()
+            .insert(axum::http::header::LOCATION, location);
+    }
+    res
+}
+
+/// Whether the request's `Host` (the URI's authority when there is no header,
+/// as in HTTP/2), without its port or a trailing dot and ignoring case, is one
+/// of `hosts` (all lowercase).
+fn is_old_host(hosts: &[String], req: &Request<Body>) -> bool {
+    let authority = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    let Some(authority) = authority else {
+        return false;
+    };
+    let host = authority.split(':').next().unwrap_or_default();
+    let host = host.strip_suffix('.').unwrap_or(host);
+    hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
 }
 
 /// Path prefixes that belong to an API rather than to the console's routing.
@@ -1101,5 +1167,189 @@ mod tests {
                 .expect("lazy pool"),
         );
         let _router = app(db, &Config::for_test()).expect("app assembles");
+    }
+
+    fn redirecting_app(bundle: &Bundle) -> Router {
+        let mut config = Config::for_test();
+        config.static_dir = Some(bundle.0.clone());
+        config.redirect_hosts = vec!["old.example.com".into()];
+        app(lazy_db(), &config).expect("app assembles")
+    }
+
+    /// Every method and path on an old host is a `308` to the public URL
+    /// (`https://otto.example.com` in `Config::for_test`), path and query
+    /// untouched, before CSRF, auth, the database or the console is reached.
+    #[tokio::test]
+    async fn an_old_host_gets_a_308_to_the_public_url_on_every_method_and_path() {
+        let bundle = bundle("old-host-308");
+        for (method, target, host, want) in [
+            (
+                "GET",
+                "/oauth/token?grant_type=a%2Fb&x=1",
+                "old.example.com",
+                "https://otto.example.com/oauth/token?grant_type=a%2Fb&x=1",
+            ),
+            (
+                "POST",
+                "/oauth/token",
+                "old.example.com",
+                "https://otto.example.com/oauth/token",
+            ),
+            (
+                "GET",
+                "/pricing?ref=x",
+                "old.example.com",
+                "https://otto.example.com/pricing?ref=x",
+            ),
+            (
+                "GET",
+                "/o/acme/members",
+                "old.example.com",
+                "https://otto.example.com/o/acme/members",
+            ),
+            (
+                "GET",
+                "/.well-known/oauth-authorization-server",
+                "old.example.com",
+                "https://otto.example.com/.well-known/oauth-authorization-server",
+            ),
+            (
+                "POST",
+                "/internal/introspect",
+                "old.example.com",
+                "https://otto.example.com/internal/introspect",
+            ),
+            (
+                "POST",
+                "/api/auth/login",
+                "old.example.com",
+                "https://otto.example.com/api/auth/login",
+            ),
+            (
+                "GET",
+                "/sso/start",
+                "old.example.com",
+                "https://otto.example.com/sso/start",
+            ),
+            (
+                "GET",
+                "/healthz",
+                "old.example.com",
+                "https://otto.example.com/healthz",
+            ),
+            (
+                "GET",
+                "/readyz",
+                "old.example.com",
+                "https://otto.example.com/readyz",
+            ),
+            ("GET", "/", "old.example.com", "https://otto.example.com/"),
+            // Port, case and a trailing dot do not change the host.
+            (
+                "GET",
+                "/oauth/token?x=1",
+                "old.example.com:8080",
+                "https://otto.example.com/oauth/token?x=1",
+            ),
+            (
+                "POST",
+                "/oauth/token",
+                "OLD.Example.COM",
+                "https://otto.example.com/oauth/token",
+            ),
+            (
+                "DELETE",
+                "/api/x",
+                "old.example.com.",
+                "https://otto.example.com/api/x",
+            ),
+            // Raw: dot segments, doubled slashes and escapes are not touched.
+            (
+                "GET",
+                "//evil.example/%2e%2e/a%20b?q=%zz",
+                "old.example.com",
+                "https://otto.example.com//evil.example/%2e%2e/a%20b?q=%zz",
+            ),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(target)
+                .header("host", host)
+                .header("authorization", "Bearer nope")
+                .body(Body::from("ignored"))
+                .unwrap();
+            let res = send(redirecting_app(&bundle), req).await;
+            assert_eq!(
+                res.status(),
+                StatusCode::PERMANENT_REDIRECT,
+                "{method} {target} {host}"
+            );
+            assert_eq!(location(&res), Some(want), "{method} {target}");
+            assert!(body(res).await.is_empty(), "{method} {target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_cannot_choose_where_the_redirect_goes() {
+        let bundle = bundle("old-host-hostile");
+        let req = Request::builder()
+            .uri("http://evil.example/oauth/token")
+            .header("host", "old.example.com")
+            .header("x-forwarded-host", "evil.example")
+            .header("x-forwarded-proto", "http")
+            .header("forwarded", "host=evil.example;proto=http")
+            .body(Body::empty())
+            .unwrap();
+        let res = send(redirecting_app(&bundle), req).await;
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(location(&res), Some("https://otto.example.com/oauth/token"));
+
+        // A hostile `X-Forwarded-Host` on the public host does not make it old.
+        let req = Request::builder()
+            .uri("/healthz")
+            .header("host", "otto.example.com")
+            .header("x-forwarded-host", "old.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let res = send(redirecting_app(&bundle), req).await;
+        assert!(location(&res).is_none(), "{res:?}");
+
+        // No `Host` header: the URI's authority decides (HTTP/2).
+        let req = Request::builder()
+            .uri("http://old.example.com/pricing")
+            .body(Body::empty())
+            .unwrap();
+        let res = send(redirecting_app(&bundle), req).await;
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(location(&res), Some("https://otto.example.com/pricing"));
+    }
+
+    #[tokio::test]
+    async fn other_hosts_are_not_redirected() {
+        let bundle = bundle("old-host-other");
+        for host in [
+            "otto.example.com",
+            "old.example.com.evil.example",
+            "xold.example.com",
+            "example.com",
+        ] {
+            let req = Request::builder()
+                .uri("/pricing")
+                .header("host", host)
+                .body(Body::empty())
+                .unwrap();
+            let res = send(redirecting_app(&bundle), req).await;
+            assert_eq!(res.status(), StatusCode::OK, "{host}");
+            assert!(location(&res).is_none(), "{host}");
+        }
+        // With none configured (the default) nothing redirects, whatever the host.
+        let req = Request::builder()
+            .uri("/pricing")
+            .header("host", "old.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let res = send(console_app(&bundle), req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(location(&res).is_none());
     }
 }

@@ -367,6 +367,7 @@ async fn refresh_grant(db: &Db, refresh: &str) -> (StatusCode, Value) {
         client_ip_header: None,
         enforce_quotas: false,
         static_dir: None,
+        redirect_hosts: vec![],
         run_migrations: true,
         log_format: otto_platform_server::LogFormat::Text,
         email: None,
@@ -1868,6 +1869,7 @@ async fn resource_server_calls_are_not_subject_to_the_browser_csrf_guard(pool: P
         client_ip_header: None,
         enforce_quotas: false,
         static_dir: None,
+        redirect_hosts: vec![],
         run_migrations: true,
         log_format: otto_platform_server::LogFormat::Text,
         email: None,
@@ -1929,7 +1931,9 @@ async fn resource_server_calls_are_not_subject_to_the_browser_csrf_guard(pool: P
 /// while resource servers not yet repointed keep calling
 /// `https://otto.savvagent.com`. Nothing may check the `Host` of those calls
 /// against the public URL: introspection, the token endpoint and the internal
-/// API must answer on the old host exactly as on the new one.
+/// API must answer on the old host exactly as on the new one. That holds while no
+/// `redirect_hosts` is configured; #135 sets one in production, and
+/// `an_old_host_gets_a_308_...` in `lib.rs` pins what the host then does.
 #[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
 async fn the_old_host_keeps_answering_server_to_server_calls_after_the_cutover(pool: PgPool) {
     let w = world(pool).await;
@@ -1941,6 +1945,7 @@ async fn the_old_host_keeps_answering_server_to_server_calls_after_the_cutover(p
         client_ip_header: None,
         enforce_quotas: false,
         static_dir: None,
+        redirect_hosts: vec![],
         run_migrations: true,
         log_format: otto_platform_server::LogFormat::Text,
         email: None,
@@ -3202,6 +3207,7 @@ async fn catalog_meters(db: &Db) -> Vec<String> {
         client_ip_header: None,
         enforce_quotas: false,
         static_dir: None,
+        redirect_hosts: vec![],
         run_migrations: true,
         log_format: otto_platform_server::LogFormat::Text,
         email: None,
@@ -4411,12 +4417,19 @@ async fn the_operator_cli_renames_shows_and_drops_aliases(pool: PgPool) {
         )),
         "{out}"
     );
-    assert!(run_resource_cmd(&w.db, "list")
+    // A dropped alias is history: `list` omits it, `show` keeps printing it.
+    let list = run_resource_cmd(&w.db, "list").await.unwrap();
+    assert!(!list.contains("alias"), "{list}");
+    assert!(list.lines().any(|l| l.starts_with(TOWER)), "{list}");
+    let shown = run_resource_cmd(&w.db, &format!("show {TOWER}"))
         .await
-        .unwrap()
-        .contains(&format!(
+        .unwrap();
+    assert!(
+        shown.contains(&format!(
             "  alias {FACTORY}\tsunset=2099-01-01T00:00:00Z\tdropped"
-        )));
+        )),
+        "{shown}"
+    );
     assert_eq!(
         introspect(&w.db, Some(&w.factory_basic()), &token).await.0,
         StatusCode::UNAUTHORIZED

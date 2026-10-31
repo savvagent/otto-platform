@@ -64,7 +64,9 @@
 //! bound to it (ones a request racing the rename minted). An alias row is never
 //! deleted, and `register` and `rename` refuse any URI that is or was one, so
 //! a retired URI is never handed to another server. `list` shows each alias
-//! under its server with its sunset and state (`live`, `expired`, `dropped`).
+//! under its server with its sunset and state (`live` or `expired`), and leaves
+//! out the dropped ones: they are history, which `show` still prints, and once
+//! every alias is dropped `list` shows none (savvagent/otto-platform#135).
 //!
 //! Secrets are printed once, on stdout, and cannot be read back: the
 //! introspection secret is stored hashed, the webhook secret sealed. Losing
@@ -75,7 +77,7 @@
 use std::io::Write;
 
 use chrono::{DateTime, Utc};
-use otto_auth::resources::{self, ResourceAlias, ResourceServerSpec};
+use otto_auth::resources::{self, AliasState, ResourceAlias, ResourceServerSpec};
 use otto_tenant::crypto::Cipher;
 use otto_tenant::Db;
 
@@ -565,7 +567,10 @@ pub async fn execute(
                     rs.webhook_url.as_deref().unwrap_or("-"),
                     rs.service.as_deref().unwrap_or("-"),
                 )?;
-                for alias in aliases.iter().filter(|a| a.resource_uri == rs.resource_uri) {
+                let shown = aliases.iter().filter(|a| {
+                    a.resource_uri == rs.resource_uri && a.state() != AliasState::Dropped
+                });
+                for alias in shown {
                     write_alias(out, alias)?;
                 }
             }
