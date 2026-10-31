@@ -2,7 +2,7 @@
 
 # otto-platform-server image, with the console bundle baked in for self-hosters.
 #
-# The bundle lives at /srv/console; the server serves it when OTTO_STATIC_DIR
+# The bundle lives at /srv/console; the server serves it when SAVVAGENT_STATIC_DIR
 # points there (fly.toml does). An optional Cloudflare Worker (web/worker,
 # docs/deploy/cloudflare.md) can serve it from the edge instead.
 
@@ -61,10 +61,10 @@ USER otto
 COPY --from=build   /usr/local/bin/otto-platform-server /usr/local/bin/otto-platform-server
 COPY --from=console /web/build                          /srv/console
 
-# OTTO_STATIC_DIR is deliberately not defaulted here: a deployment opts in (fly.toml
+# SAVVAGENT_STATIC_DIR is deliberately not defaulted here: a deployment opts in (fly.toml
 # does), so an API-only or Worker-fronted deployment is not shadowed by a second console.
-ENV OTTO_BIND=0.0.0.0:8080 \
-    OTTO_LOG_FORMAT=json \
+ENV SAVVAGENT_BIND=0.0.0.0:8080 \
+    SAVVAGENT_LOG_FORMAT=json \
     RUST_LOG=info
 
 EXPOSE 8080

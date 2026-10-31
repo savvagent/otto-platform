@@ -423,7 +423,7 @@ async fn console_signal_matches_the_challenge(pool: PgPool) {
     assert!(!label.is_empty(), "every account carries generated words");
     assert_eq!(
         me.body["credentialDisplayName"],
-        format!("Otto Platform · {label}"),
+        format!("Savvagent · {label}"),
     );
 }
 
@@ -997,7 +997,7 @@ async fn an_invitation_code_is_handed_back_accepted_once_and_grants_its_role(poo
     // The code comes back to the admin — there is no mailbox it went to
     // instead — and the link is the same secret wrapped in a console URL.
     let token = invited.body["code"].as_str().expect("no code").to_string();
-    assert!(token.starts_with("otto_inv_"), "unexpected code: {token}");
+    assert!(token.starts_with("sav_inv_"), "unexpected code: {token}");
     assert_eq!(
         invited.body["link"],
         format!("https://otto.test/invite/acme?token={token}")
@@ -1032,6 +1032,84 @@ async fn an_invitation_code_is_handed_back_accepted_once_and_grants_its_role(poo
         .send(&h.router)
         .await;
     replayed.expect(StatusCode::GONE);
+}
+
+/// Point the stored code whose plaintext is `minted` at its `otto_inv_` twin,
+/// as a code minted before the switch to Savvagent (#128) is stored, and
+/// return the twin.
+async fn as_minted_before_savvagent(h: &common::Harness, table: &str, minted: &str) -> String {
+    let old = minted.replacen("sav_inv_", "otto_inv_", 1);
+    assert_ne!(old, minted, "{minted} is not a sav_inv_ code");
+    let n = sqlx::query(&format!(
+        "UPDATE {table} SET token_hash = $2 WHERE token_hash = $1"
+    ))
+    .bind(otto_auth::crypto::hash(minted))
+    .bind(otto_auth::crypto::hash(&old))
+    .execute(h.db.pool())
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(n, 1);
+    old
+}
+
+/// Invitation and claim codes minted before the switch to Savvagent (#128)
+/// keep working: the cutover's passkey recovery redeems a claim code issued
+/// before the deploy, and so will be `otto_inv_`.
+#[sqlx::test(migrator = "otto_tenant::db::MIGRATOR")]
+async fn invite_and_claim_codes_minted_before_savvagent_still_redeem(pool: PgPool) {
+    let h = harness(pool).await;
+    let rob = onboard(&h, "rob@acme.test").await;
+    let acme = org_with_owner(&h, "acme", &rob).await;
+    let bob = onboard(&h, "bob@acme.test").await;
+
+    let invited = Call::post("/api/orgs/acme/invites")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "email": "bob@acme.test", "role": "admin" }))
+        .send(&h.router)
+        .await;
+    invited.expect(StatusCode::CREATED);
+    let minted = invited.body["code"].as_str().unwrap();
+    let old = as_minted_before_savvagent(&h, "org_invites", minted).await;
+    let joined = Call::post("/api/orgs/acme/invites/accept")
+        .with_session(&bob.session)
+        .json(serde_json::json!({ "token": old }))
+        .send(&h.router)
+        .await;
+    joined.expect(StatusCode::OK);
+    assert_eq!(joined.body["role"], "admin");
+
+    let carol = onboard(&h, "carol@acme.test").await;
+    add_member(&h, acme, carol.user, otto_core::orgs::Role::Member).await;
+    let reset = Call::post(format!(
+        "/api/orgs/acme/members/{}/reset-passkeys",
+        carol.user
+    ))
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    reset.expect(StatusCode::CREATED);
+    let minted = reset.body["code"].as_str().unwrap();
+    let old = as_minted_before_savvagent(&h, "account_claims", minted).await;
+    let mut new_device = common::authenticator();
+    let started = Call::post("/api/auth/claim/start")
+        .json(serde_json::json!({ "code": old }))
+        .send(&h.router)
+        .await;
+    started.expect(StatusCode::OK);
+    let reclaimed = common::finish_registration(
+        &h,
+        &mut new_device,
+        "/api/auth/claim/finish",
+        &started.body,
+        serde_json::json!({ "code": old }),
+    )
+    .await;
+    reclaimed.expect(StatusCode::OK);
+    assert_eq!(
+        reclaimed.body["user"]["id"].as_str().unwrap(),
+        carol.user.to_string()
+    );
 }
 
 /// A forwarded invitation mail must not be a way into someone else's org.
@@ -1224,7 +1302,7 @@ async fn a_pat_is_shown_once_audienced_for_its_resource_and_revocable(pool: PgPo
 
     let token = minted.body["token"].as_str().unwrap().to_string();
     let id = minted.body["id"].as_str().unwrap().to_string();
-    assert!(token.starts_with("otto_pat_"));
+    assert!(token.starts_with("sav_pat_"));
     assert_eq!(minted.body["resource"], common::RESOURCE);
 
     let principal = otto_auth::tokens::introspect(&h.db, &token, common::RESOURCE)
@@ -1717,7 +1795,7 @@ async fn the_openapi_document_is_public_and_describes_the_surface(pool: PgPool) 
     assert!(doc.body["paths"]["/api/orgs/{org}/teams"]["post"].is_object());
     assert_eq!(
         doc.body["components"]["securitySchemes"]["sessionCookie"]["name"],
-        "__Host-otto_session"
+        "__Host-savvagent_session"
     );
 }
 
@@ -2024,7 +2102,7 @@ async fn a_reset_account_cannot_be_claimed_without_the_code(pool: PgPool) {
 
     // A stranger with a guessed code gets nowhere.
     let guessed = Call::post("/api/auth/claim/start")
-        .json(serde_json::json!({ "code": "otto_inv_not-a-real-code" }))
+        .json(serde_json::json!({ "code": "sav_inv_not-a-real-code" }))
         .send(&h.router)
         .await;
     assert_ne!(guessed.status, StatusCode::OK);

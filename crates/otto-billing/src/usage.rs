@@ -414,7 +414,7 @@ pub enum IngestOutcome {
 /// ([`MAX_METER_QUANTITY`]): above any plausible month of any meter, so only a
 /// runaway or hostile shipper reaches it, and still a bound, where without it
 /// a shipper could bill 500 events of 1e9 per request without end. Operators
-/// tune it down to their meters with `OTTO_USAGE_HOLD_THRESHOLD`.
+/// tune it down to their meters with `SAVVAGENT_USAGE_HOLD_THRESHOLD`.
 pub const DEFAULT_HOLD_THRESHOLD: i64 = 1_000_000_000_000;
 
 /// Whether `org` (the transaction's) has authorized the resource server whose

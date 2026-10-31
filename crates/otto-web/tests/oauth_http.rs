@@ -659,7 +659,7 @@ async fn the_token_endpoint_refuses_a_request_without_pkce(pool: PgPool) {
     let refused = Call::post("/oauth/token")
         .form(&[
             ("grant_type", "authorization_code"),
-            ("code", "otto_ac_whatever"),
+            ("code", "sav_ac_whatever"),
             ("client_id", &client_id),
             ("redirect_uri", REDIRECT),
         ])
@@ -746,7 +746,7 @@ async fn a_stolen_code_is_useless_without_the_verifier(pool: PgPool) {
 async fn revocation_is_silent_about_whether_the_token_existed(pool: PgPool) {
     let h = harness(pool).await;
     Call::post("/oauth/revoke")
-        .form(&[("token", "otto_at_never-existed")])
+        .form(&[("token", "sav_at_never-existed")])
         .send(&h.router)
         .await
         .expect(StatusCode::OK);
@@ -1629,7 +1629,7 @@ async fn agent_endpoints_without_a_cookie_are_not_guarded(pool: PgPool) {
     assert_eq!(token.body["error"], "invalid_request");
 
     Call::post("/oauth/revoke")
-        .form(&[("token", "otto_at_nothing")])
+        .form(&[("token", "sav_at_nothing")])
         .send(&h.router)
         .await
         .expect(StatusCode::OK);

@@ -84,7 +84,7 @@
         <Card title={serviceName(row.service)}>
           <div class="space-y-4">
             <div>
-              <div class="otto-label">{m.usage_spend_label()}</div>
+              <div class="sav-label">{m.usage_spend_label()}</div>
               <Meter usage={row} />
             </div>
 
@@ -93,7 +93,7 @@
             {:else}
               <dl class="grid grid-cols-2 gap-y-2 text-sm">
                 <div>
-                  <dt class="otto-label">{m.budget_value_label()}</dt>
+                  <dt class="sav-label">{m.budget_value_label()}</dt>
                   <dd class="text-muted">
                     {row.budget
                       ? formatCents(row.budget.monthlyBudgetCents, currentLocale())
@@ -101,7 +101,7 @@
                   </dd>
                 </div>
                 <div>
-                  <dt class="otto-label">{m.budget_hard_stop_label()}</dt>
+                  <dt class="sav-label">{m.budget_hard_stop_label()}</dt>
                   <dd class="text-muted">
                     {row.budget?.hardStop ? m.budget_hard_stop_on() : m.budget_hard_stop_off()}
                   </dd>

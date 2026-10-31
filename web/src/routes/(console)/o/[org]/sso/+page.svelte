@@ -236,7 +236,7 @@
       <form class="max-w-lg space-y-4" onsubmit={saveConnection}>
         <Field label={m.sso_issuer_label()} hint={m.sso_issuer_hint()}>
           <input
-            class="otto-input"
+            class="sav-input"
             type="url"
             required
             bind:value={issuer}
@@ -244,11 +244,11 @@
           />
         </Field>
         <Field label={m.sso_client_id_label()}>
-          <input class="otto-input" type="text" required bind:value={clientId} />
+          <input class="sav-input" type="text" required bind:value={clientId} />
         </Field>
         <Field label={m.sso_client_secret_label()} hint={m.sso_client_secret_hint()}>
           <input
-            class="otto-input"
+            class="sav-input"
             type="password"
             required
             autocomplete="off"
@@ -278,7 +278,7 @@
         <div class="min-w-56 flex-1">
           <Field label={m.sso_domain_input_label()}>
             <input
-              class="otto-input"
+              class="sav-input"
               type="text"
               required
               bind:value={newDomain}

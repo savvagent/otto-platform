@@ -45,7 +45,7 @@ struct Server {
     server_scopes: Option<Vec<String>>,
     /// The first resource's `scopes_supported`, when it says.
     resource_scopes: Option<Vec<String>>,
-    /// `otto_authorize_resources_max`, when the server says.
+    /// `savvagent_authorize_resources_max`, when the server says.
     max_resources: Option<usize>,
     /// Resources the person leaves out on a multi-resource consent screen.
     decline: Vec<String>,
@@ -108,7 +108,7 @@ async fn server_meta(State(s): State<Shared>) -> Json<serde_json::Value> {
         meta["scopes_supported"] = scopes.clone().into();
     }
     if let Some(max) = s.max_resources {
-        meta["otto_authorize_resources_max"] = max.into();
+        meta["savvagent_authorize_resources_max"] = max.into();
     }
     Json(meta)
 }
@@ -121,7 +121,7 @@ async fn register(
     assert_eq!(body["redirect_uris"][0], "http://127.0.0.1/callback");
     (
         StatusCode::CREATED,
-        Json(serde_json::json!({ "client_id": "otto_client_test" })),
+        Json(serde_json::json!({ "client_id": "sav_client_test" })),
     )
 }
 
@@ -369,7 +369,7 @@ async fn login_caches_a_refreshable_token_and_a_second_login_reuses_it() {
             .starts_with("rt-")
     );
 
-    // `ottoctl login` again: no browser, no new authorization.
+    // `savctl login` again: no browser, no new authorization.
     let again = client(dir.path(), Box::new(NoBrowser));
     assert_eq!(
         again.login(&resource, &[], false).await.unwrap(),
@@ -474,7 +474,7 @@ async fn concurrent_refreshes_never_replay_a_refresh_token() {
         .unwrap();
     expire(dir.path());
 
-    // Separate clients, separate lock file handles: as two `ottoctl` processes.
+    // Separate clients, separate lock file handles: as two `savctl` processes.
     let clients: Vec<_> = (0..4)
         .map(|_| client(dir.path(), Box::new(NoBrowser)))
         .collect();
@@ -516,7 +516,7 @@ async fn a_revoked_grant_says_to_log_in_again_and_leaks_nothing() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::LoginRequired { .. }), "{err:?}");
-    assert!(err.to_string().contains("ottoctl login"), "{err}");
+    assert!(err.to_string().contains("savctl login"), "{err}");
     for text in [err.to_string(), format!("{err:?}")] {
         assert!(!text.contains("SECRETVALUE"), "{text}");
     }

@@ -4,8 +4,8 @@
  * and the MCP endpoint an agent is pointed at, as text that can be copied.
  *
  * Its primary button depends on whether the product has a web console of its
- * own. Otto Tower does, and the button leaves for it; Otto Flags and Otto
- * CXP live inside the visitor's AI assistant, so theirs stays on the page and
+ * own. Savvagent Tower does, and the button leaves for it; Savvagent Flags and
+ * Savvagent CXP live inside the visitor's AI assistant, so theirs stays on the page and
  * points at the connect card.
  */
 
@@ -68,22 +68,22 @@ describe('the product page', () => {
     expectNoSkips(headingLevels(container));
     // The cross-linked card's name is a real heading, one level under its section.
     const card = Array.from(container.querySelectorAll('h3')).find((h) =>
-      h.textContent?.includes('Otto Flags')
+      h.textContent?.includes('Savvagent Flags')
     );
     expect(card).toBeDefined();
-    expect(headings[0]?.textContent).toContain('Otto Tower');
+    expect(headings[0]?.textContent).toContain('Savvagent Tower');
     expect(container.textContent).toContain('https://otto-tower.savvagent.com/mcp');
 
     // The page title is the name and the product's own title phrase, with no
     // closing full stop; the description is the short SEO one, not the summary.
-    expect(document.title).toBe('Otto Tower: Coordination for teams of coding agents');
+    expect(document.title).toBe('Savvagent Tower: Coordination for teams of coding agents');
     const description = document.head.querySelector('meta[name="description"]');
     expect(description?.getAttribute('content')?.length).toBeLessThanOrEqual(160);
 
     // A link preview gets the image's alt text, and every other language.
     expect(
       document.head.querySelector('meta[property="og:image:alt"]')?.getAttribute('content')
-    ).toBe('The Otto logo');
+    ).toBe('The Savvagent logo');
     const others = Array.from(
       document.head.querySelectorAll('meta[property="og:locale:alternate"]')
     ).map((meta) => meta.getAttribute('content'));
@@ -91,8 +91,8 @@ describe('the product page', () => {
 
     // The service's own console names its destination; the arrow marking it
     // as off-site is decoration, so it is not part of the accessible name.
-    const open = container.querySelector('a[href="https://otto-tower.savvagent.com"]');
-    expect(open?.textContent).toContain('Open the Otto Tower console');
+    const open = container.querySelector('a[href="https://tower.savvagent.com"]');
+    expect(open?.textContent).toContain('Open the Savvagent Tower console');
     expect(open?.querySelector('[aria-hidden="true"]')?.textContent).toBe('↗');
 
     // The other products are cross-linked; this one is not linked to itself.
@@ -102,12 +102,12 @@ describe('the product page', () => {
     unmount(instance);
   });
 
-  it('renders Otto Flags as its own page, cross-linking Tower', () => {
+  it('renders Savvagent Flags as its own page, cross-linking Tower', () => {
     const instance = mountProduct('flags');
 
     const headings = container.querySelectorAll('h1');
     expect(headings).toHaveLength(1);
-    expect(headings[0]?.textContent).toContain('Otto Flags');
+    expect(headings[0]?.textContent).toContain('Savvagent Flags');
     expectNoSkips(headingLevels(container));
     expect(container.textContent).toContain('https://otto-flags.savvagent.com/mcp');
     expect(container.textContent).toContain('Automatic rollback on Team plans and above.');
@@ -140,7 +140,7 @@ describe('the product page', () => {
   it("keeps the way into a product's own web console when it has one", () => {
     const instance = mountProduct('tower');
 
-    expect(linkText('https://otto-tower.savvagent.com')).toContain('Open the Otto Tower console');
+    expect(linkText('https://tower.savvagent.com')).toContain('Open the Savvagent Tower console');
     expect(container.querySelector('a[href="#connect"]')).toBeNull();
     expect(container.textContent).not.toContain('has no web console of its own');
 
@@ -148,8 +148,8 @@ describe('the product page', () => {
   });
 
   for (const [slug, name] of [
-    ['flags', 'Otto Flags'],
-    ['cxp', 'Otto CXP']
+    ['flags', 'Savvagent Flags'],
+    ['cxp', 'Savvagent CXP']
   ] as const) {
     it(`sends a visitor to the connect card for ${name}, which has no web console`, () => {
       const instance = mountProduct(slug);
@@ -157,6 +157,7 @@ describe('the product page', () => {
       // Nothing on the page leads to the bare origin, which answers a browser
       // with a JSON 404.
       expect(container.querySelector(`a[href^="https://otto-${slug}."]`)).toBeNull();
+      expect(container.querySelector(`a[href^="https://${slug}.savvagent.com"]`)).toBeNull();
       expect(container.textContent).not.toContain(`Open the ${name} console`);
 
       const add = container.querySelector('a[href="#connect"]');
@@ -166,11 +167,11 @@ describe('the product page', () => {
         p.textContent?.includes('has no web console of its own')
       );
       expect(note?.textContent?.replace(/\s+/g, ' ').trim()).toBe(
-        `${name} works inside your AI assistant; it has no web console of its own. Usage and billing are in your Otto console.`
+        `${name} works inside your AI assistant; it has no web console of its own. Usage and billing are in your Savvagent console.`
       );
-      // "Otto console" goes where every other way into the console goes.
+      // "Savvagent console" goes where every other way into the console goes.
       const otto = note?.querySelector('a');
-      expect(otto?.textContent?.trim()).toBe('Otto console');
+      expect(otto?.textContent?.trim()).toBe('Savvagent console');
       expect(otto?.getAttribute('href')).toBe('/signup');
       expect(otto?.hasAttribute('data-sveltekit-reload')).toBe(true);
 
@@ -181,7 +182,7 @@ describe('the product page', () => {
     });
   }
 
-  it('sends the "Otto console" note to the signed-in visitor\'s org', () => {
+  it('sends the "Savvagent console" note to the signed-in visitor\'s org', () => {
     session.me = {
       orgs: [
         { orgId: 'o1', userId: 'u1', role: 'owner', orgSlug: 'acme', orgName: 'Acme', plan: 'free' }
@@ -190,7 +191,7 @@ describe('the product page', () => {
     const instance = mountProduct('cxp');
 
     const otto = Array.from(container.querySelectorAll('a')).find(
-      (a) => a.textContent?.trim() === 'Otto console'
+      (a) => a.textContent?.trim() === 'Savvagent console'
     );
     expect(otto?.getAttribute('href')).toBe('/o/acme');
 

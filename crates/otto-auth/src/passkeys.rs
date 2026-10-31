@@ -65,7 +65,7 @@ const CEREMONY_TTL_SECONDS: i64 = 300;
 /// The relying party's name, as both the challenge and the relying party itself
 /// report it. One constant so the two cannot disagree — an authenticator that
 /// was told one name and shown another has no way to reconcile them.
-const RP_NAME: &str = "Otto Platform";
+const RP_NAME: &str = "Savvagent";
 
 /// A registered authenticator, as the console lists it.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -148,7 +148,7 @@ pub fn credential_names(user: &User) -> CredentialNames {
             .or_else(|| user.name.clone())
             .unwrap_or_else(|| user.label.clone()),
         // The generated words, address or not. Someone who has learned which
-        // key is `Otto Platform · brisk-harbor-42` does not lose that the day
+        // key is `Savvagent · brisk-harbor-42` does not lose that the day
         // they fill in a profile — and the vault entry keeps the old words
         // regardless, so a rename here would only make the two disagree.
         display_name: format!("{RP_NAME} · {}", user.label),

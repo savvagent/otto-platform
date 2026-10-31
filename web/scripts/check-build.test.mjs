@@ -57,25 +57,25 @@ describe('expectedPages', () => {
     expect(pages).toContainEqual({
       file: 'es/pricing.html',
       lang: 'es',
-      canonical: 'https://otto.savvagent.com/es/pricing'
+      canonical: 'https://savvagent.com/es/pricing'
     });
     expect(pages).toContainEqual({
       file: 'index.html',
       lang: 'en',
-      canonical: 'https://otto.savvagent.com/'
+      canonical: 'https://savvagent.com/'
     });
   });
 });
 
 describe('checkPage', () => {
-  const expected = { file: 'de.html', lang: 'de', canonical: 'https://otto.savvagent.com/de' };
+  const expected = { file: 'de.html', lang: 'de', canonical: 'https://savvagent.com/de' };
   const messages = {
     marketing_skip_to_content: 'Zum Inhalt springen',
     marketing_footer_language: 'Sprache'
   };
   const head =
     '<html lang="de" class="h-full"><head><meta name="robots" content="index, follow"/>' +
-    '<link rel="canonical" href="https://otto.savvagent.com/de"/></head>';
+    '<link rel="canonical" href="https://savvagent.com/de"/></head>';
   const body = (skip, language) =>
     `<body><a href="#main" class="sr-only">${skip}</a><main></main>` +
     `<footer><nav aria-label="${language}"></nav></footer></body></html>`;
@@ -109,7 +109,7 @@ describe('checkPage', () => {
   });
 
   it('names each thing that is wrong', () => {
-    const bad = '<html lang="en"><head><link rel="canonical" href="https://otto.savvagent.com/"/>';
+    const bad = '<html lang="en"><head><link rel="canonical" href="https://savvagent.com/"/>';
     const errors = checkPage(bad, expected);
     expect(errors).toHaveLength(3);
     expect(errors.join('\n')).toMatch(/lang="de"/);
@@ -247,10 +247,10 @@ describe('checkBuild', () => {
 
   it('finds the placeholder in a nested text file, and not in binaries', () => {
     const { dir, write } = bundle();
-    write('_app/immutable/nodes/0.js', 'const html = "<html lang=\\"%otto.lang%\\"";');
-    write('_app/immutable/assets/logo.png', '%otto.lang%');
+    write('_app/immutable/nodes/0.js', 'const html = "<html lang=\\"%savvagent.lang%\\"";');
+    write('_app/immutable/assets/logo.png', '%savvagent.lang%');
     expect(checkBuild(dir, small, catalog)).toEqual([
-      '_app/immutable/nodes/0.js: still contains %otto.lang%'
+      '_app/immutable/nodes/0.js: still contains %savvagent.lang%'
     ]);
   });
 

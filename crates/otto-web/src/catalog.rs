@@ -330,10 +330,10 @@ pub fn catalog() -> Vec<Endpoint> {
             .status(303)
             .summary("The identity provider's redirect back")
             .describe(
-                "Server-rendered, not a console page: it mints the same __Host-otto_session \
+                "Server-rendered, not a console page: it mints the same __Host-savvagent_session \
                  cookie passkey login does and redirects, or answers a generic failure page \
                  on any of several refusal paths (an invalid/expired/reused state, a missing \
-                 or mismatched __Host-otto_sso_binding binding cookie, an unverified email, or \
+                 or mismatched __Host-savvagent_sso_binding binding cookie, an unverified email, or \
                  an email collision) — deliberately not distinguished to the caller, since \
                  this is the unauthenticated bootstrap surface. No credential is spent by \
                  reaching this URL alone; the binding cookie is what stops a captured-and-\

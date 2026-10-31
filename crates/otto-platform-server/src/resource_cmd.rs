@@ -69,7 +69,7 @@
 //! Secrets are printed once, on stdout, and cannot be read back: the
 //! introspection secret is stored hashed, the webhook secret sealed. Losing
 //! one means running the command again, which invalidates the old value.
-//! `set-webhook` needs `OTTO_ENCRYPTION_KEY`, the same key the delivery task
+//! `set-webhook` needs `SAVVAGENT_ENCRYPTION_KEY`, the same key the delivery task
 //! opens secrets with.
 
 use std::io::Write;
@@ -525,7 +525,9 @@ pub async fn execute(
         }
         Command::SetWebhook { resource_uri, url } => {
             let cipher = cipher.ok_or_else(|| {
-                anyhow::anyhow!("OTTO_ENCRYPTION_KEY must be set to store a webhook signing secret")
+                anyhow::anyhow!(
+                    "SAVVAGENT_ENCRYPTION_KEY must be set to store a webhook signing secret"
+                )
             })?;
             match resources::set_webhook(db, cipher, &resource_uri, url.as_deref()).await? {
                 Some(secret) => {

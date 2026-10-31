@@ -95,7 +95,7 @@ impl IntoResponse for ApiError {
         if status == StatusCode::UNAUTHORIZED {
             res.headers_mut().insert(
                 WWW_AUTHENTICATE,
-                "Basic realm=\"otto-platform\", charset=\"UTF-8\""
+                "Basic realm=\"savvagent\", charset=\"UTF-8\""
                     .parse()
                     .expect("static header"),
             );

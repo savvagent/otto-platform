@@ -121,7 +121,7 @@ impl Reply {
             .iter()
             .filter_map(|v| v.to_str().ok())
             .find_map(|v| {
-                let value = v.strip_prefix("__Host-otto_session=")?;
+                let value = v.strip_prefix("__Host-savvagent_session=")?;
                 let value = value.split(';').next()?;
                 (!value.is_empty()).then(|| value.to_string())
             })
@@ -228,7 +228,7 @@ impl Call {
         if let Some(token) = &self.session {
             builder = builder.header(
                 http::header::COOKIE,
-                format!("__Host-otto_session={token}; theme=dark"),
+                format!("__Host-savvagent_session={token}; theme=dark"),
             );
         }
         // A browser attaches `Origin` to every non-GET it sends, and the

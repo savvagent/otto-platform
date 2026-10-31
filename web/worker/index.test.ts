@@ -98,7 +98,7 @@ describe('the server-to-server paths', () => {
 describe('the Worker', () => {
   const assets = vi.fn(async () => new Response('<html>spa</html>'));
   const env = (origin = 'https://origin.test'): Env =>
-    ({ ASSETS: { fetch: assets } as unknown as Fetcher, OTTO_ORIGIN: origin }) as Env;
+    ({ ASSETS: { fetch: assets } as unknown as Fetcher, SAVVAGENT_ORIGIN: origin }) as Env;
   const call = (request: Request, e: Env = env()) => worker.fetch(request, e);
 
   it('answers a server-to-server path with a JSON 404, from neither the origin nor the SPA', async () => {
@@ -129,7 +129,7 @@ describe('the Worker', () => {
       upstream.mockClear();
       await call(
         new Request(`https://otto.test${path}`, {
-          headers: { cookie: '__Host-otto_session=otto_ss_abc' }
+          headers: { cookie: '__Host-savvagent_session=sav_ss_abc' }
         })
       );
       for (const [forwarded] of upstream.mock.calls) {
@@ -158,7 +158,7 @@ describe('the Worker', () => {
         headers: {
           origin: 'https://otto.test',
           'sec-fetch-site': 'same-origin',
-          cookie: '__Host-otto_session=otto_ss_abc',
+          cookie: '__Host-savvagent_session=sav_ss_abc',
           'cf-connecting-ip': '203.0.113.9'
         }
       })
@@ -171,7 +171,7 @@ describe('the Worker', () => {
     );
     expect(forwarded.headers.get('origin')).toBe('https://otto.test');
     expect(forwarded.headers.get('sec-fetch-site')).toBe('same-origin');
-    expect(forwarded.headers.get('cookie')).toContain('__Host-otto_session');
+    expect(forwarded.headers.get('cookie')).toContain('__Host-savvagent_session');
     expect(forwarded.headers.get('cf-connecting-ip')).toBe('203.0.113.9');
     expect(forwarded.redirect).toBe('manual');
     upstream.mockRestore();
@@ -190,7 +190,7 @@ describe('the Worker', () => {
   it('fails loudly when it does not know where the origin is', async () => {
     const response = await call(new Request('https://otto.test/api/me'), env(''));
     expect(response.status).toBe(500);
-    expect(await response.text()).toContain('OTTO_ORIGIN');
+    expect(await response.text()).toContain('SAVVAGENT_ORIGIN');
   });
 });
 
@@ -243,7 +243,7 @@ describe('the Worker in front of the asset bundle', () => {
   });
   const env = {
     ASSETS: { fetch: assets } as unknown as Fetcher,
-    OTTO_ORIGIN: 'https://origin.test'
+    SAVVAGENT_ORIGIN: 'https://origin.test'
   } as Env;
   const call = (path: string, init?: RequestInit) =>
     worker.fetch(new Request(`https://otto.test${path}`, init), env);
@@ -436,7 +436,7 @@ describe('the Worker in front of the asset bundle', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     const broken = {
       ASSETS: { fetch: vi.fn(async () => new Response(null, { status: 404 })) },
-      OTTO_ORIGIN: 'https://origin.test'
+      SAVVAGENT_ORIGIN: 'https://origin.test'
     } as unknown as Env;
 
     for (const path of ['/o/acme/members', '/200']) {

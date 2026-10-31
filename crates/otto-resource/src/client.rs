@@ -47,7 +47,7 @@ pub struct ClientConfig {
     /// This resource server's registered `resource_uri`; the HTTP Basic
     /// username.
     pub resource_uri: String,
-    /// The introspection credential issued at registration (`otto_rs_...`).
+    /// The introspection credential issued at registration (`sav_rs_...`).
     pub secret: String,
     pub introspection_ttl: Duration,
     pub negative_ttl: Duration,
@@ -102,10 +102,10 @@ impl std::fmt::Debug for ClientConfig {
 /// let platform = PlatformClient::new(ClientConfig::new(
 ///     "https://otto.savvagent.com",
 ///     "https://otto-flags.savvagent.com/mcp",
-///     std::env::var("OTTO_INTROSPECTION_SECRET").unwrap(),
+///     std::env::var("SAVVAGENT_INTROSPECTION_SECRET").unwrap(),
 /// ))?;
 ///
-/// match platform.introspect("otto_at_...").await? {
+/// match platform.introspect("sav_at_...").await? {
 ///     Some(claims) if claims.has_scope("flags:write") => { /* authorized */ }
 ///     Some(_) => { /* 403: valid token, missing scope */ }
 ///     None => { /* 401 */ }
@@ -439,7 +439,7 @@ impl PlatformClient {
     /// ```
     /// # use otto_resource::{ClientConfig, PlatformClient};
     /// let c = PlatformClient::new(ClientConfig::new(
-    ///     "https://otto.savvagent.com", "https://x.example/mcp", "otto_rs_x",
+    ///     "https://otto.savvagent.com", "https://x.example/mcp", "sav_rs_x",
     /// ))?;
     /// assert_eq!(c.usage_page_url("acme"), "https://otto.savvagent.com/o/acme/usage");
     /// # Ok::<(), otto_resource::Error>(())

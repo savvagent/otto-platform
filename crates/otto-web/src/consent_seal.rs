@@ -12,7 +12,7 @@
 //! branch, `deny` included.
 //!
 //! **The key.** The seal is AES-256-GCM under a subkey dedicated to it,
-//! derived from `OTTO_ENCRYPTION_KEY` with [`Cipher::derive`] and
+//! derived from `SAVVAGENT_ENCRYPTION_KEY` with [`Cipher::derive`] and
 //! [`KEY_LABEL`]. The AEAD is used for authentication: a value that opens
 //! under the subkey was produced by this server for this purpose and has not
 //! been altered. A separate key means a seal can never be opened as a secret
@@ -292,7 +292,7 @@ mod tests {
         }
         fn expected(&self) -> Expected<'_> {
             Expected {
-                client_id: "otto_client_a",
+                client_id: "sav_client_a",
                 redirect_uri: "http://127.0.0.1:1455/callback",
                 grants: vec![("https://things.otto.test/mcp", &self.scopes[..])],
                 user_id: self.user,
@@ -422,7 +422,7 @@ mod tests {
             (
                 "client_id",
                 Expected {
-                    client_id: "otto_client_b",
+                    client_id: "sav_client_b",
                     ..f.expected()
                 },
             ),

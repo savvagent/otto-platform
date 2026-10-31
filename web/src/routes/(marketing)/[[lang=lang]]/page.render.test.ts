@@ -117,14 +117,14 @@ describe('the landing page', () => {
     unmount(instance);
   });
 
-  it('pitches ottoctl, with a download and a link to the CLI page', () => {
+  it('pitches savctl, with a download and a link to the CLI page', () => {
     const instance = mount(Page, { target: container, props: { data: { lang: 'en' } } });
 
     const section = container.querySelector('section[aria-labelledby="cli-title"]');
     expect(section?.textContent).toContain('Keep secrets out of the chat');
-    expect(section?.textContent).toContain('ottoctl login --resource');
+    expect(section?.textContent).toContain('$ savctl login');
 
-    const download = links('Download ottoctl');
+    const download = links('Download savctl');
     expect(download).toHaveLength(1);
     expect(download[0]?.getAttribute('href')).toBe(
       'https://github.com/savvagent/otto-platform/releases/latest'

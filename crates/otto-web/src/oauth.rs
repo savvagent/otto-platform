@@ -1464,7 +1464,7 @@ impl IntoResponse for OAuthError {
         if status == http::StatusCode::UNAUTHORIZED {
             response.headers_mut().insert(
                 http::header::WWW_AUTHENTICATE,
-                http::HeaderValue::from_static(r#"Basic realm="otto-platform""#),
+                http::HeaderValue::from_static(r#"Basic realm="savvagent""#),
             );
         }
 
@@ -2062,7 +2062,7 @@ mod tests {
 
     fn fixture_client() -> oauth::Client {
         oauth::Client {
-            client_id: "otto_client_x".into(),
+            client_id: "sav_client_x".into(),
             client_name: Some("Agent".into()),
             redirect_uris: vec!["http://127.0.0.1:1455/callback".into()],
             disabled: false,
@@ -2073,7 +2073,7 @@ mod tests {
     fn fixture_params() -> AuthorizeParams {
         AuthorizeParams {
             response_type: "code".into(),
-            client_id: "otto_client_x".into(),
+            client_id: "sav_client_x".into(),
             redirect_uri: "http://127.0.0.1:1455/callback".into(),
             code_challenge: "x".repeat(43),
             code_challenge_method: "S256".into(),
@@ -2252,7 +2252,7 @@ mod tests {
     #[test]
     fn the_consent_page_leads_with_the_redirect_host() {
         let client = oauth::Client {
-            client_id: "otto_client_x".into(),
+            client_id: "sav_client_x".into(),
             client_name: Some("<b>Claude Code</b>".into()),
             redirect_uris: vec!["http://127.0.0.1:1455/callback".into()],
             disabled: false,
@@ -2260,7 +2260,7 @@ mod tests {
         };
         let params = AuthorizeParams {
             response_type: "code".into(),
-            client_id: "otto_client_x".into(),
+            client_id: "sav_client_x".into(),
             redirect_uri: "http://127.0.0.1:1455/callback".into(),
             code_challenge: "x".repeat(43),
             code_challenge_method: "S256".into(),

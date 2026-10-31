@@ -5,10 +5,10 @@ edition.workspace = true
 license.workspace = true
 # Follows otto-client.
 rust-version = "1.89"
-description = "The `otto-flags` binary behind `ottoctl flags`: issue Otto Flags app keys from a terminal, so the secret server key reaches a person and never a model."
+description = "The `savctl-flags` binary behind `savctl flags`: issue Otto Flags app keys from a terminal, so the secret server key reaches a person and never a model."
 
 [[bin]]
-name = "otto-flags"
+name = "savctl-flags"
 path = "src/main.rs"
 
 [dependencies]

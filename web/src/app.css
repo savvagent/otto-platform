@@ -43,20 +43,20 @@
 }
 
 @layer components {
-  .otto-card {
+  .sav-card {
     @apply rounded-lg border border-edge/60 bg-surface/70;
   }
 
-  .otto-input {
+  .sav-input {
     @apply w-full rounded-md border border-edge bg-canvas px-3 py-2 text-sm text-ink placeholder:text-faint disabled:opacity-50;
   }
 
-  .otto-label {
+  .sav-label {
     @apply mb-1 block text-xs font-medium tracking-wide text-muted uppercase;
   }
 
   /* Tokens, provisioning keys, job ids — anything that is copied, not read. */
-  .otto-mono {
+  .sav-mono {
     @apply font-mono text-sm break-all;
   }
 }

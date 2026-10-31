@@ -266,17 +266,11 @@
   <Card title={m.settings_profile_title()} description={m.settings_profile_description()}>
     <form class="max-w-sm space-y-4" onsubmit={saveProfile}>
       <Field label={m.settings_email_label()} hint={m.settings_email_hint()}>
-        <input
-          class="otto-input"
-          type="email"
-          autocomplete="username"
-          required
-          bind:value={email}
-        />
+        <input class="sav-input" type="email" autocomplete="username" required bind:value={email} />
       </Field>
 
       <Field label={m.settings_name_label()}>
-        <input class="otto-input" type="text" autocomplete="name" bind:value={name} />
+        <input class="sav-input" type="text" autocomplete="name" bind:value={name} />
       </Field>
 
       {#if profileError}<Alert>{profileError}</Alert>{/if}
@@ -296,7 +290,7 @@
           which they cannot do if the options say "German" rather than "Deutsch".
         -->
         <select
-          class="otto-input w-full"
+          class="sav-input w-full"
           value={locale}
           disabled={savingLocale}
           onchange={(e) => changeLanguage(e.currentTarget.value as Locale | '')}

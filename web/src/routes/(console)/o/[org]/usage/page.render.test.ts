@@ -57,12 +57,12 @@ describe('the usage page', () => {
       ]);
 
       const headings = Array.from(container.querySelectorAll('h2')).map((h) => h.textContent);
-      expect(headings).toEqual(['Otto Flags', 'Otto CXP']);
+      expect(headings).toEqual(['Savvagent Flags', 'Savvagent CXP']);
 
       // Table semantics: a caption, column headers and a row header per meter.
       const flags = container.querySelectorAll('table')[0]!;
       expect(flags.querySelector('caption')?.textContent?.trim()).toBe(
-        'Otto Flags meters this month'
+        'Savvagent Flags meters this month'
       );
       expect(
         Array.from(flags.querySelectorAll('th[scope="col"]')).map((th) => th.textContent?.trim())
@@ -74,7 +74,9 @@ describe('the usage page', () => {
 
       // Spend in dollars against the budget, as a meter.
       const meter = container.querySelector('[role="meter"]')!;
-      expect(meter.getAttribute('aria-label')).toBe('Otto Flags spend against its monthly budget');
+      expect(meter.getAttribute('aria-label')).toBe(
+        'Savvagent Flags spend against its monthly budget'
+      );
       expect(meter.getAttribute('aria-valuenow')).toBe('82');
       expect(meter.getAttribute('aria-valuetext')).toBe('$82.50 of $100.00 spent (82%)');
       expect(container.textContent).toContain('$82.50 this month');
@@ -88,7 +90,7 @@ describe('the usage page', () => {
       // The 80% alert this month fired, announced as a status.
       const alerts = container.querySelector('section[aria-label="Budget alerts"]');
       expect(alerts?.querySelector('[role="status"]')?.textContent?.trim()).toBe(
-        'Otto Flags has reached 80% of its monthly budget this month.'
+        'Savvagent Flags has reached 80% of its monthly budget this month.'
       );
 
       // The retired bucket: none of its numbers or words.
@@ -162,11 +164,11 @@ describe('the usage page when a service needs a card', () => {
   const notices = () => container.querySelector('section[aria-label="Payment needed"]');
   const flagsCard = () =>
     Array.from(container.querySelectorAll('section')).find(
-      (s) => s.querySelector('h2')?.textContent === 'Otto Flags'
+      (s) => s.querySelector('h2')?.textContent === 'Savvagent Flags'
     )!;
   const cxpCard = () =>
     Array.from(container.querySelectorAll('section')).find(
-      (s) => s.querySelector('h2')?.textContent === 'Otto CXP'
+      (s) => s.querySelector('h2')?.textContent === 'Savvagent CXP'
     )!;
 
   it('tells an owner paid usage is paused, links to billing, and marks the meter', async () => {
@@ -176,9 +178,9 @@ describe('the usage page when a service needs a card', () => {
     await vi.waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(2));
     const status = notices()?.querySelector('[role="status"]');
     expect(status?.textContent).toContain(
-      'Otto Flags is past its free allowance this month, so its paid usage is paused until a card is on file. Its free calls keep working.'
+      'Savvagent Flags is past its free allowance this month, so its paid usage is paused until a card is on file. Its free calls keep working.'
     );
-    expect(status?.textContent).not.toContain('Otto CXP');
+    expect(status?.textContent).not.toContain('Savvagent CXP');
     const link = status!.querySelector('a')!;
     expect(link.getAttribute('href')).toBe('/o/acme/billing');
     expect(link.textContent?.trim()).toBe('Add a card');
@@ -203,7 +205,7 @@ describe('the usage page when a service needs a card', () => {
       await vi.waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(2));
       const status = notices()?.querySelector('[role="status"]');
       expect(status?.textContent).toContain(
-        'Otto Flags is past its free allowance this month, so its paid usage is paused until an owner of this organization adds a card. Its free calls keep working.'
+        'Savvagent Flags is past its free allowance this month, so its paid usage is paused until an owner of this organization adds a card. Its free calls keep working.'
       );
       expect(status?.querySelector('a')).toBeNull();
       expect(container.querySelector('a[href="/o/acme/billing"]')).toBeNull();

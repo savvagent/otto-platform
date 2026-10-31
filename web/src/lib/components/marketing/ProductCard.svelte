@@ -7,7 +7,7 @@
   /**
    * One product, as a card that links to its page in the current language.
    *
-   * The link text names the product ("More about Otto Flags") rather than a
+   * The link text names the product ("More about Savvagent Flags") rather than a
    * bare "Learn more", so a screen reader's list of links is not five
    * identical entries.
    *
@@ -25,7 +25,7 @@
   let { service, lang, level = 3 }: Props = $props();
 </script>
 
-<article class="otto-card flex flex-col gap-3 p-5">
+<article class="sav-card flex flex-col gap-3 p-5">
   <svelte:element this={`h${level}`} class="text-lg font-semibold tracking-tight text-ink">
     {service.name}
   </svelte:element>

@@ -85,7 +85,7 @@ pub async fn create(
 /// **The row is marked consumed whether or not the caller's subsequent
 /// binding-cookie check passes.** This function's job ends at "resolve and
 /// burn the ceremony, atomically" — it is not "decide if the whole callback
-/// succeeds". The `__Host-otto_sso_binding` cookie check happens in `the HTTP layer (Phase 4)`,
+/// succeeds". The `__Host-savvagent_sso_binding` cookie check happens in `the HTTP layer (Phase 4)`,
 /// *after* this function has already returned and committed, per that spec's §5
 /// ("marks the ceremony consumed in the same step regardless of outcome").
 /// That ordering is deliberate: a captured-and-replayed callback URL that

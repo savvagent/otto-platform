@@ -236,19 +236,19 @@
 
         <dl class="mt-4 grid grid-cols-2 gap-y-2 text-sm">
           <div>
-            <dt class="otto-label">{m.billing_subscription_label()}</dt>
+            <dt class="sav-label">{m.billing_subscription_label()}</dt>
             <dd class="text-muted">
               {#if status.subscriptionStatus === null}
                 {m.billing_subscription_none()}
               {:else if SUBSCRIPTION[status.subscriptionStatus]}
                 {SUBSCRIPTION[status.subscriptionStatus]!()}
               {:else}
-                <code class="otto-mono">{status.subscriptionStatus}</code>
+                <code class="sav-mono">{status.subscriptionStatus}</code>
               {/if}
             </dd>
           </div>
           <div>
-            <dt class="otto-label">{m.billing_invoicing_label()}</dt>
+            <dt class="sav-label">{m.billing_invoicing_label()}</dt>
             <dd class="text-muted">
               {status.subscriptionLive ? m.billing_invoicing_live() : m.billing_invoicing_off()}
             </dd>

@@ -20,7 +20,7 @@
 //! ```
 //! use otto_resource::webhook::{self, LifecycleEvent};
 //!
-//! let secret = "otto_whsec_example";
+//! let secret = "sav_whsec_example";
 //! let body = br#"{"id":"6f1c0f0e-3b1a-4c55-9a53-0d5a9b2f7d11","type":"org.deleted",
 //!     "created_at":"2026-10-07T12:00:00Z",
 //!     "data":{"org_id":"0b0f3b7e-6a5e-4d4e-8f55-1f2b5d0c9a10"}}"#;
@@ -243,7 +243,7 @@ pub fn body(id: Uuid, kind: &str, created_at: DateTime<Utc>, data: &serde_json::
 mod tests {
     use super::*;
 
-    const SECRET: &str = "otto_whsec_test";
+    const SECRET: &str = "sav_whsec_test";
 
     fn sample() -> (Uuid, Vec<u8>) {
         let id = Uuid::new_v4();
@@ -265,7 +265,7 @@ mod tests {
         let (_, body) = sample();
         let header = sign(SECRET, 1000, &body);
         assert_eq!(
-            verify_at("otto_whsec_other", &header, &body, 1000, 300).unwrap_err(),
+            verify_at("sav_whsec_other", &header, &body, 1000, 300).unwrap_err(),
             WebhookError::BadSignature
         );
         let mut tampered = body.clone();
@@ -301,12 +301,12 @@ mod tests {
     #[test]
     fn rotation_header_with_two_signatures_accepts_either() {
         let (_, body) = sample();
-        let old = sign("otto_whsec_old", 1000, &body);
+        let old = sign("sav_whsec_old", 1000, &body);
         let new = sign(SECRET, 1000, &body);
         let v1 = |h: &str| h.split_once("v1=").unwrap().1.to_owned();
         let both = format!("t=1000,v1={},v1={}", v1(&old), v1(&new));
         assert!(verify_at(SECRET, &both, &body, 1000, 300).is_ok());
-        assert!(verify_at("otto_whsec_old", &both, &body, 1000, 300).is_ok());
+        assert!(verify_at("sav_whsec_old", &both, &body, 1000, 300).is_ok());
     }
 
     #[test]

@@ -57,7 +57,7 @@
     // loudly, which is the failure everyone wants; the same slot holding a
     // production hostname would mean a staging Worker silently serving real
     // user traffic from production, and nothing about it would look wrong.
-    "OTTO_ORIGIN": "http://127.0.0.1:8080"
+    "SAVVAGENT_ORIGIN": "http://127.0.0.1:8080"
   },
 
   // Production is named, never inherited: `wrangler deploy --env production`.
@@ -70,13 +70,13 @@
     "production": {
       "name": "otto-platform-console",
       "vars": {
-        "OTTO_ORIGIN": "https://otto-platform.fly.dev"
+        "SAVVAGENT_ORIGIN": "https://otto-platform.fly.dev"
       },
-      // The hostname humans use, and the one the server's OTTO_PUBLIC_URL names.
+      // The hostname humans use, and the one the server's SAVVAGENT_PUBLIC_URL names.
       // `custom_domain` makes Cloudflare create the DNS record and certificate
       // itself, which needs the savvagent.com zone to be on this Cloudflare
       // account. See docs/deploy/cloudflare.md before the first deploy.
-      "routes": [{ "pattern": "otto.savvagent.com", "custom_domain": true }],
+      "routes": [{ "pattern": "savvagent.com", "custom_domain": true }],
       // No second public way in. A `*.workers.dev` hostname or preview URL would
       // reach the same origin without this zone's normalization and WAF rules,
       // and nothing a browser needs lives there.

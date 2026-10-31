@@ -71,7 +71,7 @@
   {:else if events.length === 0}
     <Empty title={m.audit_empty()} />
   {:else}
-    <div class="otto-card overflow-x-auto">
+    <div class="sav-card overflow-x-auto">
       <table class="w-full text-sm">
         <thead class="border-b border-edge/60 text-left text-xs text-faint">
           <tr>
@@ -88,12 +88,12 @@
               <td class="px-4 py-2 whitespace-nowrap text-faint" title={absolute(event.createdAt)}>
                 {relative(event.createdAt)}
               </td>
-              <td class="otto-mono px-4 py-2 whitespace-nowrap text-ink">{event.action}</td>
+              <td class="sav-mono px-4 py-2 whitespace-nowrap text-ink">{event.action}</td>
               <td class="px-4 py-2 text-muted">{event.actorLabel ?? event.actorUserId ?? '—'}</td>
               <td class="px-4 py-2 text-muted">
                 {event.targetType ? `${event.targetType} ${event.targetId ?? ''}` : '—'}
               </td>
-              <td class="otto-mono max-w-64 truncate px-4 py-2 text-faint" title={detail(event)}>
+              <td class="sav-mono max-w-64 truncate px-4 py-2 text-faint" title={detail(event)}>
                 {detail(event)}
               </td>
             </tr>

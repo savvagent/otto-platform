@@ -152,7 +152,7 @@ async fn attempt(
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
         .ok_or_else(|| {
-            fail("cannot open the webhook signing secret (wrong OTTO_ENCRYPTION_KEY?)")
+            fail("cannot open the webhook signing secret (wrong SAVVAGENT_ENCRYPTION_KEY?)")
         })?;
 
     let body = webhook::body(d.event_id, &d.kind, d.created_at, &d.data);

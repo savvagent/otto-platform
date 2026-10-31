@@ -11,7 +11,7 @@
   import type { PageData } from './$types';
 
   /**
-   * The landing page: what the otto-* family is, which services are in it,
+   * The landing page: what the Savvagent family is, which services are in it,
    * what one account buys you across all of them, and how an agent gets
    * connected.
    *
@@ -60,7 +60,7 @@
     class="grid items-center gap-12 pt-6 lg:grid-cols-[3fr_2fr]"
   >
     <div>
-      <p class="otto-label text-accent">{m.landing_hero_eyebrow()}</p>
+      <p class="sav-label text-accent">{m.landing_hero_eyebrow()}</p>
       <h1
         id="hero-title"
         class="mt-3 text-4xl font-semibold tracking-tight text-balance text-ink sm:text-5xl"
@@ -81,7 +81,7 @@
       a copy button — so hidden from assistive technology rather than read
       out twice.
     -->
-    <div class="otto-card relative overflow-hidden p-5" aria-hidden="true">
+    <div class="sav-card relative overflow-hidden p-5" aria-hidden="true">
       <Logo class="absolute -right-8 -bottom-10 size-40 text-accent/10" />
       <div class="flex gap-1.5">
         <span class="size-2.5 rounded-full bg-edge"></span>
@@ -136,7 +136,7 @@
     </h2>
     <ol role="list" class="mt-8 grid gap-4 md:grid-cols-3">
       {#each steps as step, i (i)}
-        <li class="otto-card flex flex-col gap-3 p-5">
+        <li class="sav-card flex flex-col gap-3 p-5">
           <span
             class="flex size-8 items-center justify-center rounded-full border border-accent/60 font-mono text-sm text-accent"
             aria-hidden="true">{i + 1}</span
@@ -150,7 +150,7 @@
 
   <section aria-labelledby="cli-title" class="grid items-center gap-10 lg:grid-cols-[3fr_2fr]">
     <div>
-      <p class="otto-label text-accent">{m.landing_cli_eyebrow()}</p>
+      <p class="sav-label text-accent">{m.landing_cli_eyebrow()}</p>
       <h2 id="cli-title" class="mt-3 text-2xl font-semibold tracking-tight text-ink">
         {m.landing_cli_heading()}
       </h2>
@@ -163,16 +163,16 @@
       </div>
     </div>
     <!-- The one command a visitor runs; decorative, the full steps are on /cli. -->
-    <div class="otto-card p-5" aria-hidden="true">
-      <p class="otto-mono text-xs break-all text-muted sm:text-sm">
-        <span class="text-accent">$</span> ottoctl login --resource &lt;service MCP URL&gt;
+    <div class="sav-card p-5" aria-hidden="true">
+      <p class="sav-mono text-xs break-all text-muted sm:text-sm">
+        <span class="text-accent">$</span> savctl login
       </p>
     </div>
   </section>
 
   <section
     aria-labelledby="cta-title"
-    class="otto-card flex flex-col gap-6 bg-raised/40 p-8 sm:p-10 lg:flex-row lg:items-center lg:justify-between"
+    class="sav-card flex flex-col gap-6 bg-raised/40 p-8 sm:p-10 lg:flex-row lg:items-center lg:justify-between"
   >
     <div class="max-w-xl">
       <h2 id="cta-title" class="text-2xl font-semibold tracking-tight text-ink">

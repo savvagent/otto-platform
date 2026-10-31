@@ -27,7 +27,7 @@ fn pkce() -> (String, String) {
 async fn register(h: &Harness) -> String {
     let registered = Call::post("/oauth/register")
         .json(serde_json::json!({
-            "client_name": "ottoctl",
+            "client_name": "savctl",
             "redirect_uris": [REDIRECT],
         }))
         .send(&h.router)
@@ -184,8 +184,14 @@ async fn discovery_says_how_many_resources_one_request_may_name(pool: PgPool) {
         .await;
     meta.expect(StatusCode::OK);
     assert_eq!(
-        meta.body["otto_authorize_resources_max"],
+        meta.body["savvagent_authorize_resources_max"],
         otto_auth::oauth::MAX_RESOURCES_PER_REQUEST
+    );
+    // Renamed with the Savvagent switch; the old name is not served too.
+    assert!(
+        meta.body.get("otto_authorize_resources_max").is_none(),
+        "{}",
+        meta.body
     );
 }
 

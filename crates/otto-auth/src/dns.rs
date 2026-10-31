@@ -3,7 +3,7 @@
 //! §4.
 //!
 //! Uses the system's configured resolver (`/etc/resolv.conf` on Unix) — no
-//! new `OTTO_*` config, and no credential of otto-platform's own is needed to do
+//! new `SAVVAGENT_*` config, and no credential of otto-platform's own is needed to do
 //! a TXT lookup, which is the same trust boundary as any other outbound
 //! network call this server already makes.
 

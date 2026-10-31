@@ -352,7 +352,7 @@ async fn each_threshold_fires_once_and_emails_only_owners_and_admins(pool: PgPoo
     w.evals(1).await;
     assert_eq!(w.alerts().await, [("otto-flags".into(), 50)]);
     let to = ["admin@acme.example", "owner@acme.example"];
-    let fifty = "otto-flags has reached 50% of its monthly budget in acme";
+    let fifty = "Savvagent Flags has reached 50% of its monthly budget in acme";
     assert_eq!(
         subjects(&w.emails().await),
         [(to[0], fifty), (to[1], fifty)]
@@ -368,7 +368,7 @@ async fn each_threshold_fires_once_and_emails_only_owners_and_admins(pool: PgPoo
     assert_eq!(w.emails().await.len(), 4);
 
     // 901 cents: 80% fired with the replayed event, once.
-    let eighty = "otto-flags has reached 80% of its monthly budget in acme";
+    let eighty = "Savvagent Flags has reached 80% of its monthly budget in acme";
     let emails = w.emails().await;
     assert_eq!(subjects(&emails[2..]), [(to[0], eighty), (to[1], eighty)]);
 
@@ -391,7 +391,7 @@ async fn each_threshold_fires_once_and_emails_only_owners_and_admins(pool: PgPoo
     );
     let emails = w.emails().await;
     assert_eq!(emails.len(), 6, "{emails:?}");
-    let hundred = "otto-flags has reached 100% of its monthly budget in acme";
+    let hundred = "Savvagent Flags has reached 100% of its monthly budget in acme";
     assert_eq!(subjects(&emails[4..]), [(to[0], hundred), (to[1], hundred)]);
     let body: String =
         sqlx::query_scalar("SELECT body_text FROM notification_outbox WHERE subject = $1 LIMIT 1")
@@ -438,7 +438,7 @@ async fn a_lowered_budget_fires_each_newly_reached_threshold_once(pool: PgPool) 
         subjects(&w.emails().await),
         [(
             "admin@acme.example",
-            "otto-flags has reached 80% of its monthly budget in acme"
+            "Savvagent Flags has reached 80% of its monthly budget in acme"
         )]
     );
 
@@ -1072,7 +1072,7 @@ async fn an_alert_whose_emails_cannot_be_queued_is_retried(pool: PgPool) {
     sqlx::query(&undo).execute(w.db.pool()).await.unwrap();
     w.evals(1).await;
     assert_eq!(w.alerts().await, [("otto-flags".into(), 50)]);
-    let fifty = "otto-flags has reached 50% of its monthly budget in acme";
+    let fifty = "Savvagent Flags has reached 50% of its monthly budget in acme";
     assert_eq!(
         subjects(&w.emails().await),
         [("admin@acme.example", fifty), ("owner@acme.example", fifty)]

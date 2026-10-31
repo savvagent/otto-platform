@@ -54,7 +54,7 @@ describe('the budgets page', () => {
     const instance = render(role);
     await loaded();
 
-    const flags = card('Otto Flags');
+    const flags = card('Savvagent Flags');
     const amount = flags.querySelector<HTMLInputElement>('input[name="amount"]')!;
     // Labelled, prefilled in dollars from cents, and described by its hint.
     expect(container.querySelector(`label[for="${amount.id}"]`)?.textContent).toBe(
@@ -72,7 +72,7 @@ describe('the budgets page', () => {
     expect(flags.textContent).toContain('Remove budget');
 
     // No budget yet: an empty field, and nothing to remove.
-    const cxp = card('Otto CXP');
+    const cxp = card('Savvagent CXP');
     expect(cxp.querySelector<HTMLInputElement>('input[name="amount"]')!.value).toBe('');
     expect(cxp.textContent).not.toContain('Remove budget');
     expect(cxp.textContent).toContain('Spend unavailable');
@@ -91,16 +91,16 @@ describe('the budgets page', () => {
     expect(container.querySelector('input')).toBeNull();
     expect(container.textContent).toContain('Only owners and admins can change budgets.');
 
-    const flags = card('Otto Flags');
+    const flags = card('Savvagent Flags');
     const values = Array.from(flags.querySelectorAll('dd')).map((dd) => dd.textContent?.trim());
     expect(values).toEqual(['$100.00', 'Off']);
     expect(
-      Array.from(card('Otto CXP').querySelectorAll('dd')).map((d) => d.textContent?.trim())
+      Array.from(card('Savvagent CXP').querySelectorAll('dd')).map((d) => d.textContent?.trim())
     ).toEqual(['None', 'Off']);
 
     // Members see the alerts too.
     expect(container.querySelector('section[aria-label="Budget alerts"]')?.textContent).toContain(
-      'Otto Flags has reached 80% of its monthly budget this month.'
+      'Savvagent Flags has reached 80% of its monthly budget this month.'
     );
 
     unmount(instance);
@@ -124,7 +124,7 @@ describe('the budgets page', () => {
     const instance = render('admin');
     await loaded();
 
-    const flags = card('Otto Flags');
+    const flags = card('Savvagent Flags');
     type(flags.querySelector<HTMLInputElement>('input[name="amount"]')!, '250.50');
     const hardStop = flags.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
     hardStop.click();
@@ -132,7 +132,9 @@ describe('the budgets page', () => {
     expect(hardStop.checked).toBe(true);
     submit(flags.querySelector('form')!);
 
-    await vi.waitFor(() => expect(flags.textContent).toContain('Budget saved for Otto Flags.'));
+    await vi.waitFor(() =>
+      expect(flags.textContent).toContain('Budget saved for Savvagent Flags.')
+    );
     expect(sent).toEqual({ monthlyBudgetCents: 25_050, hardStop: true });
     const status = flags.querySelector('[role="status"][tabindex="-1"]')!;
     await vi.waitFor(() => expect(document.activeElement).toBe(status));
@@ -160,7 +162,7 @@ describe('the budgets page', () => {
     const instance = render('owner');
     await loaded();
 
-    const flags = card('Otto Flags');
+    const flags = card('Savvagent Flags');
     const amount = flags.querySelector<HTMLInputElement>('input[name="amount"]')!;
     type(amount, value);
     submit(flags.querySelector('form')!);
@@ -182,7 +184,7 @@ describe('the budgets page', () => {
     const instance = render('owner');
     await loaded();
 
-    const status = card('Otto Flags').querySelector('[role="status"][tabindex="-1"]');
+    const status = card('Savvagent Flags').querySelector('[role="status"][tabindex="-1"]');
     expect(status).not.toBeNull();
     expect(status!.textContent?.trim()).toBe('');
     expect(status!.classList.contains('hidden')).toBe(false);
@@ -210,14 +212,14 @@ describe('the budgets page', () => {
     expect(region().querySelector('[role="status"]')?.textContent).toContain('80%');
     expect(region().querySelector('[role="alert"]')).toBeNull();
 
-    const flags = card('Otto Flags');
+    const flags = card('Savvagent Flags');
     type(flags.querySelector<HTMLInputElement>('input[name="amount"]')!, '50');
     flags.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click();
     submit(flags.querySelector('form')!);
 
     await vi.waitFor(() => expect(region().querySelector('[role="alert"]')).not.toBeNull());
     expect(region().querySelector('[role="alert"]')?.textContent).toContain(
-      'Otto Flags has reached its monthly budget and its hard stop is on'
+      'Savvagent Flags has reached its monthly budget and its hard stop is on'
     );
 
     unmount(instance);
@@ -232,13 +234,15 @@ describe('the budgets page', () => {
     const instance = render('owner');
     await loaded();
 
-    const flags = card('Otto Flags');
+    const flags = card('Savvagent Flags');
     const remove = Array.from(flags.querySelectorAll('button')).find(
       (b) => b.textContent?.trim() === 'Remove budget'
     )!;
     remove.click();
 
-    await vi.waitFor(() => expect(flags.textContent).toContain('Budget removed for Otto Flags.'));
+    await vi.waitFor(() =>
+      expect(flags.textContent).toContain('Budget removed for Savvagent Flags.')
+    );
     expect(flags.querySelector<HTMLInputElement>('input[name="amount"]')!.value).toBe('');
     expect(flags.textContent).not.toContain('Remove budget');
     expect(flags.textContent).toContain('No budget set');

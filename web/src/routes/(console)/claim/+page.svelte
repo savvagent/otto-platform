@@ -62,7 +62,7 @@
   <form class="mt-6 space-y-4" onsubmit={claim}>
     <Field label={m.claim_code_label()}>
       <input
-        class="otto-input otto-mono"
+        class="sav-input sav-mono"
         type="text"
         autocapitalize="off"
         spellcheck="false"

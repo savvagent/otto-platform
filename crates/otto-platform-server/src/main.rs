@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
     // time something needs to encrypt a secret hours later. `app` checks it
     // again, which is cheap and keeps it from relying on this call.
     let cipher = otto_tenant::crypto::Cipher::from_base64_key(&config.encryption_key)
-        .context("OTTO_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
+        .context("SAVVAGENT_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
 
     let db = Db::connect(&config.database_url)
         .await
@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
         tracing::info!("applying migrations");
         db.migrate().await.context("migrations failed")?;
     } else {
-        tracing::warn!("OTTO_RUN_MIGRATIONS is off; assuming the schema is already current");
+        tracing::warn!("SAVVAGENT_RUN_MIGRATIONS is off; assuming the schema is already current");
     }
 
     // Prove tenant isolation before doing anything else, never after.
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
         }
         None => {
             tracing::warn!(
-                "notification email disabled: OTTO_SMTP_URL and OTTO_EMAIL_FROM are not set; \
+                "notification email disabled: SAVVAGENT_SMTP_URL and SAVVAGENT_EMAIL_FROM are not set; \
                  messages stay queued in notification_outbox until both are"
             );
             None
@@ -208,10 +208,10 @@ async fn run_resource_command(args: &[String]) -> Result<()> {
     let db = Db::connect(&database_url)
         .await
         .context("could not connect to DATABASE_URL")?;
-    let cipher = match std::env::var("OTTO_ENCRYPTION_KEY") {
+    let cipher = match std::env::var("SAVVAGENT_ENCRYPTION_KEY") {
         Ok(k) if !k.trim().is_empty() => Some(
             otto_tenant::crypto::Cipher::from_base64_key(&k)
-                .context("OTTO_ENCRYPTION_KEY is not a valid 32-byte base64 key")?,
+                .context("SAVVAGENT_ENCRYPTION_KEY is not a valid 32-byte base64 key")?,
         ),
         _ => None,
     };

@@ -68,7 +68,7 @@ pub fn document(endpoints: &[Endpoint]) -> Value {
         if endpoint.auth != Auth::Public {
             operation["security"] = json!([{ "sessionCookie": [] }]);
         }
-        operation["x-otto-auth"] = json!(endpoint.auth.as_str());
+        operation["x-savvagent-auth"] = json!(endpoint.auth.as_str());
 
         entry[endpoint.verb.as_str()] = operation;
     }
@@ -76,12 +76,12 @@ pub fn document(endpoints: &[Endpoint]) -> Value {
     json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "otto platform API",
+            "title": "Savvagent platform API",
             "version": env!("CARGO_PKG_VERSION"),
             "description":
                 "The identity and account REST surface, and the OAuth 2.1 authorization \
-                 server for every registered otto-* resource server. Authentication is a \
-                 session cookie (`__Host-otto_session`), set by the sign-in endpoints; \
+                 server for every registered Savvagent resource server. Authentication is a \
+                 session cookie (`__Host-savvagent_session`), set by the sign-in endpoints; \
                  the resource servers themselves use bearer tokens and are described by \
                  their own metadata documents.",
         },
@@ -515,7 +515,7 @@ fn entity_schemas() -> Value {
             "type": "object",
             "description": "Shown once. Only a SHA-256 hash of `token` is stored.",
             "properties": {
-                "token": { "type": "string", "examples": ["otto_pat_…"] },
+                "token": { "type": "string", "examples": ["sav_pat_…"] },
                 "id": uuid,
                 "name": { "type": "string" },
                 "scopes": { "type": "array", "items": { "type": "string" } },
@@ -529,7 +529,7 @@ fn entity_schemas() -> Value {
         "UsageStatus": {
             "type": "object",
             "description":
-                "This period's metered usage across every otto-* service. \
+                "This period's metered usage across every Savvagent service. \
                  `billableUsed` counts only billable calls; `totalCalls` counts every \
                  call, free ones included.",
             "properties": {

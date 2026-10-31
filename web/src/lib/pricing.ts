@@ -295,7 +295,7 @@ export interface ServiceUsageGroup {
   /** The slug meters carry, e.g. `otto-flags`. */
   service: string;
   /**
-   * The name the header and product pages use ("Otto Flags"), or the slug
+   * The name the header and product pages use ("Savvagent Flags"), or the slug
    * for a service this site does not describe yet: its price is real either
    * way, so it is shown rather than hidden.
    */

@@ -85,9 +85,9 @@
 
 <header class="border-b border-edge/60 bg-surface/40">
   <div class="mx-auto flex w-full max-w-6xl items-center gap-2 px-4 py-3 sm:gap-4">
-    <a href={localizedPath(lang, '/')} class="flex items-center gap-2" aria-label="Otto">
+    <a href={localizedPath(lang, '/')} class="flex items-center gap-2" aria-label="Savvagent">
       <Logo class="size-6 text-accent" />
-      <span class="text-sm font-semibold tracking-tight text-ink">Otto</span>
+      <span class="text-sm font-semibold tracking-tight text-ink">Savvagent</span>
     </a>
 
     <nav
@@ -123,10 +123,10 @@
           {m.marketing_nav_menu()}
         </summary>
         <nav
-          class="otto-card absolute right-0 z-10 mt-2 flex w-56 flex-col gap-1 bg-surface p-2 shadow-lg"
+          class="sav-card absolute right-0 z-10 mt-2 flex w-56 flex-col gap-1 bg-surface p-2 shadow-lg"
           aria-label={m.marketing_nav_label()}
         >
-          <span class="otto-label px-2.5 pt-1">{m.marketing_nav_products()}</span>
+          <span class="sav-label px-2.5 pt-1">{m.marketing_nav_products()}</span>
           {#each products as item (item.href)}
             <a href={item.href} class={link} aria-current={current(item.href)}>{item.label}</a>
           {/each}

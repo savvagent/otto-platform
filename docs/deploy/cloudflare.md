@@ -1,30 +1,35 @@
 # The console on Cloudflare (optional)
 
-> **This is not how production runs.** `otto.savvagent.com` resolves straight to Fly and
+> **This is not how production runs.** `savvagent.com` resolves straight to Fly and
 > `otto-platform-server` serves the console itself; see [`fly.md`](fly.md). This document
 > describes an optional alternative: a Worker in front, for a deployment whose DNS is on
-> Cloudflare. Using it means switching `OTTO_CLIENT_IP_HEADER` to `cf-connecting-ip` and
-> unsetting `OTTO_STATIC_DIR`. Nothing in the primary path depends on it.
+> Cloudflare. Using it means switching `SAVVAGENT_CLIENT_IP_HEADER` to `cf-connecting-ip` and
+> unsetting `SAVVAGENT_STATIC_DIR`. Nothing in the primary path depends on it.
+>
+> Since the [Savvagent cutover](fly.md#savvagent-cutover) the Worker's origin variable is
+> `SAVVAGENT_ORIGIN` (it was `OTTO_ORIGIN`, which the Worker no longer reads), its custom
+> domain is `savvagent.com`, and the server-side variables are `SAVVAGENT_*`. A Worker
+> deployed before then must be redeployed with the new variable name.
 
 **One Worker serves the built bundle (the prerendered marketing pages and the console's SPA
-shell) and proxies everything dynamic to `otto-platform-server`.** The browser sees one hostname, `otto.savvagent.com`.
+shell) and proxies everything dynamic to `otto-platform-server`.** The browser sees one hostname, `savvagent.com`.
 `web/wrangler.jsonc` and `web/worker/index.ts` are the whole of it; this file is the
 account-side setup neither can express, and the traps a first deploy hits.
 
-Cloudflare is a deployment choice, not an architecture: with `OTTO_STATIC_DIR` set,
+Cloudflare is a deployment choice, not an architecture: with `SAVVAGENT_STATIC_DIR` set,
 `otto-platform-server` serves `web/build` itself and nothing here is required.
 
 ## Why a Worker rather than two origins
 
 The console's session is an `HttpOnly`, `__Host-`-prefixed cookie
-(`__Host-otto_session`). `__Host-` means the browser refuses to store it unless it is
+(`__Host-savvagent_session`). `__Host-` means the browser refuses to store it unless it is
 `Secure`, has `Path=/`, and carries **no `Domain`**, so it is bound to exactly one origin.
 Hosting the SPA on one hostname and the API on another does not need a CORS header; it
 needs a different authentication transport. So whatever fronts the console must _proxy_ the
 API rather than point at it.
 
 The same single hostname is what makes **passkeys** work. The WebAuthn relying party id is
-the host of `OTTO_PUBLIC_URL` (`otto.savvagent.com`), and a browser only completes a
+the host of `SAVVAGENT_PUBLIC_URL` (`savvagent.com`), and a browser only completes a
 ceremony whose rp_id is a suffix of the page's own origin. The page's origin is the Worker's
 hostname, which is that host. The origin server's own hostname (`otto-platform.fly.dev`)
 never appears in a ceremony, and `GET /api/auth/webauthn` reports `rpId` from the same
@@ -59,7 +64,7 @@ to a credential check for no caller, and the Worker's `cf-connecting-ip` header 
 nothing to a client that is not a browser. Resource servers should be configured with
 `https://otto-platform.fly.dev` as the platform origin for introspection, usage ingest and
 lifecycle webhooks. Note that the OAuth _issuer_ they validate against is still
-`https://otto.savvagent.com`, because that is `OTTO_PUBLIC_URL`.
+`https://savvagent.com`, because that is `SAVVAGENT_PUBLIC_URL`.
 
 The list mirrors `API_PREFIXES` in `crates/otto-platform-server/src/lib.rs` (plus the two
 health routes, minus the server-to-server paths). `web/worker/index.test.ts` is the half of
@@ -75,16 +80,16 @@ npx wrangler deploy --env production   # or: npm run deploy, which does both
 ```
 
 **Naming the environment is load-bearing.** The default configuration is the development
-one: a different Worker (`otto-platform-console-dev`) whose `OTTO_ORIGIN` is
+one: a different Worker (`otto-platform-console-dev`) whose `SAVVAGENT_ORIGIN` is
 `http://127.0.0.1:8080`. A bare `wrangler deploy` therefore cannot overwrite the Worker the
 console runs on, and cannot silently point a staging build at production. It deploys
 something that proxies to an origin nobody is running, which fails immediately and visibly.
 `--env production` is the only path to the real hostname, and it deploys the Worker named
 `otto-platform-console`, proxying to `https://otto-platform.fly.dev`, with a custom domain
-on `otto.savvagent.com`.
+on `savvagent.com`.
 
 Another environment is a block in `wrangler.jsonc` beside `production`, or a one-off
-override: `npx wrangler deploy --var OTTO_ORIGIN:https://other.fly.dev`.
+override: `npx wrangler deploy --var SAVVAGENT_ORIGIN:https://other.fly.dev`.
 
 ### Account-side setup (once)
 
@@ -92,35 +97,35 @@ override: `npx wrangler deploy --var OTTO_ORIGIN:https://other.fly.dev`.
    (`"custom_domain": true` in `wrangler.jsonc`) creates the DNS record and certificate
    itself, but only inside a zone Cloudflare serves. If `savvagent.com` DNS is still at
    Namecheap, moving it is a nameserver change that affects every record on the domain
-   (including `otto-tower.savvagent.com`). Copy the existing records across first. If
+   (including the services' hosts, such as `tower.savvagent.com`). Copy the existing records across first. If
    that is not wanted, see "Without Cloudflare" below.
 2. Authenticate wrangler (`npx wrangler login`) as a user who can edit that zone.
-3. Deploy with `--env production`. Wrangler attaches `otto.savvagent.com` to the Worker.
-4. **No `fly certs add otto.savvagent.com` is needed** in this topology: the browser's TLS
+3. Deploy with `--env production`. Wrangler attaches `savvagent.com` to the Worker.
+4. **No `fly certs add savvagent.com` is needed** in this topology: the browser's TLS
    terminates at Cloudflare, and the Worker reaches Fly at `otto-platform.fly.dev`, which
    already has a certificate. (Add the cert only if you choose the no-Worker path below.)
 
 ## What must be true on the origin
 
-For the Worker deployment, `fly.toml` must be changed from its primary-path values (`OTTO_CLIENT_IP_HEADER=fly-client-ip`, `OTTO_STATIC_DIR=/srv/console`). This is why each one is what it is.
+For the Worker deployment, `fly.toml` must be changed from its primary-path values (`SAVVAGENT_CLIENT_IP_HEADER=fly-client-ip`, `SAVVAGENT_STATIC_DIR=/srv/console`). This is why each one is what it is.
 
-| Variable                | Value                        | Why                                                                                                                        |
-| ----------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `OTTO_PUBLIC_URL`       | `https://otto.savvagent.com` | The Worker's hostname, never the origin's. The OAuth issuer, discovery documents and the WebAuthn rp_id are built from it. |
-| `OTTO_CLIENT_IP_HEADER` | `cf-connecting-ip`           | See below. Previously `fly-client-ip`.                                                                                     |
+| Variable                     | Value                   | Why                                                                                                                        |
+| ---------------------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `SAVVAGENT_PUBLIC_URL`       | `https://savvagent.com` | The Worker's hostname, never the origin's. The OAuth issuer, discovery documents and the WebAuthn rp_id are built from it. |
+| `SAVVAGENT_CLIENT_IP_HEADER` | `cf-connecting-ip`      | See below. Previously `fly-client-ip`.                                                                                     |
 
 ### The CSRF guard needs nothing, because the Worker leaves `Origin` alone
 
 `crates/otto-web/src/csrf.rs` refuses any non-`GET` that carries the session cookie unless
-its `Origin` equals the origin of `OTTO_PUBLIC_URL` (or, with no `Origin`, it carries
+its `Origin` equals the origin of `SAVVAGENT_PUBLIC_URL` (or, with no `Origin`, it carries
 `Sec-Fetch-Site: same-origin`). The browser is on the Worker's hostname, so it sends
-`Origin: https://otto.savvagent.com`, and the Worker forwards every request header as it
+`Origin: https://savvagent.com`, and the Worker forwards every request header as it
 found it. It rewrites exactly one: `cf-connecting-ip`.
 
 ### Rate limiting needed a change: `fly-client-ip` -> `cf-connecting-ip`
 
 Per-IP throttles (`signup:{ip}`, `login:ip:{ip}`, claim) and the audit trail's `ip` key on
-`OTTO_CLIENT_IP_HEADER`. With `fly-client-ip`, Fly's proxy overwrites the header with the
+`SAVVAGENT_CLIENT_IP_HEADER`. With `fly-client-ip`, Fly's proxy overwrites the header with the
 address it sees, and behind the Worker that is a **Cloudflare egress address**: every
 visitor to the console would share a handful of throttle buckets, and one attacker could
 lock out everyone. Cloudflare overwrites `CF-Connecting-IP` before the Worker runs, so that
@@ -145,7 +150,7 @@ locked down. In rough order of strength:
 2. **Authenticated Origin Pulls**, so the origin accepts browser-path TLS clients only if
    they present Cloudflare's certificate.
 3. A shared-secret header added by the Worker and checked by the server before it trusts
-   `OTTO_CLIENT_IP_HEADER` (not implemented; the smallest code change).
+   `SAVVAGENT_CLIENT_IP_HEADER` (not implemented; the smallest code change).
 
 None of these is wired up. The deploy works without them; the throttles are only as strong
 as the origin's reachability until one is.
@@ -157,13 +162,13 @@ thing minus Cloudflare's own edge:
 
 ```bash
 # origin (a scratch database)
-DATABASE_URL=postgres://… OTTO_PUBLIC_URL=http://localhost:8788 OTTO_BIND=127.0.0.1:8080 \
-OTTO_CLIENT_IP_HEADER=cf-connecting-ip OTTO_ENCRYPTION_KEY=$(openssl rand -base64 32) \
+DATABASE_URL=postgres://… SAVVAGENT_PUBLIC_URL=http://localhost:8788 SAVVAGENT_BIND=127.0.0.1:8080 \
+SAVVAGENT_CLIENT_IP_HEADER=cf-connecting-ip SAVVAGENT_ENCRYPTION_KEY=$(openssl rand -base64 32) \
   cargo run -p otto-platform-server
 
 # edge
 cd web && npm run build
-npx wrangler dev --port 8788 --var OTTO_ORIGIN:http://127.0.0.1:8080
+npx wrangler dev --port 8788 --var SAVVAGENT_ORIGIN:http://127.0.0.1:8080
 ```
 
 What that run established:

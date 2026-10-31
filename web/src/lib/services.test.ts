@@ -33,25 +33,27 @@ const defaultGetLocale = getLocale;
 afterEach(() => overwriteGetLocale(defaultGetLocale));
 
 describe('the services list', () => {
-  it('ships Otto Tower, Otto Flags and Otto CXP, over https', () => {
+  it('ships Savvagent Tower, Savvagent Flags and Savvagent CXP, over https', () => {
     expect(SERVICES.map((s) => [s.slug, s.name])).toEqual([
-      ['tower', 'Otto Tower'],
-      ['flags', 'Otto Flags'],
-      ['cxp', 'Otto CXP']
+      ['tower', 'Savvagent Tower'],
+      ['flags', 'Savvagent Flags'],
+      ['cxp', 'Savvagent CXP']
     ]);
+    // The MCP address is the service's OAuth resource URI, which stays on its
+    // pre-rebrand host until the service switches in rebrand phase 3 (#135).
     for (const service of SERVICES) {
       expect(service.mcpUrl).toBe(`https://otto-${service.slug}.savvagent.com/mcp`);
     }
   });
 
   /**
-   * Only Otto Tower serves a web console. Flags and CXP answer a browser
+   * Only Savvagent Tower serves a web console. Flags and CXP answer a browser
    * at their origin with a JSON 404, so a `consoleUrl` on either would put a
    * dead end back in the header.
    */
-  it('gives a web console to Otto Tower only', () => {
+  it('gives a web console to Savvagent Tower only', () => {
     expect(SERVICES.map((s) => [s.slug, s.consoleUrl])).toEqual([
-      ['tower', 'https://otto-tower.savvagent.com'],
+      ['tower', 'https://tower.savvagent.com'],
       ['flags', undefined],
       ['cxp', undefined]
     ]);
@@ -95,7 +97,7 @@ describe('the services list', () => {
   });
 
   it('finds a service by its slug, and nothing for a slug no service owns', () => {
-    expect(serviceBySlug('flags')?.name).toBe('Otto Flags');
+    expect(serviceBySlug('flags')?.name).toBe('Savvagent Flags');
     expect(serviceBySlug('nope')).toBeUndefined();
     expect(serviceBySlug('')).toBeUndefined();
   });
@@ -153,7 +155,7 @@ describe('where a link to a service goes', () => {
     const tower = serviceBySlug('tower')!;
     expect(serviceLink(tower, 'en')).toEqual({
       kind: 'console',
-      href: 'https://otto-tower.savvagent.com'
+      href: 'https://tower.savvagent.com'
     });
   });
 

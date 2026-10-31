@@ -27,20 +27,21 @@ impl Role {
 }
 
 /// Whether `s` has the shape of a token the platform mints for a resource
-/// server: an OAuth access (`*_at_`) or personal access (`*_pat_`) prefix
+/// server: an OAuth access (`sav_at_`) or personal access (`sav_pat_`) prefix
 /// followed by 43 base64url characters (32 random bytes, unpadded). Refresh
-/// tokens (`*_rt_`) are never presented to a resource server.
+/// tokens (`sav_rt_`) are never presented to a resource server.
 ///
-/// Both the `otto_` and the `sav_` prefixes pass while the Savvagent rebrand
-/// (#128) is under way: resource servers pin this crate by rev, so they have to
-/// accept `sav_` tokens before the platform starts minting them.
+/// The `otto_at_` and `otto_pat_` prefixes no longer pass: the switch to
+/// Savvagent (savvagent/otto-platform#128) retired every sign-in token minted
+/// under them, and the platform answers inactive for one, so a resource server
+/// need not ask.
 ///
 /// A pre-filter only: passing it says nothing about validity, but failing it
 /// means the platform would answer inactive, so no call is needed. This
 /// mirrors `otto_auth::crypto::generate`; the platform's test suite asserts
 /// every token kind it mints passes.
 pub fn looks_like_token(s: &str) -> bool {
-    const PREFIXES: [&str; 4] = ["sav_at_", "sav_pat_", "otto_at_", "otto_pat_"];
+    const PREFIXES: [&str; 2] = ["sav_at_", "sav_pat_"];
     let Some(rest) = PREFIXES.iter().find_map(|p| s.strip_prefix(p)) else {
         return false;
     };
@@ -677,10 +678,20 @@ mod tests {
     const BODY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-_9";
 
     #[test]
-    fn access_and_personal_tokens_pass_under_either_prefix() {
-        for prefix in ["sav_at_", "sav_pat_", "otto_at_", "otto_pat_"] {
+    fn access_and_personal_tokens_pass_under_the_sav_prefix() {
+        for prefix in ["sav_at_", "sav_pat_"] {
             let token = format!("{prefix}{BODY}");
             assert!(looks_like_token(&token), "{token}");
+        }
+    }
+
+    /// Savvagent (#128) retired the `otto_` sign-in tokens: a well-formed one
+    /// is no longer worth a call to the platform.
+    #[test]
+    fn retired_otto_access_and_personal_tokens_do_not_pass() {
+        for prefix in ["otto_at_", "otto_pat_"] {
+            let token = format!("{prefix}{BODY}");
+            assert!(!looks_like_token(&token), "{token}");
         }
     }
 

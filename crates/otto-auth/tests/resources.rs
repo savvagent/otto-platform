@@ -557,7 +557,7 @@ async fn introspection_credentials_authenticate_only_their_resource(pool: PgPool
     register_both(&db).await;
 
     // No credential issued yet.
-    let err = resources::authenticate_introspection(&db, FLAGS, "otto_rs_anything")
+    let err = resources::authenticate_introspection(&db, FLAGS, "sav_rs_anything")
         .await
         .unwrap_err();
     assert!(matches!(err, AuthError::InvalidClient(_)), "{err:?}");
