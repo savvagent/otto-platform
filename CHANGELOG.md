@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.18.0](https://github.com/savvagent/otto-platform/compare/v0.17.0...v0.18.0) (2026-10-31)
+
+
+### ⚠ BREAKING CHANGES
+
+* rename the crates to savvagent-* ([#136](https://github.com/savvagent/otto-platform/issues/136)) (#143)
+
+### Code Refactoring
+
+* rename the crates to savvagent-* ([#136](https://github.com/savvagent/otto-platform/issues/136)) ([#143](https://github.com/savvagent/otto-platform/issues/143)) ([6738a50](https://github.com/savvagent/otto-platform/commit/6738a509a1a4641530ec2e525ee2eaa3958d23b6))
+
 ## [0.17.0](https://github.com/savvagent/otto-platform/compare/v0.16.0...v0.17.0) (2026-10-31)
 
 
