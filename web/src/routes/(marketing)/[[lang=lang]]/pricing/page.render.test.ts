@@ -545,7 +545,9 @@ describe('the pricing page', () => {
       ['1.000.001 en adelante', expect.stringMatching(/^0,001\sUS\$$/)]
     ]);
     expect(meterRows('Flag evaluations')[0]).toEqual(['Hasta 1000', 'Gratis']);
-    expect(card('Savvagent Flags').textContent).toContain('Las primeras 1000 unidades gratis cada mes');
+    expect(card('Savvagent Flags').textContent).toContain(
+      'Las primeras 1000 unidades gratis cada mes'
+    );
     expect(usageRegion().textContent).not.toContain('€');
     expect(card('Free').querySelector('p')?.textContent?.trim()).toBe('Gratis');
 

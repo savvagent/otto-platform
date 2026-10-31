@@ -84,7 +84,9 @@ export function dollarsInput(cents: number): string {
  * Service slugs that were renamed. Usage and budget rows written before the
  * rename still carry the old slug, and must keep a display name.
  */
-const LEGACY_SERVICE_NAMES: ReadonlyMap<string, string> = new Map([['otto-factory', 'Savvagent Tower']]);
+const LEGACY_SERVICE_NAMES: ReadonlyMap<string, string> = new Map([
+  ['otto-factory', 'Savvagent Tower']
+]);
 
 /**
  * The name a service slug (`otto-flags`) goes by in the header and on the

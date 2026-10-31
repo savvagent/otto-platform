@@ -266,13 +266,7 @@
   <Card title={m.settings_profile_title()} description={m.settings_profile_description()}>
     <form class="max-w-sm space-y-4" onsubmit={saveProfile}>
       <Field label={m.settings_email_label()} hint={m.settings_email_hint()}>
-        <input
-          class="sav-input"
-          type="email"
-          autocomplete="username"
-          required
-          bind:value={email}
-        />
+        <input class="sav-input" type="email" autocomplete="username" required bind:value={email} />
       </Field>
 
       <Field label={m.settings_name_label()}>

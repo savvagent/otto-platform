@@ -140,13 +140,7 @@
 
     <form class="mt-6 space-y-4" onsubmit={saveProfile}>
       <Field label={m.signup_email_label()} hint={m.signup_email_hint()}>
-        <input
-          class="sav-input"
-          type="email"
-          autocomplete="username"
-          required
-          bind:value={email}
-        />
+        <input class="sav-input" type="email" autocomplete="username" required bind:value={email} />
       </Field>
 
       <Field label={m.signup_name_label()} hint={m.signup_name_hint()}>

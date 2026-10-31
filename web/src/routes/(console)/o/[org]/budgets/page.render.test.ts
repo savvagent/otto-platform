@@ -132,7 +132,9 @@ describe('the budgets page', () => {
     expect(hardStop.checked).toBe(true);
     submit(flags.querySelector('form')!);
 
-    await vi.waitFor(() => expect(flags.textContent).toContain('Budget saved for Savvagent Flags.'));
+    await vi.waitFor(() =>
+      expect(flags.textContent).toContain('Budget saved for Savvagent Flags.')
+    );
     expect(sent).toEqual({ monthlyBudgetCents: 25_050, hardStop: true });
     const status = flags.querySelector('[role="status"][tabindex="-1"]')!;
     await vi.waitFor(() => expect(document.activeElement).toBe(status));
@@ -238,7 +240,9 @@ describe('the budgets page', () => {
     )!;
     remove.click();
 
-    await vi.waitFor(() => expect(flags.textContent).toContain('Budget removed for Savvagent Flags.'));
+    await vi.waitFor(() =>
+      expect(flags.textContent).toContain('Budget removed for Savvagent Flags.')
+    );
     expect(flags.querySelector<HTMLInputElement>('input[name="amount"]')!.value).toBe('');
     expect(flags.textContent).not.toContain('Remove budget');
     expect(flags.textContent).toContain('No budget set');

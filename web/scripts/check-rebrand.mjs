@@ -160,7 +160,8 @@ export function findHits(root = repoRoot) {
     readFileSync(join(root, file), 'utf8')
       .split('\n')
       .forEach((text, n) => {
-        for (const context of unexplained(text, patterns)) hits.push(`${file}:${n + 1}: ${context}`);
+        for (const context of unexplained(text, patterns))
+          hits.push(`${file}:${n + 1}: ${context}`);
       });
   }
   for (const file of RUST_COPY_FILES) {

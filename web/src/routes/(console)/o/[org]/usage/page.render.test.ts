@@ -74,7 +74,9 @@ describe('the usage page', () => {
 
       // Spend in dollars against the budget, as a meter.
       const meter = container.querySelector('[role="meter"]')!;
-      expect(meter.getAttribute('aria-label')).toBe('Savvagent Flags spend against its monthly budget');
+      expect(meter.getAttribute('aria-label')).toBe(
+        'Savvagent Flags spend against its monthly budget'
+      );
       expect(meter.getAttribute('aria-valuenow')).toBe('82');
       expect(meter.getAttribute('aria-valuetext')).toBe('$82.50 of $100.00 spent (82%)');
       expect(container.textContent).toContain('$82.50 this month');

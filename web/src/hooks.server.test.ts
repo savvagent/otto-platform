@@ -4,7 +4,8 @@ import { describe, expect, it } from 'vitest';
 import { handle } from './hooks.server';
 
 /** A stand-in for the shell `app.html` produces, placeholder and all. */
-const TEMPLATE = '<!doctype html>\n<html lang="%savvagent.lang%" class="h-full"><head></head></html>';
+const TEMPLATE =
+  '<!doctype html>\n<html lang="%savvagent.lang%" class="h-full"><head></head></html>';
 
 /** Run `handle` and return the page as the hook leaves it. */
 async function render(params: Record<string, string>): Promise<string> {

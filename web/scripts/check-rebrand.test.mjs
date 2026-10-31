@@ -13,7 +13,10 @@ import { findHits, parseAllowlist, rustStrings, unexplained } from './check-rebr
 describe('parseAllowlist', () => {
   it('reads one pattern per line from the allowlist block, skipping comments', () => {
     const doc = '# Title\n\n```allowlist\n# why\n_otto-verify\\b\n\n\\botto-flags\\b\n```\n';
-    expect(parseAllowlist(doc).map((p) => p.source)).toEqual(['_otto-verify\\b', '\\botto-flags\\b']);
+    expect(parseAllowlist(doc).map((p) => p.source)).toEqual([
+      '_otto-verify\\b',
+      '\\botto-flags\\b'
+    ]);
   });
 
   it('refuses a doc with no allowlist block', () => {
