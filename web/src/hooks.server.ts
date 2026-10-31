@@ -6,7 +6,7 @@ import { isSupported } from '$lib/locale';
  * The whole opening of the root element, not the bare placeholder, so the
  * replacement can only ever land on `<html lang>`.
  */
-const PLACEHOLDER = '<html lang="%otto.lang%"';
+const PLACEHOLDER = '<html lang="%savvagent.lang%"';
 
 /**
  * Write the page's language into `<html lang>`.

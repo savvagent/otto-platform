@@ -670,6 +670,22 @@ async fn alert_recipients(tx: &mut Tx<'_>) -> Result<(String, Vec<String>)> {
     Ok((slug, recipients))
 }
 
+/// The name a person knows a service by, for a billing service slug.
+///
+/// Billing slugs keep their `otto-` prefix (they are stored on every usage row
+/// and in Stripe; see `docs/rebrand-allowlist.md`), so an email that names a
+/// service maps the slug to the product's name, as the console's
+/// `serviceName` does. A slug with no product name yet is shown as itself.
+fn service_display_name(service: &str) -> &str {
+    match service {
+        // `otto-factory` is the slug Savvagent Tower billed under before #92.
+        "otto-tower" | "otto-factory" => "Savvagent Tower",
+        "otto-flags" => "Savvagent Flags",
+        "otto-cxp" => "Savvagent CXP",
+        other => other,
+    }
+}
+
 /// One budget alert email. English only for now: recipients' locales are a
 /// follow-up.
 #[derive(Debug, Clone)]
@@ -685,11 +701,14 @@ struct AlertEmail<'a> {
 }
 
 impl AlertEmail<'_> {
-    /// One line: the service and org slugs are `[a-z0-9-]` by construction.
+    /// One line: the org slug is `[a-z0-9-]` by construction, and the service
+    /// is a [`service_display_name`], itself one line.
     fn subject(&self) -> String {
         format!(
             "{} has reached {}% of its monthly budget in {}",
-            self.service, self.threshold, self.org_slug
+            service_display_name(self.service),
+            self.threshold,
+            self.org_slug
         )
     }
 
@@ -698,13 +717,13 @@ impl AlertEmail<'_> {
             format!(
                 "Hard stop is on: once spend reaches the budget, {} refuses billable calls \
                  until the month ends or the budget is raised. Free calls keep working.",
-                self.service
+                service_display_name(self.service)
             )
         } else {
             format!(
                 "Hard stop is off: {} keeps working past the budget, and usage over it is \
                  billed.",
-                self.service
+                service_display_name(self.service)
             )
         };
         format!(
@@ -716,8 +735,8 @@ impl AlertEmail<'_> {
              {stop}\n\
              \n\
              You are receiving this because you are an owner or admin of {org}. Owners and \
-             admins can change or remove the budget in the Otto console.\n",
-            service = self.service,
+             admins can change or remove the budget in the Savvagent console.\n",
+            service = service_display_name(self.service),
             pct = percent_used(self.spend_cents, self.budget_cents),
             org = self.org_slug,
             period = self.period,
@@ -842,6 +861,15 @@ mod tests {
     }
 
     #[test]
+    fn an_email_names_a_service_by_its_product_name() {
+        assert_eq!(service_display_name("otto-tower"), "Savvagent Tower");
+        assert_eq!(service_display_name("otto-factory"), "Savvagent Tower");
+        assert_eq!(service_display_name("otto-flags"), "Savvagent Flags");
+        assert_eq!(service_display_name("otto-cxp"), "Savvagent CXP");
+        assert_eq!(service_display_name("otto-new"), "otto-new");
+    }
+
+    #[test]
     fn the_email_is_one_line_subject_and_plain_text() {
         let alert = AlertEmail {
             service: "otto-flags",
@@ -854,9 +882,15 @@ mod tests {
         };
         assert_eq!(
             alert.subject(),
-            "otto-flags has reached 80% of its monthly budget in acme"
+            "Savvagent Flags has reached 80% of its monthly budget in acme"
         );
         let body = alert.body();
+        assert!(
+            body.starts_with("Savvagent Flags has used 81%"),
+            "the body names the product, not its billing slug: {body}"
+        );
+        assert!(body.contains("in the Savvagent console"), "{body}");
+        assert!(!body.to_lowercase().contains("otto"), "{body}");
         assert!(body.contains("used 81%"), "{body}");
         assert!(body.contains("Spend in 2026-10 (UTC): $8.12"), "{body}");
         assert!(body.contains("Monthly budget: $10.00"), "{body}");

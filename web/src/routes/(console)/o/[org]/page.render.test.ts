@@ -80,17 +80,17 @@ describe('the organization overview', () => {
     // one, "unavailable" (never $0) where the price could not be read.
     const spend = container.querySelector('[role="meter"]')!.closest('ul')!;
     const rows = Array.from(spend.querySelectorAll('li')).map((li) => li.textContent);
-    expect(rows[0]).toContain('Otto Flags');
+    expect(rows[0]).toContain('Savvagent Flags');
     expect(rows[0]).toContain('$82.50');
     expect(rows[0]).toContain('$82.50 of $100.00 (82%)');
-    expect(rows[1]).toContain('Otto CXP');
+    expect(rows[1]).toContain('Savvagent CXP');
     expect(rows[1]).toContain('Spend unavailable');
     expect(rows[1]).not.toContain('$0');
     expect(container.textContent).not.toMatch(/operation|bucket|billable/i);
 
     // This month's 80% alert, here as well as on the budgets page.
     expect(container.querySelector('section[aria-label="Budget alerts"]')?.textContent).toContain(
-      'Otto Flags has reached 80% of its monthly budget this month.'
+      'Savvagent Flags has reached 80% of its monthly budget this month.'
     );
 
     const tiles = Array.from(container.querySelectorAll('a[href^="/o/acme/"]')).map(
@@ -99,18 +99,19 @@ describe('the organization overview', () => {
     expect(tiles.some((t) => t?.includes('2') && t.includes('Members'))).toBe(true);
     expect(tiles.some((t) => t?.includes('1') && t.includes('Teams'))).toBe(true);
 
-    // Otto Tower has a web console to leave for; Flags and CXP do not, so
+    // Savvagent Tower has a web console to leave for; Flags and CXP do not, so
     // they go to their connect cards, badged as connectors.
-    const tower = container.querySelector('a[href="https://otto-tower.savvagent.com"]');
-    expect(tower?.textContent?.trim()).toBe('Otto Tower');
+    const tower = container.querySelector('a[href="https://tower.savvagent.com"]');
+    expect(tower?.textContent?.trim()).toBe('Savvagent Tower');
     for (const [slug, name] of [
-      ['flags', 'Otto Flags'],
-      ['cxp', 'Otto CXP']
+      ['flags', 'Savvagent Flags'],
+      ['cxp', 'Savvagent CXP']
     ]) {
       const link = container.querySelector(`a[href="/products/${slug}#connect"]`);
       expect(link?.getAttribute('aria-label')).toBe(`${name}, connector`);
       expect(link?.textContent).toContain('Connector');
       expect(container.querySelector(`a[href^="https://otto-${slug}."]`)).toBeNull();
+      expect(container.querySelector(`a[href^="https://${slug}.savvagent.com"]`)).toBeNull();
     }
 
     unmount(instance);
@@ -164,9 +165,9 @@ describe('the overview when a service needs a card', () => {
     await vi.waitFor(() => expect(notices()).not.toBeNull());
     const status = notices()!.querySelector('[role="status"]')!;
     expect(status.textContent).toContain(
-      'Otto Flags is past its free allowance this month, so its paid usage is paused until a card is on file. Its free calls keep working.'
+      'Savvagent Flags is past its free allowance this month, so its paid usage is paused until a card is on file. Its free calls keep working.'
     );
-    expect(status.textContent).not.toContain('Otto CXP');
+    expect(status.textContent).not.toContain('Savvagent CXP');
     const link = status.querySelector('a')!;
     expect(link.getAttribute('href')).toBe('/o/acme/billing');
     expect(link.textContent?.trim()).toBe('Add a card');
@@ -176,7 +177,7 @@ describe('the overview when a service needs a card', () => {
     const rows = Array.from(container.querySelectorAll('[role="meter"]'))
       .map((meter) => meter.closest('li')!)
       .map((li) => li.textContent);
-    expect(rows[0]).toContain('Otto Flags');
+    expect(rows[0]).toContain('Savvagent Flags');
     expect(rows[0]).toContain('Paid usage paused');
     const cxp = Array.from(container.querySelectorAll('li')).find((li) =>
       li.textContent?.includes('Spend unavailable')
@@ -196,7 +197,7 @@ describe('the overview when a service needs a card', () => {
       await vi.waitFor(() => expect(notices()).not.toBeNull());
       const status = notices()!.querySelector('[role="status"]')!;
       expect(status.textContent).toContain(
-        'Otto Flags is past its free allowance this month, so its paid usage is paused until an owner of this organization adds a card. Its free calls keep working.'
+        'Savvagent Flags is past its free allowance this month, so its paid usage is paused until an owner of this organization adds a card. Its free calls keep working.'
       );
       expect(status.querySelector('a')).toBeNull();
       expect(container.querySelector('a[href="/o/acme/billing"]')).toBeNull();

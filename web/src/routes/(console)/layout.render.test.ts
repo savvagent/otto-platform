@@ -50,9 +50,9 @@ describe('the console header', () => {
       a.getAttribute('aria-label') ?? a.textContent?.trim()
     ]);
     expect(links).toEqual([
-      ['https://otto-tower.savvagent.com', 'Otto Tower'],
-      ['/products/flags#connect', 'Otto Flags, connector'],
-      ['/products/cxp#connect', 'Otto CXP, connector']
+      ['https://tower.savvagent.com', 'Savvagent Tower'],
+      ['/products/flags#connect', 'Savvagent Flags, connector'],
+      ['/products/cxp#connect', 'Savvagent CXP, connector']
     ]);
     for (const slug of ['flags', 'cxp']) {
       expect(nav!.querySelector(`a[href="/products/${slug}#connect"]`)?.textContent).toContain(

@@ -7,7 +7,7 @@
   import type { PageData } from './$types';
 
   /**
-   * The `ottoctl` command-line tool: what it is, where to get it, how to run it
+   * The `savctl` command-line tool: what it is, where to get it, how to run it
    * the first time.
    *
    * **Commands, URLs and file names are not messages.** They are the same in
@@ -17,40 +17,40 @@
    * a prerendered file. They are external links: the prerender crawler only
    * follows same-origin ones.
    *
-   * Prebuilt archives and the install steps mirror `docs/ottoctl.md`, which
+   * Prebuilt archives and the install steps mirror `docs/savctl.md`, which
    * is the source of truth; change them together.
    */
   let { data }: { data: PageData } = $props();
 
   const RELEASES = 'https://github.com/savvagent/otto-platform/releases/latest';
   const DOWNLOAD = `${RELEASES}/download`;
-  const DOCS = 'https://github.com/savvagent/otto-platform/blob/main/docs/ottoctl.md';
+  const DOCS = 'https://github.com/savvagent/otto-platform/blob/main/docs/savctl.md';
 
   /** Platform names are names, so they are not translated. */
   const PLATFORMS = [
-    { name: 'Linux x86_64', archive: 'ottoctl-x86_64-unknown-linux-musl.tar.gz' },
-    { name: 'Linux arm64', archive: 'ottoctl-aarch64-unknown-linux-musl.tar.gz' },
-    { name: 'macOS Apple silicon', archive: 'ottoctl-aarch64-apple-darwin.tar.gz' },
-    { name: 'macOS Intel', archive: 'ottoctl-x86_64-apple-darwin.tar.gz' },
-    { name: 'Windows x86_64', archive: 'ottoctl-x86_64-pc-windows-msvc.zip' }
+    { name: 'Linux x86_64', archive: 'savctl-x86_64-unknown-linux-musl.tar.gz' },
+    { name: 'Linux arm64', archive: 'savctl-aarch64-unknown-linux-musl.tar.gz' },
+    { name: 'macOS Apple silicon', archive: 'savctl-aarch64-apple-darwin.tar.gz' },
+    { name: 'macOS Intel', archive: 'savctl-x86_64-apple-darwin.tar.gz' },
+    { name: 'Windows x86_64', archive: 'savctl-x86_64-pc-windows-msvc.zip' }
   ];
 
   const UNIX_INSTALL = [
     'target=aarch64-apple-darwin',
     `base=${DOWNLOAD}`,
-    'curl -fsSLO "$base/ottoctl-$target.tar.gz"',
+    'curl -fsSLO "$base/savctl-$target.tar.gz"',
     'curl -fsSLO "$base/SHA256SUMS"',
-    'grep " ottoctl-$target.tar.gz\\$" SHA256SUMS | shasum -a 256 -c',
-    'tar xzf "ottoctl-$target.tar.gz"',
-    'install -m 0755 "ottoctl-$target/ottoctl" "ottoctl-$target/otto-flags" ~/.local/bin/'
+    'grep " savctl-$target.tar.gz\\$" SHA256SUMS | shasum -a 256 -c',
+    'tar xzf "savctl-$target.tar.gz"',
+    'install -m 0755 "savctl-$target/savctl" "savctl-$target/savctl-flags" ~/.local/bin/'
   ].join('\n');
 
   const WINDOWS_INSTALL = [
     `$base = "${DOWNLOAD}"`,
-    'Invoke-WebRequest "$base/ottoctl-x86_64-pc-windows-msvc.zip" -OutFile ottoctl.zip',
+    'Invoke-WebRequest "$base/savctl-x86_64-pc-windows-msvc.zip" -OutFile savctl.zip',
     'Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS',
-    '(Get-FileHash ottoctl.zip -Algorithm SHA256).Hash',
-    'Expand-Archive ottoctl.zip -DestinationPath .'
+    '(Get-FileHash savctl.zip -Algorithm SHA256).Hash',
+    'Expand-Archive savctl.zip -DestinationPath .'
   ].join('\n');
 
   const FROM_SOURCE =
@@ -64,7 +64,7 @@
 
   const loginServices = SERVICES.flatMap((service) =>
     service.mcpUrl
-      ? [{ name: service.name, command: `ottoctl login --resource ${service.mcpUrl}` }]
+      ? [{ name: service.name, command: `savctl login --resource ${service.mcpUrl}` }]
       : []
   );
 
@@ -75,7 +75,7 @@
 
 <div class="flex flex-col gap-20 pb-10 sm:gap-24">
   <section aria-labelledby="cli-title" class="max-w-3xl pt-6">
-    <p class="otto-label text-accent">{m.cli_eyebrow()}</p>
+    <p class="sav-label text-accent">{m.cli_eyebrow()}</p>
     <h1
       id="cli-title"
       class="mt-3 text-4xl font-semibold tracking-tight text-balance text-ink sm:text-5xl"
@@ -106,9 +106,9 @@
     <p class="mt-3 text-muted">{m.cli_download_intro()}</p>
     <ul role="list" aria-label={m.cli_download_list_label()} class="mt-6 grid gap-3 sm:grid-cols-2">
       {#each PLATFORMS as platform (platform.archive)}
-        <li class="otto-card p-4">
+        <li class="sav-card p-4">
           <a href="{DOWNLOAD}/{platform.archive}" class="block {ext}">{platform.name}</a>
-          <span class="otto-mono mt-1 block text-xs text-muted">{platform.archive}</span>
+          <span class="sav-mono mt-1 block text-xs text-muted">{platform.archive}</span>
         </li>
       {/each}
     </ul>
@@ -147,7 +147,7 @@
     <p class="mt-3 text-muted">{m.cli_unsigned_body()}</p>
     <div class="mt-5">
       <p class="mb-2 text-sm text-muted">{m.cli_unsigned_macos()}</p>
-      <CopyField value="xattr -d com.apple.quarantine ottoctl" />
+      <CopyField value="xattr -d com.apple.quarantine savctl" />
     </div>
     <p class="mt-5 text-sm text-muted">{m.cli_unsigned_windows()}</p>
   </section>
@@ -158,7 +158,7 @@
     </h2>
     <p class="mt-3 text-muted">{m.cli_first_body()}</p>
     <div class="mt-5 flex flex-col gap-4">
-      <CopyField value="ottoctl login --resource <service MCP URL>" label={m.cli_first_label()} />
+      <CopyField value="savctl login" label={m.cli_first_label()} />
       {#if loginServices.length > 0}
         <p class="text-sm text-muted">{m.cli_first_services()}</p>
         {#each loginServices as service (service.name)}

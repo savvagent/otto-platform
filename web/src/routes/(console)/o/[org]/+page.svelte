@@ -95,7 +95,7 @@
   <div>
     <h1 class="text-lg font-semibold">{org.title}</h1>
     <p class="mt-0.5 text-sm text-faint">
-      <code class="otto-mono">{org.slug}</code> · {m.overview_role_and_plan({
+      <code class="sav-mono">{org.slug}</code> · {m.overview_role_and_plan({
         role: org.role ? roleLabel(org.role) : '—',
         plan: org.org?.plan ?? '—'
       })}
@@ -121,7 +121,7 @@
 
     <div class="grid grid-cols-2 gap-3">
       {#each tiles as tile (tile.href)}
-        <a class="otto-card px-4 py-3 transition hover:bg-raised" href="/o/{org.slug}/{tile.href}">
+        <a class="sav-card px-4 py-3 transition hover:bg-raised" href="/o/{org.slug}/{tile.href}">
           <div class="text-2xl font-semibold text-ink">
             {tile.value.toLocaleString(currentLocale())}
           </div>

@@ -31,12 +31,12 @@
    * `ConsoleLink`, so it follows the session like the header's.
    *
    * **A product with no console of its own says so, rather than linking to
-   * its origin.** Otto Flags and Otto CXP answer a browser with a JSON 404:
+   * its origin.** Savvagent Flags and Savvagent CXP answer a browser with a JSON 404:
    * the place a person uses them is their AI assistant. So for a service
    * without `consoleUrl` the primary button is "Add to your AI assistant", an
    * in-page link to the connect card, and one line under the buttons says
    * there is no web console and where usage and billing are instead. That
-   * line's "Otto console" goes where `ConsoleLink` goes (`consoleEntry`), with
+   * line's "Savvagent console" goes where `ConsoleLink` goes (`consoleEntry`), with
    * the same `data-sveltekit-reload`. There is no disabled "coming soon"
    * button: a control that does nothing is a dead end with better manners.
    *
@@ -63,7 +63,7 @@
   const link = $derived(service ? serviceLink(service, data.lang) : undefined);
   /** No web console of its own, but an endpoint to add to an assistant: Flags, CXP. */
   const agentOnly = $derived(link?.kind === 'connector');
-  const ottoConsole = $derived(consoleEntry(session));
+  const savvagentConsole = $derived(consoleEntry(session));
   const command = $derived(service ? claudeCodeCommand(service) : undefined);
 
   /**
@@ -125,7 +125,7 @@
 
   <div class="flex flex-col gap-20 pb-10 sm:gap-24">
     <section aria-labelledby="product-title" class="max-w-3xl pt-6">
-      <p class="otto-label text-accent">{m.product_eyebrow()}</p>
+      <p class="sav-label text-accent">{m.product_eyebrow()}</p>
       <h1
         id="product-title"
         class="mt-3 text-4xl font-semibold tracking-tight text-ink sm:text-5xl"
@@ -152,9 +152,9 @@
         <p class="mt-4 text-sm text-pretty text-muted">
           {m.product_agent_only_note({ name: service.name })}
           {billing[0] ?? ''}<a
-            href={ottoConsole.href}
+            href={savvagentConsole.href}
             class="font-medium text-accent underline underline-offset-2 hover:decoration-2"
-            data-sveltekit-reload>{m.product_otto_console()}</a
+            data-sveltekit-reload>{m.product_savvagent_console()}</a
           >{billing[1] ?? ''}
         </p>
       {/if}
@@ -187,7 +187,7 @@
           tabindex="-1"
           bind:this={connect}
           aria-labelledby="connect-title"
-          class="connect otto-card scroll-mt-6 self-start p-6"
+          class="connect sav-card scroll-mt-6 self-start p-6"
           class:arrived
           onblur={() => (arrived = false)}
           onanimationend={(event) => {

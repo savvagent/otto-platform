@@ -141,7 +141,7 @@
     <form class="mt-6 space-y-4" onsubmit={saveProfile}>
       <Field label={m.signup_email_label()} hint={m.signup_email_hint()}>
         <input
-          class="otto-input"
+          class="sav-input"
           type="email"
           autocomplete="username"
           required
@@ -150,7 +150,7 @@
       </Field>
 
       <Field label={m.signup_name_label()} hint={m.signup_name_hint()}>
-        <input class="otto-input" type="text" autocomplete="name" bind:value={name} />
+        <input class="sav-input" type="text" autocomplete="name" bind:value={name} />
       </Field>
 
       {#if error}<Alert>{error}</Alert>{/if}

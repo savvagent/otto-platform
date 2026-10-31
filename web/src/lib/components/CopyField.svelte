@@ -31,10 +31,10 @@
 </script>
 
 <div>
-  {#if label}<span class="otto-label">{label}</span>{/if}
+  {#if label}<span class="sav-label">{label}</span>{/if}
   <div class="flex items-start gap-2">
     <code
-      class="otto-mono flex-1 rounded-md border border-edge bg-canvas px-3 py-2 text-ink"
+      class="sav-mono flex-1 rounded-md border border-edge bg-canvas px-3 py-2 text-ink"
       class:whitespace-pre-wrap={multiline}>{value}</code
     >
     <Button tone="quiet" onclick={onCopy}>

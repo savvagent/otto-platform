@@ -135,14 +135,14 @@
 
 <form class="space-y-3" onsubmit={save} novalidate>
   <div>
-    <label class="otto-label" for="{id}-amount">{m.budget_amount_label()}</label>
+    <label class="sav-label" for="{id}-amount">{m.budget_amount_label()}</label>
     <input
       bind:this={input}
       bind:value={amount}
       oninput={() => (notice = undefined)}
       id="{id}-amount"
       name="amount"
-      class="otto-input mt-1 w-full max-w-60"
+      class="sav-input mt-1 w-full max-w-60"
       inputmode="decimal"
       autocomplete="off"
       aria-invalid={fieldError ? 'true' : undefined}

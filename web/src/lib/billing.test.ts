@@ -97,10 +97,10 @@ describe('formatPercent', () => {
 
 describe('serviceName', () => {
   it('names a described service, and shows any other slug as given', () => {
-    expect(serviceName('otto-flags')).toBe('Otto Flags');
-    expect(serviceName('otto-tower')).toBe('Otto Tower');
+    expect(serviceName('otto-flags')).toBe('Savvagent Flags');
+    expect(serviceName('otto-tower')).toBe('Savvagent Tower');
     // Rows written before the rename still carry the old slug.
-    expect(serviceName('otto-factory')).toBe('Otto Tower');
+    expect(serviceName('otto-factory')).toBe('Savvagent Tower');
     expect(serviceName('otto-new')).toBe('otto-new');
   });
 

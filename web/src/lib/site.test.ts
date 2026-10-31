@@ -12,7 +12,7 @@ import {
 
 describe('the site constants', () => {
   it('names the production origin, with no trailing slash', () => {
-    expect(SITE_ORIGIN).toBe('https://otto.savvagent.com');
+    expect(SITE_ORIGIN).toBe('https://savvagent.com');
     expect(CONTACT_EMAIL).toBe('sales@savvagent.com');
   });
 
@@ -38,20 +38,20 @@ describe('alternates', () => {
   it('lists every locale plus x-default, as absolute URLs', () => {
     const links = alternates('/pricing');
     expect(links).toEqual([
-      { hreflang: 'en', href: 'https://otto.savvagent.com/pricing' },
-      { hreflang: 'es', href: 'https://otto.savvagent.com/es/pricing' },
-      { hreflang: 'de', href: 'https://otto.savvagent.com/de/pricing' },
-      { hreflang: 'fr', href: 'https://otto.savvagent.com/fr/pricing' },
-      { hreflang: 'it', href: 'https://otto.savvagent.com/it/pricing' },
-      { hreflang: 'hi', href: 'https://otto.savvagent.com/hi/pricing' },
-      { hreflang: 'x-default', href: 'https://otto.savvagent.com/pricing' }
+      { hreflang: 'en', href: 'https://savvagent.com/pricing' },
+      { hreflang: 'es', href: 'https://savvagent.com/es/pricing' },
+      { hreflang: 'de', href: 'https://savvagent.com/de/pricing' },
+      { hreflang: 'fr', href: 'https://savvagent.com/fr/pricing' },
+      { hreflang: 'it', href: 'https://savvagent.com/it/pricing' },
+      { hreflang: 'hi', href: 'https://savvagent.com/hi/pricing' },
+      { hreflang: 'x-default', href: 'https://savvagent.com/pricing' }
     ]);
   });
 
   it('writes the root without a trailing slash for prefixed locales', () => {
     const links = alternates('/');
-    expect(links.find((l) => l.hreflang === 'de')?.href).toBe('https://otto.savvagent.com/de');
-    expect(links.find((l) => l.hreflang === 'x-default')?.href).toBe('https://otto.savvagent.com/');
+    expect(links.find((l) => l.hreflang === 'de')?.href).toBe('https://savvagent.com/de');
+    expect(links.find((l) => l.hreflang === 'x-default')?.href).toBe('https://savvagent.com/');
   });
 });
 

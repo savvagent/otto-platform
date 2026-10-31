@@ -7,7 +7,7 @@ import type { EntryGenerator, PageLoad } from './$types';
 
 /**
  * `/products/factory` is the product's old address, from before it was renamed
- * Otto Tower. Links to it are out in the world, so it answers with a redirect
+ * Savvagent Tower. Links to it are out in the world, so it answers with a redirect
  * to `/products/tower` (in the same locale) instead of a 404.
  *
  * The site is built to static files, so the redirect is prerendered: SvelteKit

@@ -160,7 +160,7 @@
 
 <div class="flex flex-col gap-20 pb-10 sm:gap-24">
   <section aria-labelledby="pricing-title" class="max-w-3xl pt-6">
-    <p class="otto-label text-accent">{m.pricing_eyebrow()}</p>
+    <p class="sav-label text-accent">{m.pricing_eyebrow()}</p>
     <h1
       id="pricing-title"
       class="mt-3 text-4xl font-semibold tracking-tight text-balance text-ink sm:text-5xl"
@@ -194,7 +194,7 @@
       {:else if plans.status === 'loading'}
         <ul role="list" class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4" aria-hidden="true">
           {#each [0, 1, 2, 3] as i (i)}
-            <li class="otto-card flex animate-pulse flex-col gap-4 p-5">
+            <li class="sav-card flex animate-pulse flex-col gap-4 p-5">
               <span class="h-5 w-24 rounded bg-edge/60"></span>
               <span class="h-8 w-20 rounded bg-edge/60"></span>
               <span class="h-4 w-full rounded bg-edge/40"></span>
@@ -244,7 +244,7 @@
       {:else if plans.status === 'loading'}
         <ul role="list" class="grid gap-4 md:grid-cols-2 lg:grid-cols-3" aria-hidden="true">
           {#each [0, 1, 2] as i (i)}
-            <li class="otto-card flex animate-pulse flex-col gap-4 p-5">
+            <li class="sav-card flex animate-pulse flex-col gap-4 p-5">
               <span class="h-5 w-28 rounded bg-edge/60"></span>
               <span class="h-4 w-full rounded bg-edge/40"></span>
               <span class="h-4 w-2/3 rounded bg-edge/40"></span>
@@ -252,7 +252,7 @@
           {/each}
         </ul>
       {:else if plans.meters.length === 0}
-        <p class="otto-card p-5 text-muted">{m.pricing_usage_empty()}</p>
+        <p class="sav-card p-5 text-muted">{m.pricing_usage_empty()}</p>
       {:else if usage}
         <ul role="list" class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {#each usage as service (service.service)}

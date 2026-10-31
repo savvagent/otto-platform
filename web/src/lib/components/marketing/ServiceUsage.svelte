@@ -48,7 +48,7 @@
   {/if}
 {/snippet}
 
-<article class="otto-card flex flex-col gap-5 p-5">
+<article class="sav-card flex flex-col gap-5 p-5">
   <svelte:element this={`h${level}`} class="text-lg font-semibold tracking-tight text-ink">
     {usage.name}
   </svelte:element>

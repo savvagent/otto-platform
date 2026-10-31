@@ -423,7 +423,7 @@ async fn console_signal_matches_the_challenge(pool: PgPool) {
     assert!(!label.is_empty(), "every account carries generated words");
     assert_eq!(
         me.body["credentialDisplayName"],
-        format!("Otto Platform · {label}"),
+        format!("Savvagent · {label}"),
     );
 }
 

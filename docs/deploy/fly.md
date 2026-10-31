@@ -4,7 +4,7 @@
 `otto-platform-server` serves everything: the API, the OAuth authorization server, and the
 `web/` bundle, which is the prerendered marketing pages and the console (`web/build`, baked
 into the image at `/srv/console`). There is no edge in front,
-which is also how `otto-tower.savvagent.com` runs. An optional Cloudflare Worker
+which is also how the services, such as Savvagent Tower, run. An optional Cloudflare Worker
 alternative is in [`cloudflare.md`](cloudflare.md).
 
 One origin matters here for two reasons. The session is a `__Host-` cookie, which the
@@ -35,7 +35,7 @@ Never in `fly.toml`. Staged with `fly secrets set -a otto-platform`; see also th
 | `DATABASE_URL`          | yes                             | Staged by `fly postgres attach`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `SAVVAGENT_ENCRYPTION_KEY`   | yes                             | 32 random bytes, base64 (`openssl rand -base64 32`). Encrypts secrets at rest; losing it makes them unreadable.                                                                                                                                                                                                                                                                                                                                                                                             |
 | `SAVVAGENT_SMTP_URL`         | no; together with the next one  | Notification email's SMTP server, credentials in the URL: `smtps://user:pass@host:465` or `smtp://user:pass@host:587?tls=required`. Unset (with `SAVVAGENT_EMAIL_FROM` also unset), email is disabled: the boot log says so and budget-alert emails wait in `notification_outbox` until it is set.                                                                                                                                                                                                               |
-| `SAVVAGENT_EMAIL_FROM`       | no; together with the one above | The `From:` mailbox, e.g. `otto <alerts@savvagent.com>`. Setting exactly one of the two email secrets fails the deploy's health check by refusing to start.                                                                                                                                                                                                                                                                                                                                                 |
+| `SAVVAGENT_EMAIL_FROM`       | no; together with the one above | The `From:` mailbox, e.g. `Savvagent <alerts@savvagent.com>`. Setting exactly one of the two email secrets fails the deploy's health check by refusing to start.                                                                                                                                                                                                                                                                                                                                                 |
 | `STRIPE_SECRET_KEY`     | no; together with the next one  | Billing's Stripe API key: a restricted key (`rk_live_...`) with the permissions under [Stripe setup](#stripe-setup). Its mode (live or test) must match the one recorded in the database ([Switching Stripe modes](#switching-stripe-modes)), or the server refuses to start. Unset (with `STRIPE_WEBHOOK_SECRET` also unset), billing is disabled: the boot log says so, `GET /api/orgs/{org}/billing` reports `billingEnabled: false`, and the setup route and the webhook answer `503 billing_disabled`. |
 | `STRIPE_WEBHOOK_SECRET` | no; together with the one above | The webhook endpoint's signing secret (`whsec_...`), shown by Stripe when the endpoint is created. Setting exactly one of the two Stripe secrets fails the deploy's health check by refusing to start.                                                                                                                                                                                                                                                                                                      |
 
@@ -44,7 +44,7 @@ Set the two email secrets in one command so no release boots with only one of th
 ```bash
 fly secrets set -a otto-platform \
   SAVVAGENT_SMTP_URL='smtps://USER:PASSWORD@smtp.example.com:465' \
-  SAVVAGENT_EMAIL_FROM='otto <alerts@savvagent.com>'
+  SAVVAGENT_EMAIL_FROM='Savvagent <alerts@savvagent.com>'
 ```
 
 **Turning email on sends the backlog.** With the secrets unset, every notification is kept

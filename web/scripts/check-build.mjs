@@ -31,7 +31,7 @@ import { readCatalog, readSettings } from './check-messages.mjs';
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 /** Mirrors `SITE_ORIGIN` in `src/lib/site.ts`. */
-export const SITE_ORIGIN = 'https://otto.savvagent.com';
+export const SITE_ORIGIN = 'https://savvagent.com';
 
 /** Mirrors the slugs in `src/lib/services.ts`. */
 const PRODUCT_SLUGS = ['tower', 'flags', 'cxp'];
@@ -260,8 +260,8 @@ export function checkBuild(
   // Text files only: an image read as UTF-8 is noise, not a page.
   for (const path of walk(dir)) {
     if (!TEXT_EXTENSIONS.has(extname(path))) continue;
-    if (readFileSync(path, 'utf8').includes('%otto.lang%')) {
-      errors.push(`${relative(dir, path)}: still contains %otto.lang%`);
+    if (readFileSync(path, 'utf8').includes('%savvagent.lang%')) {
+      errors.push(`${relative(dir, path)}: still contains %savvagent.lang%`);
     }
   }
   return errors;

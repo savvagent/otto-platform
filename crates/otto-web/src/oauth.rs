@@ -1464,7 +1464,7 @@ impl IntoResponse for OAuthError {
         if status == http::StatusCode::UNAUTHORIZED {
             response.headers_mut().insert(
                 http::header::WWW_AUTHENTICATE,
-                http::HeaderValue::from_static(r#"Basic realm="otto-platform""#),
+                http::HeaderValue::from_static(r#"Basic realm="savvagent""#),
             );
         }
 

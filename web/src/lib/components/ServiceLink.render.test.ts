@@ -5,7 +5,7 @@
  * A service with a web console is a plain external link, as before. One
  * without is a link to its product page's connect card, carries a visible
  * "Connector" badge so the difference shows before the click, and reads as
- * "Otto CXP, connector" to a screen reader.
+ * "Savvagent CXP, connector" to a screen reader.
  */
 
 import { flushSync, mount, unmount } from 'svelte';
@@ -46,8 +46,8 @@ describe('a link to a service', () => {
   it('leaves for the web console of a service that has one', () => {
     const { instance, link } = render('tower');
 
-    expect(link.getAttribute('href')).toBe('https://otto-tower.savvagent.com');
-    expect(link.textContent?.trim()).toBe('Otto Tower');
+    expect(link.getAttribute('href')).toBe('https://tower.savvagent.com');
+    expect(link.textContent?.trim()).toBe('Savvagent Tower');
     expect(link.hasAttribute('aria-label')).toBe(false);
     expect(link.hasAttribute('data-sveltekit-reload')).toBe(false);
 
@@ -61,8 +61,8 @@ describe('a link to a service', () => {
     // A marketing page, reached from the console: a full load, like every
     // link across that line.
     expect(link.hasAttribute('data-sveltekit-reload')).toBe(true);
-    expect(link.getAttribute('aria-label')).toBe('Otto CXP, connector');
-    expect(link.textContent?.replace(/\s+/g, ' ').trim()).toBe('Otto CXP Connector');
+    expect(link.getAttribute('aria-label')).toBe('Savvagent CXP, connector');
+    expect(link.textContent?.replace(/\s+/g, ' ').trim()).toBe('Savvagent CXP Connector');
 
     unmount(instance);
   });

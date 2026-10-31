@@ -70,7 +70,7 @@ function fakeMe(overrides: Partial<Me> = {}): Me {
     shouldAddPasskey: false,
     passkeyCount: 1,
     credentialName: 'ada@example.test',
-    credentialDisplayName: 'Otto Platform · brisk-harbor-42',
+    credentialDisplayName: 'Savvagent · brisk-harbor-42',
     ...overrides
   };
 }

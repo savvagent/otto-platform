@@ -65,7 +65,7 @@ export const USAGE = {
 } satisfies UsageStatus & Record<string, unknown>;
 
 /**
- * `USAGE` for an org with no live subscription whose Otto Flags spend is past
+ * `USAGE` for an org with no live subscription whose Savvagent Flags spend is past
  * its free allowance: the server refuses Flags' billable calls with
  * `payment_required` until a card is on file. CXP's spend is unknown, so it
  * is never flagged.
