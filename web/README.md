@@ -183,7 +183,7 @@ is stored; an English page only offers a link to the visitor's apparent language
 
 | Path                            | What it is                                                                                    |
 | ------------------------------- | --------------------------------------------------------------------------------------------- |
-| `src/lib/api.ts`                | The only place that talks to `savvagent-web`. `ApiError` carries the stable `code`.                |
+| `src/lib/api.ts`                | The only place that talks to `savvagent-web`. `ApiError` carries the stable `code`.           |
 | `src/lib/types.ts`              | The wire types, transcribed from the OpenAPI document.                                        |
 | `src/lib/session.svelte.ts`     | Who is signed in. A rune module, not a store.                                                 |
 | `src/lib/org.svelte.ts`         | The org the current route is about, via context.                                              |
