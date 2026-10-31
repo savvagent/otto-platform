@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.16.0](https://github.com/savvagent/otto-platform/compare/v0.15.0...v0.16.0) (2026-10-31)
+
+
+### ⚠ BREAKING CHANGES
+
+* rebrand phase 2: the platform becomes Savvagent ([#139](https://github.com/savvagent/otto-platform/issues/139))
+
+### Features
+
+* rebrand phase 2: the platform becomes Savvagent ([#139](https://github.com/savvagent/otto-platform/issues/139)) ([397759f](https://github.com/savvagent/otto-platform/commit/397759f0f9deedbb72e925e02cd99d45b33b5d5e))
+
 ## [0.15.0](https://github.com/savvagent/otto-platform/compare/v0.14.0...v0.15.0) (2026-10-30)
 
 
