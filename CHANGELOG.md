@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/savvagent/otto-platform/compare/v0.16.0...v0.17.0) (2026-10-31)
+
+
+### Features
+
+* redirect otto.savvagent.com to savvagent.com ([#141](https://github.com/savvagent/otto-platform/issues/141)) ([03ab3f6](https://github.com/savvagent/otto-platform/commit/03ab3f624fb39ce418e2c4533b0d9f991ecf3622)), closes [#135](https://github.com/savvagent/otto-platform/issues/135)
+
 ## [0.16.0](https://github.com/savvagent/otto-platform/compare/v0.15.0...v0.16.0) (2026-10-31)
 
 
