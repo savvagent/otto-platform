@@ -168,12 +168,12 @@ A `savctl-<app>` binary links the `otto-client` crate:
     // ... call the app with token.expose() as a bearer token ...
     secret_from_app.deliver(&otto_client::Sink::Terminal)?;
 
-## Otto Flags keys
+## Savvagent Flags keys
 
     savctl flags app create <name> [--env <environment>]... [--out <file> [--overwrite]]
     savctl flags keys rotate --app <name-or-id> [--which server|client|both] [--out <file> [--overwrite]]
 
-These issue an Otto Flags app's SDK keys. `app create` registers the app and
+These issue an Savvagent Flags app's SDK keys. `app create` registers the app and
 issues both keys. `keys rotate` replaces the server key by default, and the old
 one stops working at once. Both need an owner or admin of the organization. They
 sign in to `$SAVVAGENT_FLAGS_RESOURCE` (default `https://otto-flags.savvagent.com/mcp`)

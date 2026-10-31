@@ -42,7 +42,7 @@
     void (async () => {
       try {
         const joined = await api.org(wanted);
-        // Guard against an out-otto-order response: a fast navigation between two
+        // Guard against an out-of-order response: a fast navigation between two
         // orgs can land the first fetch after the second, and applying it would
         // show the wrong org's name over the right org's data.
         if (context.slug !== wanted) return;

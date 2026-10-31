@@ -43,7 +43,7 @@
     <link rel="alternate" hreflang={link.hreflang} href={link.href} />
   {/each}
   <meta property="og:type" content="website" />
-  <meta property="og:site_name" content="Otto" />
+  <meta property="og:site_name" content="Savvagent" />
   <meta property="og:title" content={title} />
   <meta property="og:description" content={description} />
   <meta property="og:url" content={canonical} />

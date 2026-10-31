@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * The CLI page: what `ottoctl` is, a download link per platform, the install and
+ * The CLI page: what `savctl` is, a download link per platform, the install and
  * first-use commands as copyable text, and the same page in another language.
  *
  * Commands and URLs are not translated, so the Spanish test checks that the
@@ -16,14 +16,14 @@ import { session } from '$lib/session.svelte';
 import Page from './+page.svelte';
 
 const LATEST = 'https://github.com/savvagent/otto-platform/releases/latest';
-const DOCS = 'https://github.com/savvagent/otto-platform/blob/main/docs/ottoctl.md';
+const DOCS = 'https://github.com/savvagent/otto-platform/blob/main/docs/savctl.md';
 
 const ARCHIVES = [
-  'ottoctl-x86_64-unknown-linux-musl.tar.gz',
-  'ottoctl-aarch64-unknown-linux-musl.tar.gz',
-  'ottoctl-aarch64-apple-darwin.tar.gz',
-  'ottoctl-x86_64-apple-darwin.tar.gz',
-  'ottoctl-x86_64-pc-windows-msvc.zip'
+  'savctl-x86_64-unknown-linux-musl.tar.gz',
+  'savctl-aarch64-unknown-linux-musl.tar.gz',
+  'savctl-aarch64-apple-darwin.tar.gz',
+  'savctl-x86_64-apple-darwin.tar.gz',
+  'savctl-x86_64-pc-windows-msvc.zip'
 ];
 
 /** Heading levels in document order, so a skip (h1 → h3) is visible as a jump of two. */
@@ -102,7 +102,7 @@ describe('the CLI page', () => {
       Array.from(container.querySelectorAll('a')).find((a) => a.textContent?.includes(text));
     expect(link('SHA256SUMS')?.getAttribute('href')).toBe(`${LATEST}/download/SHA256SUMS`);
     expect(link('All releases')?.getAttribute('href')).toBe(LATEST);
-    expect(link('ottoctl.md')?.getAttribute('href')).toBe(DOCS);
+    expect(link('savctl.md')?.getAttribute('href')).toBe(DOCS);
 
     unmount(instance);
   });
@@ -113,15 +113,15 @@ describe('the CLI page', () => {
 
     const unix = all.find((s) => s.includes('shasum -a 256 -c'));
     expect(unix).toContain(`base=${LATEST}/download`);
-    expect(unix).toContain('curl -fsSLO "$base/ottoctl-$target.tar.gz"');
+    expect(unix).toContain('curl -fsSLO "$base/savctl-$target.tar.gz"');
     expect(unix).toContain(
-      'install -m 0755 "ottoctl-$target/ottoctl" "ottoctl-$target/otto-flags" ~/.local/bin/'
+      'install -m 0755 "savctl-$target/savctl" "savctl-$target/savctl-flags" ~/.local/bin/'
     );
 
     const windows = all.find((s) => s.includes('Invoke-WebRequest'));
     expect(windows).toContain(`$base = "${LATEST}/download"`);
-    expect(windows).toContain('ottoctl-x86_64-pc-windows-msvc.zip');
-    expect(windows).toContain('Get-FileHash ottoctl.zip -Algorithm SHA256');
+    expect(windows).toContain('savctl-x86_64-pc-windows-msvc.zip');
+    expect(windows).toContain('Get-FileHash savctl.zip -Algorithm SHA256');
 
     expect(all).toContain(
       'cargo install --locked --git https://github.com/savvagent/otto-platform ottoctl otto-flags-cli'
@@ -133,7 +133,7 @@ describe('the CLI page', () => {
   it('says the binaries are unsigned, with the macOS and Windows workarounds', () => {
     const instance = mountPage();
 
-    expect(snippets()).toContain('xattr -d com.apple.quarantine ottoctl');
+    expect(snippets()).toContain('xattr -d com.apple.quarantine savctl');
     expect(container.textContent).toContain('SmartScreen');
     expect(container.textContent).toContain('Run anyway');
 
@@ -144,9 +144,10 @@ describe('the CLI page', () => {
     const instance = mountPage();
     const all = snippets();
 
-    expect(all).toContain('ottoctl login --resource <service MCP URL>');
+    expect(all).toContain('savctl login');
+    expect(all.some((s) => s.includes('<service MCP URL>'))).toBe(false);
     for (const service of SERVICES) {
-      if (service.mcpUrl) expect(all).toContain(`ottoctl login --resource ${service.mcpUrl}`);
+      if (service.mcpUrl) expect(all).toContain(`savctl login --resource ${service.mcpUrl}`);
     }
 
     unmount(instance);

@@ -24,7 +24,7 @@ import type { Locale } from '$lib/locale';
  * at build time, and a preview deploy should still point crawlers at the real
  * site rather than at itself.
  */
-export const SITE_ORIGIN = 'https://otto.savvagent.com';
+export const SITE_ORIGIN = 'https://savvagent.com';
 
 /** Where sales questions go. Shown on the marketing pages, never in the console. */
 export const CONTACT_EMAIL = 'sales@savvagent.com';

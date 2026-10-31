@@ -1,14 +1,14 @@
 /**
- * The Otto products: linked from the console's header, and described on the
- * public marketing pages.
+ * The Savvagent products: linked from the console's header, and described on
+ * the public marketing pages.
  *
- * Otto is split across hostnames: this console owns the account and the
+ * Savvagent is split across hostnames: this console owns the account and the
  * organization (sign-in, passkeys, members, teams, SSO, usage, audit), and each
  * product is a service on its own host that signs in here with OAuth.
  *
- * **Not every service has a web console.** Otto Tower serves one, which links
- * back to this console, so a person never has to know a hostname. Otto Flags
- * and Otto CXP are agent-only: their origin answers a browser with a JSON 404,
+ * **Not every service has a web console.** Savvagent Tower serves one, which
+ * links back to this console, so a person never has to know a hostname.
+ * Savvagent Flags and Savvagent CXP are agent-only: their origin answers a browser with a JSON 404,
  * and the place a person uses them is their AI assistant, with the service
  * added as a custom connector. So the field is `consoleUrl`, and optional, and
  * a link to a service goes through `serviceLink`, which sends a service with no
@@ -67,7 +67,7 @@ export interface Service {
   name: string;
   /**
    * The origin of the service's own web console, with no trailing slash, e.g.
-   * `https://otto-tower.savvagent.com` — or absent for a service that has
+   * `https://tower.savvagent.com` — or absent for a service that has
    * none. Absent is not "unknown": it is what makes every link to the service
    * point at its connect card, so set it only for an origin that answers a
    * browser with a page. An external origin, so a link to it is a full
@@ -77,6 +77,13 @@ export interface Service {
   /**
    * The MCP endpoint an agent is pointed at, if the service has one: the
    * "connector address" a person pastes into their assistant.
+   *
+   * **This is the service's OAuth resource URI, not just a link.** An MCP
+   * client signs in for exactly this URL (RFC 8707 `resource`), and the
+   * service's protected-resource metadata must name the same one. The services
+   * still serve their pre-rebrand resource URIs, so these stay on the old hosts
+   * until each service switches in rebrand phase 3 (#135); the web console
+   * link (`consoleUrl`) is only a link, so it is already on the new host.
    */
   mcpUrl?: string;
   copy: ServiceCopy;
@@ -85,8 +92,8 @@ export interface Service {
 const CONFIGURED: readonly Service[] = [
   {
     slug: 'tower',
-    name: 'Otto Tower',
-    consoleUrl: 'https://otto-tower.savvagent.com',
+    name: 'Savvagent Tower',
+    consoleUrl: 'https://tower.savvagent.com',
     // `OF_RESOURCE_URI` in the service's `fly.toml`: the MCP endpoint is
     // `/mcp` on the service's own origin.
     mcpUrl: 'https://otto-tower.savvagent.com/mcp',
@@ -106,7 +113,7 @@ const CONFIGURED: readonly Service[] = [
   },
   {
     slug: 'flags',
-    name: 'Otto Flags',
+    name: 'Savvagent Flags',
     // No `consoleUrl`: the origin serves the API and `/mcp`, not a page.
     mcpUrl: 'https://otto-flags.savvagent.com/mcp',
     copy: {
@@ -125,7 +132,7 @@ const CONFIGURED: readonly Service[] = [
   },
   {
     slug: 'cxp',
-    name: 'Otto CXP',
+    name: 'Savvagent CXP',
     // No `consoleUrl`: the origin serves the API and `/mcp`, not a page.
     mcpUrl: 'https://otto-cxp.savvagent.com/mcp',
     copy: {
@@ -200,8 +207,13 @@ export function serviceLink(service: Service, lang: Locale): ServiceDestination 
 
 /**
  * The name an MCP client knows the service by: `otto-{slug}`, which is also
- * the first label of its host and the name each service's own docs use, so a
- * person who follows both ends up with one server rather than two.
+ * the first label of its MCP host, the name each service's own docs use, so a
+ * person who follows both ends up with one server rather than two, and the
+ * service slug its usage is billed under (`serviceName` matches on it).
+ *
+ * It keeps the old prefix for now: billing slugs are never renamed, and the
+ * MCP server names change with each service's resource URI in rebrand phase 3
+ * (#135). See `docs/rebrand-allowlist.md`.
  */
 export function connectorName(service: Service): string {
   return `otto-${service.slug}`;

@@ -167,12 +167,12 @@
       <form class="flex flex-wrap items-end gap-3" onsubmit={invite}>
         <div class="min-w-56 flex-1">
           <Field label={m.members_field_email()}>
-            <input class="otto-input" type="email" required bind:value={inviteEmail} />
+            <input class="sav-input" type="email" required bind:value={inviteEmail} />
           </Field>
         </div>
         <div class="w-36">
           <Field label={m.members_field_role()}>
-            <select class="otto-input" bind:value={inviteRole}>
+            <select class="sav-input" bind:value={inviteRole}>
               <option value="member">{m.members_role_member()}</option>
               <option value="admin">{m.members_role_admin()}</option>
               {#if org.isOwner}<option value="owner">{m.members_role_owner()}</option>{/if}
@@ -229,7 +229,7 @@
 
             {#if org.isAdmin}
               <select
-                class="otto-input w-28"
+                class="sav-input w-28"
                 value={member.role}
                 disabled={busy === member.id}
                 onchange={(e) =>

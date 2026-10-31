@@ -111,7 +111,7 @@
         <Card title={serviceName(service.service)}>
           <div class="space-y-4">
             <div>
-              <div class="otto-label">{m.usage_spend_label()}</div>
+              <div class="sav-label">{m.usage_spend_label()}</div>
               <Meter usage={service} />
               {#if service.spendError}
                 <p class="mt-1 text-xs text-faint">{m.usage_spend_unavailable_hint()}</p>

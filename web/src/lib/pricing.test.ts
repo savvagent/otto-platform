@@ -208,9 +208,9 @@ describe('usageByService', () => {
     const cxp = meter({ service: 'otto-cxp', meter: 'tickets', displayName: 'Tickets' });
     const groups = usageByService([cxp, flags]);
     expect(groups.map((g) => [g.service, g.name, g.meters])).toEqual([
-      ['otto-tower', 'Otto Tower', []],
-      ['otto-flags', 'Otto Flags', [flags]],
-      ['otto-cxp', 'Otto CXP', [cxp]]
+      ['otto-tower', 'Savvagent Tower', []],
+      ['otto-flags', 'Savvagent Flags', [flags]],
+      ['otto-cxp', 'Savvagent CXP', [cxp]]
     ]);
   });
 
@@ -226,7 +226,7 @@ describe('usageByService', () => {
 describe('featureLabels', () => {
   it('names a known feature that is on, in the current language', () => {
     const labels = featureLabels({ auto_rollback: true });
-    expect(labels.map((label) => label())).toEqual(['Automatic rollback in Otto Flags']);
+    expect(labels.map((label) => label())).toEqual(['Automatic rollback in Savvagent Flags']);
 
     overwriteGetLocale(() => 'es');
     expect(labels[0]?.()).toBe(m.pricing_feature_auto_rollback({}, { locale: 'es' }));

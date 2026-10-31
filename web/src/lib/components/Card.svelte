@@ -11,7 +11,7 @@
   let { title, description, actions, children }: Props = $props();
 </script>
 
-<section class="otto-card">
+<section class="sav-card">
   {#if title || actions}
     <header class="flex items-start justify-between gap-4 border-b border-edge/60 px-4 py-3">
       <div>

@@ -4,12 +4,12 @@
   import { serviceLink, type Service } from '$lib/services';
 
   /**
-   * A link to an Otto service from inside the console: the header's Services
+   * A link to a Savvagent service from inside the console: the header's Services
    * nav, and the org home's Services card.
    *
    * **Where it goes is `serviceLink`'s call, not this component's.** A service
    * with a web console is a plain external link to it, as it always was. One
-   * without — Otto Flags, Otto CXP — has nothing at its origin but a JSON 404,
+   * without — Savvagent Flags, Savvagent CXP — has nothing at its origin but a JSON 404,
    * so the link goes to its product page's connect card instead, which says
    * how to add it to an AI assistant.
    *
@@ -21,7 +21,7 @@
    * console in Spanish lands on the Spanish page.
    *
    * **The difference shows before the click.** A connector gets a small
-   * "Connector" badge, and an accessible name ("Otto CXP, connector") that
+   * "Connector" badge, and an accessible name ("Savvagent CXP, connector") that
    * reads as a phrase rather than the two words run together; the badge is
    * hidden from assistive technology, which already hears it in the name.
    * The name starts with the visible text, so a voice-control user can say

@@ -353,12 +353,12 @@ const GENERIC_REFUSAL: &str = "This sign-in link is invalid, expired, or has alr
 const NOT_EMAIL_VERIFIED: &str = "Your identity provider did not confirm your email address. \
      Contact your organization's sign-in support.";
 const EMAIL_MISMATCH: &str = "The identity provider account you used does not match the email \
-     address on this otto account. Sign in with the identity provider account that \
+     address on this Savvagent account. Sign in with the identity provider account that \
      matches, or update your account's email first.";
 const EMAIL_COLLISION: &str = "An account already exists for this email address. Sign in with \
      your existing credentials, then link single sign-on from account settings.";
 const IDENTITY_LINKED_ELSEWHERE: &str = "That identity provider account is already linked to a \
-     different otto account.";
+     different Savvagent account.";
 const ACCOUNT_DISABLED: &str = "This account has been disabled. Contact your organization's \
      admin.";
 

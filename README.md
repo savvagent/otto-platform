@@ -1,38 +1,38 @@
-# otto-platform
+# Savvagent platform
 
-The shared identity/auth/billing/tenant-isolation substrate for the otto-*
-family of agent-facing MCP servers (otto-tower, otto-flags, and future
-otto-* services).
+The shared identity/auth/billing/tenant-isolation substrate for Savvagent's
+agent-facing MCP servers (Savvagent Tower, Savvagent Flags, Savvagent CXP, and
+future Savvagent services).
 
-## Relationship to otto-factory, otto-flags, and the design doc
+## Relationship to the services and the design doc
 
-otto-factory's `of-core`/`of-auth` crates originally mixed generic identity,
-auth, and billing infrastructure together with otto-factory-specific domain
-code (jobs, repos, leases, trackers, messages). This repository is the
-extraction of just the generic substrate, so that a second product,
-otto-flags, and any future otto-* service can share one identity/org/billing/
-auth backend instead of each reimplementing it.
+The first service's (then otto-factory's) `of-core`/`of-auth` crates
+originally mixed generic identity, auth, and billing infrastructure together
+with its own domain code (jobs, repos, leases, trackers, messages). This
+repository is the extraction of just the generic substrate, so that a second
+product, Savvagent Flags, and any future Savvagent service can share one
+identity/org/billing/auth backend instead of each reimplementing it.
 
-See otto-flags' design doc, `docs/specs/2026-09-15-otto-flags-design.md` §2–§5
+See the Flags design doc, `docs/specs/2026-09-15-otto-flags-design.md` §2–§5
 (in the otto-flags repo), and its `VISION.md`, for the full rationale. In
 short:
 
 - One physical **identity database** (this repo's Postgres) holds `orgs`,
   `users`, `org_members`, auth, and billing. It is the single source of truth
   for "who is this org" and "what can they do."
-- Each otto-* service keeps its **own domain database** (otto-tower's
-  jobs/repos/leases; otto-flags' flags/environments/targeting). They share no
+- Each Savvagent service keeps its **own domain database** (Tower's
+  jobs/repos/leases; Flags' flags/environments/targeting). They share no
   tables, only the same `org_id` UUID namespace — no cross-database foreign
   keys, application-level referential integrity only.
 - Tokens are minted by this repo's auth layer and audience-bound per service
-  (RFC 8707 resource indicators). A token minted for one otto-* service
+  (RFC 8707 resource indicators). A token minted for one Savvagent service
   cannot be replayed against another.
 
-It is deployed at `https://otto.savvagent.com`. otto-tower is its first
+It is deployed at `https://savvagent.com`. Savvagent Tower is its first
 resource server: it depends on `otto-tenant` and `otto-resource` from this repo,
 validates bearer tokens through introspection, and its console signs in here
-with OAuth. otto-flags is meant to be the second, needing nothing from the
-platform beyond registering itself.
+with OAuth. Savvagent Flags is the second, needing nothing from the platform
+beyond registering itself.
 
 `otto-platform-server` serves the identity HTTP surface — the OAuth 2.1
 authorization server, sign-in (passkeys and enterprise SSO), and the
@@ -102,7 +102,7 @@ crates/
 │                         `savctl <app> ...` runs `savctl-<app>` from PATH. See
 │                         [docs/savctl.md](docs/savctl.md).
 ├── otto-flags-cli/       binary `savctl-flags`, run as `savctl flags`: issue an
-│                         Otto Flags app's keys so the secret server key goes
+│                         Savvagent Flags app's keys so the secret server key goes
 │                         to a terminal or an owner-only file, not a model.
 └── otto-platform-server/ binary: loads config, connects, runs migrations,
                           verifies tenant isolation, then serves /healthz,
@@ -166,7 +166,7 @@ Stripe secrets):
 | `SAVVAGENT_RUN_MIGRATIONS` | `1` | Apply migrations at startup. |
 | `SAVVAGENT_LOG_FORMAT` | `text` | `json` for structured logs. |
 | `SAVVAGENT_SMTP_URL` | unset | Secret. SMTP server for notification email, credentials in the URL: `smtps://user:pass@host:465` or `smtp://user:pass@host:587?tls=required` (plain `smtp://` only to a loopback host). Set together with `SAVVAGENT_EMAIL_FROM`; exactly one of the two refuses to start. With neither, email is disabled (logged at boot) and messages stay queued in `notification_outbox`. |
-| `SAVVAGENT_EMAIL_FROM` | unset | Secret. The `From:` mailbox for notification email, e.g. `otto <alerts@savvagent.com>`. Set together with `SAVVAGENT_SMTP_URL`. |
+| `SAVVAGENT_EMAIL_FROM` | unset | Secret. The `From:` mailbox for notification email, e.g. `Savvagent <alerts@savvagent.com>`. Set together with `SAVVAGENT_SMTP_URL`. |
 | `STRIPE_SECRET_KEY` | unset | Secret. Billing's Stripe API key (`sk_...`, or a restricted `rk_...`), live or test mode (`..._live_...` / `..._test_...`); the first boot records its mode in the database and a key of the other mode refuses to start. Set together with `STRIPE_WEBHOOK_SECRET`; exactly one of the two refuses to start. With neither, billing is disabled (logged at boot): `GET /api/orgs/{org}/billing` reports `billingEnabled: false`, and `POST /api/orgs/{org}/billing/setup` and `POST /api/stripe/webhook` answer `503 billing_disabled`. |
 | `STRIPE_WEBHOOK_SECRET` | unset | Secret. The Stripe webhook endpoint's signing secret (`whsec_...`). Set together with `STRIPE_SECRET_KEY`. |
 

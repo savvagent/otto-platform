@@ -182,7 +182,7 @@ describe('the pricing page', () => {
     // It sits outside the busy region, which would otherwise mute it.
     expect(status().textContent?.trim()).toBe('Loading plans');
     expect(status().closest('[aria-busy]')).toBeNull();
-    const skeletons = region().querySelectorAll('.otto-card');
+    const skeletons = region().querySelectorAll('.sav-card');
     expect(skeletons).toHaveLength(4);
     expect(skeletons[0]?.closest('[aria-hidden="true"]')).not.toBeNull();
     expect(plans).toHaveBeenCalledTimes(1);
@@ -205,13 +205,13 @@ describe('the pricing page', () => {
     expect(free.querySelector('p')?.textContent?.trim()).toBe('Free');
     expect(free.textContent).not.toContain('$0');
     expect(free.textContent).toContain('Usage is billed separately, per service');
-    expect(free.textContent).not.toContain('Automatic rollback in Otto Flags');
+    expect(free.textContent).not.toContain('Automatic rollback in Savvagent Flags');
     expect(free.querySelector('a[href="/signup"]')?.textContent?.trim()).toBe('Create account');
 
     const team = card('Team');
     expect(team.textContent).toContain('$29');
     expect(team.textContent).toContain('Usage is billed separately, per service');
-    expect(team.textContent).toContain('Automatic rollback in Otto Flags');
+    expect(team.textContent).toContain('Automatic rollback in Savvagent Flags');
     expect(team.querySelector('a[href="/signup"]')).not.toBeNull();
 
     const business = card('Business');
@@ -257,7 +257,7 @@ describe('the pricing page', () => {
     const services = Array.from(usageRegion().querySelectorAll('h3')).map((h) =>
       h.textContent?.trim()
     );
-    expect(services).toEqual(['Otto Tower', 'Otto Flags', 'Otto CXP']);
+    expect(services).toEqual(['Savvagent Tower', 'Savvagent Flags', 'Savvagent CXP']);
 
     // Exact prices from millionths of a cent; the first unit of each tier is
     // the one after the tier before.
@@ -271,14 +271,14 @@ describe('the pricing page', () => {
       ['1,001 and above', '$0.00000007']
     ]);
 
-    const flags = card('Otto Flags');
+    const flags = card('Savvagent Flags');
     expect(flags.textContent).toContain('Billed per evaluation');
     expect(flags.textContent).toContain('First 1,000 units free every month');
     // No free first tier, so no "free" claim.
-    expect(card('Otto Tower').textContent).not.toContain('free every month');
+    expect(card('Savvagent Tower').textContent).not.toContain('free every month');
     // A service with nothing priced says so, rather than vanishing or reading as free.
-    expect(card('Otto CXP').textContent).toContain('No usage price published yet.');
-    expect(card('Otto CXP').querySelector('table')).toBeNull();
+    expect(card('Savvagent CXP').textContent).toContain('No usage price published yet.');
+    expect(card('Savvagent CXP').querySelector('table')).toBeNull();
 
     const headers = Array.from(usageRegion().querySelectorAll('th[scope="col"]')).map((th) =>
       th.textContent?.trim()
@@ -432,7 +432,7 @@ describe('the pricing page', () => {
     expect(card('Team').textContent).toContain('$29');
     expect(usageRegion().querySelectorAll('table')).toHaveLength(1);
     expect(meterRows('Jobs completed')).toHaveLength(3);
-    expect(card('Otto Flags').textContent).toContain('No usage price published yet.');
+    expect(card('Savvagent Flags').textContent).toContain('No usage price published yet.');
     expect(consoleError).toHaveBeenCalledOnce();
     expect((consoleError.mock.calls[0]?.[1] as Error).message).toContain(
       'meters[1].tiers[0].unitAmountUcents'
@@ -449,8 +449,8 @@ describe('the pricing page', () => {
     const instance = mountPage();
     await settle();
 
-    expect(card('Otto Flags').querySelectorAll('table')).toHaveLength(1);
-    expect(card('Otto Flags').textContent).not.toContain('(copy)');
+    expect(card('Savvagent Flags').querySelectorAll('table')).toHaveLength(1);
+    expect(card('Savvagent Flags').textContent).not.toContain('(copy)');
     expect(consoleError).toHaveBeenCalledOnce();
 
     unmount(instance);
@@ -475,7 +475,7 @@ describe('the pricing page', () => {
 
     const team = card('Team');
     expect(team.textContent).toContain('$29');
-    expect(team.textContent).not.toContain('Automatic rollback in Otto Flags');
+    expect(team.textContent).not.toContain('Automatic rollback in Savvagent Flags');
     expect(consoleError).not.toHaveBeenCalled();
 
     unmount(instance);
@@ -536,7 +536,7 @@ describe('the pricing page', () => {
     expect(team.textContent).toMatch(/29\sUS\$/);
     expect(team.textContent).not.toContain('€');
     expect(team.textContent).toContain('El uso se factura aparte, por servicio');
-    expect(team.textContent).toContain('Reversión automática en Otto Flags');
+    expect(team.textContent).toContain('Reversión automática en Savvagent Flags');
     expect(card('Enterprise').textContent).toContain('Contáctanos');
 
     expect(meterRows('Jobs completed')).toEqual([
@@ -545,7 +545,7 @@ describe('the pricing page', () => {
       ['1.000.001 en adelante', expect.stringMatching(/^0,001\sUS\$$/)]
     ]);
     expect(meterRows('Flag evaluations')[0]).toEqual(['Hasta 1000', 'Gratis']);
-    expect(card('Otto Flags').textContent).toContain('Las primeras 1000 unidades gratis cada mes');
+    expect(card('Savvagent Flags').textContent).toContain('Las primeras 1000 unidades gratis cada mes');
     expect(usageRegion().textContent).not.toContain('€');
     expect(card('Free').querySelector('p')?.textContent?.trim()).toBe('Gratis');
 

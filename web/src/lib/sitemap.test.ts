@@ -25,23 +25,23 @@ describe('sitemapXml', () => {
 
   it('has one <url> per page per locale', () => {
     expect(xml.match(/<url>/g)).toHaveLength(2 * 6);
-    expect(xml).toContain('<loc>https://otto.savvagent.com/</loc>');
-    expect(xml).toContain('<loc>https://otto.savvagent.com/es</loc>');
-    expect(xml).toContain('<loc>https://otto.savvagent.com/hi/pricing</loc>');
+    expect(xml).toContain('<loc>https://savvagent.com/</loc>');
+    expect(xml).toContain('<loc>https://savvagent.com/es</loc>');
+    expect(xml).toContain('<loc>https://savvagent.com/hi/pricing</loc>');
   });
 
   it('lists every alternate, plus x-default, under each <url>', () => {
     const entry = xml.split('<url>')[1] ?? '';
     expect(entry.match(/<xhtml:link /g)).toHaveLength(7);
     expect(entry).toContain(
-      '<xhtml:link rel="alternate" hreflang="x-default" href="https://otto.savvagent.com/"/>'
+      '<xhtml:link rel="alternate" hreflang="x-default" href="https://savvagent.com/"/>'
     );
     expect(entry).toContain(
-      '<xhtml:link rel="alternate" hreflang="fr" href="https://otto.savvagent.com/fr"/>'
+      '<xhtml:link rel="alternate" hreflang="fr" href="https://savvagent.com/fr"/>'
     );
   });
 
   it('escapes what XML cannot carry verbatim', () => {
-    expect(sitemapXml(['/a&b'])).toContain('<loc>https://otto.savvagent.com/a&amp;b</loc>');
+    expect(sitemapXml(['/a&b'])).toContain('<loc>https://savvagent.com/a&amp;b</loc>');
   });
 });

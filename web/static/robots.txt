@@ -20,4 +20,4 @@ Disallow: /oauth/
 Disallow: /sso/
 Disallow: /internal/
 
-Sitemap: https://otto.savvagent.com/sitemap.xml
+Sitemap: https://savvagent.com/sitemap.xml

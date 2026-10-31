@@ -125,12 +125,12 @@
       <form class="flex flex-wrap items-end gap-3" onsubmit={create}>
         <div class="w-44">
           <Field label={m.teams_field_slug()}>
-            <input class="otto-input otto-mono" required bind:value={slug} />
+            <input class="sav-input sav-mono" required bind:value={slug} />
           </Field>
         </div>
         <div class="min-w-48 flex-1">
           <Field label={m.teams_field_name()} hint={m.teams_field_name_hint()}>
-            <input class="otto-input" bind:value={name} />
+            <input class="sav-input" bind:value={name} />
           </Field>
         </div>
         <div class="pb-0.5">
@@ -150,10 +150,10 @@
   {:else}
     <ul class="space-y-2">
       {#each teams as team (team.id)}
-        <li class="otto-card">
+        <li class="sav-card">
           <div class="flex flex-wrap items-center gap-3 px-4 py-3">
             <div class="min-w-0 flex-1">
-              <span class="otto-mono text-sm text-ink">{team.slug}</span>
+              <span class="sav-mono text-sm text-ink">{team.slug}</span>
               <p class="text-xs text-faint">{team.name}</p>
             </div>
 
@@ -213,7 +213,7 @@
                 <label class="flex items-end gap-2">
                   <span class="sr-only">{m.teams_add_member_label({ team: team.slug })}</span>
                   <select
-                    class="otto-input w-64"
+                    class="sav-input w-64"
                     value=""
                     onchange={(e) => {
                       const user = e.currentTarget.value;

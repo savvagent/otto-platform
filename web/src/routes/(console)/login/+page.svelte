@@ -167,7 +167,7 @@
       <form class="mt-3 space-y-3" onsubmit={signInWithSso}>
         <Field label={m.login_sso_email_label()}>
           <input
-            class="otto-input"
+            class="sav-input"
             type="email"
             required
             autocomplete="email"

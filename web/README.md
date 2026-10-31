@@ -1,8 +1,8 @@
-# `web/` — the Otto platform console and public site
+# `web/` — the Savvagent platform console and public site
 
 SvelteKit 2 · Svelte 5 (runes) · Tailwind v4 · TypeScript, strict.
 
-One static bundle, two things in it. The **public marketing pages**: what Otto is, a page
+One static bundle, two things in it. The **public marketing pages**: what Savvagent is, a page
 per product, and pricing read live from the plan catalog, in every language the console
 speaks. And the **account and organization console**: signing in with a passkey (or
 enterprise SSO), creating an account, managing passkeys and sessions, reviewing the
@@ -12,8 +12,8 @@ the usage meter and the audit log. Both talk to `otto-platform-server`'s API
 
 What it does **not** hold is any product's own domain: queues, repositories, trackers and
 agent connection live in each service, which signs in here with OAuth, and are used through
-its own web console (Otto Tower's, for one) or, for an agent-only service such as Otto Flags
-or Otto CXP, through the person's AI assistant. The products are a small list in
+its own web console (Savvagent Tower's, for one) or, for an agent-only service such as Savvagent Flags
+or Savvagent CXP, through the person's AI assistant. The products are a small list in
 [`src/lib/services.ts`](src/lib/services.ts), which the console header links from and the
 marketing pages describe; see "Adding a product" below.
 
@@ -93,10 +93,10 @@ The public pages, prerendered, `index, follow`:
 
 | Route              | What                                                                                                |
 | ------------------ | --------------------------------------------------------------------------------------------------- |
-| `/`                | Landing: what Otto is, the products, the way into the console.                                      |
+| `/`                | Landing: what Savvagent is, the products, the way into the console.                                      |
 | `/products/[slug]` | One per product in `services.ts`, with its own title and description.                               |
 | `/pricing`         | How plans and usage work, prerendered; the plans themselves fetched live from `GET /api/plans`.     |
-| `/cli`             | The `ottoctl` command-line tool: downloads, install and first-use commands, link to its docs.       |
+| `/cli`             | The `savctl` command-line tool: downloads, install and first-use commands, link to its docs.       |
 | `/{lang}/…`        | Each of the above in `es`, `de`, `fr`, `it` and `hi` (`/es`, `/es/pricing`). English is unprefixed. |
 | `/sitemap.xml`     | Every page in every language, with its alternates. Built from `src/lib/sitemap.ts`.                 |
 | `/robots.txt`      | `static/robots.txt`: disallows the console, API and OAuth paths, and points at the sitemap.         |

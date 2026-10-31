@@ -149,9 +149,9 @@
     <div class="mx-auto flex w-full max-w-6xl items-center gap-4 px-4 py-3">
       <!-- `/home`, not `/`: inside the console the logo means "my org", and `/`
            is the public marketing page. -->
-      <a href="/home" class="flex items-center gap-2" aria-label="Otto">
+      <a href="/home" class="flex items-center gap-2" aria-label="Savvagent">
         <Logo class="size-6 text-accent" />
-        <span class="text-sm font-semibold tracking-tight text-ink">Otto</span>
+        <span class="text-sm font-semibold tracking-tight text-ink">Savvagent</span>
       </a>
 
       {#if session.signedIn}
@@ -178,14 +178,14 @@
 
       <div class="ml-auto flex items-center gap-3 text-sm">
         <!--
-          The Otto services. One with a web console is a plain external link:
+          The Savvagent services. One with a web console is a plain external link:
           each is its own origin with its own session, so following one is a
           full navigation. One without goes to its product page's connect card,
           badged as a connector; `ServiceLink` says why.
         -->
         {#if SERVICES.length > 0}
           <nav class="hidden items-center gap-1 sm:flex" aria-label={m.nav_services()}>
-            <span class="otto-label">{m.nav_services()}</span>
+            <span class="sav-label">{m.nav_services()}</span>
             {#each SERVICES as service (service.slug)}
               <ServiceLink {service} variant="nav" />
             {/each}
