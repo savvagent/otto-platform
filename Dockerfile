@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# otto-platform-server image, with the console bundle baked in for self-hosters.
+# savvagent-platform-server image, with the console bundle baked in for self-hosters.
 #
 # The bundle lives at /srv/console; the server serves it when SAVVAGENT_STATIC_DIR
 # points there (fly.toml does). An optional Cloudflare Worker (web/worker,
@@ -23,7 +23,7 @@ RUN npm run build
 # ---------------------------------------------------------------- server
 FROM rust:1-slim-bookworm AS build
 
-# webauthn-rs (otto-auth) pulls in webauthn-attestation-ca, which links
+# webauthn-rs (savvagent-auth) pulls in webauthn-attestation-ca, which links
 # openssl for attestation certificate verification. openssl-sys builds against
 # the system OpenSSL, so it needs the headers and pkg-config to find them.
 RUN apt-get update \
@@ -42,8 +42,8 @@ COPY . .
 # caches from being shared with other projects' builds on the same host.
 RUN --mount=type=cache,id=otto-platform-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=otto-platform-target,target=/app/target,sharing=locked \
-    cargo build --release -p otto-platform-server \
-    && cp target/release/otto-platform-server /usr/local/bin/otto-platform-server
+    cargo build --release -p savvagent-platform-server \
+    && cp target/release/savvagent-platform-server /usr/local/bin/savvagent-platform-server
 
 # ---------------------------------------------------------------- runtime
 FROM debian:bookworm-slim AS runtime
@@ -55,10 +55,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Nothing here writes to the filesystem or binds a privileged port.
-RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin otto
-USER otto
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin savvagent
+USER savvagent
 
-COPY --from=build   /usr/local/bin/otto-platform-server /usr/local/bin/otto-platform-server
+COPY --from=build   /usr/local/bin/savvagent-platform-server /usr/local/bin/savvagent-platform-server
 COPY --from=console /web/build                          /srv/console
 
 # SAVVAGENT_STATIC_DIR is deliberately not defaulted here: a deployment opts in (fly.toml
@@ -71,4 +71,4 @@ EXPOSE 8080
 
 # Exec form, so the process is PID 1 and receives SIGTERM directly and the
 # graceful shutdown actually runs on every deploy.
-ENTRYPOINT ["/usr/local/bin/otto-platform-server"]
+ENTRYPOINT ["/usr/local/bin/savvagent-platform-server"]

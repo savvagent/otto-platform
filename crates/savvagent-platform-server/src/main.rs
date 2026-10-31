@@ -1,0 +1,358 @@
+//! `savvagent-platform-server` — boots the shared identity/auth/billing substrate
+//! against a real Postgres, runs migrations, proves tenant isolation is
+//! actually in force, and only then starts serving HTTP.
+//!
+//! The HTTP surface is health checks, the identity API and OAuth authorization
+//! server, and the resource-server API (see `lib.rs`). The console is the rest
+//! of Phase 4 of `docs/plans/2026-10-06-platform-cutover.md`.
+//!
+//! `savvagent-platform-server resource ...`, `client ...`, `pricebook ...` and
+//! `stripe ...` are operator commands instead: they provision resource servers
+//! and OAuth clients, set what each value meter costs, or make Stripe match
+//! the price book, and exit.
+
+use std::net::SocketAddr;
+
+use anyhow::{Context, Result};
+use savvagent_platform_server::{app, Config, LogFormat};
+use savvagent_tenant::Db;
+use tokio::net::TcpListener;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Loads `.env` if there is one. `dotenvy` never overwrites a variable that
+    // is already set, so a file that accidentally ships inside an image cannot
+    // override the deployment's real configuration.
+    let dotenv = dotenvy::dotenv();
+
+    // `resource ...` provisions and exits. It needs only the database and,
+    // for a webhook secret, the key, so it runs before `Config::from_env`
+    // demands the server's whole configuration (public URL and so on). It
+    // does not migrate or verify isolation; point it at a database a server
+    // has already migrated.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("resource") {
+        return run_resource_command(&args[1..]).await;
+    }
+    if args.first().map(String::as_str) == Some("client") {
+        return run_client_command(&args[1..]).await;
+    }
+    if args.first().map(String::as_str) == Some("pricebook") {
+        return run_pricebook_command(&args[1..]).await;
+    }
+    if args.first().map(String::as_str) == Some("stripe") {
+        return run_stripe_command(&args[1..]).await;
+    }
+    if args.first().map(String::as_str) == Some("usage") {
+        return run_usage_command(&args[1..]).await;
+    }
+    if !args.is_empty() {
+        anyhow::bail!(
+            "unknown arguments {args:?}; run with none to serve, or `resource ...` / \
+             `client ...` / `pricebook ...` / `stripe ...` / `usage ...`"
+        );
+    }
+
+    let config = Config::from_env().context(
+        "configuration is incomplete. Copy .env.example to .env for local runs, \
+         or set the variables named above in the deployment",
+    )?;
+
+    init_tracing(config.log_format)?;
+    match dotenv {
+        Ok(path) => tracing::debug!(path = %path.display(), "loaded .env"),
+        Err(_) => tracing::debug!("no .env file; using the process environment"),
+    }
+
+    // Validate the key before anything else can be built with it, so a bad one
+    // is a startup error naming the variable rather than a failure the first
+    // time something needs to encrypt a secret hours later. `app` checks it
+    // again, which is cheap and keeps it from relying on this call.
+    let cipher = savvagent_tenant::crypto::Cipher::from_base64_key(&config.encryption_key)
+        .context("SAVVAGENT_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
+
+    let db = Db::connect(&config.database_url)
+        .await
+        .context("could not connect to DATABASE_URL")?;
+
+    if config.run_migrations {
+        // sqlx holds a Postgres advisory lock for the whole run, so several
+        // replicas starting together is safe: the losers block until the
+        // winner is done rather than racing each other through the same DDL.
+        tracing::info!("applying migrations");
+        db.migrate().await.context("migrations failed")?;
+    } else {
+        tracing::warn!("SAVVAGENT_RUN_MIGRATIONS is off; assuming the schema is already current");
+    }
+
+    // Prove tenant isolation before doing anything else, never after.
+    // Row-level security is the one guard the *environment* can switch off —
+    // the same migrations isolate perfectly under one database role and not
+    // at all under another, and no amount of reading this repository tells
+    // you which one a deployment connects as. Discovering that from a
+    // customer is not a recoverable failure, so it is a startup error naming
+    // the remediation.
+    let isolation = db
+        .verify_tenant_isolation()
+        .await
+        .context("refusing to serve: tenant isolation is not enforced by this database")?;
+    tracing::info!("{}", isolation.summary());
+
+    // A live key against test-mode records (or the reverse) would bill
+    // nobody correctly: refuse to start, saying how to switch on purpose.
+    savvagent_platform_server::verify_stripe_mode(&db, &config).await?;
+
+    let router = app(db.clone(), &config)?;
+
+    // Lifecycle webhooks: the same key that seals IdP secrets seals each
+    // resource server's signing secret.
+    let (stop_tasks, stop_rx) = tokio::sync::watch::channel(false);
+    let webhook_task = tokio::spawn(savvagent_platform_server::webhooks::run(
+        db.clone(),
+        cipher,
+        stop_rx.clone(),
+    ));
+
+    // Notification email, only when SMTP is configured. Without it rows wait
+    // in the outbox; saying so here is the difference between "email is off"
+    // and "email is broken" for whoever reads the boot log.
+    let email_task = match &config.email {
+        Some(email) => {
+            let mailer = savvagent_platform_server::email::SmtpMailer::new(email)?;
+            tracing::info!("notification email enabled");
+            Some(tokio::spawn(savvagent_platform_server::email::run(
+                db.clone(),
+                mailer,
+                stop_rx.clone(),
+            )))
+        }
+        None => {
+            tracing::warn!(
+                "notification email disabled: SAVVAGENT_SMTP_URL and SAVVAGENT_EMAIL_FROM are not set; \
+                 messages stay queued in notification_outbox until both are"
+            );
+            None
+        }
+    };
+
+    // Billing, only when both Stripe secrets are set (`Config` refuses one
+    // without the other). Off is a supported state, not a fault: production
+    // boots and serves without it. On, every machine runs the sync loop (a
+    // lease in the database lets one of them sync at a time) and the meter
+    // event shipper (leased row claims let them share the outbox).
+    let stripe = savvagent_platform_server::stripe(&config)?;
+    let shipper_task = savvagent_platform_server::stripe_shipper::spawn(
+        db.clone(),
+        stripe.as_ref(),
+        stop_rx.clone(),
+    );
+    let stripe_task = match stripe {
+        Some(stripe) => {
+            tracing::info!("billing enabled: Stripe is configured");
+            Some(tokio::spawn(
+                savvagent_platform_server::stripe_cmd::run_loop(
+                    db.clone(),
+                    stripe.client,
+                    stop_rx.clone(),
+                ),
+            ))
+        }
+        None => None,
+    };
+    if config.stripe.is_none() {
+        tracing::warn!(
+            "billing disabled: STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET are not set; no card \
+             can be put on file and the Stripe webhook answers 503 billing_disabled"
+        );
+    }
+
+    let listener = TcpListener::bind(config.bind)
+        .await
+        .with_context(|| format!("could not bind {}", config.bind))?;
+    tracing::info!(
+        bind = %config.bind,
+        public_url = %config.public_url,
+        enforce_quotas = config.enforce_quotas,
+        billing_enabled = config.stripe.is_some(),
+        "savvagent-platform-server ready: schema migrated, tenant isolation verified"
+    );
+
+    // `ConnectInfo` is not decoration: `savvagent_web::state::client_ip` reads the
+    // peer address out of it, and that address is what every per-IP throttle and
+    // every audit entry is keyed on. Serve without this and `client_ip` returns
+    // `None` for every request, which silently disables rate limiting on the
+    // login and registration endpoints.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("server error")?;
+    let _ = stop_tasks.send(true);
+    let _ = webhook_task.await;
+    if let Some(task) = email_task {
+        let _ = task.await;
+    }
+    if let Some(task) = stripe_task {
+        let _ = task.await;
+    }
+    if let Some(task) = shipper_task {
+        let _ = task.await;
+    }
+    tracing::info!("shut down cleanly");
+    Ok(())
+}
+
+async fn run_resource_command(args: &[String]) -> Result<()> {
+    use savvagent_platform_server::resource_cmd;
+
+    let cmd =
+        resource_cmd::parse(args).map_err(|e| anyhow::anyhow!("{e}\n\n{}", resource_cmd::USAGE))?;
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+    let db = Db::connect(&database_url)
+        .await
+        .context("could not connect to DATABASE_URL")?;
+    let cipher = match std::env::var("SAVVAGENT_ENCRYPTION_KEY") {
+        Ok(k) if !k.trim().is_empty() => Some(
+            savvagent_tenant::crypto::Cipher::from_base64_key(&k)
+                .context("SAVVAGENT_ENCRYPTION_KEY is not a valid 32-byte base64 key")?,
+        ),
+        _ => None,
+    };
+    resource_cmd::execute(&db, cipher.as_ref(), cmd, &mut std::io::stdout()).await
+}
+
+async fn run_client_command(args: &[String]) -> Result<()> {
+    use savvagent_platform_server::client_cmd;
+
+    let cmd =
+        client_cmd::parse(args).map_err(|e| anyhow::anyhow!("{e}\n\n{}", client_cmd::USAGE))?;
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+    let db = Db::connect(&database_url)
+        .await
+        .context("could not connect to DATABASE_URL")?;
+    client_cmd::execute(&db, cmd, &mut std::io::stdout()).await
+}
+
+async fn run_pricebook_command(args: &[String]) -> Result<()> {
+    use savvagent_platform_server::pricebook_cmd;
+
+    let cmd = pricebook_cmd::parse(args)
+        .map_err(|e| anyhow::anyhow!("{e}\n\n{}", pricebook_cmd::USAGE))?;
+    // `set` logs what it changed (before and after) at info; to stderr, so
+    // the command's own output on stdout stays clean.
+    init_cli_tracing()?;
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+    let db = Db::connect(&database_url)
+        .await
+        .context("could not connect to DATABASE_URL")?;
+    pricebook_cmd::execute(&db, cmd, &mut std::io::stdout()).await
+}
+
+async fn run_usage_command(args: &[String]) -> Result<()> {
+    use savvagent_platform_server::usage_cmd;
+
+    let cmd = usage_cmd::parse(args).map_err(|e| anyhow::anyhow!("{e}\n\n{}", usage_cmd::USAGE))?;
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+    let db = Db::connect(&database_url)
+        .await
+        .context("could not connect to DATABASE_URL")?;
+    usage_cmd::execute(&db, cmd, &mut std::io::stdout()).await
+}
+
+async fn run_stripe_command(args: &[String]) -> Result<()> {
+    use savvagent_platform_server::stripe_cmd;
+
+    // Reads only the outbox: no Stripe key needed.
+    if let [cmd] = args {
+        if cmd == "outbox" {
+            let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+            let db = Db::connect(&database_url)
+                .await
+                .context("could not connect to DATABASE_URL")?;
+            return savvagent_platform_server::stripe_shipper::write_counts(
+                &db,
+                &mut std::io::stdout(),
+            )
+            .await;
+        }
+    }
+    let cmd =
+        stripe_cmd::parse(args).map_err(|e| anyhow::anyhow!("{e}\n\n{}", stripe_cmd::USAGE))?;
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+    let key = savvagent_platform_server::config::stripe_key_from_env()?;
+    let db = Db::connect(&database_url)
+        .await
+        .context("could not connect to DATABASE_URL")?;
+    // The same guard as the server's boot: never sync a test-mode database
+    // with a live key, or the reverse.
+    savvagent_billing::billing::check_key_mode(&db, &key)
+        .await
+        .context("refusing to sync: the Stripe key does not fit this database")?;
+    let client =
+        savvagent_billing::stripe::Client::new(key).context("could not build the Stripe client")?;
+    stripe_cmd::execute(&db, &client, cmd, &mut std::io::stdout()).await
+}
+
+/// Resolves on SIGINT or SIGTERM.
+///
+/// `SIGTERM` is the one that matters — it is what a container runtime sends
+/// before it waits its grace period and then sends `SIGKILL`. A server that
+/// only handles `SIGINT` looks fine in a terminal and is hard-killed on every
+/// single deploy, dropping whatever was in flight.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install the SIGINT handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install the SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("SIGINT; shutting down"),
+        _ = terminate => tracing::info!("SIGTERM; shutting down"),
+    }
+}
+
+/// Text logs on stderr at `info` (or `RUST_LOG`), for an operator command.
+fn init_cli_tracing() -> Result<()> {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init()
+        .map_err(|e| anyhow::anyhow!("could not initialize tracing: {e}"))
+}
+
+fn init_tracing(format: LogFormat) -> Result<()> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let registry = tracing_subscriber::registry().with(filter);
+
+    // JSON for deployments, whose log pipeline parses fields; human-readable
+    // text for a terminal.
+    match format {
+        LogFormat::Json => registry
+            .with(tracing_subscriber::fmt::layer().json())
+            .try_init(),
+        LogFormat::Text => registry.with(tracing_subscriber::fmt::layer()).try_init(),
+    }
+    .context("could not initialize tracing")?;
+    Ok(())
+}

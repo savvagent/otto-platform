@@ -183,16 +183,16 @@ jobs:
             chore
             revert
           scopes: |
-            otto-tenant
-            otto-core
-            otto-billing
-            otto-auth
-            otto-web
-            otto-resource
-            otto-client
-            ottoctl
-            otto-flags-cli
-            otto-platform-server
+            savvagent-tenant
+            savvagent-core
+            savvagent-billing
+            savvagent-auth
+            savvagent-web
+            savvagent-resource
+            savvagent-client
+            savvagent-ctl
+            savvagent-flags-cli
+            savvagent-platform-server
             web
             docs
             ci
@@ -200,7 +200,7 @@ jobs:
           requireScope: false
           subjectPattern: ^(?![A-Z]).+$
 
-  # The `savctl` CLI (packages ottoctl and otto-flags-cli) ships for macOS and
+  # The `savctl` CLI (packages savvagent-ctl and savvagent-flags-cli) ships for macOS and
   # Windows too; the rust job covers Linux.
   # These crates have no database, so no Postgres here.
   cli:
@@ -221,10 +221,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo clippy
-        run: cargo clippy -p otto-client -p ottoctl -p otto-flags-cli --all-targets -- -D warnings
+        run: cargo clippy -p savvagent-client -p savvagent-ctl -p savvagent-flags-cli --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test -p otto-client -p ottoctl -p otto-flags-cli
+        run: cargo test -p savvagent-client -p savvagent-ctl -p savvagent-flags-cli
 
   # Whether a PR touches what goes into the CLI binaries, so cli-binaries
   # builds them on those PRs and not on every one.
@@ -243,15 +243,15 @@ jobs:
         with:
           filters: |
             cli:
-              - 'crates/ottoctl/**'
-              - 'crates/otto-client/**'
-              - 'crates/otto-flags-cli/**'
+              - 'crates/savvagent-ctl/**'
+              - 'crates/savvagent-client/**'
+              - 'crates/savvagent-flags-cli/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
 
   # Release binaries of `savctl` and the `savctl-<app>` binaries it runs (built
-  # from the ottoctl and otto-flags-cli packages), on each platform's own runner. On a PR
+  # from the savvagent-ctl and savvagent-flags-cli packages), on each platform's own runner. On a PR
   # that touches the CLI this only proves they build; on the push that
   # release-please turned into a release, cli-release attaches them. Archive
   # names carry no version, so releases/latest/download/<name> is a stable
@@ -297,7 +297,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: cargo build
-        run: cargo build --release --locked -p ottoctl -p otto-flags-cli --target "$TARGET"
+        run: cargo build --release --locked -p savvagent-ctl -p savvagent-flags-cli --target "$TARGET"
         shell: bash
 
       - name: Package

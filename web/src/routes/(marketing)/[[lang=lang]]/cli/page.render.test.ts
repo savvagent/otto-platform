@@ -124,7 +124,7 @@ describe('the CLI page', () => {
     expect(windows).toContain('Get-FileHash savctl.zip -Algorithm SHA256');
 
     expect(all).toContain(
-      'cargo install --locked --git https://github.com/savvagent/otto-platform ottoctl otto-flags-cli'
+      'cargo install --locked --git https://github.com/savvagent/otto-platform savvagent-ctl savvagent-flags-cli'
     );
 
     unmount(instance);

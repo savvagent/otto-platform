@@ -1,6 +1,6 @@
 /**
  * Server answers for the org pages' render tests, shaped exactly as
- * `otto-web` serializes them, and a `fetch` stand-in that routes by method
+ * `savvagent-web` serializes them, and a `fetch` stand-in that routes by method
  * and path.
  *
  * The usage body carries the legacy bucket fields too, as the server still

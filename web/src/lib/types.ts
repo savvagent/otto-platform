@@ -1,7 +1,7 @@
 /**
  * The console API's wire types.
  *
- * Hand-written, and mirroring `crates/otto-web/src/openapi.rs` rather than
+ * Hand-written, and mirroring `crates/savvagent-web/src/openapi.rs` rather than
  * generated from it. Generation would be the reflex; it is the wrong trade at
  * this size. A generator has to run in CI to be worth anything, and until
  * the server binds a port there is no document to fetch — so the "generated"
@@ -10,7 +10,7 @@
  * `GET /api/openapi.json` is the authority either way; this is a transcription
  * of it, and `npm run check` fails when a page reads a field not declared here.
  *
- * Every name is camelCase because every response body is: `otto-web`'s structs
+ * Every name is camelCase because every response body is: `savvagent-web`'s structs
  * carry `#[serde(rename_all = "camelCase")]`.
  */
 
@@ -64,7 +64,7 @@ export interface Me {
   passkeyCount: number;
   /**
    * What a fresh registration would file this account's credential under, as
-   * `otto_auth::passkeys::credential_names` composed it.
+   * `savvagent_auth::passkeys::credential_names` composed it.
    *
    * Handed over rather than derived here, and forwarded to
    * `signalCurrentUserDetails` **verbatim**. A second copy of the

@@ -26,7 +26,7 @@ import { WebauthnError } from './webauthn';
 /**
  * Every code this bundle has a translation for.
  *
- * Enumerated from `otto_core::Error::code()`, `otto-web`'s `auth_code()`, the two
+ * Enumerated from `savvagent_core::Error::code()`, `savvagent-web`'s `auth_code()`, the two
  * codes `api.ts` mints for itself, and `WebauthnErrorCode`. Deliberately not
  * exhaustive over what the server *could* send — see the fallback above. A code
  * missing from here is a sentence in English, not a missing sentence.
@@ -36,7 +36,7 @@ const KNOWN: Record<string, () => string> = {
   network: () => m.error_network(),
   unknown: () => m.error_unknown(),
 
-  // ---- otto-core ----
+  // ---- savvagent-core ----
   org_not_found: () => m.error_org_not_found(),
   team_not_found: () => m.error_team_not_found(),
   team_slug_taken: () => m.error_team_slug_taken(),
@@ -48,7 +48,7 @@ const KNOWN: Record<string, () => string> = {
   invalid_argument: () => m.error_invalid_argument(),
   internal_error: () => m.error_internal(),
 
-  // ---- otto-web / otto-auth ----
+  // ---- savvagent-web / savvagent-auth ----
   unauthenticated: () => m.error_unauthenticated(),
   not_found: () => m.error_not_found(),
   forbidden: () => m.error_forbidden(),

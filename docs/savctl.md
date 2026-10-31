@@ -51,20 +51,20 @@ release published.
 
 From source, with Rust 1.89 or later:
 
-    cargo install --locked --git https://github.com/savvagent/otto-platform ottoctl otto-flags-cli
+    cargo install --locked --git https://github.com/savvagent/otto-platform savvagent-ctl savvagent-flags-cli
 
-The packages keep their old names, `ottoctl` and `otto-flags-cli`, for now; they
+The packages keep their old names, `savvagent-ctl` and `savvagent-flags-cli`, for now; they
 install the `savctl` and `savctl-flags` binaries.
 
-## Upgrading from `ottoctl`
+## Upgrading from `savvagent-ctl`
 
-`savctl` replaces `ottoctl`, and `savctl-flags` replaces `otto-flags`. Nothing
+`savctl` replaces `savvagent-ctl`, and `savctl-flags` replaces `otto-flags`. Nothing
 carries over: `savctl` keeps its credentials in a new directory (see [Where
 credentials live](#where-credentials-live)), reads `SAVVAGENT_CONFIG_DIR` and
 `SAVVAGENT_FLAGS_RESOURCE` instead of `OTTO_CONFIG_DIR` and
 `OTTO_FLAGS_RESOURCE`, and runs `savctl-<app>` binaries, not `otto-<app>`.
 Tokens issued before the switch no longer work anyway, so run `savctl login`
-once. You can then delete the old `ottoctl` and `otto-flags` binaries and the
+once. You can then delete the old `savvagent-ctl` and `otto-flags` binaries and the
 old `otto` config directory.
 
 ## Sign in
@@ -106,7 +106,7 @@ If you ask for a scope the authorization server does not offer, `savctl` says
 so and lists what it does offer, instead of opening a consent page that shows
 only an error.
 
-This is the flow an MCP client uses against `otto-auth`, with nothing new on the
+This is the flow an MCP client uses against `savvagent-auth`, with nothing new on the
 server: read the resource's protected-resource metadata (RFC 9728), check the
 authorization server's metadata names the issuer it was fetched for (RFC 8414),
 register dynamically (RFC 7591, a public client), then authorization code with
@@ -140,7 +140,7 @@ are set as the entry is created.
   authorization server and, per resource, the access token, refresh token and
   expiry. It is replaced by writing a new file and renaming it into place.
 - `credentials.lock` is held while the file changes. Refresh holds it across the
-  token request: otto-auth treats a refresh token presented twice as a replay and
+  token request: savvagent-auth treats a refresh token presented twice as a replay and
   revokes every token the client holds, so two `savctl` processes must never
   refresh the same grant. A process that finds the lock taken waits up to 60
   seconds and then uses the other process's result.
@@ -161,12 +161,12 @@ looked for.
 Any `savctl-<app>` on your `PATH` runs as you and can read the credentials file,
 just as any `git-<cmd>` or `cargo-<cmd>` could. Install only ones you trust.
 
-A `savctl-<app>` binary links the `otto-client` crate:
+A `savctl-<app>` binary links the `savvagent-client` crate:
 
-    let client = otto_client::Client::with_defaults()?;
-    let token = client.token("https://flags.example/mcp").await?; // otto_client::Secret
+    let client = savvagent_client::Client::with_defaults()?;
+    let token = client.token("https://flags.example/mcp").await?; // savvagent_client::Secret
     // ... call the app with token.expose() as a bearer token ...
-    secret_from_app.deliver(&otto_client::Sink::Terminal)?;
+    secret_from_app.deliver(&savvagent_client::Sink::Terminal)?;
 
 ## Savvagent Flags keys
 
@@ -213,7 +213,7 @@ otto-flags does since savvagent/otto-flags#189):
 - The issue scope is not in the resource's default scopes, so a client gets it
   only by asking and being granted it on the consent screen.
 - The service's `savctl-<app>` binary asks for it and receives the secret through
-  `otto_client::Client::call_tool` with the field named as secret. It claims
+  `savvagent_client::Client::call_tool` with the field named as secret. It claims
   the destination with `Sink::reserve` before the call and delivers with
   `Reservation::deliver` after it.
 
@@ -226,7 +226,7 @@ Registering the scope on the platform, with plain words for the consent screen.
 `resource register` is idempotent: on an existing resource it replaces the name
 and scopes, and keeps descriptions it is not given.
 
-    otto-platform-server resource register https://otto-flags.savvagent.com/mcp \
+    savvagent-platform-server resource register https://otto-flags.savvagent.com/mcp \
       --name otto-flags \
       --scopes flags:read,flags:write,apps:admin,keys:issue \
       --default-scopes flags:read \
@@ -239,7 +239,7 @@ describe` changes only the descriptions.
 
 ## Secrets
 
-A secret an app returns should be wrapped in `otto_client::Secret`. It has no
+A secret an app returns should be wrapped in `savvagent_client::Secret`. It has no
 readable `Display` or `Debug`, and its only way out is `deliver`:
 
 - `Sink::Terminal` prints it on stdout only when stdout is a terminal. Piped or

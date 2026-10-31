@@ -4,7 +4,7 @@ import tailwindcss from '@tailwindcss/vite';
 import { defineConfig } from 'vite';
 
 /**
- * In production the console and the API are one origin: `otto-platform-server` serves
+ * In production the console and the API are one origin: `savvagent-platform-server` serves
  * the built bundle beside `/api`, `/oauth`, `/sso` and `/.well-known`, and in the
  * Cloudflare deployment a Worker does the same job (`worker/index.ts`).
  *

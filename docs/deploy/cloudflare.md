@@ -1,7 +1,7 @@
 # The console on Cloudflare (optional)
 
 > **This is not how production runs.** `savvagent.com` resolves straight to Fly and
-> `otto-platform-server` serves the console itself; see [`fly.md`](fly.md). This document
+> `savvagent-platform-server` serves the console itself; see [`fly.md`](fly.md). This document
 > describes an optional alternative: a Worker in front, for a deployment whose DNS is on
 > Cloudflare. Using it means switching `SAVVAGENT_CLIENT_IP_HEADER` to `cf-connecting-ip` and
 > unsetting `SAVVAGENT_STATIC_DIR`. Nothing in the primary path depends on it.
@@ -12,12 +12,12 @@
 > deployed before then must be redeployed with the new variable name.
 
 **One Worker serves the built bundle (the prerendered marketing pages and the console's SPA
-shell) and proxies everything dynamic to `otto-platform-server`.** The browser sees one hostname, `savvagent.com`.
+shell) and proxies everything dynamic to `savvagent-platform-server`.** The browser sees one hostname, `savvagent.com`.
 `web/wrangler.jsonc` and `web/worker/index.ts` are the whole of it; this file is the
 account-side setup neither can express, and the traps a first deploy hits.
 
 Cloudflare is a deployment choice, not an architecture: with `SAVVAGENT_STATIC_DIR` set,
-`otto-platform-server` serves `web/build` itself and nothing here is required.
+`savvagent-platform-server` serves `web/build` itself and nothing here is required.
 
 ## Why a Worker rather than two origins
 
@@ -66,7 +66,7 @@ nothing to a client that is not a browser. Resource servers should be configured
 lifecycle webhooks. Note that the OAuth _issuer_ they validate against is still
 `https://savvagent.com`, because that is `SAVVAGENT_PUBLIC_URL`.
 
-The list mirrors `API_PREFIXES` in `crates/otto-platform-server/src/lib.rs` (plus the two
+The list mirrors `API_PREFIXES` in `crates/savvagent-platform-server/src/lib.rs` (plus the two
 health routes, minus the server-to-server paths). `web/worker/index.test.ts` is the half of
 that check that lives here; nothing mechanically ties the two lists together, so a change to
 one is a change to both.
@@ -80,12 +80,12 @@ npx wrangler deploy --env production   # or: npm run deploy, which does both
 ```
 
 **Naming the environment is load-bearing.** The default configuration is the development
-one: a different Worker (`otto-platform-console-dev`) whose `SAVVAGENT_ORIGIN` is
+one: a different Worker (`savvagent-platform-console-dev`) whose `SAVVAGENT_ORIGIN` is
 `http://127.0.0.1:8080`. A bare `wrangler deploy` therefore cannot overwrite the Worker the
 console runs on, and cannot silently point a staging build at production. It deploys
 something that proxies to an origin nobody is running, which fails immediately and visibly.
 `--env production` is the only path to the real hostname, and it deploys the Worker named
-`otto-platform-console`, proxying to `https://otto-platform.fly.dev`, with a custom domain
+`savvagent-platform-console`, proxying to `https://otto-platform.fly.dev`, with a custom domain
 on `savvagent.com`.
 
 Another environment is a block in `wrangler.jsonc` beside `production`, or a one-off
@@ -116,7 +116,7 @@ For the Worker deployment, `fly.toml` must be changed from its primary-path valu
 
 ### The CSRF guard needs nothing, because the Worker leaves `Origin` alone
 
-`crates/otto-web/src/csrf.rs` refuses any non-`GET` that carries the session cookie unless
+`crates/savvagent-web/src/csrf.rs` refuses any non-`GET` that carries the session cookie unless
 its `Origin` equals the origin of `SAVVAGENT_PUBLIC_URL` (or, with no `Origin`, it carries
 `Sec-Fetch-Site: same-origin`). The browser is on the Worker's hostname, so it sends
 `Origin: https://savvagent.com`, and the Worker forwards every request header as it
@@ -157,14 +157,14 @@ as the origin's reachability until one is.
 
 ## Verified locally
 
-`wrangler dev` in front of `cargo run -p otto-platform-server`, the same shape as the real
+`wrangler dev` in front of `cargo run -p savvagent-platform-server`, the same shape as the real
 thing minus Cloudflare's own edge:
 
 ```bash
 # origin (a scratch database)
 DATABASE_URL=postgres://… SAVVAGENT_PUBLIC_URL=http://localhost:8788 SAVVAGENT_BIND=127.0.0.1:8080 \
 SAVVAGENT_CLIENT_IP_HEADER=cf-connecting-ip SAVVAGENT_ENCRYPTION_KEY=$(openssl rand -base64 32) \
-  cargo run -p otto-platform-server
+  cargo run -p savvagent-platform-server
 
 # edge
 cd web && npm run build

@@ -27,13 +27,13 @@ export const ALLOWLIST_DOC = 'docs/rebrand-allowlist.md';
 
 /** The Rust files whose string literals a person reads. */
 export const RUST_COPY_FILES = [
-  'crates/otto-web/src/i18n.rs',
-  'crates/otto-web/src/routes/sso.rs',
-  'crates/otto-web/src/openapi.rs',
-  'crates/otto-core/src/i18n.rs',
-  'crates/otto-platform-server/src/email.rs',
-  'crates/otto-billing/src/budgets.rs',
-  'crates/otto-auth/src/passkeys.rs'
+  'crates/savvagent-web/src/i18n.rs',
+  'crates/savvagent-web/src/routes/sso.rs',
+  'crates/savvagent-web/src/openapi.rs',
+  'crates/savvagent-core/src/i18n.rs',
+  'crates/savvagent-platform-server/src/email.rs',
+  'crates/savvagent-billing/src/budgets.rs',
+  'crates/savvagent-auth/src/passkeys.rs'
 ];
 
 const HIT = /(?<!\p{L})otto/giu;

@@ -54,7 +54,7 @@
   ].join('\n');
 
   const FROM_SOURCE =
-    'cargo install --locked --git https://github.com/savvagent/otto-platform ottoctl otto-flags-cli';
+    'cargo install --locked --git https://github.com/savvagent/otto-platform savvagent-ctl savvagent-flags-cli';
 
   const why = [
     { title: () => m.cli_why_signin_title(), body: () => m.cli_why_signin_body() },

@@ -1,7 +1,7 @@
 /**
  * Where to send the browser after a successful sign-in.
  *
- * `otto-web` redirects a signed-out visitor from `/oauth/authorize` to
+ * `savvagent-web` redirects a signed-out visitor from `/oauth/authorize` to
  * `/login?next=/oauth/authorize?…`, so `next` routinely names a *server* route
  * rather than a page in this app. That is why the caller does a full
  * navigation instead of `goto`: the client router has no `/oauth/authorize`,
