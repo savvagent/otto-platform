@@ -13,9 +13,11 @@ the host of `SAVVAGENT_PUBLIC_URL`, so passkeys only work when the browser is on
 `savvagent.com`, not on `otto-platform.fly.dev` or the old `otto.savvagent.com`.
 
 `otto.savvagent.com` was the console and issuer until the [Savvagent
-cutover](#savvagent-cutover). It still resolves to this app, and keeps answering resource
-servers' introspection, token and `/internal/*` calls (none of which checks the `Host`)
-until every service has moved to `savvagent.com` (#135).
+cutover](#savvagent-cutover). It still resolves to this app and keeps its certificate, but
+since #135 it only redirects: `SAVVAGENT_REDIRECT_HOSTS=otto.savvagent.com` answers every
+request there with a `308` to the same path and query on `savvagent.com`, before CSRF,
+auth, rate limits or the console are reached. The [#135 runbook](#135-drop-the-aliases-and-redirect-ottosavvagentcom)
+is how it was turned on.
 
 ## Configuration (`fly.toml`)
 
@@ -482,7 +484,7 @@ fly certs show savvagent.com -a otto-platform   # prints the records to create
 Create at Namecheap what `fly certs show` prints: an `A` and `AAAA` for `@` (the app's
 IPs; an apex cannot be a `CNAME`). Then `fly certs check savvagent.com -a otto-platform`
 until it reports issued. `otto.savvagent.com` keeps its certificate and records on this app
-until #135 makes it redirect-only.
+so that, once #135 turns it into a redirect, the redirect works over HTTPS.
 
 **Settle this before the first passkey is registered.** Changing the host later invalidates
 every passkey.
@@ -494,9 +496,11 @@ everything else. That is fine: they authenticate with the resource server's own
 credential. Resource servers use `https://savvagent.com` for everything, the issuer,
 introspection, usage ingest and webhooks, and `https://otto-platform.fly.dev` is no longer
 needed by anyone. Until a service is repointed it keeps working against
-`https://otto.savvagent.com`: nothing on these routes compares the `Host` with
-`SAVVAGENT_PUBLIC_URL` (`the_old_host_keeps_answering_server_to_server_calls_after_the_cutover`
-pins it), only the advertised issuer differs.
+`https://otto.savvagent.com` while that host is still served: nothing on these routes
+compares the `Host` with `SAVVAGENT_PUBLIC_URL`
+(`the_old_host_keeps_answering_server_to_server_calls_after_the_cutover` pins it when no
+redirect host is configured), only the advertised issuer differs. #135 ends that: the old
+host then redirects, so repoint every service first.
 
 ## CSRF
 
@@ -736,7 +740,8 @@ it). That includes refusing the old sign-in tokens (`otto_at_`, `otto_rt_`, `ott
 `otto_ss_`, `otto_pat_`): they are treated as unknown on either host, so an agent still
 holding one signs in again, wherever it points. Only browser sign-in on the old host stops
 working, because no passkey is bound to it any more. #135 turns it into a redirect once
-every service has moved.
+every service has moved; see [the #135 runbook](#135-drop-the-aliases-and-redirect-ottosavvagentcom),
+after which the paragraph above no longer holds.
 
 ### Rolling back across the cutover
 
@@ -751,6 +756,65 @@ credentials up by hash and knows nothing of the prefix switch, so `sav_` tokens 
 secrets issued after the cutover keep working on it, and the retired `otto_` sign-in tokens
 that are still unexpired and unrevoked come back to life until you roll forward again.
 Prefer rolling forward with a fix.
+
+## #135: drop the aliases and redirect otto.savvagent.com
+
+The last step of the rebrand (savvagent/otto-platform#135, part of #128). The services'
+old resource URIs (`https://otto-<service>.savvagent.com/mcp`) stop being aliases, and the
+old platform host `otto.savvagent.com` stops serving and only redirects. The code is
+`SAVVAGENT_REDIRECT_HOSTS`: a request whose `Host` (port and case ignored) is listed gets
+a `308 Permanent Redirect` with an empty body, to `SAVVAGENT_PUBLIC_URL` plus the request's
+raw path and query, for every method and path (console pages, `/oauth/*`, `/.well-known/*`,
+`/api/*`, `/sso/*`, `/internal/*`, the health routes). It is the outermost layer, so it
+runs before CSRF, auth, rate limits and static serving, and the target never comes from
+the request's own scheme, host or `X-Forwarded-*`. The server refuses to start if a listed
+host is the public URL's host. `fly.toml` sets it to `otto.savvagent.com`; the certificate
+stays so the redirect works over HTTPS.
+
+Do not deploy this release until the preconditions hold, because a client that does not
+follow a redirect (Stripe does not; most HTTP clients drop an `Authorization` header when
+a redirect changes host) fails on the old host from the deploy on.
+
+**Preconditions (done before this release):**
+
+1. Every service's old host already redirects to its new one: CXP (#64), Flags (#202,
+   except `/api/`, which still has to be served for older SDKs) and Tower (#286). Check
+   each with `curl -sI`, for example
+   `curl -sI https://otto-cxp.savvagent.com/mcp | grep -i '^location'`.
+2. Every service's platform URL (`CXP_PLATFORM_URL`, `FLAGS_PLATFORM_URL`,
+   `OF_PLATFORM_URL`) is `https://savvagent.com`.
+3. Every MCP client has moved to the new URLs (`https://cxp.savvagent.com/mcp` and so on):
+   an MCP client signs in for exactly the URL it was given.
+4. The Stripe webhook endpoint posts to `https://savvagent.com/api/stripe/webhook` (step 4
+   of the [cutover](#savvagent-cutover)), if billing is enabled.
+
+**Steps:**
+
+1. Drop the three live aliases. This revokes the grants still bound to each alias.
+
+   ```bash
+   fly ssh console -a otto-platform
+   # then, inside the machine:
+   otto-platform-server resource drop-alias https://otto-cxp.savvagent.com/mcp
+   otto-platform-server resource drop-alias https://otto-flags.savvagent.com/mcp
+   otto-platform-server resource drop-alias https://otto-tower.savvagent.com/mcp
+   ```
+
+2. Deploy this release. This is when `otto.savvagent.com` starts redirecting.
+3. Verify:
+
+   ```bash
+   curl -sI https://otto.savvagent.com/.well-known/oauth-authorization-server
+   # HTTP/2 308
+   # location: https://savvagent.com/.well-known/oauth-authorization-server
+   ```
+
+   and `otto-platform-server resource list` (in the machine, as above) shows each server
+   with no `alias` lines: `list` omits dropped aliases, `resource show <uri>` still prints
+   them as history.
+
+To undo the redirect, remove `SAVVAGENT_REDIRECT_HOSTS` from `fly.toml` and redeploy: the
+old host is then served again, as before. A dropped alias is not brought back that way.
 
 ## Migrations and rolling back
 

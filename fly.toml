@@ -29,8 +29,10 @@
 # and its host is the WebAuthn relying party id, so passkeys only work when the
 # browser is actually on that host: neither otto-platform.fly.dev nor the old
 # otto.savvagent.com can complete a passkey ceremony. otto.savvagent.com still
-# points at this app and keeps answering resource servers' introspection and
-# token calls until every service has moved (savvagent/otto-platform#135).
+# points at this app, and its certificate stays, but only to redirect: every
+# request there gets a 308 to the same path and query on savvagent.com
+# (SAVVAGENT_REDIRECT_HOSTS below; savvagent/otto-platform#135). Nothing is
+# served from it any more, so every client must use savvagent.com.
 # Changing the host again invalidates every passkey; the cutover runbook in
 # docs/deploy/fly.md is how this one was done.
 
@@ -47,6 +49,10 @@ primary_region = "iad"
   RUST_LOG = "info"
   # The origin browsers see; also fixes the WebAuthn relying party id (its host).
   SAVVAGENT_PUBLIC_URL = "https://savvagent.com"
+  # Hosts that only redirect to the public URL (308, same path and query, every
+  # method), checked before anything else. The old pre-rebrand host: its cert
+  # stays so the redirect works over HTTPS. Never list the public URL's host.
+  SAVVAGENT_REDIRECT_HOSTS = "otto.savvagent.com"
   # Fly's proxy overwrites this header with the real client address (it does
   # not append, unlike X-Forwarded-For), which is the only property that makes
   # a per-IP throttle keyed on it worth anything. Nothing sits in front of Fly:

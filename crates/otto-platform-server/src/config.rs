@@ -66,6 +66,13 @@ pub struct Config {
     /// Worker in `web/worker/` in front instead.
     pub static_dir: Option<PathBuf>,
 
+    /// Hosts that only redirect (`SAVVAGENT_REDIRECT_HOSTS`): bare lowercase
+    /// hostnames, empty by default. Every request whose `Host` is one of them
+    /// is answered `308` to the same path and query under `public_url`,
+    /// before anything else runs (see `lib.rs`). Never the public URL's own
+    /// host, which `from_env` refuses.
+    pub redirect_hosts: Vec<String>,
+
     pub run_migrations: bool,
     pub log_format: LogFormat,
 
@@ -141,6 +148,9 @@ pub mod var {
     pub const CLIENT_IP_HEADER: &str = "SAVVAGENT_CLIENT_IP_HEADER";
     pub const ENFORCE_QUOTAS: &str = "SAVVAGENT_ENFORCE_QUOTAS";
     pub const STATIC_DIR: &str = "SAVVAGENT_STATIC_DIR";
+    /// New with the old-host redirect (savvagent/otto-platform#135): it has no
+    /// `OTTO_*` predecessor, so it is not in [`RETIRED`](super::RETIRED).
+    pub const REDIRECT_HOSTS: &str = "SAVVAGENT_REDIRECT_HOSTS";
     pub const RUN_MIGRATIONS: &str = "SAVVAGENT_RUN_MIGRATIONS";
     pub const LOG_FORMAT: &str = "SAVVAGENT_LOG_FORMAT";
     pub const SMTP_URL: &str = "SAVVAGENT_SMTP_URL";
@@ -205,6 +215,10 @@ impl Config {
                 .filter(|v| !v.is_empty()),
             enforce_quotas: parse_var(env, var::ENFORCE_QUOTAS, "0", parse_bool)?,
             static_dir: optional(env, var::STATIC_DIR).map(|v| PathBuf::from(v.trim())),
+            redirect_hosts: parse_redirect_hosts(
+                optional(env, var::REDIRECT_HOSTS).as_deref(),
+                &public_url,
+            )?,
             run_migrations: parse_var(env, var::RUN_MIGRATIONS, "1", parse_bool)?,
             log_format: parse_var(env, var::LOG_FORMAT, "text", |v| match v {
                 "json" => Ok(LogFormat::Json),
@@ -407,6 +421,59 @@ fn validate_public_url(public_url: &str) -> Result<()> {
     Ok(())
 }
 
+/// `SAVVAGENT_REDIRECT_HOSTS`: comma-separated bare hostnames, lowercased and
+/// de-duplicated. Absent or blank means none.
+///
+/// Each entry must be a plain DNS name: no scheme, port, path, userinfo or
+/// trailing dot, because the redirect compares it to a request's `Host` with
+/// the port already removed, and an entry that could never match would leave
+/// the old host being served while the operator believes it redirects. An
+/// entry equal to the public URL's host is refused: it would redirect to
+/// itself forever. (This server has no allowed-host list to overlap with.)
+fn parse_redirect_hosts(raw: Option<&str>, public_url: &str) -> Result<Vec<String>> {
+    let name = var::REDIRECT_HOSTS;
+    let public_host = url::Url::parse(public_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+    let mut hosts: Vec<String> = Vec::new();
+    for entry in raw.unwrap_or_default().split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let host = entry.to_ascii_lowercase();
+        if !is_bare_hostname(&host) {
+            return Err(anyhow!(
+                "{name} entries are bare hostnames (no scheme, port, path or trailing dot), \
+                 got {entry:?}"
+            ));
+        }
+        if public_host.as_deref() == Some(host.as_str()) {
+            return Err(anyhow!(
+                "{name} entry {host:?} is the {} host: it would redirect to itself",
+                var::PUBLIC_URL
+            ));
+        }
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    Ok(hosts)
+}
+
+/// A dotted DNS name of letters, digits and inner hyphens, at most 253 bytes.
+fn is_bare_hostname(host: &str) -> bool {
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
 fn optional(env: Lookup<'_>, name: &str) -> Option<String> {
     env(name).filter(|v| !v.trim().is_empty())
 }
@@ -458,6 +525,7 @@ impl Config {
             client_ip_header: None,
             enforce_quotas: false,
             static_dir: None,
+            redirect_hosts: vec![],
             run_migrations: true,
             log_format: LogFormat::Text,
             email: None,
@@ -529,6 +597,7 @@ mod tests {
             ("SAVVAGENT_CLIENT_IP_HEADER", "Fly-Client-IP"),
             ("SAVVAGENT_ENFORCE_QUOTAS", "yes"),
             ("SAVVAGENT_STATIC_DIR", "/srv/console"),
+            ("SAVVAGENT_REDIRECT_HOSTS", "Otto.Savvagent.com"),
             ("SAVVAGENT_RUN_MIGRATIONS", "off"),
             ("SAVVAGENT_LOG_FORMAT", "json"),
             ("SAVVAGENT_SMTP_URL", "smtps://u:p@smtp.example.com:465"),
@@ -542,6 +611,7 @@ mod tests {
         assert_eq!(config.client_ip_header.as_deref(), Some("fly-client-ip"));
         assert!(config.enforce_quotas);
         assert_eq!(config.static_dir, Some(PathBuf::from("/srv/console")));
+        assert_eq!(config.redirect_hosts, ["otto.savvagent.com"]);
         assert!(!config.run_migrations);
         assert_eq!(config.log_format, LogFormat::Json);
         assert_eq!(config.email.unwrap().from, "alerts@example.com");
@@ -566,7 +636,13 @@ mod tests {
         // constant cannot be left out of the check.
         let asked = asked.borrow();
         let declared = declared_vars();
-        assert_eq!(declared.len(), RETIRED.len(), "{declared:?}");
+        // Every `SAVVAGENT_*` name replaced an `OTTO_*` one, except the
+        // settings added since the rebrand.
+        let added = [var::REDIRECT_HOSTS];
+        assert_eq!(declared.len(), RETIRED.len() + added.len(), "{declared:?}");
+        for (_, new) in RETIRED {
+            assert!(declared.iter().any(|d| d == new), "{new} is not declared");
+        }
         for name in &declared {
             assert!(asked.iter().any(|a| a == name), "{name} is never read");
         }
@@ -718,6 +794,7 @@ mod tests {
             assert_eq!(config.public_url, "https://savvagent.com");
             assert_eq!(config.static_dir, Some(PathBuf::from("/srv/console")));
             assert_eq!(config.client_ip_header.as_deref(), Some("fly-client-ip"));
+            assert_eq!(config.redirect_hosts, ["otto.savvagent.com"]);
             assert_eq!(config.log_format, LogFormat::Json);
             assert_eq!(config.email.is_some(), all);
             assert_eq!(config.stripe.is_some(), all);
@@ -919,5 +996,79 @@ mod tests {
         for bad in ["otto.savvagent.com", "ftp://otto.savvagent.com", "https://"] {
             assert!(validate_public_url(bad).is_err(), "{bad} should be refused");
         }
+    }
+
+    const PUBLIC: &str = "https://savvagent.com";
+
+    #[test]
+    fn redirect_hosts_are_empty_by_default_and_read_as_a_list() {
+        for raw in [None, Some(""), Some(" , ")] {
+            assert!(parse_redirect_hosts(raw, PUBLIC).unwrap().is_empty());
+        }
+        let hosts = parse_redirect_hosts(
+            Some(" Otto.Savvagent.com , ,old.example,otto.savvagent.com"),
+            PUBLIC,
+        )
+        .unwrap();
+        assert_eq!(hosts, ["otto.savvagent.com", "old.example"]);
+    }
+
+    #[test]
+    fn redirect_hosts_are_bare_hostnames() {
+        for bad in [
+            "https://otto.savvagent.com",
+            "otto.savvagent.com/path",
+            "user@otto.savvagent.com",
+            "otto.savvagent.com:8080",
+            "otto.savvagent.com.",
+            "[::1]",
+            "-otto.savvagent.com",
+            "otto..savvagent.com",
+            "otto savvagent.com",
+            "otto.savvagent.com, https://x.example",
+        ] {
+            let err = parse_redirect_hosts(Some(bad), PUBLIC)
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("SAVVAGENT_REDIRECT_HOSTS"), "{bad:?}: {err}");
+            assert!(err.contains("bare hostnames"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_redirect_host_cannot_be_the_public_url_host() {
+        for (public, raw) in [
+            (PUBLIC, "savvagent.com"),
+            (PUBLIC, "otto.savvagent.com,SAVVAGENT.com"),
+            ("https://savvagent.example:8443", "Savvagent.example"),
+        ] {
+            let err = parse_redirect_hosts(Some(raw), public)
+                .expect_err(raw)
+                .to_string();
+            assert!(err.contains("redirect to itself"), "{raw:?}: {err}");
+        }
+    }
+
+    /// The same checks, end to end through the environment.
+    #[test]
+    fn startup_refuses_a_bad_redirect_host() {
+        let base = [
+            ("DATABASE_URL", "postgres://db"),
+            ("SAVVAGENT_PUBLIC_URL", PUBLIC),
+            ("SAVVAGENT_ENCRYPTION_KEY", KEY),
+        ];
+        let load = |extra: (&str, &str)| {
+            let mut env = base.to_vec();
+            env.push(extra);
+            let asked = std::cell::RefCell::new(Vec::new());
+            let loaded = Config::from_lookup(&vars(&env, &asked));
+            loaded.map_err(|e| format!("{e:#}"))
+        };
+        let err = load(("SAVVAGENT_REDIRECT_HOSTS", "savvagent.com")).unwrap_err();
+        assert!(err.contains("redirect to itself"), "{err}");
+        let err = load(("SAVVAGENT_REDIRECT_HOSTS", "otto.savvagent.com:443")).unwrap_err();
+        assert!(err.contains("bare hostnames"), "{err}");
+        let ok = load(("SAVVAGENT_REDIRECT_HOSTS", "otto.savvagent.com")).unwrap();
+        assert_eq!(ok.redirect_hosts, ["otto.savvagent.com"]);
     }
 }

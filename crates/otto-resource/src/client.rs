@@ -42,7 +42,7 @@ const MAX_NEGATIVE_ENTRIES: u64 = 1_000;
 /// Configuration for a [`PlatformClient`].
 #[derive(Clone)]
 pub struct ClientConfig {
-    /// The platform's origin, e.g. `https://otto.savvagent.com`.
+    /// The platform's origin, e.g. `https://savvagent.com`.
     pub base_url: String,
     /// This resource server's registered `resource_uri`; the HTTP Basic
     /// username.
@@ -100,7 +100,7 @@ impl std::fmt::Debug for ClientConfig {
 /// use otto_resource::{ClientConfig, PlatformClient};
 ///
 /// let platform = PlatformClient::new(ClientConfig::new(
-///     "https://otto.savvagent.com",
+///     "https://savvagent.com",
 ///     "https://otto-flags.savvagent.com/mcp",
 ///     std::env::var("SAVVAGENT_INTROSPECTION_SECRET").unwrap(),
 /// ))?;
@@ -439,9 +439,9 @@ impl PlatformClient {
     /// ```
     /// # use otto_resource::{ClientConfig, PlatformClient};
     /// let c = PlatformClient::new(ClientConfig::new(
-    ///     "https://otto.savvagent.com", "https://x.example/mcp", "sav_rs_x",
+    ///     "https://savvagent.com", "https://x.example/mcp", "sav_rs_x",
     /// ))?;
-    /// assert_eq!(c.usage_page_url("acme"), "https://otto.savvagent.com/o/acme/usage");
+    /// assert_eq!(c.usage_page_url("acme"), "https://savvagent.com/o/acme/usage");
     /// # Ok::<(), otto_resource::Error>(())
     /// ```
     pub fn usage_page_url(&self, org_slug: &str) -> String {
