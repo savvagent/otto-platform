@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/otto-tenant",
-  "crates/otto-core",
-  "crates/otto-billing",
-  "crates/otto-auth",
-  "crates/otto-web",
-  "crates/otto-resource",
-  "crates/otto-client",
-  "crates/ottoctl",
-  "crates/otto-flags-cli",
-  "crates/otto-platform-server",
+  "crates/savvagent-tenant",
+  "crates/savvagent-core",
+  "crates/savvagent-billing",
+  "crates/savvagent-auth",
+  "crates/savvagent-web",
+  "crates/savvagent-resource",
+  "crates/savvagent-client",
+  "crates/savvagent-ctl",
+  "crates/savvagent-flags-cli",
+  "crates/savvagent-platform-server",
 ]
 
 [workspace.package]
@@ -20,13 +20,13 @@ license = "AGPL-3.0-or-later"
 rust-version = "1.88"
 
 [workspace.dependencies]
-otto-tenant = { path = "crates/otto-tenant" }
-otto-core = { path = "crates/otto-core" }
-otto-billing = { path = "crates/otto-billing" }
-otto-auth = { path = "crates/otto-auth" }
-otto-web = { path = "crates/otto-web" }
-otto-resource = { path = "crates/otto-resource" }
-otto-client = { path = "crates/otto-client" }
+savvagent-tenant = { path = "crates/savvagent-tenant" }
+savvagent-core = { path = "crates/savvagent-core" }
+savvagent-billing = { path = "crates/savvagent-billing" }
+savvagent-auth = { path = "crates/savvagent-auth" }
+savvagent-web = { path = "crates/savvagent-web" }
+savvagent-resource = { path = "crates/savvagent-resource" }
+savvagent-client = { path = "crates/savvagent-client" }
 
 sqlx = { version = "0.8", default-features = false, features = [
   "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "macros", "migrate", "json",
@@ -46,7 +46,7 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-# Only used by otto-core's labels.rs test module (asserting the generated
+# Only used by savvagent-core's labels.rs test module (asserting the generated
 # handle's shape). Not a runtime dependency of any crate in this workspace.
 regex = "1"
 url = "2"

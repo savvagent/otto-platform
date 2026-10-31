@@ -1,7 +1,7 @@
 {
-  // OPTIONAL alternative to serving the console from otto-platform-server (the
+  // OPTIONAL alternative to serving the console from savvagent-platform-server (the
   // primary path, docs/deploy/fly.md). The console, deployed to Cloudflare as one Worker that serves the built SPA
-  // and forwards everything dynamic to otto-platform-server. See
+  // and forwards everything dynamic to savvagent-platform-server. See
   // docs/deploy/cloudflare.md for the account-side setup this file cannot
   // express, and worker/index.ts for why it is a proxy rather than a second
   // origin.
@@ -9,7 +9,7 @@
   // The default config is the development one, and it is named as such: a
   // bare `wrangler deploy` should never be able to land on the Worker the
   // console actually runs on. Production is a named environment below.
-  "name": "otto-platform-console-dev",
+  "name": "savvagent-platform-console-dev",
   "main": "worker/index.ts",
   "compatibility_date": "2026-09-02",
 
@@ -50,7 +50,7 @@
   },
 
   "vars": {
-    // Where otto-platform-server listens. Not a secret: a hostname.
+    // Where savvagent-platform-server listens. Not a secret: a hostname.
     //
     // The default is the local origin on purpose. A deploy that forgets to name
     // an environment then proxies to somewhere that is not listening and fails
@@ -64,11 +64,11 @@
   //
   // `name` is stated here because wrangler otherwise derives it by suffixing the
   // top-level one, and a deploy that silently created
-  // `otto-platform-console-dev-production` would look successful while serving
+  // `savvagent-platform-console-dev-production` would look successful while serving
   // nobody.
   "env": {
     "production": {
-      "name": "otto-platform-console",
+      "name": "savvagent-platform-console",
       "vars": {
         "SAVVAGENT_ORIGIN": "https://otto-platform.fly.dev"
       },

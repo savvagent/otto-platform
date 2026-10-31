@@ -1,0 +1,38 @@
+[package]
+name = "savvagent-billing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+savvagent-tenant.workspace = true
+savvagent-core.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+schemars.workspace = true
+uuid.workspace = true
+# Stripe client (`stripe` module).
+reqwest.workspace = true
+serde_urlencoded.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# The per-org billing lease waits (`billing::OrgLease`); `billing::mock`
+# also runs its listener on it.
+tokio.workspace = true
+# Only for `billing::mock` under the `test-support` feature.
+axum = { workspace = true, optional = true }
+
+[features]
+# Compiles `billing::mock`, a local stand-in for Stripe, so other crates'
+# tests (savvagent-web, savvagent-platform-server) can run the billing flows with no
+# network. Enabled only from dev-dependencies; never in a production build.
+test-support = ["dep:axum"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+axum.workspace = true

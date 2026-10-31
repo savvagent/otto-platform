@@ -1,7 +1,7 @@
 # Deploying the platform on Fly
 
 `savvagent.com` resolves straight to the Fly app `otto-platform`, and
-`otto-platform-server` serves everything: the API, the OAuth authorization server, and the
+`savvagent-platform-server` serves everything: the API, the OAuth authorization server, and the
 `web/` bundle, which is the prerendered marketing pages and the console (`web/build`, baked
 into the image at `/srv/console`). There is no edge in front,
 which is also how the services, such as Savvagent Tower, run. An optional Cloudflare Worker
@@ -149,7 +149,7 @@ of them is done by CI or by the server.
    00:00 UTC on the first of each month. A lease in the database lets only one machine
    sync at a time. The first boot with a key records the key's mode (live or test) in the
    database; see [Switching Stripe modes](#switching-stripe-modes).
-5. **Prices.** Set the price book (`otto-platform-server pricebook set ...`, see the
+5. **Prices.** Set the price book (`savvagent-platform-server pricebook set ...`, see the
    README). A price must be set at least 24 hours before the month it takes effect (by
    the database's clock), so **the first billable month is next month at the earliest**,
    or the month after that if you set prices on a month's last day. `set` prints what the
@@ -160,7 +160,7 @@ of them is done by CI or by the server.
    `DATABASE_URL` and `STRIPE_SECRET_KEY` as secrets:
 
    ```bash
-   fly ssh console -a otto-platform -C "otto-platform-server stripe sync"
+   fly ssh console -a otto-platform -C "savvagent-platform-server stripe sync"
    ```
 
    It prints what it did (a second run prints `nothing to do`), or `another stripe sync is
@@ -182,7 +182,7 @@ matches):
   unpaid" or "leave past due" keep the subscription live here: its usage keeps being
   queued for Stripe (so it is invoiced if the card recovers), but billable use past the
   free tiers answers `payment_required` as soon as it is `unpaid`, and 7 days after it
-  became `past_due` (`otto_billing::billing::gate::PAYMENT_GRACE`). A card marked
+  became `past_due` (`savvagent_billing::billing::gate::PAYMENT_GRACE`). A card marked
   `failed` or `detached` gets the same 7 days.
 - **Invoice finalization**: leave Stripe's automatic finalization of subscription
   invoices on. Stripe makes each month's invoice as a draft at 00:00 UTC on the first and
@@ -201,7 +201,7 @@ matches):
 
 ### How usage reaches an invoice
 
-Metered usage reaches Stripe as one meter event per org, meter, customer and UTC hour, sent after the hour ends (expect up to ~1 h of lag). A billing month closes 2 h after 00:00 UTC on the 1st; usage arriving later is billed in the current month. `otto-platform-server stripe outbox` counts these hourly rows, not individual usage events. Sent rows are swept after 35 days, 5,000 per batch.
+Metered usage reaches Stripe as one meter event per org, meter, customer and UTC hour, sent after the hour ends (expect up to ~1 h of lag). A billing month closes 2 h after 00:00 UTC on the 1st; usage arriving later is billed in the current month. `savvagent-platform-server stripe outbox` counts these hourly rows, not individual usage events. Sent rows are swept after 35 days, 5,000 per batch.
 
 Ingest queues the metered usage of every org with a live subscription in
 `stripe_meter_outbox`, and every machine runs a shipper that sends it, once `stripe sync`
@@ -220,7 +220,7 @@ platform does. Usage of a month before the subscription is not billed; that incl
 previous month when the card goes on file between 00:00 and 02:00 UTC on the first (that
 month is still open for late events, but the org had no card during it). A
 re-subscription after a cancellation is backdated only past the earlier subscription
-(see `otto_billing::billing`, "The first month").
+(see `savvagent_billing::billing`, "The first month").
 
 **Invoices wait for their usage.** See *Invoice finalization* above. A held invoice is
 finalized once the month has closed, two sync runs at least 10 minutes apart have seen
@@ -314,7 +314,7 @@ an hour. With billing disabled the rows wait until it is enabled.
 
 ### Monitoring
 
-- `fly ssh console -a otto-platform -C "otto-platform-server stripe outbox"`: rows by
+- `fly ssh console -a otto-platform -C "savvagent-platform-server stripe outbox"`: rows by
   status and the oldest pending row's age. Any `rejected` or `expired` rows are usage that
   will not be invoiced (each row's `last_error` says why). The oldest pending row should
   be under about two hours old (an hour's usage waits for its hour to end); much older
@@ -325,7 +325,7 @@ an hour. With billing disabled the rows wait until it is enabled.
   middle of", and the shipper's rejected/expired rows and 401/403s. A 401/403 (the key
   lacks *Billing Meter Events: write*) is retried, backing off to one pass every 5
   minutes; fix the key and nothing is lost.
-- `fly ssh console -a otto-platform -C "otto-platform-server usage held"`: usage events
+- `fly ssh console -a otto-platform -C "savvagent-platform-server usage held"`: usage events
   held for review instead of billed, because they would take an org's total of one meter
   in one billing month past `SAVVAGENT_USAGE_HOLD_THRESHOLD` (default 1,000,000,000,000). Each is
   logged at error level when held ("usage held for operator review"), has been refused to
@@ -504,7 +504,7 @@ host then redirects, so repoint every service first.
 
 ## CSRF
 
-`crates/otto-web/src/csrf.rs` refuses a non-`GET` that carries the session cookie unless its
+`crates/savvagent-web/src/csrf.rs` refuses a non-`GET` that carries the session cookie unless its
 `Origin` equals the origin of `SAVVAGENT_PUBLIC_URL` (or, with no `Origin`, it carries
 `Sec-Fetch-Site: same-origin`). Served directly the browser sends exactly that origin, so
 nothing needs configuring. `the_console_served_directly_keeps_csrf_and_json_404s` pins it.
@@ -682,10 +682,10 @@ device from the console's settings while you are there.
 
 Nothing to do for the console: it signs in with passkeys and the session cookie, not
 through an OAuth client, so there is no console client to register. OAuth clients
-(dynamically registered, or `otto-platform-server client register --first-party`) are rows
+(dynamically registered, or `savvagent-platform-server client register --first-party`) are rows
 in the database and do not depend on the issuer's host; their redirect URIs are on the
 clients' own hosts and keep working. A first-party client whose redirect URI is on
-`otto.savvagent.com` would need registering again with `otto-platform-server client
+`otto.savvagent.com` would need registering again with `savvagent-platform-server client
 register --first-party` and its `savvagent.com` URI; nothing in this repository registers
 one.
 
@@ -699,14 +699,14 @@ dropped there explicitly anyway (`resource drop-alias`).
 ```bash
 fly ssh console -a otto-platform
 # then, inside the machine:
-otto-platform-server resource list      # confirm the current URIs below before renaming
-otto-platform-server resource rename https://otto-tower.savvagent.com/mcp https://tower.savvagent.com/mcp \
+savvagent-platform-server resource list      # confirm the current URIs below before renaming
+savvagent-platform-server resource rename https://otto-tower.savvagent.com/mcp https://tower.savvagent.com/mcp \
   --alias-until 2027-06-30T00:00:00Z --name "Savvagent Tower"
-otto-platform-server resource rename https://otto-flags.savvagent.com/mcp https://flags.savvagent.com/mcp \
+savvagent-platform-server resource rename https://otto-flags.savvagent.com/mcp https://flags.savvagent.com/mcp \
   --alias-until 2027-06-30T00:00:00Z --name "Savvagent Flags"
-otto-platform-server resource rename https://otto-cxp.savvagent.com/mcp https://cxp.savvagent.com/mcp \
+savvagent-platform-server resource rename https://otto-cxp.savvagent.com/mcp https://cxp.savvagent.com/mcp \
   --alias-until 2027-06-30T00:00:00Z --name "Savvagent CXP"
-otto-platform-server resource list      # each new URI, with its old one as a `live` alias
+savvagent-platform-server resource list      # each new URI, with its old one as a `live` alias
 ```
 
 `rename` moves each server's tokens, authorization codes and usage dedupe ledger in one
@@ -795,9 +795,9 @@ a redirect changes host) fails on the old host from the deploy on.
    ```bash
    fly ssh console -a otto-platform
    # then, inside the machine:
-   otto-platform-server resource drop-alias https://otto-cxp.savvagent.com/mcp
-   otto-platform-server resource drop-alias https://otto-flags.savvagent.com/mcp
-   otto-platform-server resource drop-alias https://otto-tower.savvagent.com/mcp
+   savvagent-platform-server resource drop-alias https://otto-cxp.savvagent.com/mcp
+   savvagent-platform-server resource drop-alias https://otto-flags.savvagent.com/mcp
+   savvagent-platform-server resource drop-alias https://otto-tower.savvagent.com/mcp
    ```
 
 2. Deploy this release. This is when `otto.savvagent.com` starts redirecting.
@@ -809,7 +809,7 @@ a redirect changes host) fails on the old host from the deploy on.
    # location: https://savvagent.com/.well-known/oauth-authorization-server
    ```
 
-   and `otto-platform-server resource list` (in the machine, as above) shows each server
+   and `savvagent-platform-server resource list` (in the machine, as above) shows each server
    with no `alias` lines: `list` omits dropped aliases, `resource show <uri>` still prints
    them as history.
 
@@ -818,7 +818,7 @@ old host is then served again, as before. A dropped alias is not brought back th
 
 ## Migrations and rolling back
 
-Every machine applies the schema migrations (`crates/otto-tenant/migrations`) when it
+Every machine applies the schema migrations (`crates/savvagent-tenant/migrations`) when it
 boots, under a Postgres advisory lock, so the first machine of a new release migrates and
 the rest find nothing to do. There are no down migrations, and the schema is never rolled
 back.
@@ -826,7 +826,7 @@ back.
 **Migrations are additive.** A migration adds tables, nullable columns, constraints and
 indexes; it never drops or renames anything a released binary reads. So a newer schema is
 always one the previous release can run against, and the migrator is built for it: it
-ignores applied migrations it does not know (`otto_tenant::db::MIGRATOR`), instead of
+ignores applied migrations it does not know (`savvagent_tenant::db::MIGRATOR`), instead of
 refusing to boot. **To roll back, deploy the previous release's image** (for example
 `fly deploy -a otto-platform --image <previous image>`; `fly releases -a otto-platform
 --image` lists them). It boots against the newer schema and serves. (A release from
@@ -896,7 +896,7 @@ still serving.
   only through such tokens and still has usage to ship is refused, and is fixed by one new
   token (or by inserting its row into `org_resource_grants`).
 - A metered event that would take an org's total of one meter in one UTC billing month past
-  `SAVVAGENT_USAGE_HOLD_THRESHOLD` is held in `usage_held_events` (`otto-platform-server usage
+  `SAVVAGENT_USAGE_HOLD_THRESHOLD` is held in `usage_held_events` (`savvagent-platform-server usage
   held`), not counted and not billed, and reported to its shipper as rejected with a reason
   starting `held_for_review`. There is no release command yet: counting a held event is a
   manual operator step.

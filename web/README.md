@@ -7,8 +7,8 @@ per product, and pricing read live from the plan catalog, in every language the 
 speaks. And the **account and organization console**: signing in with a passkey (or
 enterprise SSO), creating an account, managing passkeys and sessions, reviewing the
 account's own security activity, and, per organization, members, invitations, teams, SSO,
-the usage meter and the audit log. Both talk to `otto-platform-server`'s API
-(`crates/otto-web`; the contract is `GET /api/openapi.json`).
+the usage meter and the audit log. Both talk to `savvagent-platform-server`'s API
+(`crates/savvagent-web`; the contract is `GET /api/openapi.json`).
 
 What it does **not** hold is any product's own domain: queues, repositories, trackers and
 agent connection live in each service, which signs in here with OAuth, and are used through
@@ -171,7 +171,7 @@ reader as "du", the informal register, on the marketing pages as in the console.
 
 Not translated, on purpose: product names, wire values and commands. The server-rendered
 consent and error pages for `/oauth/authorize` are localized by a table in
-`crates/otto-web/src/i18n.rs`, which shares no keys with these catalogs.
+`crates/savvagent-web/src/i18n.rs`, which shares no keys with these catalogs.
 
 A change of language **reloads the document**: Paraglide's `m.*()` are plain calls, not
 reactive reads, so Svelte has nothing to invalidate. In the console, the account's choice
@@ -183,7 +183,7 @@ is stored; an English page only offers a link to the visitor's apparent language
 
 | Path                            | What it is                                                                                    |
 | ------------------------------- | --------------------------------------------------------------------------------------------- |
-| `src/lib/api.ts`                | The only place that talks to `otto-web`. `ApiError` carries the stable `code`.                |
+| `src/lib/api.ts`                | The only place that talks to `savvagent-web`. `ApiError` carries the stable `code`.                |
 | `src/lib/types.ts`              | The wire types, transcribed from the OpenAPI document.                                        |
 | `src/lib/session.svelte.ts`     | Who is signed in. A rune module, not a store.                                                 |
 | `src/lib/org.svelte.ts`         | The org the current route is about, via context.                                              |
@@ -206,7 +206,7 @@ is stored; an English page only offers a link to the visitor's apparent language
 
 ## Deploying
 
-Production serves this bundle from `otto-platform-server` on Fly (`SAVVAGENT_STATIC_DIR=/srv/console`
+Production serves this bundle from `savvagent-platform-server` on Fly (`SAVVAGENT_STATIC_DIR=/srv/console`
 in `fly.toml`; the Dockerfile builds it), at `savvagent.com`:
 [`docs/deploy/fly.md`](../docs/deploy/fly.md).
 
@@ -232,5 +232,5 @@ header).
 
 `worker/index.ts` and `wrangler.jsonc` are an **optional** Cloudflare Worker alternative
 (`npm run deploy`, `--env production`; a bare `wrangler deploy` lands on the separate
-`otto-platform-console-dev` Worker). It needs the domain's DNS on Cloudflare and a different
+`savvagent-platform-console-dev` Worker). It needs the domain's DNS on Cloudflare and a different
 client-IP header; see [`docs/deploy/cloudflare.md`](../docs/deploy/cloudflare.md).

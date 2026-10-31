@@ -18,7 +18,7 @@ import type { BudgetThreshold, ServiceBudget } from '$lib/types';
 
 /**
  * The largest monthly budget the server accepts, in cents ($10,000,000):
- * `otto_billing::budgets::MAX_MONTHLY_BUDGET_CENTS`.
+ * `savvagent_billing::budgets::MAX_MONTHLY_BUDGET_CENTS`.
  */
 export const MAX_MONTHLY_BUDGET_CENTS = 1_000_000_000;
 

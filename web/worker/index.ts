@@ -3,7 +3,7 @@
  *
  * Cloudflare serves the built SPA from its own network and forwards everything
  * dynamic (`/api`, `/oauth`, `/sso`, `/.well-known`, and the health probes) to
- * `otto-platform-server`. The browser talks to exactly one hostname, which is
+ * `savvagent-platform-server`. The browser talks to exactly one hostname, which is
  * not a performance decision: the console's session is an `HttpOnly`,
  * `__Host-` prefixed cookie, and `__Host-` means the browser refuses to store it
  * unless it is `Secure`, has `Path=/`, and carries no `Domain`. Put the SPA on
@@ -20,9 +20,9 @@
  */
 
 /**
- * Path prefixes that belong to `otto-platform-server` rather than to the
+ * Path prefixes that belong to `savvagent-platform-server` rather than to the
  * console's own client-side routing. **This list mirrors `API_PREFIXES` in
- * `crates/otto-platform-server/src/lib.rs`, minus the server-to-server paths in
+ * `crates/savvagent-platform-server/src/lib.rs`, minus the server-to-server paths in
  * `NEVER_PROXIED`** and must not drift from it: the server keeps the same list
  * to decide what gets a JSON `404` instead of the SPA shell, and a prefix that
  * exists on one side only is a route that behaves differently depending on
@@ -106,7 +106,7 @@ export function isNeverProxied(path: string): boolean {
 export interface Env {
   /** The built `web/build` bundle, uploaded with the Worker. */
   ASSETS: Fetcher;
-  /** Where `otto-platform-server` actually listens, e.g. `https://otto-platform.fly.dev`. */
+  /** Where `savvagent-platform-server` actually listens, e.g. `https://otto-platform.fly.dev`. */
   SAVVAGENT_ORIGIN: string;
 }
 
@@ -196,7 +196,7 @@ function redirectOnSite(path: string, search: string): Response {
 /**
  * The bundle side of the Worker: prerendered pages and assets as themselves,
  * and the shell for any page route that has no file. The same steps, in the
- * same order, as `route` in `crates/otto-platform-server/src/lib.rs`.
+ * same order, as `route` in `crates/savvagent-platform-server/src/lib.rs`.
  *
  * `not_found_handling` is `"none"` (see wrangler.jsonc), so the binding's
  * `404` reaches this function and the shell is chosen here, where the rule can
@@ -292,7 +292,7 @@ export default {
       return json(500, {
         error: 'misconfigured',
         error_description:
-          'this Worker has no SAVVAGENT_ORIGIN, so it does not know where otto-platform-server is. ' +
+          'this Worker has no SAVVAGENT_ORIGIN, so it does not know where savvagent-platform-server is. ' +
           'Deploy with --env production, or pass --var SAVVAGENT_ORIGIN:https://…'
       });
     }

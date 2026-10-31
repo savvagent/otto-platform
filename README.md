@@ -29,12 +29,12 @@ short:
   cannot be replayed against another.
 
 It is deployed at `https://savvagent.com`. Savvagent Tower is its first
-resource server: it depends on `otto-tenant` and `otto-resource` from this repo,
+resource server: it depends on `savvagent-tenant` and `savvagent-resource` from this repo,
 validates bearer tokens through introspection, and its console signs in here
 with OAuth. Savvagent Flags is the second, needing nothing from the platform
 beyond registering itself.
 
-`otto-platform-server` serves the identity HTTP surface — the OAuth 2.1
+`savvagent-platform-server` serves the identity HTTP surface — the OAuth 2.1
 authorization server, sign-in (passkeys and enterprise SSO), and the
 account/org API — for every registered resource server, plus the
 resource-server API (introspection, usage ingest, member lookup, lifecycle
@@ -56,7 +56,7 @@ and never pass through a model. Prebuilt binaries for Linux (x86_64, arm64),
 macOS (Apple silicon, Intel) and Windows (x86_64) are attached to every
 [release](https://github.com/savvagent/otto-platform/releases/latest), with
 checksums. To install and verify one, see
-[docs/savctl.md](docs/savctl.md#install). `savctl` replaces `ottoctl`:
+[docs/savctl.md](docs/savctl.md#install). `savctl` replaces `savvagent-ctl`:
 credentials now live under `~/.config/savvagent` (`SAVVAGENT_CONFIG_DIR`), so
 run `savctl login` once after upgrading.
 
@@ -64,76 +64,76 @@ run `savctl login` once after upgrading.
 
 ```
 crates/
-├── otto-tenant/          lowest-level: typed ids, the pinned-transaction
+├── savvagent-tenant/          lowest-level: typed ids, the pinned-transaction
 │                         connection pool (Db/Tx/Unpinned), the row-level-
 │                         security isolation proof, the audit-events pattern,
 │                         `Cipher` (AES-256-GCM encryption at rest).
 │                         Owns no domain model — no users, no orgs.
-├── otto-core/            identity domain: users, orgs, org_members, teams,
+├── savvagent-core/            identity domain: users, orgs, org_members, teams,
 │                         org_invites, locales, account labels, enterprise
 │                         SSO data (IdP connections, claimed domains,
 │                         federated identities, SSO ceremonies,
-│                         enforce_sso guards). Built on otto-tenant.
-├── otto-billing/         usage metering and plan-limit queries
+│                         enforce_sso guards). Built on savvagent-tenant.
+├── savvagent-billing/         usage metering and plan-limit queries
 │                         (usage_events, org_period_usage, plans,
-│                         subscriptions). Built on otto-tenant and otto-core.
-├── otto-auth/            OAuth 2.1 authorization server, passkeys/WebAuthn,
+│                         subscriptions). Built on savvagent-tenant and savvagent-core.
+├── savvagent-auth/            OAuth 2.1 authorization server, passkeys/WebAuthn,
 │                         browser sessions, personal access tokens,
 │                         login-attempt rate limiting, OIDC federation client
 │                         and DNS domain verification. Built on
-│                         otto-tenant and otto-core.
-├── otto-web/             the HTTP surface as a library: OAuth discovery,
+│                         savvagent-tenant and savvagent-core.
+├── savvagent-web/             the HTTP surface as a library: OAuth discovery,
 │                         /oauth/*, /sso/callback, /api/auth/*, /api/me*,
 │                         the org API (members, invites, teams, SSO
 │                         admin, tokens, usage, audit), and the public
 │                         plan catalog (/api/plans). Routes and the
 │                         OpenAPI document come from one catalog. Built on
-│                         otto-tenant, otto-core, otto-billing, otto-auth.
-├── otto-resource/        what a resource server (otto-tower, otto-flags)
+│                         savvagent-tenant, savvagent-core, savvagent-billing, savvagent-auth.
+├── savvagent-resource/        what a resource server (otto-tower, otto-flags)
 │                         links: introspection, usage and lookup clients
 │                         with 60 s caches, webhook signature verification.
 │                         No database dependency.
-├── otto-client/          what a terminal tool links to sign in as an MCP
+├── savvagent-client/          what a terminal tool links to sign in as an MCP
 │                         client does: discovery, dynamic registration,
 │                         PKCE S256 on a loopback redirect, a per-resource
 │                         token cache, and `Secret` output that never reaches
 │                         a log. No database dependency.
-├── ottoctl/              binary `savctl`: `savctl login [--resource <uri>]`, and
+├── savvagent-ctl/              binary `savctl`: `savctl login [--resource <uri>]`, and
 │                         `savctl <app> ...` runs `savctl-<app>` from PATH. See
 │                         [docs/savctl.md](docs/savctl.md).
-├── otto-flags-cli/       binary `savctl-flags`, run as `savctl flags`: issue an
+├── savvagent-flags-cli/       binary `savctl-flags`, run as `savctl flags`: issue an
 │                         Savvagent Flags app's keys so the secret server key goes
 │                         to a terminal or an owner-only file, not a model.
-└── otto-platform-server/ binary: loads config, connects, runs migrations,
+└── savvagent-platform-server/ binary: loads config, connects, runs migrations,
                           verifies tenant isolation, then serves /healthz,
-                          /readyz, otto-web's router, the
+                          /readyz, savvagent-web's router, the
                           resource-server API (`POST /oauth/introspect`,
                           `/internal/*`), and, with SAVVAGENT_STATIC_DIR, the
                           web/ bundle. Delivers lifecycle webhooks and
                           provisions resource servers, first-party
                           OAuth clients and the price book, and syncs
                           the price book to Stripe
-                          (`otto-platform-server resource ...`,
+                          (`savvagent-platform-server resource ...`,
                           `client ...`, `pricebook ...`, `stripe sync`).
 ```
 
-Dependency direction: `otto-tenant` ← `otto-core` ← `otto-billing`,
-`otto-auth` ← `otto-web` ← `otto-platform-server`. The server also uses
-`otto-resource` for the wire types it shares with resource servers.
+Dependency direction: `savvagent-tenant` ← `savvagent-core` ← `savvagent-billing`,
+`savvagent-auth` ← `savvagent-web` ← `savvagent-platform-server`. The server also uses
+`savvagent-resource` for the wire types it shares with resource servers.
 
-Because `otto_tenant::Db` and `otto_tenant::Tx` are defined in a crate that
-`otto-core`/`otto-billing`/`otto-auth` depend on rather than own, Rust's
+Because `savvagent_tenant::Db` and `savvagent_tenant::Tx` are defined in a crate that
+`savvagent-core`/`savvagent-billing`/`savvagent-auth` depend on rather than own, Rust's
 orphan rules mean their query methods are added as **extension traits**
-(`otto_core::orgs::OrgsExt`, `otto_core::orgs::OrgsTxExt`,
-`otto_core::teams::TeamsExt`, `otto_core::invites::InvitesExt`,
-`otto_core::invites::AccountClaimsExt`, `otto_billing::usage::UsageExt`)
+(`savvagent_core::orgs::OrgsExt`, `savvagent_core::orgs::OrgsTxExt`,
+`savvagent_core::teams::TeamsExt`, `savvagent_core::invites::InvitesExt`,
+`savvagent_core::invites::AccountClaimsExt`, `savvagent_billing::usage::UsageExt`)
 rather than the inherent `impl Db { ... }` / `impl Tx<'_> { ... }` blocks
 otto-factory's original single `of-core` crate could write. Import the
 trait alongside `Db`/`Tx` to call its methods, e.g.:
 
 ```rust
-use otto_core::orgs::OrgsExt;
-use otto_tenant::Db;
+use savvagent_core::orgs::OrgsExt;
+use savvagent_tenant::Db;
 
 let user = db.get_user(user_id).await?;
 ```
@@ -148,7 +148,7 @@ cp .env.example .env
 # edit .env: DATABASE_URL=postgres://postgres:postgres@localhost:5432/otto_platform
 #            SAVVAGENT_ENCRYPTION_KEY=$(openssl rand -base64 32)
 
-cargo run -p otto-platform-server
+cargo run -p savvagent-platform-server
 ```
 
 Configuration is all `SAVVAGENT_*` (plus `DATABASE_URL`, `RUST_LOG` and the two
@@ -173,7 +173,7 @@ Stripe secrets):
 On startup it will:
 
 1. Connect to `DATABASE_URL`.
-2. Run every migration in `crates/otto-tenant/migrations/` (idempotent —
+2. Run every migration in `crates/savvagent-tenant/migrations/` (idempotent —
    safe to run from multiple replicas at once; sqlx takes a Postgres
    advisory lock for the duration).
 3. Verify tenant isolation is actually enforced — as the role a tenant
@@ -186,7 +186,7 @@ Set `SAVVAGENT_RUN_MIGRATIONS=0` to skip step 2 (e.g. a deployment that migrates
 as a separate step ahead of a rolling restart).
 
 A resource server must be registered by an operator
-(`otto-platform-server resource register`, below) before clients can authorize
+(`savvagent-platform-server resource register`, below) before clients can authorize
 against it. The authorization server serves every registered one; a client names its
 target with the RFC 8707 `resource` parameter, which may be omitted only while
 exactly one is registered.
@@ -194,16 +194,16 @@ exactly one is registered.
 Each scope can carry a human-readable description, which the consent screen
 shows in place of the bare scope name (the name stays alongside it; a scope
 with no description is shown as its name). A service sets them with
-`otto_auth::resources::set_scope_descriptions`, and an operator with the CLI:
+`savvagent_auth::resources::set_scope_descriptions`, and an operator with the CLI:
 
 ```sh
-otto-platform-server resource register https://otto-factory.example/mcp \
+savvagent-platform-server resource register https://otto-factory.example/mcp \
   --name otto-factory --scopes jobs:read,jobs:write \
   --scope-description 'jobs:read=View your jobs and their results' \
   --scope-description 'jobs:write=Create, change, and cancel jobs'
 
 # Replace the set later, or remove it with --clear.
-otto-platform-server resource describe https://otto-factory.example/mcp \
+savvagent-platform-server resource describe https://otto-factory.example/mcp \
   --scope-description 'jobs:read=View your jobs and their results'
 ```
 
@@ -230,10 +230,10 @@ assigns, so one service can never declare or ship meters under another's
 name:
 
 ```sh
-otto-platform-server resource set-service https://otto-flags.example/mcp otto-flags
+savvagent-platform-server resource set-service https://otto-flags.example/mcp otto-flags
 
 # Or at registration time:
-otto-platform-server resource register https://otto-flags.example/mcp \
+savvagent-platform-server resource register https://otto-flags.example/mcp \
   --name otto-flags --scopes flags:read,flags:write --service otto-flags
 ```
 
@@ -243,7 +243,7 @@ meters under it. `resource list` and `resource show` print it
 (`service=-` when none is set).
 
 At startup the service declares its meters with
-`otto_resource::PlatformClient::declare_meters` (`PUT /internal/meters`, at
+`savvagent_resource::PlatformClient::declare_meters` (`PUT /internal/meters`, at
 most 50 per request, upserted idempotently), and only then starts its usage
 shipper. A meter outside its own namespace, or a malformed one (meter name
 `^[a-z][a-z0-9_]{0,62}$`, display name up to 80 characters, unit up to 32), is
@@ -266,9 +266,9 @@ back, printing what it would move, or the refusal and exiting non-zero.
 it:
 
 ```sh
-otto-platform-server resource show https://otto-factory.example/mcp
-otto-platform-server resource rename-service https://otto-factory.example/mcp otto-tower --dry-run
-otto-platform-server resource rename-service https://otto-factory.example/mcp otto-tower
+savvagent-platform-server resource show https://otto-factory.example/mcp
+savvagent-platform-server resource rename-service https://otto-factory.example/mcp otto-tower --dry-run
+savvagent-platform-server resource rename-service https://otto-factory.example/mcp otto-tower
 ```
 
 In one transaction it moves the service's meters (`otto-factory/<m>` becomes
@@ -305,9 +305,9 @@ to run it again. `resource show <uri>` beforehand shows the server and its
 aliases without changing anything.
 
 ```sh
-otto-platform-server resource rename https://otto-factory.example/mcp \
+savvagent-platform-server resource rename https://otto-factory.example/mcp \
   https://otto-tower.example/mcp --alias-until 2027-01-31T00:00:00Z --name otto-tower
-otto-platform-server resource list   # the alias is listed under its server
+savvagent-platform-server resource list   # the alias is listed under its server
 ```
 
 In one transaction it changes the canonical URI (webhook deliveries and older
@@ -351,7 +351,7 @@ many, so a dropped alias leaves no live credential behind. Running it again
 is safe and revokes any straggler:
 
 ```sh
-otto-platform-server resource drop-alias https://otto-factory.example/mcp
+savvagent-platform-server resource drop-alias https://otto-factory.example/mcp
 ```
 
 Alias rows are never deleted. `register` and `rename` refuse any URI that is,
@@ -361,7 +361,7 @@ renaming onto a **live** alias of the same server swaps the two URIs back,
 keeping the alias's sunset unless `--alias-until` gives a new one:
 
 ```sh
-otto-platform-server resource rename https://otto-tower.example/mcp \
+savvagent-platform-server resource rename https://otto-tower.example/mcp \
   https://otto-factory.example/mcp
 ```
 
@@ -381,9 +381,9 @@ the owner; the repository ships none.
 
 ```sh
 # Illustrative only: the first 1,000 units each month free, then 0.15 cents each.
-otto-platform-server pricebook set example-service/requests --effective 2026-12 \
+savvagent-platform-server pricebook set example-service/requests --effective 2026-12 \
   --tier 1000:0 --tier inf:150000
-otto-platform-server pricebook list
+savvagent-platform-server pricebook list
 ```
 
 Each `--tier` is `<up_to>:<ucents>`, with strictly increasing bounds and the
@@ -428,7 +428,7 @@ server runs it itself, at boot, every 15 minutes and just after each month
 starts (one machine at a time); the command runs it now and prints what it did:
 
 ```sh
-otto-platform-server stripe sync
+savvagent-platform-server stripe sync
 ```
 
 It creates a Stripe billing meter for every declared meter and a Stripe Price
@@ -448,11 +448,11 @@ endpoint are set up by hand: see
 
 ### Running just the migrations
 
-Any tool that runs `sqlx::migrate!` against `crates/otto-tenant/migrations/`
+Any tool that runs `sqlx::migrate!` against `crates/savvagent-tenant/migrations/`
 works, including the `sqlx-cli`:
 
 ```sh
-sqlx migrate run --source crates/otto-tenant/migrations
+sqlx migrate run --source crates/savvagent-tenant/migrations
 ```
 
 ## Testing
@@ -463,7 +463,7 @@ cargo test --workspace
 ```
 
 Unit tests run without a database. The integration tests (`#[sqlx::test]`,
-including `otto-web`'s HTTP tests, which drive the real router with a
+including `savvagent-web`'s HTTP tests, which drive the real router with a
 software passkey authenticator and a mock IdP) need a Postgres whose role can
 create databases, named by `DATABASE_URL` — CI uses a `postgres:16` service on
 port 15434 (see `.github/workflows/ci.yml`; create the `otto_app` role first).
@@ -474,7 +474,7 @@ createdb otto_platform_dev
 DATABASE_URL=postgres://localhost/otto_platform_dev \
   SAVVAGENT_PUBLIC_URL=http://localhost:8080 \
   SAVVAGENT_ENCRYPTION_KEY=$(openssl rand -base64 32) \
-  cargo run -p otto-platform-server
+  cargo run -p savvagent-platform-server
 ```
 
 A successful boot logs a line like:

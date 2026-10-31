@@ -9,7 +9,7 @@ import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
  * A SvelteKit server rendering these pages would have to hold that credential
  * to fetch on the user's behalf — a second process with the keys to every
  * console session, for pages that are behind a login and cannot be cached
- * anyway. Building to static files that `otto-platform-server` serves on the same origin
+ * anyway. Building to static files that `savvagent-platform-server` serves on the same origin
  * as `/api` keeps the cookie in exactly one place: the browser.
  *
  * The public marketing pages are the exception, and a safe one: they read no
@@ -24,7 +24,7 @@ import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
  *
  * The shell is `200.html`, not `index.html`, because `index.html` is now the
  * prerendered landing page; writing the fallback there would overwrite it.
- * `otto-platform-server` and the Worker both serve `200.html` for unmatched
+ * `savvagent-platform-server` and the Worker both serve `200.html` for unmatched
  * paths, with an `X-Robots-Tag: noindex` header, and the server refuses to
  * start without it.
  *
